@@ -4,18 +4,22 @@
 //! holds a per-dimension int8 copy of the vectors present in one worktree and
 //! scans all of it per query, keeping the [`FIRST_PASS`] best codes; those are
 //! re-ranked against their fp16 rows read through a read-only mmap, and the
-//! best [`RESULTS`] are returned.
+//! best [`RESULTS`] are returned. A [`RowMask`] restricts the scan to the rows
+//! a filter admits, so the best rows *within* the filter come back.
 
 mod calibration;
 mod fp16;
 mod index;
+mod mask;
 mod qos;
 mod topk;
 
 pub use calibration::{Calibration, calibration_for};
 pub use index::KnnIndex;
+pub use mask::RowMask;
 #[cfg(target_os = "macos")]
 pub use qos::performance_cores;
+pub(crate) use qos::set_user_interactive;
 
 use std::io;
 

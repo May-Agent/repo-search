@@ -4,6 +4,7 @@ pub mod chunk;
 mod embed;
 pub mod knn;
 pub mod reconcile;
+pub mod search;
 pub mod store;
 
-pub use embed::{Embedder, UnitVector};
+pub use embed::{Embedder, QueryTask, UnitVector};

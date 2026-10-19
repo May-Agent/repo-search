@@ -8,6 +8,7 @@ use std::path::Path;
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use tokio::sync::{mpsc, oneshot};
 
+use super::query::{self, ChunkFilter, ChunkId, ChunkRow, Side};
 use super::{
     ChunkRecord, ContentHash, Error, FileState, ensure_version, open_conn, remove_db_files,
     send_and_wait, spawn_actor,
@@ -70,6 +71,40 @@ enum Request {
     },
     FileStates {
         reply: oneshot::Sender<Result<Vec<FileState>, Error>>,
+    },
+    Bm25 {
+        query: String,
+        filter: ChunkFilter,
+        limit: u32,
+        reply: oneshot::Sender<Result<Vec<ChunkId>, Error>>,
+    },
+    ByHashes {
+        hashes: Vec<ContentHash>,
+        filter: ChunkFilter,
+        reply: oneshot::Sender<Result<Vec<Vec<ChunkId>>, Error>>,
+    },
+    Chunks {
+        ids: Vec<ChunkId>,
+        reply: oneshot::Sender<Result<Vec<ChunkRow>, Error>>,
+    },
+    Count {
+        side: Side,
+        reply: oneshot::Sender<Result<u64, Error>>,
+    },
+    HashSides {
+        reply: oneshot::Sender<Result<Vec<(ContentHash, Side)>, Error>>,
+    },
+    HashesMatching {
+        filter: ChunkFilter,
+        reply: oneshot::Sender<Result<Vec<ContentHash>, Error>>,
+    },
+    Matching {
+        query: String,
+        ids: Vec<ChunkId>,
+        reply: oneshot::Sender<Result<Vec<ChunkId>, Error>>,
+    },
+    Kinds {
+        reply: oneshot::Sender<Result<Vec<String>, Error>>,
     },
 }
 
@@ -167,6 +202,103 @@ impl Index {
     pub async fn chunk_hashes(&self) -> Result<Vec<ContentHash>, Error> {
         send_and_wait(&self.tx, |reply| Request::ChunkHashes { reply }).await
     }
+
+    /// Up to `limit` chunks matching the FTS5 expression `query` and `filter`,
+    /// best BM25 first.
+    ///
+    /// # Errors
+    ///
+    /// When SQLite rejects the expression or the read, or the actor is gone.
+    pub async fn bm25(
+        &self,
+        query: String,
+        filter: ChunkFilter,
+        limit: u32,
+    ) -> Result<Vec<ChunkId>, Error> {
+        send_and_wait(&self.tx, |reply| Request::Bm25 {
+            query,
+            filter,
+            limit,
+            reply,
+        })
+        .await
+    }
+
+    /// For each of `hashes`, in order, the chunks holding it that pass
+    /// `filter`; empty for a hash this index lacks or the filter rejects.
+    ///
+    /// # Errors
+    ///
+    /// When SQLite rejects the read or the actor is gone.
+    pub async fn chunks_with_hashes(
+        &self,
+        hashes: Vec<ContentHash>,
+        filter: ChunkFilter,
+    ) -> Result<Vec<Vec<ChunkId>>, Error> {
+        send_and_wait(&self.tx, |reply| Request::ByHashes {
+            hashes,
+            filter,
+            reply,
+        })
+        .await
+    }
+
+    /// The rows of `ids`, in the order given; an id the index no longer
+    /// holds is absent.
+    ///
+    /// # Errors
+    ///
+    /// When SQLite rejects the read or the actor is gone.
+    pub async fn chunks(&self, ids: Vec<ChunkId>) -> Result<Vec<ChunkRow>, Error> {
+        send_and_wait(&self.tx, |reply| Request::Chunks { ids, reply }).await
+    }
+
+    /// The number of chunk rows on `side`.
+    ///
+    /// # Errors
+    ///
+    /// When SQLite rejects the read or the actor is gone.
+    pub async fn count(&self, side: Side) -> Result<u64, Error> {
+        send_and_wait(&self.tx, |reply| Request::Count { side, reply }).await
+    }
+
+    /// Every distinct chunk content hash with the side its chunks are on.
+    ///
+    /// # Errors
+    ///
+    /// When SQLite rejects the read or the actor is gone.
+    pub async fn hash_sides(&self) -> Result<Vec<(ContentHash, Side)>, Error> {
+        send_and_wait(&self.tx, |reply| Request::HashSides { reply }).await
+    }
+
+    /// The distinct content hashes of the chunks that pass `filter`.
+    ///
+    /// # Errors
+    ///
+    /// When SQLite rejects the read or the actor is gone.
+    pub async fn hashes_matching(&self, filter: ChunkFilter) -> Result<Vec<ContentHash>, Error> {
+        send_and_wait(&self.tx, |reply| Request::HashesMatching { filter, reply }).await
+    }
+
+    /// The chunks among `ids` whose indexed text matches the FTS5 expression
+    /// `query`, in id order.
+    ///
+    /// # Errors
+    ///
+    /// When SQLite rejects the expression or the read, or the actor is gone.
+    pub async fn matching(&self, query: String, ids: Vec<ChunkId>) -> Result<Vec<ChunkId>, Error> {
+        send_and_wait(&self.tx, |reply| Request::Matching { query, ids, reply }).await
+    }
+
+    /// Every distinct kind the index holds, chunk kinds and member kinds
+    /// alike, sorted.
+    ///
+    /// # Errors
+    ///
+    /// When SQLite rejects the read or the actor is gone.
+    pub async fn kinds(&self) -> Result<Vec<String>, Error> {
+        send_and_wait(&self.tx, |reply| Request::Kinds { reply }).await
+    }
 }
 
 /// Creates `.repo-search/` when missing and opens the index database. Runs on
@@ -219,6 +351,39 @@ fn serve(mut conn: Connection, mut rx: mpsc::Receiver<Request>) {
             }
             Request::ChunkHashes { reply } => {
                 let _ = reply.send(chunk_hashes(&conn));
+            }
+            Request::Bm25 {
+                query,
+                filter,
+                limit,
+                reply,
+            } => {
+                let _ = reply.send(query::bm25(&conn, &query, &filter, limit));
+            }
+            Request::ByHashes {
+                hashes,
+                filter,
+                reply,
+            } => {
+                let _ = reply.send(query::by_hashes(&conn, &hashes, &filter));
+            }
+            Request::Chunks { ids, reply } => {
+                let _ = reply.send(query::chunks(&conn, &ids));
+            }
+            Request::Count { side, reply } => {
+                let _ = reply.send(query::count(&conn, side));
+            }
+            Request::HashSides { reply } => {
+                let _ = reply.send(query::hash_sides(&conn));
+            }
+            Request::HashesMatching { filter, reply } => {
+                let _ = reply.send(query::hashes_matching(&conn, &filter));
+            }
+            Request::Matching { query, ids, reply } => {
+                let _ = reply.send(query::matching(&conn, &query, &ids));
+            }
+            Request::Kinds { reply } => {
+                let _ = reply.send(query::kinds(&conn));
             }
         }
     }

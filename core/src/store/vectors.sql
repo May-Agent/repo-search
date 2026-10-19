@@ -8,6 +8,8 @@ CREATE TABLE vectors (
     slot         INTEGER NOT NULL,
     PRIMARY KEY (model_id, content_hash)
 ) WITHOUT ROWID;
+-- `since` reads a model's newest slots; the primary key orders hashes, not slots.
+CREATE INDEX vectors_by_slot ON vectors (model_id, slot);
 
 -- `next_slot` is the first unallocated row of the model's file. The calibration
 -- (per-dimension bounds the in-memory int8 codes are quantized with, as
