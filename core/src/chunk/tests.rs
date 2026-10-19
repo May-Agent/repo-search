@@ -1,19 +1,19 @@
 //! Unit tests for the chunker, one per rule of the reference semantics.
 //! Expected values were produced by the reference chunker `chunk_ts.py`.
 
-use super::{Chunk, ChunkKind, Chunker, Rust};
+use super::{Chunk, ChunkKind, Chunker, FileChunker, Rust};
 
 const PATH: &str = "src/lib.rs";
 
 fn chunks(src: &str) -> (Chunker<Rust>, Vec<Chunk>) {
     let mut chunker = Chunker::new(Rust);
-    let out = chunker.chunk_file(PATH, src);
+    let out = chunker.chunk_file(PATH, src).unwrap();
     (chunker, out)
 }
 
 fn chunks_at(path: &str, src: &str) -> (Chunker<Rust>, Vec<Chunk>) {
     let mut chunker = Chunker::new(Rust);
-    let out = chunker.chunk_file(path, src);
+    let out = chunker.chunk_file(path, src).unwrap();
     (chunker, out)
 }
 
@@ -43,7 +43,7 @@ fn item_carries_its_trivia() {
         "/// doc\n#[derive(Debug)]\n// a note\nstruct S;"
     );
     assert_eq!(c.members.len(), 1);
-    assert_eq!(chunker.kind_name(c.members[0].kind), "struct_item");
+    assert_eq!(chunker.member_kind_name(c.members[0].kind), "struct_item");
     assert_eq!(c.members[0].symbol, "S");
 }
 
@@ -158,10 +158,10 @@ invoc!{}
         all[0].title,
         "src/lib.rs › struct S, enum E, trait T, impl S, impl Display for S, const C, static ST, type Ty, union U, macro_rules! mac, macro invoc"
     );
-    let member_kinds: Vec<&str> = all[0]
+    let member_kinds: Vec<_> = all[0]
         .members
         .iter()
-        .map(|m| chunker.kind_name(m.kind))
+        .map(|m| chunker.member_kind_name(m.kind))
         .collect();
     assert_eq!(
         member_kinds,
@@ -209,10 +209,10 @@ fn oversized_impl_splits_into_members() {
         "tests/fixtures/oversized_impl.rs › struct Pad, impl Pad"
     );
     assert_eq!(all[0].lines, 1..=3);
-    let kinds: Vec<&str> = all[0]
+    let kinds: Vec<_> = all[0]
         .members
         .iter()
-        .map(|m| chunker.kind_name(m.kind))
+        .map(|m| chunker.member_kind_name(m.kind))
         .collect();
     assert_eq!(kinds, ["struct_item", "impl_item"]);
     let symbols: Vec<&str> = all[0].members.iter().map(|m| m.symbol.as_str()).collect();
@@ -225,7 +225,10 @@ fn oversized_impl_splits_into_members() {
     );
     assert_eq!(all[1].lines, 4..=63);
     assert_eq!(all[1].members.len(), 15);
-    assert_eq!(chunker.kind_name(all[1].members[0].kind), "function_item");
+    assert_eq!(
+        chunker.member_kind_name(all[1].members[0].kind),
+        "function_item"
+    );
     assert_eq!(all[1].members[0].symbol, "Pad::m00");
     assert_eq!(all[1].members[14].symbol, "Pad::m14");
 
@@ -296,14 +299,17 @@ fn oversized_trait_and_mod_split() {
         "tests/fixtures/split_scopes.rs › fn preamble, trait Wide"
     );
     assert_eq!(all[0].lines, 1..=9);
-    assert_eq!(chunker.kind_name(all[0].members[1].kind), "trait_item");
+    assert_eq!(
+        chunker.member_kind_name(all[0].members[1].kind),
+        "trait_item"
+    );
 
     // trait members pack within the trait's context
     assert_eq!(all[1].kind, ChunkKind::Packed);
     assert_eq!(all[1].lines, 10..=31);
     assert_eq!(all[1].members.len(), 11);
     assert_eq!(
-        chunker.kind_name(all[1].members[0].kind),
+        chunker.member_kind_name(all[1].members[0].kind),
         "function_signature_item"
     );
     assert_eq!(all[1].members[0].symbol, "Wide::member_00");
@@ -316,7 +322,7 @@ fn oversized_trait_and_mod_split() {
     assert_eq!(all[3].members[7].symbol, "Wide::member_29");
 
     // the mod's header is the first unit of its own group and stays alone
-    assert_eq!(all[4].kind, ChunkKind::Header(all[4].members[0].kind));
+    assert!(matches!(all[4].kind, ChunkKind::Header(_)));
     assert_eq!(kind(&chunker, &all[4]), "mod_item_header");
     assert_eq!(all[4].title, "tests/fixtures/split_scopes.rs › mod deep");
     assert_eq!(all[4].lines, 72..=72);
@@ -327,7 +333,10 @@ fn oversized_trait_and_mod_split() {
     assert_eq!(all[5].kind, ChunkKind::Packed);
     assert_eq!(all[5].lines, 73..=134);
     assert_eq!(all[5].members.len(), 16);
-    assert_eq!(chunker.kind_name(all[5].members[0].kind), "line_comment");
+    assert_eq!(
+        chunker.member_kind_name(all[5].members[0].kind),
+        "line_comment"
+    );
     assert_eq!(all[5].members[0].symbol, "deep");
     assert_eq!(
         &src[all[5].members[0].bytes.clone()],
@@ -368,7 +377,10 @@ fn module_docs_pack_like_other_units() {
     assert_eq!(all.len(), 1);
     assert_eq!(all[0].kind, ChunkKind::Packed);
     assert_eq!(all[0].title, "src/lib.rs › module docs, fn f");
-    assert_eq!(chunker.kind_name(all[0].members[0].kind), "line_comment");
+    assert_eq!(
+        chunker.member_kind_name(all[0].members[0].kind),
+        "line_comment"
+    );
 }
 
 /// A packed group stops growing at 1200 bytes; the next small item starts a
@@ -429,8 +441,8 @@ impl<T> Cache<T> for Store<T> {
 #[test]
 fn parser_reuse() {
     let mut chunker = Chunker::new(Rust);
-    let a = chunker.chunk_file("a.rs", "fn a() {}\n");
-    let b = chunker.chunk_file("b.rs", "fn b() {}\n");
+    let a = chunker.chunk_file("a.rs", "fn a() {}\n").unwrap();
+    let b = chunker.chunk_file("b.rs", "fn b() {}\n").unwrap();
     assert_eq!(a[0].title, "a.rs › fn a");
     assert_eq!(b[0].title, "b.rs › fn b");
 }
@@ -454,7 +466,7 @@ fn line_split_counts_code_points_not_bytes() {
 #[test]
 fn python_lines_boundaries() {
     let src = "a\r\nb\rc\x0bd\x0ce\x1cf\x1dg\x1eh\u{85}i\u{2028}j\u{2029}k\n";
-    let lines: Vec<&str> = super::python_lines(src)
+    let lines: Vec<&str> = super::units::python_lines(src)
         .into_iter()
         .map(|range| &src[range])
         .collect();
