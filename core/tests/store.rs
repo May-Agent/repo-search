@@ -242,6 +242,26 @@ fn vector_cache_is_shared_between_worktrees() {
 }
 
 #[test]
+fn cached_reports_membership_without_the_fp16_file() {
+    let common = tempfile::tempdir().unwrap();
+    let cache = block_on(VectorCache::open(common.path())).unwrap();
+    let hit = ContentHash::of_chunk("fn a", "fn a() {}");
+    let miss = ContentHash::of_chunk("fn b", "fn b() {}");
+    block_on(cache.put_many("m", vec![(hit, UnitVector::normalize(vec![1.0, 2.0]))])).unwrap();
+
+    // Removing the fp16 file proves the query reads only the SQLite index.
+    for entry in fs::read_dir(common.path().join("repo-search")).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().is_some_and(|e| e == "f16") {
+            fs::remove_file(path).unwrap();
+        }
+    }
+    let found = block_on(cache.cached("m", &[hit, miss, hit])).unwrap();
+    assert_eq!(found, HashSet::from([hit]));
+    assert!(block_on(cache.cached("other", &[hit])).unwrap().is_empty());
+}
+
+#[test]
 fn scan_pages_interleaved_with_writes_return_every_vector_once() {
     let common = tempfile::tempdir().unwrap();
     let cache = block_on(VectorCache::open(common.path())).unwrap();
