@@ -2,18 +2,19 @@
 //! metadata and a contentless FTS5 table over chunk titles and bodies.
 
 use std::fs;
+use std::ops::{Range, RangeInclusive};
 use std::path::Path;
 
-use rusqlite::{Connection, Transaction, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use tokio::sync::{mpsc, oneshot};
 
 use super::{
-    ChunkRecord, Error, FileState, ensure_version, open_conn, remove_db_files, send_and_wait,
-    spawn_actor,
+    ChunkRecord, ContentHash, Error, FileState, ensure_version, open_conn, remove_db_files,
+    send_and_wait, spawn_actor,
 };
 
 /// Schema generation; a database at any other version is deleted and rebuilt.
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 /// One file's change inside an atomic batch.
 #[derive(Debug)]
@@ -23,12 +24,49 @@ pub enum FileChange {
     Replace(FileState, Vec<ChunkRecord>),
     /// The file is gone from the worktree.
     Remove(String),
+    /// The file's bytes are unchanged but its stat fingerprint moved; the
+    /// stored chunks stay and only the fingerprint is rewritten. The path must
+    /// already be stored.
+    Restamp(FileState),
+}
+
+/// What an applied batch did to the chunk rows.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Applied {
+    /// Chunk rows deleted, including those a replaced file held before.
+    pub chunks_removed: u64,
+    /// Chunk rows inserted.
+    pub chunks_added: u64,
+}
+
+/// Where a stored chunk's text lives: enough to rebuild it from the file's
+/// bytes without parsing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredChunk {
+    /// Worktree-relative path of the file.
+    pub path: String,
+    /// The chunk's title.
+    pub title: String,
+    /// 1-based line range, inclusive.
+    pub lines: RangeInclusive<u32>,
+    /// Byte ranges of the chunk's members, in order; the text is the slices
+    /// joined by `\n`.
+    pub ranges: Vec<Range<u64>>,
+    /// The vector cache key.
+    pub content_hash: ContentHash,
 }
 
 enum Request {
     Apply {
         changes: Vec<FileChange>,
-        reply: oneshot::Sender<Result<(), Error>>,
+        reply: oneshot::Sender<Result<Applied, Error>>,
+    },
+    ChunkHashes {
+        reply: oneshot::Sender<Result<Vec<ContentHash>, Error>>,
+    },
+    ChunksByHash {
+        hashes: Vec<ContentHash>,
+        reply: oneshot::Sender<Result<Vec<StoredChunk>, Error>>,
     },
     FileStates {
         reply: oneshot::Sender<Result<Vec<FileState>, Error>>,
@@ -66,7 +104,7 @@ impl Index {
     ///
     /// When SQLite rejects a change — the whole batch is rolled back — or the
     /// actor is gone.
-    pub async fn apply(&self, changes: Vec<FileChange>) -> Result<(), Error> {
+    pub async fn apply(&self, changes: Vec<FileChange>) -> Result<Applied, Error> {
         send_and_wait(&self.tx, |reply| Request::Apply { changes, reply }).await
     }
 
@@ -80,7 +118,9 @@ impl Index {
         state: FileState,
         chunks: Vec<ChunkRecord>,
     ) -> Result<(), Error> {
-        self.apply(vec![FileChange::Replace(state, chunks)]).await
+        self.apply(vec![FileChange::Replace(state, chunks)])
+            .await
+            .map(drop)
     }
 
     /// Drops one file's state, chunks, members and FTS rows.
@@ -89,7 +129,9 @@ impl Index {
     ///
     /// As [`Index::apply`].
     pub async fn remove_file(&self, path: &str) -> Result<(), Error> {
-        self.apply(vec![FileChange::Remove(path.to_owned())]).await
+        self.apply(vec![FileChange::Remove(path.to_owned())])
+            .await
+            .map(drop)
     }
 
     /// Every stored file fingerprint, for reconcile to diff the worktree walk
@@ -101,6 +143,29 @@ impl Index {
     /// When SQLite rejects the read or the actor is gone.
     pub async fn file_states(&self) -> Result<Vec<FileState>, Error> {
         send_and_wait(&self.tx, |reply| Request::FileStates { reply }).await
+    }
+
+    /// The first stored chunk (by id) of each of `hashes`, in the order given;
+    /// a hash the index does not hold yields nothing.
+    ///
+    /// # Errors
+    ///
+    /// When SQLite rejects the read or the actor is gone.
+    pub async fn chunks_by_hash(
+        &self,
+        hashes: Vec<ContentHash>,
+    ) -> Result<Vec<StoredChunk>, Error> {
+        send_and_wait(&self.tx, |reply| Request::ChunksByHash { hashes, reply }).await
+    }
+
+    /// The content hash of every stored chunk, one entry per chunk row in
+    /// index order; reconcile checks them against the vector cache.
+    ///
+    /// # Errors
+    ///
+    /// When SQLite rejects the read or the actor is gone.
+    pub async fn chunk_hashes(&self) -> Result<Vec<ContentHash>, Error> {
+        send_and_wait(&self.tx, |reply| Request::ChunkHashes { reply }).await
     }
 }
 
@@ -149,25 +214,56 @@ fn serve(mut conn: Connection, mut rx: mpsc::Receiver<Request>) {
             Request::FileStates { reply } => {
                 let _ = reply.send(file_states(&conn));
             }
+            Request::ChunksByHash { hashes, reply } => {
+                let _ = reply.send(chunks_by_hash(&conn, &hashes));
+            }
+            Request::ChunkHashes { reply } => {
+                let _ = reply.send(chunk_hashes(&conn));
+            }
         }
     }
 }
 
-fn apply(conn: &mut Connection, changes: &[FileChange]) -> Result<(), Error> {
+fn apply(conn: &mut Connection, changes: &[FileChange]) -> Result<Applied, Error> {
     let tx = conn.transaction()?;
+    let mut applied = Applied::default();
     for change in changes {
         match change {
-            FileChange::Replace(state, chunks) => replace(&tx, state, chunks)?,
-            FileChange::Remove(path) => remove(&tx, path)?,
+            FileChange::Replace(state, chunks) => {
+                let (removed, added) = replace(&tx, state, chunks)?;
+                applied.chunks_removed += removed;
+                applied.chunks_added += added;
+            }
+            FileChange::Remove(path) => applied.chunks_removed += remove(&tx, path)?,
+            FileChange::Restamp(state) => restamp(&tx, state)?,
         }
     }
     tx.commit()?;
-    Ok(())
+    Ok(applied)
+}
+
+fn restamp(tx: &Transaction<'_>, state: &FileState) -> Result<(), Error> {
+    let updated = tx.execute(
+        "UPDATE files SET size = ?2, mtime_ns = ?3, inode = ?4, content_hash = ?5 \
+         WHERE path = ?1",
+        params![
+            state.path,
+            i64_of(state.size)?,
+            state.mtime_ns,
+            i64_of(state.inode)?,
+            state.content_hash
+        ],
+    )?;
+    if updated == 1 {
+        Ok(())
+    } else {
+        Err(Error::NotStored(state.path.clone()))
+    }
 }
 
 /// Deletes every stored row of `path`, FTS first: the contentless table only
-/// forgets the rows it is told to by rowid.
-fn remove(tx: &Transaction<'_>, path: &str) -> Result<(), Error> {
+/// forgets the rows it is told to by rowid. Returns the chunk rows deleted.
+fn remove(tx: &Transaction<'_>, path: &str) -> Result<u64, Error> {
     tx.execute(
         "DELETE FROM fts WHERE rowid IN (SELECT id FROM chunks WHERE path = ?1)",
         [path],
@@ -176,9 +272,9 @@ fn remove(tx: &Transaction<'_>, path: &str) -> Result<(), Error> {
         "DELETE FROM chunk_members WHERE chunk_id IN (SELECT id FROM chunks WHERE path = ?1)",
         [path],
     )?;
-    tx.execute("DELETE FROM chunks WHERE path = ?1", [path])?;
+    let removed = tx.execute("DELETE FROM chunks WHERE path = ?1", [path])?;
     tx.execute("DELETE FROM files WHERE path = ?1", [path])?;
-    Ok(())
+    Ok(removed as u64)
 }
 
 /// SQLite integers are signed 64-bit; a wider value is a rejected change, not
@@ -187,8 +283,13 @@ fn i64_of(value: u64) -> Result<i64, Error> {
     i64::try_from(value).map_err(|_| Error::IntRange(i128::from(value)))
 }
 
-fn replace(tx: &Transaction<'_>, state: &FileState, chunks: &[ChunkRecord]) -> Result<(), Error> {
-    remove(tx, &state.path)?;
+/// Returns `(chunk rows removed, chunk rows added)`.
+fn replace(
+    tx: &Transaction<'_>,
+    state: &FileState,
+    chunks: &[ChunkRecord],
+) -> Result<(u64, u64), Error> {
+    let removed = remove(tx, &state.path)?;
     tx.execute(
         "INSERT INTO files (path, size, mtime_ns, inode, content_hash) \
          VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -201,8 +302,8 @@ fn replace(tx: &Transaction<'_>, state: &FileState, chunks: &[ChunkRecord]) -> R
         ],
     )?;
     let mut chunk_stmt = tx.prepare(
-        "INSERT INTO chunks (path, start_line, end_line, title, kind, content_hash, tokens) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        "INSERT INTO chunks (path, start_line, end_line, title, kind, content_hash) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
     )?;
     let mut member_stmt = tx.prepare(
         "INSERT INTO chunk_members (chunk_id, ord, start_byte, end_byte, kind, symbol) \
@@ -217,7 +318,6 @@ fn replace(tx: &Transaction<'_>, state: &FileState, chunks: &[ChunkRecord]) -> R
             chunk.title,
             chunk.kind,
             chunk.content_hash,
-            chunk.tokens,
         ])?;
         let chunk_id = tx.last_insert_rowid();
         for (ord, member) in chunk.members.iter().enumerate() {
@@ -235,7 +335,60 @@ fn replace(tx: &Transaction<'_>, state: &FileState, chunks: &[ChunkRecord]) -> R
         }
         fts_stmt.execute(params![chunk_id, chunk.title, chunk.fts_body])?;
     }
-    Ok(())
+    Ok((removed, chunks.len() as u64))
+}
+
+fn chunks_by_hash(conn: &Connection, hashes: &[ContentHash]) -> Result<Vec<StoredChunk>, Error> {
+    let mut chunk_stmt = conn.prepare(
+        "SELECT id, path, title, start_line, end_line FROM chunks \
+         WHERE content_hash = ?1 ORDER BY id LIMIT 1",
+    )?;
+    let mut member_stmt = conn.prepare(
+        "SELECT start_byte, end_byte FROM chunk_members WHERE chunk_id = ?1 ORDER BY ord",
+    )?;
+    let mut out = Vec::with_capacity(hashes.len());
+    for hash in hashes {
+        let row = chunk_stmt
+            .query_row([hash], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, u32>(3)?,
+                    row.get::<_, u32>(4)?,
+                ))
+            })
+            .optional()?;
+        let Some((id, path, title, start, end)) = row else {
+            continue;
+        };
+        let ranges = member_stmt
+            .query_map([id], |row| {
+                let start = row.get::<_, i64>(0)?;
+                let end = row.get::<_, i64>(1)?;
+                Ok(u64::try_from(start)
+                    .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(0, start))?
+                    ..u64::try_from(end)
+                        .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(1, end))?)
+            })?
+            .collect::<Result<_, _>>()?;
+        out.push(StoredChunk {
+            path,
+            title,
+            lines: start..=end,
+            ranges,
+            content_hash: *hash,
+        });
+    }
+    Ok(out)
+}
+
+fn chunk_hashes(conn: &Connection) -> Result<Vec<ContentHash>, Error> {
+    let mut stmt = conn.prepare("SELECT content_hash FROM chunks ORDER BY id")?;
+    let rows = stmt
+        .query_map([], |row| row.get(0))?
+        .collect::<Result<_, _>>()?;
+    Ok(rows)
 }
 
 fn file_states(conn: &Connection) -> Result<Vec<FileState>, Error> {
