@@ -690,3 +690,146 @@ fn chunks_by_hash_returns_the_first_row_with_member_ranges() {
     assert_eq!(found[0].lines, 3..=3);
     assert_eq!(found[0].ranges, vec![0..text.len() as u64]);
 }
+
+#[test]
+fn since_lists_the_vectors_stored_from_a_slot_on() {
+    let common = tempfile::tempdir().unwrap();
+    let cache = block_on(VectorCache::open(common.path())).unwrap();
+    let batch = |range: std::ops::Range<usize>| -> Vec<(ContentHash, UnitVector)> {
+        range
+            .map(|i| {
+                (
+                    ContentHash::of_chunk("t", &i.to_string()),
+                    UnitVector::normalize(vec![1.0, i as f32 + 1.0]),
+                )
+            })
+            .collect()
+    };
+    block_on(cache.put_many("m", batch(0..3))).unwrap();
+    let info = block_on(cache.model("m")).unwrap().unwrap();
+    assert_eq!((info.vectors, info.next_slot), (3, 3));
+    assert!(
+        block_on(cache.since("m", info.next_slot))
+            .unwrap()
+            .is_empty()
+    );
+
+    block_on(cache.put_many("m", batch(2..6))).unwrap();
+    let after = block_on(cache.model("m")).unwrap().unwrap();
+    assert_eq!((after.vectors, after.next_slot), (6, 6));
+    let new = block_on(cache.since("m", info.next_slot)).unwrap();
+    assert_eq!(
+        new.iter().map(|s| s.slot).collect::<Vec<_>>(),
+        [3, 4, 5],
+        "slots in order"
+    );
+    assert_eq!(
+        new.iter().map(|s| s.content_hash).collect::<Vec<_>>(),
+        batch(3..6).iter().map(|(h, _)| *h).collect::<Vec<_>>()
+    );
+    assert!(block_on(cache.since("other", 0)).unwrap().is_empty());
+}
+
+#[test]
+fn chunk_queries_bind_the_doc_kind_and_expose_filters() {
+    use repo_search_core::chunk::ChunkKind;
+    use repo_search_core::store::{ChunkFilter, Side};
+
+    let tree = tempfile::tempdir().unwrap();
+    let index = block_on(Index::open(tree.path())).unwrap();
+    let doc_kind = ChunkKind::Doc.static_name().unwrap();
+    let files = [
+        ("a.rs", "function_item", "alpha beta"),
+        ("b.rs", "struct_item", "alpha gamma"),
+        ("c.md", doc_kind, "alpha docs"),
+    ];
+    for (path, kind, text) in files {
+        let record = chunk(1..=3, &format!("{path} › {text}"), kind, text);
+        block_on(index.replace_file(state(path, text.as_bytes()), vec![record])).unwrap();
+    }
+    let filter = |side, paths: Option<Vec<&str>>, kinds: Vec<&str>| ChunkFilter {
+        side,
+        paths: paths.map(|p| p.into_iter().map(str::to_owned).collect()),
+        extensions: Vec::new(),
+        kinds: kinds.into_iter().map(str::to_owned).collect(),
+        symbol: None,
+    };
+    assert!(filter(Side::Code, None, vec![]).is_unrestricted());
+    assert!(!filter(Side::Code, Some(vec![]), vec![]).is_unrestricted());
+
+    // The sides split on the reserved kind.
+    assert_eq!(block_on(index.count(Side::Code)).unwrap(), 2);
+    assert_eq!(block_on(index.count(Side::Docs)).unwrap(), 1);
+    let sides = block_on(index.hash_sides()).unwrap();
+    assert_eq!(sides.iter().filter(|(_, s)| *s == Side::Docs).count(), 1);
+
+    let hash_of = |path: &str, text: &str| ContentHash::of_chunk(&format!("{path} › {text}"), text);
+    let code = block_on(index.hashes_matching(filter(Side::Code, None, vec![]))).unwrap();
+    assert_eq!(
+        code.into_iter().collect::<HashSet<_>>(),
+        HashSet::from([
+            hash_of("a.rs", "alpha beta"),
+            hash_of("b.rs", "alpha gamma")
+        ])
+    );
+    let narrowed =
+        block_on(index.hashes_matching(filter(Side::Code, Some(vec!["b.rs"]), vec![]))).unwrap();
+    assert_eq!(narrowed, [hash_of("b.rs", "alpha gamma")]);
+    let by_kind =
+        block_on(index.hashes_matching(filter(Side::Code, None, vec!["function_item"]))).unwrap();
+    assert_eq!(by_kind, [hash_of("a.rs", "alpha beta")]);
+    let docs = block_on(index.hashes_matching(filter(Side::Docs, None, vec![]))).unwrap();
+    assert_eq!(docs, [hash_of("c.md", "alpha docs")]);
+
+    // Kinds the index holds, for `--kind` validation.
+    assert_eq!(
+        block_on(index.kinds()).unwrap(),
+        ["doc", "function_item", "struct_item"]
+    );
+
+    // Which of some chunks spell a phrase.
+    let all =
+        block_on(index.bm25("\"alpha\"".to_owned(), filter(Side::Code, None, vec![]), 10)).unwrap();
+    assert_eq!(all.len(), 2);
+    let phrase = block_on(index.matching("\"alpha gamma\"".to_owned(), all.clone())).unwrap();
+    assert_eq!(phrase.len(), 1);
+    assert!(
+        block_on(index.matching("\"alpha gamma\"".to_owned(), vec![]))
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn the_extension_filter_is_ascii_case_insensitive() {
+    use repo_search_core::chunk::ChunkKind;
+    use repo_search_core::store::{ChunkFilter, Side};
+
+    let tree = tempfile::tempdir().unwrap();
+    let index = block_on(Index::open(tree.path())).unwrap();
+    let doc_kind = ChunkKind::Doc.static_name().unwrap();
+    for (path, kind, text) in [
+        ("README.MD", doc_kind, "alpha docs"),
+        ("a.rs", "function_item", "alpha code"),
+    ] {
+        let record = chunk(1..=3, &format!("{path} › {text}"), kind, text);
+        block_on(index.replace_file(state(path, text.as_bytes()), vec![record])).unwrap();
+    }
+    // `--lang markdown` carries `md`: `README.MD` is markdown because the
+    // SQL `LIKE` on the path is ASCII case-insensitive.
+    let filter = ChunkFilter {
+        side: Side::Docs,
+        paths: None,
+        extensions: vec!["md"],
+        kinds: Vec::new(),
+        symbol: None,
+    };
+    let docs = block_on(index.hashes_matching(filter)).unwrap();
+    assert_eq!(
+        docs,
+        [ContentHash::of_chunk(
+            "README.MD › alpha docs",
+            "alpha docs"
+        )]
+    );
+}

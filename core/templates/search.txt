@@ -1,0 +1,11 @@
+{% for section in sections -%}
+{{ section.title }}:
+{% for file in section.files -%}
+{{ file.path }}
+{% for chunk in file.chunks %}  {{ chunk.lines[0] }}-{{ chunk.lines[1] }}{% if !chunk.label.is_empty() %}  {{ chunk.label }}{% endif %}  [{% for channel in chunk.channels %}{% if !loop.first %}+{% endif %}{{ channel }}{% endfor %}]
+{{ chunk.text|indent(4, true) }}
+{% endfor -%}
+{% endfor %}
+{% endfor -%}
+-- fresh @ {{ freshness.commit }} +{{ freshness.changed_files }} changed files reconciled; vectors {{ freshness.percent() }}%
+

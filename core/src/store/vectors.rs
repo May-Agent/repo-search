@@ -79,6 +79,9 @@ pub struct ModelInfo {
     pub dim: usize,
     /// How many distinct content hashes are cached.
     pub vectors: u64,
+    /// The first unallocated row of the fp16 file: every cached vector sits
+    /// in a slot below it, and a vector stored later gets a slot at or above.
+    pub next_slot: u64,
     /// The flat fp16 file; row `slot` is at byte offset `slot * dim * 2`.
     pub file: PathBuf,
 }
@@ -146,6 +149,11 @@ enum Request {
         model_id: String,
         after: Option<ContentHash>,
         limit: i64,
+        reply: oneshot::Sender<Result<Vec<CachedSlot>, Error>>,
+    },
+    Since {
+        model_id: String,
+        from_slot: u64,
         reply: oneshot::Sender<Result<Vec<CachedSlot>, Error>>,
     },
     Model {
@@ -286,6 +294,22 @@ impl VectorCache {
         .await
     }
 
+    /// Every entry stored under `model_id` at slot `from_slot` or later,
+    /// ordered by slot: the vectors added since a reader last saw
+    /// [`ModelInfo::next_slot`] equal to `from_slot`.
+    ///
+    /// # Errors
+    ///
+    /// When SQLite rejects the read or the actor is gone.
+    pub async fn since(&self, model_id: &str, from_slot: u64) -> Result<Vec<CachedSlot>, Error> {
+        send_and_wait(&self.tx, |reply| Request::Since {
+            model_id: model_id.to_owned(),
+            from_slot,
+            reply,
+        })
+        .await
+    }
+
     /// The dimension, vector count and fp16 file of `model_id`; `None` before
     /// its first vector is stored.
     ///
@@ -407,6 +431,13 @@ fn serve(mut conn: Connection, dir: &Path, mut rx: mpsc::Receiver<Request>) {
                 reply,
             } => {
                 let _ = reply.send(scan(&conn, &model_id, after, limit));
+            }
+            Request::Since {
+                model_id,
+                from_slot,
+                reply,
+            } => {
+                let _ = reply.send(since(&conn, &model_id, from_slot));
             }
             Request::Model { model_id, reply } => {
                 let _ = reply.send(model(&conn, dir, &model_id));
@@ -628,18 +659,32 @@ fn scan(
     Ok(page)
 }
 
+fn since(conn: &Connection, model_id: &str, from_slot: u64) -> Result<Vec<CachedSlot>, Error> {
+    let mut stmt = conn.prepare(
+        "SELECT content_hash, slot FROM vectors \
+         WHERE model_id = ?1 AND slot >= ?2 ORDER BY slot",
+    )?;
+    let mut rows = stmt.query(params![model_id, i64_of(from_slot)?])?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next()? {
+        out.push(CachedSlot {
+            content_hash: row.get(0)?,
+            slot: u64_of(row.get(1)?)?,
+        });
+    }
+    Ok(out)
+}
+
 fn model(conn: &Connection, dir: &Path, model_id: &str) -> Result<Option<ModelInfo>, Error> {
-    let Some((dim, _)) = model_row(conn, model_id)? else {
+    let Some((dim, next_slot)) = model_row(conn, model_id)? else {
         return Ok(None);
     };
-    let vectors: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM vectors WHERE model_id = ?1",
-        params![model_id],
-        |row| row.get(0),
-    )?;
+    // Slots are allocated densely and never deleted: the first unallocated
+    // slot is the vector count.
     Ok(Some(ModelInfo {
         dim,
-        vectors: u64_of(vectors)?,
+        vectors: next_slot,
+        next_slot,
         file: fp16_path(dir, model_id),
     }))
 }

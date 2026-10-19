@@ -34,6 +34,27 @@ impl UnitVector {
     }
 }
 
+/// How a query is phrased for the embedding model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueryTask {
+    /// The code list: `task: code retrieval | query: <query>`.
+    CodeRetrieval,
+    /// The docs list: `task: question answering | query: <query>`.
+    QuestionAnswering,
+}
+
+impl QueryTask {
+    /// The prompt text the model is given for `query`.
+    #[must_use]
+    pub fn prompt(self, query: &str) -> String {
+        let task = match self {
+            Self::CodeRetrieval => "code retrieval",
+            Self::QuestionAnswering => "question answering",
+        };
+        format!("task: {task} | query: {query}")
+    }
+}
+
 /// A text encoder. Calls block: callers run it on a thread they own and set its QoS.
 pub trait Embedder {
     /// The backend's failure.
@@ -49,17 +70,30 @@ pub trait Embedder {
     /// When the backend fails to run the model.
     fn embed_document(&mut self, title: &str, text: &str) -> Result<UnitVector, Self::Error>;
 
-    /// Embeds a search query.
+    /// Embeds a search query for `task`; the implementation applies
+    /// [`QueryTask::prompt`].
     ///
     /// # Errors
     ///
     /// When the backend fails to run the model.
-    fn embed_query(&mut self, query: &str) -> Result<UnitVector, Self::Error>;
+    fn embed_query(&mut self, task: QueryTask, query: &str) -> Result<UnitVector, Self::Error>;
 }
 
 #[cfg(test)]
 mod tests {
-    use super::UnitVector;
+    use super::{QueryTask, UnitVector};
+
+    #[test]
+    fn prompts_name_the_task() {
+        assert_eq!(
+            QueryTask::CodeRetrieval.prompt("find x"),
+            "task: code retrieval | query: find x"
+        );
+        assert_eq!(
+            QueryTask::QuestionAnswering.prompt("what is x"),
+            "task: question answering | query: what is x"
+        );
+    }
 
     #[test]
     fn normalize_scales_to_unit_length() {

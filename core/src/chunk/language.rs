@@ -37,25 +37,39 @@ pub enum Language {
     Config(ConfigFormat),
 }
 
+/// The lower-case file extensions of every language `of_path` detects.
+const EXTENSIONS: &[(&[&str], Language)] = &[
+    (&["rs"], Language::Rust),
+    (
+        &["md", "markdown", "mdx"],
+        Language::Doc(DocFormat::Markdown),
+    ),
+    (&["rst"], Language::Doc(DocFormat::Rst)),
+    (&["adoc", "asciidoc"], Language::Doc(DocFormat::AsciiDoc)),
+    (&["txt"], Language::Doc(DocFormat::Text)),
+    (&["toml"], Language::Config(ConfigFormat::Toml)),
+    (&["yaml", "yml"], Language::Config(ConfigFormat::Yaml)),
+    (&["json", "jsonc"], Language::Config(ConfigFormat::Json)),
+];
+
 impl Language {
+    /// Every language `of_path` detects.
+    pub const ALL: &[Self] = &[
+        Self::Rust,
+        Self::Doc(DocFormat::Markdown),
+        Self::Doc(DocFormat::Rst),
+        Self::Doc(DocFormat::AsciiDoc),
+        Self::Doc(DocFormat::Text),
+        Self::Config(ConfigFormat::Toml),
+        Self::Config(ConfigFormat::Yaml),
+        Self::Config(ConfigFormat::Json),
+    ];
+
     /// The language of the file at `path`, or `None` for an extension the
     /// chunkers do not know; such files are never read.
     #[must_use]
     pub fn of_path(path: &Path) -> Option<Self> {
         let extension = path.extension()?.to_str()?;
-        const EXTENSIONS: &[(&[&str], Language)] = &[
-            (&["rs"], Language::Rust),
-            (
-                &["md", "markdown", "mdx"],
-                Language::Doc(DocFormat::Markdown),
-            ),
-            (&["rst"], Language::Doc(DocFormat::Rst)),
-            (&["adoc", "asciidoc"], Language::Doc(DocFormat::AsciiDoc)),
-            (&["txt"], Language::Doc(DocFormat::Text)),
-            (&["toml"], Language::Config(ConfigFormat::Toml)),
-            (&["yaml", "yml"], Language::Config(ConfigFormat::Yaml)),
-            (&["json", "jsonc"], Language::Config(ConfigFormat::Json)),
-        ];
         EXTENSIONS
             .iter()
             .find(|(names, _)| {
@@ -64,6 +78,26 @@ impl Language {
                     .any(|name| extension.eq_ignore_ascii_case(name))
             })
             .map(|&(_, language)| language)
+    }
+
+    /// The language `name` names (`--lang`), ASCII case-insensitively — the
+    /// same names `name` returns.
+    #[must_use]
+    pub fn of_name(name: &str) -> Option<Self> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|language| language.name().eq_ignore_ascii_case(name))
+    }
+
+    /// The file extensions `of_path` detects as this language, lower-case.
+    #[must_use]
+    pub fn extensions(self) -> &'static [&'static str] {
+        EXTENSIONS
+            .iter()
+            .find(|(_, language)| *language == self)
+            .map(|(names, _)| *names)
+            .expect("ALL lists every language of_path detects")
     }
 
     /// The name `--lang` filters on.
@@ -111,5 +145,22 @@ mod tests {
         assert_eq!(of("Makefile"), None);
         assert!(Language::Doc(DocFormat::Rst).is_doc());
         assert_eq!(Language::Config(ConfigFormat::Yaml).name(), "yaml");
+    }
+
+    #[test]
+    fn names_round_trip_through_of_name() {
+        for &language in Language::ALL {
+            assert_eq!(Language::of_name(language.name()), Some(language));
+            assert_eq!(
+                Language::of_name(&language.name().to_uppercase()),
+                Some(language)
+            );
+        }
+        assert_eq!(Language::of_name("cobol"), None);
+        assert_eq!(Language::of_name("Markdown"), Language::of_name("markdown"));
+        assert_eq!(
+            Language::of_name("markdown").unwrap().extensions(),
+            ["md", "markdown", "mdx"]
+        );
     }
 }

@@ -6,7 +6,7 @@ use std::io;
 /// Marks the calling thread as user-interactive work so the scheduler keeps it
 /// on a performance core.
 #[cfg(target_os = "macos")]
-pub(super) fn set_user_interactive() {
+pub(crate) fn set_user_interactive() {
     // SAFETY: the call only changes the calling thread's QoS class.
     let rc = unsafe {
         libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0)
@@ -16,7 +16,7 @@ pub(super) fn set_user_interactive() {
 
 /// Scan threads need no QoS marking off macOS.
 #[cfg(not(target_os = "macos"))]
-pub(super) fn set_user_interactive() {}
+pub(crate) fn set_user_interactive() {}
 
 /// The number of performance cores: the default scan thread count, which the
 /// caller passes to `KnnIndex::search`.
