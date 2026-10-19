@@ -120,8 +120,8 @@ fn search_agrees_with_an_exact_scan_and_is_thread_count_independent() {
     let queries = 10;
     for _ in 0..queries {
         let query = rng.unit(DIM);
-        let one = index.search(&query, 1);
-        let four = index.search(&query, 4);
+        let one = index.search(&query, 1, None);
+        let four = index.search(&query, 4, None);
         assert_eq!(one, four);
         assert_eq!(one.len(), RESULTS);
         assert!(one.windows(2).all(|w| w[0].1 >= w[1].1), "best first");
@@ -163,8 +163,8 @@ fn more_threads_than_rows_still_works() {
     let rows = (0..5).map(|i| (hash_of(i), i as u64));
     let index = KnnIndex::build(calibrate(&vectors), &file, rows).unwrap();
     let query = rng.unit(16);
-    assert_eq!(index.search(&query, 1), index.search(&query, 8));
-    assert_eq!(index.search(&query, 1).len(), 5);
+    assert_eq!(index.search(&query, 1, None), index.search(&query, 8, None));
+    assert_eq!(index.search(&query, 1, None).len(), 5);
 }
 
 #[test]
@@ -220,7 +220,7 @@ fn insert_remove_and_remap_keep_the_index_consistent() {
     .unwrap();
     for _ in 0..5 {
         let query = rng.unit(DIM);
-        assert_eq!(index.search(&query, 1), fresh.search(&query, 1));
+        assert_eq!(index.search(&query, 1, None), fresh.search(&query, 1, None));
     }
 }
 
@@ -234,4 +234,136 @@ fn inserting_an_indexed_hash_panics() {
     write_rows(&file, &vectors);
     let mut index = KnnIndex::build(calibrate(&vectors), &file, [(hash_of(0), 0)]).unwrap();
     let _ = index.insert(hash_of(0), 1);
+}
+
+/// An index over `vectors`, row `i` holding `hash_of(i)`.
+fn index_of(vectors: &[UnitVector], dir: &Path) -> KnnIndex {
+    let file = dir.join("m.f16");
+    write_rows(&file, vectors);
+    let rows = (0..vectors.len()).map(|i| (hash_of(i), i as u64));
+    KnnIndex::build(calibrate(vectors), &file, rows).unwrap()
+}
+
+fn dot(a: &UnitVector, b: &UnitVector) -> f32 {
+    a.as_slice()
+        .iter()
+        .zip(b.as_slice())
+        .map(|(a, b)| a * b)
+        .sum()
+}
+
+#[test]
+fn a_full_mask_changes_nothing_and_an_empty_one_finds_nothing() {
+    let mut rng = Rng(11);
+    let vectors: Vec<UnitVector> = (0..500).map(|_| rng.unit(32)).collect();
+    let dir = tempfile::tempdir().unwrap();
+    let index = index_of(&vectors, dir.path());
+    let query = rng.unit(32);
+
+    let all: Vec<ContentHash> = (0..500).map(hash_of).collect();
+    let full = index.mask(&all);
+    assert_eq!(full.count(), 500);
+    assert_eq!(
+        index.search(&query, 3, Some(&full)),
+        index.search(&query, 3, None)
+    );
+    let none = index.mask(&[]);
+    assert!(index.search(&query, 3, Some(&none)).is_empty());
+    // A hash the index does not hold admits nothing.
+    assert_eq!(index.mask(&[hash_of(9999)]).count(), 0);
+}
+
+#[test]
+fn masked_search_returns_the_best_rows_inside_the_mask_whatever_the_thread_count() {
+    const DIM: usize = 64;
+    let mut rng = Rng(21);
+    let vectors: Vec<UnitVector> = (0..3000).map(|_| rng.unit(DIM)).collect();
+    let dir = tempfile::tempdir().unwrap();
+    let index = index_of(&vectors, dir.path());
+    let query = rng.unit(DIM);
+
+    // The 300 rows farthest from the query: none can be in the unmasked top.
+    let mut by_score: Vec<usize> = (0..vectors.len()).collect();
+    by_score.sort_by(|&a, &b| dot(&vectors[a], &query).total_cmp(&dot(&vectors[b], &query)));
+    let farthest: Vec<usize> = by_score[..300].to_vec();
+    let hashes: Vec<ContentHash> = farthest.iter().map(|&i| hash_of(i)).collect();
+    let mask = index.mask(&hashes);
+    assert_eq!(mask.count(), 300);
+
+    let unmasked = index.search(&query, 1, None);
+    assert!(unmasked.iter().all(|(h, _)| !hashes.contains(h)));
+
+    let one = index.search(&query, 1, Some(&mask));
+    let four = index.search(&query, 4, Some(&mask));
+    assert_eq!(one, four);
+    assert_eq!(one.len(), RESULTS);
+    assert!(one.iter().all(|(h, _)| hashes.contains(h)));
+    assert!(one.windows(2).all(|w| w[0].1 >= w[1].1), "best first");
+
+    let mut exact: Vec<usize> = farthest.clone();
+    exact.sort_by(|&a, &b| dot(&vectors[b], &query).total_cmp(&dot(&vectors[a], &query)));
+    let truth: HashSet<ContentHash> = exact[..RESULTS].iter().map(|&i| hash_of(i)).collect();
+    let overlap = one.iter().filter(|(h, _)| truth.contains(h)).count() as f64 / RESULTS as f64;
+    assert!(overlap >= 0.95, "masked top-{RESULTS} overlap {overlap}");
+    assert_eq!(
+        one[0].0,
+        hash_of(exact[0]),
+        "the nearest admitted row first"
+    );
+}
+
+#[test]
+fn masked_ties_resolve_to_the_lower_row_for_any_thread_count() {
+    // Every row holds the same vector, so every score is equal.
+    let mut rng = Rng(5);
+    let v = rng.unit(16);
+    let vectors: Vec<UnitVector> = (0..40).map(|_| v.clone()).collect();
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("m.f16");
+    write_rows(&file, &vectors);
+    let calibration = calibrate(&[v.clone(), rng.unit(16)]);
+    let index =
+        KnnIndex::build(calibration, &file, (0..40).map(|i| (hash_of(i), i as u64))).unwrap();
+
+    let admitted = [30usize, 4, 17, 9, 38, 22];
+    let hashes: Vec<ContentHash> = admitted.iter().map(|&i| hash_of(i)).collect();
+    let mask = index.mask(&hashes);
+    let want: Vec<ContentHash> = [4usize, 9, 17, 22, 30, 38]
+        .iter()
+        .map(|&i| hash_of(i))
+        .collect();
+    for threads in [1, 2, 4, 7] {
+        let got: Vec<ContentHash> = index
+            .search(&v, threads, Some(&mask))
+            .into_iter()
+            .map(|(h, _)| h)
+            .collect();
+        assert_eq!(got, want, "{threads} threads");
+    }
+}
+
+#[test]
+fn a_mask_built_after_a_removal_follows_the_new_row_numbers() {
+    let mut rng = Rng(8);
+    let vectors: Vec<UnitVector> = (0..20).map(|_| rng.unit(16)).collect();
+    let dir = tempfile::tempdir().unwrap();
+    let mut index = index_of(&vectors, dir.path());
+    // Row 19 moves into row 2's place.
+    assert!(index.remove(&hash_of(2)));
+    let mask = index.mask(&[hash_of(19), hash_of(2)]);
+    assert_eq!(mask.count(), 1);
+    let hits = index.search(&vectors[19], 2, Some(&mask));
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].0, hash_of(19));
+}
+
+#[test]
+#[should_panic(expected = "another row count")]
+fn a_mask_of_another_size_panics() {
+    let mut rng = Rng(2);
+    let vectors: Vec<UnitVector> = (0..4).map(|_| rng.unit(8)).collect();
+    let dir = tempfile::tempdir().unwrap();
+    let index = index_of(&vectors, dir.path());
+    let mask = super::RowMask::none(3);
+    let _ = index.search(&vectors[0], 1, Some(&mask));
 }

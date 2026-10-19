@@ -12,7 +12,8 @@ use crate::store::ContentHash;
 
 use super::calibration::Calibration;
 use super::fp16::Fp16File;
-use super::qos::set_user_interactive;
+use super::mask::RowMask;
+use super::set_user_interactive;
 use super::topk::TopK;
 use super::{Error, FIRST_PASS, RESULTS};
 
@@ -127,25 +128,50 @@ impl KnnIndex {
         true
     }
 
+    /// The mask admitting the rows of `hashes`; a hash the index does not
+    /// hold is ignored. Rows are renumbered by [`remove`](Self::remove), so
+    /// build the mask after the last update and use it for one search.
+    #[must_use]
+    pub fn mask<'a>(&self, hashes: impl IntoIterator<Item = &'a ContentHash>) -> RowMask {
+        let mut mask = RowMask::none(self.len());
+        for hash in hashes {
+            if let Some(&row) = self.rows.get(hash) {
+                mask.insert(row as usize);
+            }
+        }
+        mask
+    }
+
     /// The [`RESULTS`] vectors most similar to `query`, best first, with their
-    /// fp16 dot product against it.
+    /// fp16 dot product against it. With a `mask`, only the rows it admits are
+    /// scanned and returned; without one the whole index is.
     ///
-    /// The query is quantized and every code scanned on `threads` threads (the
-    /// calling thread when 1), each keeping its [`FIRST_PASS`] best; the merged
-    /// candidates are re-ranked with the fp16 rows. Equal scores resolve to the
-    /// lower row, so the result does not depend on `threads`.
+    /// The query is quantized and every admitted code scanned on `threads`
+    /// threads (the calling thread when 1), each keeping its [`FIRST_PASS`]
+    /// best; the merged candidates are re-ranked with the fp16 rows. Equal
+    /// scores resolve to the lower row, so the result does not depend on
+    /// `threads`.
     ///
     /// # Panics
     ///
-    /// When `threads` is 0 or the query's dimension differs from the index's.
+    /// When `threads` is 0, the query's dimension differs from the index's, or
+    /// `mask` was built for a different number of rows.
     #[must_use]
-    pub fn search(&self, query: &UnitVector, threads: usize) -> Vec<(ContentHash, f32)> {
+    pub fn search(
+        &self,
+        query: &UnitVector,
+        threads: usize,
+        mask: Option<&RowMask>,
+    ) -> Vec<(ContentHash, f32)> {
         assert!(threads > 0, "search needs at least one thread");
+        if let Some(mask) = mask {
+            assert_eq!(mask.rows(), self.len(), "the mask spans another row count");
+        }
         let dim = self.calibration.dim();
         let mut weights = vec![0i8; dim];
         self.calibration.query_weights(query, &mut weights);
 
-        let first_pass = self.first_pass(&weights, threads);
+        let first_pass = self.first_pass(&weights, threads, mask);
 
         let query16: Vec<f16> = query.as_slice().iter().map(|&x| f16::from_f32(x)).collect();
         let mut best = TopK::new(RESULTS);
@@ -159,10 +185,10 @@ impl KnnIndex {
             .collect()
     }
 
-    fn first_pass(&self, weights: &[i8], threads: usize) -> TopK {
+    fn first_pass(&self, weights: &[i8], threads: usize, mask: Option<&RowMask>) -> TopK {
         let rows = self.hashes.len();
         if threads == 1 {
-            return self.scan(weights, 0..rows);
+            return self.scan(weights, 0..rows, mask);
         }
         let per_thread = rows.div_ceil(threads);
         thread::scope(|scope| {
@@ -171,7 +197,7 @@ impl KnnIndex {
                     let range = (t * per_thread).min(rows)..((t + 1) * per_thread).min(rows);
                     scope.spawn(move || {
                         set_user_interactive();
-                        self.scan(weights, range)
+                        self.scan(weights, range, mask)
                     })
                 })
                 .collect::<Vec<_>>()
@@ -182,10 +208,13 @@ impl KnnIndex {
         })
     }
 
-    fn scan(&self, weights: &[i8], rows: Range<usize>) -> TopK {
+    fn scan(&self, weights: &[i8], rows: Range<usize>, mask: Option<&RowMask>) -> TopK {
         let dim = self.calibration.dim();
         let mut top = TopK::new(FIRST_PASS);
         for row in rows {
+            if mask.is_some_and(|m| !m.contains(row)) {
+                continue;
+            }
             let codes = &self.codes[row * dim..(row + 1) * dim];
             let score = i8::dot(codes, weights).expect("same dimension");
             top.push(score as f32, row as u32);
