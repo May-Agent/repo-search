@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
@@ -6,8 +6,8 @@ use std::path::{Path, PathBuf};
 use futures_executor::block_on;
 use repo_search_core::UnitVector;
 use repo_search_core::store::{
-    self, ChunkRecord, ContentHash, FileChange, FileState, Index, MemberRecord, VectorCache,
-    fts_body, split_identifiers,
+    self, ChunkRecord, ContentHash, FileChange, FileState, Index, MemberRecord, StoredCalibration,
+    VectorCache, fts_body, split_identifiers,
 };
 
 fn state(path: &str, content: &[u8]) -> FileState {
@@ -377,4 +377,212 @@ fn a_foreign_version_on_the_shared_cache_is_rejected() {
         }
         other => panic!("expected BadSchemaVersion, got {other:?}"),
     }
+}
+
+fn fp16_of(vector: &UnitVector) -> Vec<u8> {
+    vector
+        .as_slice()
+        .iter()
+        .flat_map(|&x| half::f16::from_f32(x).to_le_bytes())
+        .collect()
+}
+
+#[test]
+fn vectors_live_in_a_flat_fp16_file_at_slot_offsets() {
+    let common = tempfile::tempdir().unwrap();
+    let cache = block_on(VectorCache::open(common.path())).unwrap();
+    assert!(block_on(cache.model("m")).unwrap().is_none());
+
+    let vectors: Vec<(ContentHash, UnitVector)> = (0..5)
+        .map(|i| {
+            (
+                ContentHash::of_chunk("fn v", &format!("fn v{i}() {{}}")),
+                UnitVector::normalize(vec![i as f32 + 1.0, -1.0, 0.5, 2.0]),
+            )
+        })
+        .collect();
+    block_on(cache.put_many("m", vectors.clone())).unwrap();
+
+    let info = block_on(cache.model("m")).unwrap().unwrap();
+    assert_eq!((info.dim, info.vectors), (4, 5));
+    let name = info.file.file_name().unwrap().to_str().unwrap();
+    let id_hash = name
+        .strip_prefix("vectors.v1.")
+        .and_then(|n| n.strip_suffix(".f16"))
+        .unwrap();
+    assert_eq!(id_hash.len(), 16);
+    assert!(id_hash.bytes().all(|b| b.is_ascii_hexdigit()));
+    assert_eq!(
+        info.file.parent().unwrap(),
+        common.path().join("repo-search")
+    );
+
+    let bytes = fs::read(&info.file).unwrap();
+    assert_eq!(bytes.len(), 5 * 4 * 2);
+    let hashes: Vec<ContentHash> = vectors.iter().map(|(h, _)| *h).collect();
+    for hit in block_on(cache.get_many("m", &hashes)).unwrap() {
+        let (_, vector) = vectors
+            .iter()
+            .find(|(h, _)| *h == hit.content_hash)
+            .unwrap();
+        let at = hit.slot as usize * 8;
+        assert_eq!(&bytes[at..at + 8], fp16_of(vector));
+        assert_eq!(hit.fp16_bytes(), fp16_of(vector));
+    }
+
+    // Slots are dense and the scan reports them.
+    let mut slots: Vec<u64> = block_on(cache.scan("m", None, 100))
+        .unwrap()
+        .iter()
+        .map(|s| s.slot)
+        .collect();
+    slots.sort_unstable();
+    assert_eq!(slots, [0, 1, 2, 3, 4]);
+
+    // An id that is not a file name is safe, and its file is its own.
+    block_on(cache.put_many("org/model:1 ../x", vectors[..1].to_vec())).unwrap();
+    let other = block_on(cache.model("org/model:1 ../x")).unwrap().unwrap();
+    assert_ne!(other.file, info.file);
+    assert_eq!(other.file.parent(), info.file.parent());
+}
+
+#[test]
+fn a_cached_hash_keeps_its_slot_and_vector() {
+    let common = tempfile::tempdir().unwrap();
+    let cache = block_on(VectorCache::open(common.path())).unwrap();
+    let hash = ContentHash::of_chunk("fn v", "fn v() {}");
+    let first = UnitVector::normalize(vec![1.0, 2.0]);
+    block_on(cache.put_many("m", vec![(hash, first.clone())])).unwrap();
+    block_on(cache.put_many("m", vec![(hash, UnitVector::normalize(vec![-3.0, 1.0]))])).unwrap();
+
+    let hits = block_on(cache.get_many("m", &[hash])).unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].slot, 0);
+    assert_eq!(hits[0].fp16_bytes(), fp16_of(&first));
+    assert_eq!(block_on(cache.model("m")).unwrap().unwrap().vectors, 1);
+}
+
+#[test]
+fn a_vector_of_another_dimension_rolls_the_batch_back() {
+    let common = tempfile::tempdir().unwrap();
+    let cache = block_on(VectorCache::open(common.path())).unwrap();
+    let ok = ContentHash::of_chunk("fn a", "fn a() {}");
+    block_on(cache.put_many("m", vec![(ok, UnitVector::normalize(vec![1.0, 2.0]))])).unwrap();
+
+    let fresh = ContentHash::of_chunk("fn b", "fn b() {}");
+    let bad = ContentHash::of_chunk("fn c", "fn c() {}");
+    let err = block_on(cache.put_many(
+        "m",
+        vec![
+            (fresh, UnitVector::normalize(vec![1.0, 1.0])),
+            (bad, UnitVector::normalize(vec![1.0, 1.0, 1.0])),
+        ],
+    ))
+    .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            store::Error::DimMismatch {
+                expected: 2,
+                got: 3,
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+    assert_eq!(
+        block_on(cache.get_many("m", &[ok, fresh, bad]))
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(block_on(cache.model("m")).unwrap().unwrap().vectors, 1);
+
+    // The slot the failed batch would have taken goes to the next writer.
+    block_on(cache.put_many("m", vec![(fresh, UnitVector::normalize(vec![1.0, 1.0]))])).unwrap();
+    let hits = block_on(cache.get_many("m", &[fresh])).unwrap();
+    assert_eq!(hits[0].slot, 1);
+}
+
+#[test]
+fn concurrent_writers_never_overlap_slots() {
+    let common = tempfile::tempdir().unwrap();
+    let a = block_on(VectorCache::open(common.path())).unwrap();
+    let b = block_on(VectorCache::open(common.path())).unwrap();
+    let vector_of =
+        |i: usize| UnitVector::normalize(vec![i as f32 + 1.0, (i % 7) as f32 - 3.0, 0.25]);
+    let hash_of = |i: usize| ContentHash::of_chunk("fn v", &format!("fn v{i}() {{}}"));
+
+    // Writer A owns evens, B odds, and both race on the shared 0..40.
+    std::thread::scope(|scope| {
+        for (cache, parity) in [(&a, 0), (&b, 1)] {
+            scope.spawn(move || {
+                for chunk in (0..400)
+                    .filter(|i| i % 2 == parity)
+                    .collect::<Vec<_>>()
+                    .chunks(10)
+                {
+                    let batch = chunk.iter().map(|&i| (hash_of(i), vector_of(i))).collect();
+                    block_on(cache.put_many("m", batch)).unwrap();
+                    let shared = (0..40).map(|i| (hash_of(i), vector_of(i))).collect();
+                    block_on(cache.put_many("m", shared)).unwrap();
+                }
+            });
+        }
+    });
+
+    let info = block_on(a.model("m")).unwrap().unwrap();
+    assert_eq!(info.vectors, 400);
+    assert_eq!(fs::metadata(&info.file).unwrap().len(), 400 * 3 * 2);
+    let hashes: Vec<ContentHash> = (0..400).map(hash_of).collect();
+    let hits = block_on(b.get_many("m", &hashes)).unwrap();
+    assert_eq!(hits.len(), 400);
+    let mut slots = HashSet::new();
+    for hit in hits {
+        let i = (0..400).find(|&i| hash_of(i) == hit.content_hash).unwrap();
+        assert_eq!(hit.fp16_bytes(), fp16_of(&vector_of(i)), "row {i}");
+        assert!(slots.insert(hit.slot), "slot {} allocated twice", hit.slot);
+    }
+}
+
+#[test]
+fn calibration_is_stored_per_model() {
+    let common = tempfile::tempdir().unwrap();
+    let cache = block_on(VectorCache::open(common.path())).unwrap();
+    let hash = ContentHash::of_chunk("fn v", "fn v() {}");
+    let calibration = || StoredCalibration {
+        lo: vec![-1.0, 0.5].into(),
+        hi: vec![1.0, 0.75].into(),
+        count: 12,
+    };
+
+    let err = block_on(cache.set_calibration("m", calibration())).unwrap_err();
+    assert!(matches!(err, store::Error::UnknownModel(_)), "{err:?}");
+
+    block_on(cache.put_many("m", vec![(hash, UnitVector::normalize(vec![1.0, 2.0]))])).unwrap();
+    assert!(block_on(cache.calibration("m")).unwrap().is_none());
+    block_on(cache.set_calibration("m", calibration())).unwrap();
+    assert_eq!(
+        block_on(cache.calibration("m")).unwrap(),
+        Some(calibration())
+    );
+
+    let short = StoredCalibration {
+        lo: vec![0.0].into(),
+        hi: vec![1.0].into(),
+        count: 1,
+    };
+    let err = block_on(cache.set_calibration("m", short)).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            store::Error::DimMismatch {
+                expected: 2,
+                got: 1,
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+    assert!(block_on(cache.calibration("other")).unwrap().is_none());
 }
