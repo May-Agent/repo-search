@@ -1,0 +1,8 @@
+[package]
+name = "repo-search-coreml"
+version = "0.0.0"
+description = "Core ML Embedder backend for repo-search (Apple Silicon)"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true

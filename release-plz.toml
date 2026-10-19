@@ -1,0 +1,16 @@
+[workspace]
+git_only = true
+publish = false
+git_release_enable = false
+
+[[package]]
+name = "repo-search"
+git_tag_name = "v{{ version }}"
+
+[[package]]
+name = "repo-search-core"
+git_tag_name = "core/v{{ version }}"
+
+[[package]]
+name = "repo-search-coreml"
+git_tag_name = "coreml/v{{ version }}"
