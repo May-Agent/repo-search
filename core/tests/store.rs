@@ -1,3 +1,4 @@
+use numkong::f16;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::ops::RangeInclusive;
@@ -383,7 +384,7 @@ fn fp16_of(vector: &UnitVector) -> Vec<u8> {
     vector
         .as_slice()
         .iter()
-        .flat_map(|&x| half::f16::from_f32(x).to_le_bytes())
+        .flat_map(|&x| f16::from_f32(x).0.to_le_bytes())
         .collect()
 }
 
@@ -585,4 +586,58 @@ fn calibration_is_stored_per_model() {
         "{err:?}"
     );
     assert!(block_on(cache.calibration("other")).unwrap().is_none());
+}
+
+#[test]
+fn bounds_cover_every_committed_vector_at_fp16_precision() {
+    let common = tempfile::tempdir().unwrap();
+    let cache = block_on(VectorCache::open(common.path())).unwrap();
+
+    let err = block_on(cache.bounds("m")).unwrap_err();
+    assert!(matches!(err, store::Error::UnknownModel(_)), "{err:?}");
+
+    let vectors = [
+        vec![3.0, -1.0, 2.0],
+        vec![-2.0, 4.0, 0.5],
+        vec![1.0, 1.0, -3.0],
+    ];
+    let batch: Vec<(ContentHash, UnitVector)> = vectors
+        .iter()
+        .enumerate()
+        .map(|(i, v)| {
+            (
+                ContentHash::of_chunk("fn v", &format!("fn v{i}() {{}}")),
+                UnitVector::normalize(v.clone()),
+            )
+        })
+        .collect();
+    let stored: Vec<Vec<f32>> = batch
+        .iter()
+        .map(|(_, v)| {
+            v.as_slice()
+                .iter()
+                .map(|x| f16::from_f32(*x).to_f32())
+                .collect()
+        })
+        .collect();
+    block_on(cache.put_many("m", batch)).unwrap();
+
+    let bounds = block_on(cache.bounds("m")).unwrap();
+    assert_eq!(bounds.count, 3);
+    for d in 0..3 {
+        let column = stored.iter().map(|v| v[d]);
+        assert_eq!(bounds.lo[d], column.clone().fold(f32::INFINITY, f32::min));
+        assert_eq!(bounds.hi[d], column.fold(f32::NEG_INFINITY, f32::max));
+    }
+}
+
+#[test]
+fn a_calibration_over_no_vectors_is_rejected() {
+    let common = tempfile::tempdir().unwrap();
+    let cache = block_on(VectorCache::open(common.path())).unwrap();
+    let hash = ContentHash::of_chunk("fn v", "fn v() {}");
+    block_on(cache.put_many("m", vec![(hash, UnitVector::normalize(vec![1.0, 2.0]))])).unwrap();
+    let err = block_on(cache.set_calibration("m", StoredCalibration::empty(2))).unwrap_err();
+    assert!(matches!(err, store::Error::EmptyCalibration(_)), "{err:?}");
+    assert!(block_on(cache.calibration("m")).unwrap().is_none());
 }

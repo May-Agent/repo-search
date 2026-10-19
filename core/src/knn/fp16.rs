@@ -4,7 +4,7 @@ use std::fs::File;
 use std::io;
 use std::path::Path;
 
-use memmap2::Mmap;
+use memmap2::{MmapOptions, MmapRaw};
 use numkong::f16;
 
 use super::Error;
@@ -16,10 +16,14 @@ const _: () = assert!(
 
 /// The fp16 rows of one model: row `slot` is at byte offset `slot * dim * 2`.
 ///
-/// The cache only ever appends to the file, so a mapped range stays valid.
+/// The cache never rewrites a committed row and never shrinks the file, and
+/// only committed slots (those the `vectors` table references) are read, so a
+/// mapped committed row stays valid and unchanging. Bytes past `next_slot` may
+/// be overwritten by other processes; the mapping is raw and no reference is
+/// ever created over it as a whole, only over single committed rows.
 pub(super) struct Fp16File {
     file: File,
-    map: Option<Mmap>,
+    map: Option<MmapRaw>,
     dim: usize,
 }
 
@@ -40,9 +44,10 @@ impl Fp16File {
         self.map = if self.file.metadata()?.len() == 0 {
             None
         } else {
-            // SAFETY: the vector cache never truncates or shrinks the file, so
-            // every mapped page stays backed for the life of the mapping.
-            Some(unsafe { Mmap::map(&self.file)? })
+            // A raw map is safe to create: no reference spans it. The cache
+            // never truncates the file, so every page stays backed, and
+            // `row` views only single committed rows.
+            Some(MmapOptions::new().map_raw_read_only(&self.file)?)
         };
         Ok(())
     }
@@ -71,10 +76,14 @@ impl Fp16File {
     pub(super) fn row(&self, slot: u64) -> &[f16] {
         let map = self.map.as_ref().expect("row read before cover");
         let start = usize::try_from(slot).expect("slot fits in usize") * self.dim * 2;
-        let bytes = &map[start..start + self.dim * 2];
-        // SAFETY: `f16` is a transparent u16 and the host is little-endian, as
-        // asserted above; the mapping is page-aligned and `start` is even, so
-        // the pointer is 2-aligned; the length is `dim` whole elements.
-        unsafe { std::slice::from_raw_parts(bytes.as_ptr().cast::<f16>(), self.dim) }
+        assert!(start + self.dim * 2 <= map.len(), "row past the map");
+        // SAFETY: `cover` admitted `slot`, so the row lies inside the map; it
+        // is a committed row, which is never rewritten, so the slice covers
+        // only bytes that stay fixed for its lifetime, and no reference to any
+        // other part of the map exists. `f16` is a transparent u16 and the host
+        // is little-endian, as asserted above; the mapping is page-aligned and
+        // `start` is even, so the pointer is 2-aligned; the length is `dim`
+        // whole elements.
+        unsafe { std::slice::from_raw_parts(map.as_ptr().add(start).cast::<f16>(), self.dim) }
     }
 }

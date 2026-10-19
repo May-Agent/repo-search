@@ -6,10 +6,6 @@ use crate::UnitVector;
 use crate::store::{StoredCalibration, VectorCache};
 
 use super::Error;
-use super::fp16::Fp16File;
-
-/// Rows read per `scan` page while calibrating.
-const SCAN_PAGE: u32 = 4096;
 
 /// Per-dimension affine map from fp32 components to unsigned 8-bit codes:
 /// `code = round((x - lo) / scale)`, `scale = (hi - lo) / 255`.
@@ -19,33 +15,6 @@ pub struct Calibration {
     pub lo: Box<[f32]>,
     /// Per-dimension step, `(hi - lo) / 255`; zero for a constant dimension.
     pub scale: Box<[f32]>,
-}
-
-/// Running per-dimension min/max.
-struct Bounds {
-    lo: Box<[f32]>,
-    hi: Box<[f32]>,
-    rows: u64,
-}
-
-impl Bounds {
-    fn new(dim: usize) -> Self {
-        Self {
-            lo: vec![f32::INFINITY; dim].into(),
-            hi: vec![f32::NEG_INFINITY; dim].into(),
-            rows: 0,
-        }
-    }
-
-    fn add(&mut self, row: &[f16]) {
-        assert_eq!(row.len(), self.lo.len(), "row dimension");
-        for ((x, lo), hi) in row.iter().zip(&mut self.lo).zip(&mut self.hi) {
-            let x = x.to_f32();
-            *lo = lo.min(x);
-            *hi = hi.max(x);
-        }
-        self.rows += 1;
-    }
 }
 
 impl Calibration {
@@ -58,7 +27,7 @@ impl Calibration {
     pub fn from_rows<'a>(rows: impl IntoIterator<Item = &'a [f16]>) -> Self {
         let mut rows = rows.into_iter();
         let first = rows.next().expect("cannot calibrate without rows");
-        let mut bounds = Bounds::new(first.len());
+        let mut bounds = StoredCalibration::empty(first.len());
         bounds.add(first);
         rows.for_each(|row| bounds.add(row));
         Self::from_bounds(&bounds.lo, &bounds.hi)
@@ -132,8 +101,8 @@ impl Calibration {
 /// taken while the cache held only short chunks must not stick. Codes live in
 /// memory only, so recalibrating invalidates nothing on disk.
 ///
-/// The recomputation reads the whole fp16 file page by page, doing a
-/// bounded amount of compute between awaits.
+/// The recomputation runs on the vector-cache actor thread as one request,
+/// so no file or database work happens on the calling executor.
 ///
 /// # Errors
 ///
@@ -150,32 +119,11 @@ pub async fn calibration_for(cache: &VectorCache, model_id: &str) -> Result<Cali
         return Ok(Calibration::from_bounds(&stored.lo, &stored.hi));
     }
 
-    let mut file = Fp16File::open(&info.file, info.dim)?;
-    let mut bounds = Bounds::new(info.dim);
-    let mut cursor = None;
-    loop {
-        let page = cache.scan(model_id, cursor, SCAN_PAGE).await?;
-        for entry in &page {
-            file.cover(entry.slot)?;
-            bounds.add(file.row(entry.slot));
-        }
-        if page.len() < SCAN_PAGE as usize {
-            break;
-        }
-        cursor = page.last().map(|entry| entry.content_hash);
-    }
-    if bounds.rows == 0 {
+    let bounds = cache.bounds(model_id).await?;
+    if bounds.count == 0 {
         return Err(Error::NoVectors(model_id.to_owned()));
     }
-    cache
-        .set_calibration(
-            model_id,
-            StoredCalibration {
-                lo: bounds.lo.clone(),
-                hi: bounds.hi.clone(),
-                count: bounds.rows,
-            },
-        )
-        .await?;
-    Ok(Calibration::from_bounds(&bounds.lo, &bounds.hi))
+    let calibration = Calibration::from_bounds(&bounds.lo, &bounds.hi);
+    cache.set_calibration(model_id, bounds).await?;
+    Ok(calibration)
 }

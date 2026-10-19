@@ -1,5 +1,6 @@
 //! Scan-thread scheduling: user-interactive QoS and the default thread count.
 
+#[cfg(target_os = "macos")]
 use std::io;
 
 /// Marks the calling thread as user-interactive work so the scheduler keeps it
@@ -43,18 +44,7 @@ pub fn performance_cores() -> io::Result<usize> {
     usize::try_from(count).map_err(|_| io::Error::other("negative performance core count"))
 }
 
-/// The number of hardware threads: the default scan thread count, which the
-/// caller passes to `KnnIndex::search`.
-///
-/// # Errors
-///
-/// When the platform does not report its parallelism.
-#[cfg(not(target_os = "macos"))]
-pub fn performance_cores() -> io::Result<usize> {
-    std::thread::available_parallelism().map(std::num::NonZero::get)
-}
-
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 mod tests {
     #[test]
     fn reports_at_least_one_core() {

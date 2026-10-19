@@ -4,7 +4,7 @@ members = ["core", "coreml"]
 
 [workspace.package]
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.90"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/May-Agent/repo-search"
 

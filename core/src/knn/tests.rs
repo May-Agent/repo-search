@@ -43,7 +43,7 @@ fn write_rows(path: &Path, vectors: &[UnitVector]) {
         .flat_map(|v| {
             v.as_slice()
                 .iter()
-                .flat_map(|&x| half::f16::from_f32(x).to_le_bytes())
+                .flat_map(|&x| f16::from_f32(x).0.to_le_bytes())
         })
         .collect();
     fs::write(path, bytes).unwrap();

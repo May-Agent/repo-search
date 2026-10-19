@@ -83,9 +83,14 @@ pub enum Error {
         got: usize,
     },
 
-    /// A calibration was set for a model that has no vectors yet.
+    /// An operation named a model with no cached vectors.
     #[error("model {0:?} has no cached vectors")]
     UnknownModel(String),
+
+    /// A calibration counting no vectors was offered for a model; its bounds
+    /// would be infinite.
+    #[error("calibration of model {0:?} counts no vectors")]
+    EmptyCalibration(String),
 }
 
 /// Sends `request` to an actor and awaits its reply.

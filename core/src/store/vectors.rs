@@ -9,12 +9,18 @@
 //! Slots are allocated inside SQLite's write transaction and rows are written
 //! positionally, so concurrent daemons never overlap: the write lock
 //! serialises allocation. Rows are written and synced before the transaction
-//! commits; a crash in between leaves an unreferenced row, which is harmless.
+//! commits. A crash or rollback in between leaves unreferenced bytes at slots
+//! at or past `next_slot`, which a later batch overwrites. The invariants
+//! readers rely on: a committed row is never rewritten, only committed slots
+//! (those the `vectors` table references) are ever read, and no reference
+//! spans uncommitted bytes, so the mapped file is only ever viewed one
+//! committed row at a time.
 
 use std::fs::{self, File, OpenOptions};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 
+use numkong::f16;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use tokio::sync::{mpsc, oneshot};
 
@@ -48,8 +54,10 @@ impl CachedVector {
     #[must_use]
     pub fn to_f32(&self) -> Vec<f32> {
         self.fp16
-            .chunks_exact(2)
-            .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| f16(u16::from_le_bytes(*c)).to_f32())
             .collect()
     }
 }
@@ -86,6 +94,37 @@ pub struct StoredCalibration {
     pub count: u64,
 }
 
+impl StoredCalibration {
+    /// Empty bounds over `dim` dimensions: no vectors counted yet.
+    #[must_use]
+    pub fn empty(dim: usize) -> Self {
+        Self {
+            lo: vec![f32::INFINITY; dim].into(),
+            hi: vec![f32::NEG_INFINITY; dim].into(),
+            count: 0,
+        }
+    }
+
+    /// Widens the bounds to cover `row` and counts it.
+    ///
+    /// # Panics
+    ///
+    /// When `row` is not as long as the bounds.
+    pub fn add(&mut self, row: &[f16]) {
+        self.widen(row.iter().map(|x| x.to_f32()));
+    }
+
+    /// Widens the bounds to cover a row already converted to `f32`.
+    fn widen(&mut self, row: impl ExactSizeIterator<Item = f32>) {
+        assert_eq!(row.len(), self.lo.len(), "row dimension");
+        for ((x, lo), hi) in row.zip(&mut self.lo).zip(&mut self.hi) {
+            *lo = lo.min(x);
+            *hi = hi.max(x);
+        }
+        self.count += 1;
+    }
+}
+
 enum Request {
     GetMany {
         model_id: String,
@@ -110,6 +149,10 @@ enum Request {
     Calibration {
         model_id: String,
         reply: oneshot::Sender<Result<Option<StoredCalibration>, Error>>,
+    },
+    Bounds {
+        model_id: String,
+        reply: oneshot::Sender<Result<StoredCalibration, Error>>,
     },
     SetCalibration {
         model_id: String,
@@ -246,11 +289,27 @@ impl VectorCache {
         .await
     }
 
+    /// The per-dimension bounds over every vector cached under `model_id`,
+    /// computed on the actor thread, which owns the file and database reads.
+    ///
+    /// # Errors
+    ///
+    /// When the model has no vectors ([`Error::UnknownModel`]), SQLite rejects
+    /// the read, the fp16 file cannot be read, or the actor is gone.
+    pub async fn bounds(&self, model_id: &str) -> Result<StoredCalibration, Error> {
+        send_and_wait(&self.tx, |reply| Request::Bounds {
+            model_id: model_id.to_owned(),
+            reply,
+        })
+        .await
+    }
+
     /// Replaces the calibration of `model_id`.
     ///
     /// # Errors
     ///
-    /// When the model has no vectors ([`Error::UnknownModel`]), a bound's
+    /// When the model has no vectors ([`Error::UnknownModel`]), the
+    /// calibration counts no vectors ([`Error::EmptyCalibration`]), a bound's
     /// length differs from the model's dimension, SQLite rejects the write, or
     /// the actor is gone.
     pub async fn set_calibration(
@@ -323,6 +382,9 @@ fn serve(mut conn: Connection, dir: &Path, mut rx: mpsc::Receiver<Request>) {
             Request::Calibration { model_id, reply } => {
                 let _ = reply.send(calibration(&conn, &model_id));
             }
+            Request::Bounds { model_id, reply } => {
+                let _ = reply.send(bounds(&conn, dir, &model_id));
+            }
             Request::SetCalibration {
                 model_id,
                 calibration,
@@ -338,11 +400,13 @@ fn serve(mut conn: Connection, dir: &Path, mut rx: mpsc::Receiver<Request>) {
 /// the id keep arbitrary ids valid file names.
 fn fp16_path(dir: &Path, model_id: &str) -> PathBuf {
     let digest = blake3::hash(model_id.as_bytes());
-    let mut prefix = [0; 8];
-    prefix.copy_from_slice(&digest.as_bytes()[..8]);
+    let prefix = digest
+        .as_bytes()
+        .first_chunk::<8>()
+        .expect("BLAKE3 digest is 32 bytes");
     dir.join(format!(
         "vectors.v{SCHEMA_VERSION}.{:016x}.f16",
-        u64::from_be_bytes(prefix)
+        u64::from_be_bytes(*prefix)
     ))
 }
 
@@ -467,7 +531,7 @@ fn put_many(
             }
             row.clear();
             for &x in vector.as_slice() {
-                row.extend_from_slice(&half::f16::from_f32(x).to_le_bytes());
+                row.extend_from_slice(&f16::from_f32(x).0.to_le_bytes());
             }
             file.write_all_at(&row, row_offset(next_slot, dim))?;
             insert.execute(params![model_id, *hash, i64_of(next_slot)?])?;
@@ -534,8 +598,10 @@ fn blob_to_f32s(blob: &[u8], dim: usize, what: &'static str) -> Result<Box<[f32]
         return Err(Error::CorruptBlob(what));
     }
     Ok(blob
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| f32::from_le_bytes(*c))
         .collect())
 }
 
@@ -559,6 +625,30 @@ fn calibration(conn: &Connection, model_id: &str) -> Result<Option<StoredCalibra
     }))
 }
 
+/// Bounds over every committed row of `model_id`; only slots the `vectors`
+/// table references are read.
+fn bounds(conn: &Connection, dir: &Path, model_id: &str) -> Result<StoredCalibration, Error> {
+    let Some((dim, _)) = model_row(conn, model_id)? else {
+        return Err(Error::UnknownModel(model_id.to_owned()));
+    };
+    let file = File::open(fp16_path(dir, model_id))?;
+    let mut stmt = conn.prepare("SELECT slot FROM vectors WHERE model_id = ?1 ORDER BY slot")?;
+    let mut slots = stmt.query(params![model_id])?;
+    let mut bounds = StoredCalibration::empty(dim);
+    let mut bytes = vec![0; dim * 2];
+    let mut row = vec![f16(0); dim];
+    let mut wide = vec![0.0f32; dim];
+    while let Some(slot) = slots.next()? {
+        file.read_exact_at(&mut bytes, row_offset(u64_of(slot.get(0)?)?, dim))?;
+        for (x, c) in row.iter_mut().zip(bytes.as_chunks::<2>().0) {
+            *x = f16(u16::from_le_bytes(*c));
+        }
+        numkong::cast(&row, &mut wide).expect("row and buffer are both dim long");
+        bounds.widen(wide.iter().copied());
+    }
+    Ok(bounds)
+}
+
 fn set_calibration(
     conn: &Connection,
     model_id: &str,
@@ -567,6 +657,9 @@ fn set_calibration(
     let Some((dim, _)) = model_row(conn, model_id)? else {
         return Err(Error::UnknownModel(model_id.to_owned()));
     };
+    if calibration.count == 0 {
+        return Err(Error::EmptyCalibration(model_id.to_owned()));
+    }
     for bound in [&calibration.lo, &calibration.hi] {
         if bound.len() != dim {
             return Err(Error::DimMismatch {

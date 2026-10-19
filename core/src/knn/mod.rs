@@ -14,6 +14,7 @@ mod topk;
 
 pub use calibration::{Calibration, calibration_for};
 pub use index::KnnIndex;
+#[cfg(target_os = "macos")]
 pub use qos::performance_cores;
 
 use std::io;
