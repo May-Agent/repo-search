@@ -204,12 +204,7 @@ pub async fn reconcile(
             .filter(|hash| seen.insert(*hash))
             .collect()
     };
-    let cached: HashSet<ContentHash> = cache
-        .get_many(model_id, &distinct)
-        .await?
-        .into_iter()
-        .map(|v| v.content_hash)
-        .collect();
+    let cached = cache.cached(model_id, &distinct).await?;
     let chunks_with_vector = rows.iter().filter(|h| cached.contains(h)).count() as u64;
 
     // Missing hashes, distinct, in index order.

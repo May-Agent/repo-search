@@ -16,6 +16,7 @@
 //! spans uncommitted bytes, so the mapped file is only ever viewed one
 //! committed row at a time.
 
+use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
@@ -131,6 +132,11 @@ enum Request {
         hashes: Vec<ContentHash>,
         reply: oneshot::Sender<Result<Vec<CachedVector>, Error>>,
     },
+    Cached {
+        model_id: String,
+        hashes: Vec<ContentHash>,
+        reply: oneshot::Sender<Result<HashSet<ContentHash>, Error>>,
+    },
     PutMany {
         model_id: String,
         vectors: Vec<(ContentHash, UnitVector)>,
@@ -209,6 +215,25 @@ impl VectorCache {
         hashes: &[ContentHash],
     ) -> Result<Vec<CachedVector>, Error> {
         send_and_wait(&self.tx, |reply| Request::GetMany {
+            model_id: model_id.to_owned(),
+            hashes: hashes.to_vec(),
+            reply,
+        })
+        .await
+    }
+
+    /// The subset of `hashes` that has a cached vector under `model_id`.
+    /// Answered from the SQLite index alone; the fp16 file is never read.
+    ///
+    /// # Errors
+    ///
+    /// When SQLite rejects the read or the actor is gone.
+    pub async fn cached(
+        &self,
+        model_id: &str,
+        hashes: &[ContentHash],
+    ) -> Result<HashSet<ContentHash>, Error> {
+        send_and_wait(&self.tx, |reply| Request::Cached {
             model_id: model_id.to_owned(),
             hashes: hashes.to_vec(),
             reply,
@@ -361,6 +386,13 @@ fn serve(mut conn: Connection, dir: &Path, mut rx: mpsc::Receiver<Request>) {
             } => {
                 let _ = reply.send(get_many(&mut conn, dir, &model_id, &hashes));
             }
+            Request::Cached {
+                model_id,
+                hashes,
+                reply,
+            } => {
+                let _ = reply.send(cached(&mut conn, &model_id, &hashes));
+            }
             Request::PutMany {
                 model_id,
                 vectors,
@@ -482,6 +514,29 @@ fn get_many(
             })
         })
         .collect()
+}
+
+/// Membership only: one existence probe per hash inside a single read
+/// transaction, touching no fp16 row.
+fn cached(
+    conn: &mut Connection,
+    model_id: &str,
+    hashes: &[ContentHash],
+) -> Result<HashSet<ContentHash>, Error> {
+    let tx = conn.transaction()?;
+    let mut found = HashSet::with_capacity(hashes.len());
+    {
+        let mut stmt = tx.prepare(
+            "SELECT EXISTS(SELECT 1 FROM vectors WHERE model_id = ?1 AND content_hash = ?2)",
+        )?;
+        for hash in hashes {
+            if stmt.query_row(params![model_id, *hash], |row| row.get::<_, bool>(0))? {
+                found.insert(*hash);
+            }
+        }
+    }
+    tx.commit()?;
+    Ok(found)
 }
 
 fn put_many(
