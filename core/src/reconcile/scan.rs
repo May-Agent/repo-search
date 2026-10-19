@@ -11,7 +11,7 @@ use std::path::Path;
 use ignore::WalkBuilder;
 
 use super::{Error, PendingChunk, SkipReason, Skipped};
-use crate::chunk::{Chunker, Rust};
+use crate::chunk::{self, Chunker, ConfigChunker, DocChunker, FileChunker, Language, Rust};
 use crate::store::{
     ChunkRecord, ContentHash, FileChange, FileState, MemberRecord, StoredChunk, fts_body,
 };
@@ -20,22 +20,8 @@ use crate::store::{
 /// are switched off.
 const RESERVED_DIRS: [&str; 2] = [".git", ".repo-search"];
 
-/// A source language the chunker understands.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Language {
-    Rust,
-}
-
-impl Language {
-    fn of_path(path: &Path) -> Option<Self> {
-        match path.extension()?.to_str()? {
-            "rs" => Some(Self::Rust),
-            _ => None,
-        }
-    }
-}
-
-/// One chunker per language, reused across files.
+/// The chunkers that carry state across files: the tree-sitter parser is
+/// reused, the documentation and configuration chunkers are stateless.
 struct Chunkers {
     rust: Chunker<Rust>,
 }
@@ -48,20 +34,27 @@ impl Chunkers {
     }
 
     /// The records of `src` plus each chunk's text, in chunk order.
-    fn chunk(&mut self, language: Language, path: &str, src: &str) -> Vec<(ChunkRecord, String)> {
+    fn chunk(
+        &mut self,
+        language: Language,
+        path: &str,
+        src: &str,
+    ) -> Result<Vec<(ChunkRecord, String)>, chunk::Error> {
         match language {
             Language::Rust => chunk_with(&mut self.rust, path, src),
+            Language::Doc(format) => chunk_with(&mut DocChunker::new(format), path, src),
+            Language::Config(format) => chunk_with(&mut ConfigChunker::new(format), path, src),
         }
     }
 }
 
-fn chunk_with<G: crate::chunk::Grammar>(
-    chunker: &mut Chunker<G>,
+fn chunk_with<C: FileChunker>(
+    chunker: &mut C,
     path: &str,
     src: &str,
-) -> Vec<(ChunkRecord, String)> {
-    let chunks = chunker.chunk_file(path, src);
-    chunks
+) -> Result<Vec<(ChunkRecord, String)>, chunk::Error> {
+    let chunks = chunker.chunk_file(path, src)?;
+    Ok(chunks
         .iter()
         .map(|chunk| {
             let mut text = String::new();
@@ -75,7 +68,7 @@ fn chunk_with<G: crate::chunk::Grammar>(
                     .iter()
                     .map(|m| MemberRecord {
                         bytes: m.bytes.start as u64..m.bytes.end as u64,
-                        kind: chunker.kind_name(m.kind).to_owned(),
+                        kind: chunker.member_kind_name(m.kind).into_owned(),
                         symbol: m.symbol.clone(),
                     })
                     .collect(),
@@ -84,7 +77,7 @@ fn chunk_with<G: crate::chunk::Grammar>(
             };
             (record, text)
         })
-        .collect()
+        .collect())
 }
 
 /// Everything the walk decided, before anything is written.
@@ -179,7 +172,17 @@ pub(super) fn plan(
             });
             continue;
         };
-        let chunked = chunkers.chunk(cand.language, &cand.rel, &src);
+        let chunked = match chunkers.chunk(cand.language, &cand.rel, &src) {
+            Ok(chunked) => chunked,
+            Err(error) => {
+                tracing::warn!(path = %cand.rel, %error, "skipping a file that is not valid");
+                plan.skipped.push(Skipped {
+                    path: cand.rel,
+                    reason: SkipReason::Malformed,
+                });
+                continue;
+            }
+        };
         let mut records = Vec::with_capacity(chunked.len());
         for (record, text) in chunked {
             plan.texts
@@ -202,7 +205,7 @@ pub(super) fn plan(
         plan.changes.push(FileChange::Replace(state, records));
     }
     // Whatever was stored but not seen alive is gone: deleted (including
-    // vanished mid-pass), newly ignored, or no longer valid UTF-8.
+    // vanished mid-pass), newly ignored, no longer valid UTF-8, or malformed.
     let mut gone: Vec<String> = stored
         .into_keys()
         .filter(|path| !live.contains(path))

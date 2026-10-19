@@ -90,6 +90,8 @@ pub enum SkipReason {
     NotUtf8,
     /// The file's path is not valid UTF-8; [`Skipped::path`] is lossy.
     NotUtf8Path,
+    /// A configuration file that does not parse in its format.
+    Malformed,
 }
 
 /// A walked file that was not indexed; any chunks it had are dropped. A file

@@ -89,7 +89,7 @@ fn first_pass_indexes_everything_and_reports_missing_vectors() {
     let fx = Fixture::new();
     fx.write("src/a.rs", "fn alpha() { 1; }\n\nstruct Gamma;\n");
     fx.write("src/b.rs", "fn beta() { 2; }\n");
-    fx.write("README.md", "not rust\n");
+    fx.write("notes.xyz", "unknown extension\n");
 
     let first = fx.pass();
     let r = &first.report;
@@ -402,7 +402,7 @@ fn a_missing_worktree_is_an_error_and_leaves_the_index_untouched() {
 
 #[test]
 fn rebuilt_pending_text_equals_the_chunkers_for_packed_crlf_non_ascii() {
-    use repo_search_core::chunk::{ChunkKind, Chunker, Rust};
+    use repo_search_core::chunk::{ChunkKind, Chunker, FileChunker, Rust};
 
     let src = "// caf\u{e9} \u{65e5}\u{672c}\u{8a9e}\r\nfn a() { \"na\u{ef}ve\"; }\r\n\r\nfn b() { \"\u{4e16}\u{754c}\"; }\r\n\r\nfn c() { 3; }\r\n";
     let fx = Fixture::new();
@@ -411,7 +411,7 @@ fn rebuilt_pending_text_equals_the_chunkers_for_packed_crlf_non_ascii() {
 
     let mut expected = Vec::new();
     let mut packed = false;
-    for chunk in Chunker::new(Rust).chunk_file("p.rs", src) {
+    for chunk in Chunker::new(Rust).chunk_file("p.rs", src).unwrap() {
         packed |= chunk.kind == ChunkKind::Packed && chunk.members.len() > 1;
         let mut text = String::new();
         chunk.write_text(src, &mut text);
@@ -431,4 +431,45 @@ fn rebuilt_pending_text_equals_the_chunkers_for_packed_crlf_non_ascii() {
     expected.sort_by_key(|(_, t)| t.clone());
     assert_eq!(got, expected);
     assert!(second.pending.iter().any(|c| c.text.contains("\r\n")));
+}
+
+#[test]
+fn documentation_and_configuration_are_chunked_by_extension() {
+    let fx = Fixture::new();
+    fx.write("a.rs", "fn alpha() { 1; }\n");
+    fx.write("docs/guide.md", "# Guide\n\n## Setup\ninstall the widget\n");
+    fx.write("Cargo.toml", "[package]\nname = \"demo\"\n");
+    fx.write("conf.yaml", "server:\n  port: 80\n");
+    fx.write("package.json", "{\"name\": \"demo\"}");
+    fx.write("image.png", "not read");
+
+    let r = fx.pass();
+    assert_eq!(r.report.files_scanned, 5);
+    assert!(r.report.skipped.is_empty());
+    assert_eq!(fx.fts_hits("widget"), 1);
+    let doc_title: String =
+        fx.query("SELECT title FROM chunks WHERE path = 'docs/guide.md' AND kind = 'doc'");
+    assert_eq!(doc_title, "docs/guide.md › Guide › Setup");
+    let member_kind: String = fx.query(
+        "SELECT m.kind FROM chunk_members m JOIN chunks c ON c.id = m.chunk_id \
+         WHERE c.path = 'docs/guide.md'",
+    );
+    assert_eq!(member_kind, "doc");
+    let config_chunks: i64 = fx.query("SELECT count(*) FROM chunk_members WHERE kind = 'config'");
+    assert_eq!(config_chunks, 3);
+}
+
+#[test]
+fn malformed_configuration_is_reported_and_dropped() {
+    let fx = Fixture::new();
+    fx.write("c.json", "{\"a\": 1}");
+    fx.pass();
+    fx.write("c.json", "{\"a\": ");
+    // A different size moves the fingerprint.
+    let r = fx.pass();
+    assert_eq!(r.report.skipped.len(), 1);
+    assert_eq!(r.report.skipped[0].path, "c.json");
+    assert_eq!(r.report.skipped[0].reason, SkipReason::Malformed);
+    assert_eq!(r.report.files_removed, 1);
+    assert_eq!(r.report.chunks_total, 0);
 }
