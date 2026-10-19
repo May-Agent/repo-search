@@ -16,8 +16,7 @@ CREATE TABLE chunks (
     end_line     INTEGER NOT NULL,
     title        TEXT NOT NULL,
     kind         TEXT NOT NULL,
-    content_hash BLOB NOT NULL,
-    tokens       INTEGER NOT NULL
+    content_hash BLOB NOT NULL
 );
 CREATE INDEX chunks_by_path ON chunks (path);
 CREATE INDEX chunks_by_hash ON chunks (content_hash);

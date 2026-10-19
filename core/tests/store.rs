@@ -32,7 +32,6 @@ fn chunk(lines: RangeInclusive<u32>, title: &str, kind: &str, text: &str) -> Chu
             symbol: title.into(),
         }],
         content_hash: ContentHash::of_chunk(title, text),
-        tokens: 10,
         fts_body: fts_body(text),
     }
 }
@@ -640,4 +639,34 @@ fn a_calibration_over_no_vectors_is_rejected() {
     let err = block_on(cache.set_calibration("m", StoredCalibration::empty(2))).unwrap_err();
     assert!(matches!(err, store::Error::EmptyCalibration(_)), "{err:?}");
     assert!(block_on(cache.calibration("m")).unwrap().is_none());
+}
+
+#[test]
+fn restamping_an_unstored_path_is_a_named_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let index = block_on(Index::open(dir.path())).unwrap();
+    let err = block_on(index.apply(vec![FileChange::Restamp(state("nope.rs", b"x"))]))
+        .err()
+        .unwrap();
+    assert!(matches!(err, store::Error::NotStored(p) if p == "nope.rs"));
+}
+
+#[test]
+fn chunks_by_hash_returns_the_first_row_with_member_ranges() {
+    let dir = tempfile::tempdir().unwrap();
+    let index = block_on(Index::open(dir.path())).unwrap();
+    let text = "fn a() {}";
+    block_on(index.replace_file(
+        state("src/a.rs", b"a"),
+        vec![chunk(3..=3, "fn a", "fn", text)],
+    ))
+    .unwrap();
+    let hash = ContentHash::of_chunk("fn a", text);
+    let missing = ContentHash::of_chunk("other", "x");
+    let found = block_on(index.chunks_by_hash(vec![missing, hash])).unwrap();
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].path, "src/a.rs");
+    assert_eq!(found[0].title, "fn a");
+    assert_eq!(found[0].lines, 3..=3);
+    assert_eq!(found[0].ranges, vec![0..text.len() as u64]);
 }

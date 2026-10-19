@@ -17,7 +17,7 @@ use std::time::Duration;
 use rusqlite::{Connection, TransactionBehavior};
 use tokio::sync::{mpsc, oneshot};
 
-pub use index::{FileChange, Index};
+pub use index::{Applied, FileChange, Index, StoredChunk};
 pub use records::{ChunkRecord, ContentHash, FileState, MemberRecord, fts_body, split_identifiers};
 pub use vectors::{CachedSlot, CachedVector, ModelInfo, StoredCalibration, VectorCache};
 
@@ -65,6 +65,10 @@ pub enum Error {
     /// SQLite stores signed 64-bit integers; a field did not fit.
     #[error("integer {0} is outside sqlite's signed 64-bit range")]
     IntRange(i128),
+
+    /// A restamp named a path the index does not hold.
+    #[error("cannot restamp {0:?}: the index does not hold it")]
+    NotStored(String),
 
     /// A blob read back from the database has a shape the writer never
     /// produces.
