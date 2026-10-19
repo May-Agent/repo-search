@@ -91,8 +91,6 @@ pub struct ChunkRecord {
     pub members: Vec<MemberRecord>,
     /// BLAKE3 of `of_chunk(title, text)`; the vector cache's key.
     pub content_hash: ContentHash,
-    /// Token count of the chunk.
-    pub tokens: u32,
     /// What FTS indexes, built by [`fts_body`]; the chunk text itself is never
     /// stored.
     pub fts_body: String,
