@@ -19,7 +19,7 @@ use tokio::sync::{mpsc, oneshot};
 
 pub use index::{Applied, FileChange, Index, StoredChunk};
 pub use records::{ChunkRecord, ContentHash, FileState, MemberRecord, fts_body, split_identifiers};
-pub use vectors::{CachedVector, VectorCache};
+pub use vectors::{CachedSlot, CachedVector, ModelInfo, StoredCalibration, VectorCache};
 
 /// Bound on each actor's request queue.
 const QUEUE: usize = 64;
@@ -74,6 +74,27 @@ pub enum Error {
     /// produces.
     #[error("corrupt {0} blob")]
     CorruptBlob(&'static str),
+
+    /// A vector or calibration does not have the dimension the model's cache
+    /// was created with.
+    #[error("model {model_id:?} stores {expected}-dimensional vectors, got {got}")]
+    DimMismatch {
+        /// The model whose cache rejected the write.
+        model_id: String,
+        /// The dimension recorded when the model's first vector was stored.
+        expected: usize,
+        /// The dimension that was offered.
+        got: usize,
+    },
+
+    /// An operation named a model with no cached vectors.
+    #[error("model {0:?} has no cached vectors")]
+    UnknownModel(String),
+
+    /// A calibration counting no vectors was offered for a model; its bounds
+    /// would be infinite.
+    #[error("calibration of model {0:?} counts no vectors")]
+    EmptyCalibration(String),
 }
 
 /// Sends `request` to an actor and awaits its reply.
