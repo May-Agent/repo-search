@@ -369,32 +369,34 @@ pub(super) enum Step {
     Done,
 }
 
-/// Fills a budget of tokens from the two ranked lists, one file group at a
-/// time, alternating between code and docs (code first, one group from each
-/// per turn). A list is taken in rank order and ends at the first chunk that
-/// no longer fits; once it is exhausted the other list continues alone. The
-/// very first chunk is always taken, so a budget smaller than the best chunk
-/// still answers. Groups are compared by rank within their own list: scores
-/// never cross between the two lists.
+/// Fills a budget of tokens from the two ranked lists, taking them in turn
+/// — code first, one file per turn in rank order — and adding the file's
+/// next-best chunk on each of its turns, so a file's second chunk comes only
+/// after every ranked file of the list has shown its best one. A pass gives
+/// every ranked file of a list one turn and repeats while budget and chunks
+/// remain. A list ends at the first chunk that does not fit — what was taken
+/// stays — or when every file's chunks are taken, and the other list then
+/// continues alone until the budget is used. The very first unit is always
+/// taken, so a budget smaller than the best chunk still answers. Files are
+/// compared by rank within their own list: scores never cross between the
+/// two lists.
 ///
-/// A group is a file and all of its ranked chunks (files-only: the file
-/// alone); a chunk's cost is what the text rendering prints for it: its text
-/// and label plus, for the first chunk of a file, the path. A chunk's text is
-/// read only when the selection reaches it, so [`advance`](Self::advance)
-/// stops at the first chunk whose text is unread and the caller supplies it.
+/// A chunk's cost is what the text rendering prints for it: its text and
+/// label plus, for the first chunk of a file, the path (files-only: the
+/// path alone). A chunk's text is read only when the selection reaches it,
+/// so [`advance`](Self::advance) stops at the first chunk whose text is
+/// unread and the caller supplies it. The emitted chunks are grouped by
+/// file in the order the files were first chosen, each file's chunks in
+/// rank order.
 pub(super) struct Selector {
     budget: usize,
     files_only: bool,
     groups: [Vec<Group>; 2],
-    /// Each side's file groups as ranked-chunk indices, in rank order; built
-    /// on the first advance.
-    order: [Option<Vec<Vec<usize>>>; 2],
-    /// The next group of each side.
+    /// Each side's files in rank order; built on the first advance.
+    files: [Option<Vec<FilePass>>; 2],
+    /// The file whose turn of the current pass is next; wraps to the first
+    /// file of the list.
     cursor: [usize; 2],
-    /// Where in the open group the walk stands, and its chunks taken so far:
-    /// a `Needs` resumes there instead of recounting them.
-    group_pos: [usize; 2],
-    pending: [Vec<usize>; 2],
     open: [bool; 2],
     used: usize,
     /// Whether any unit has been emitted: the very first is always taken
@@ -407,22 +409,39 @@ pub(super) struct Selector {
 
 const SIDES: [Side; 2] = [Side::Code, Side::Docs];
 
-/// `list` grouped by path: groups in order of first (best-ranked) appearance,
-/// members in rank order. A file's chunks need not be consecutive in the
-/// ranked list.
-fn group_order(list: &[RankedChunk]) -> Vec<Vec<usize>> {
-    let mut order: Vec<Vec<usize>> = Vec::new();
+/// One file of a list's pass order: its ranked-chunk indices and how far the
+/// selection's passes over it have gone.
+#[derive(Debug)]
+struct FilePass {
+    /// The file's ranked-chunk indices in rank order; a file's chunks need
+    /// not be consecutive in the ranked list.
+    chunks: Vec<usize>,
+    /// Chunks already taken: the next turn of the file offers
+    /// `chunks[taken]`.
+    taken: usize,
+    /// The file's entry in `groups`, once its first chunk is taken.
+    group: Option<usize>,
+}
+
+/// `list` grouped by path: files in order of first (best-ranked) appearance,
+/// each with its ranked-chunk indices in rank order.
+fn file_order(list: &[RankedChunk]) -> Vec<FilePass> {
+    let mut files: Vec<FilePass> = Vec::new();
     let mut by_path: HashMap<&str, usize> = HashMap::new();
     for (i, chunk) in list.iter().enumerate() {
         match by_path.get(chunk.row.path.as_str()) {
-            Some(&g) => order[g].push(i),
+            Some(&f) => files[f].chunks.push(i),
             None => {
-                by_path.insert(chunk.row.path.as_str(), order.len());
-                order.push(vec![i]);
+                by_path.insert(chunk.row.path.as_str(), files.len());
+                files.push(FilePass {
+                    chunks: vec![i],
+                    taken: 0,
+                    group: None,
+                });
             }
         }
     }
-    order
+    files
 }
 
 impl Selector {
@@ -431,10 +450,8 @@ impl Selector {
             budget,
             files_only,
             groups: [Vec::new(), Vec::new()],
-            order: [None, None],
+            files: [None, None],
             cursor: [0; 2],
-            group_pos: [0; 2],
-            pending: [Vec::new(), Vec::new()],
             open: [true; 2],
             used: 0,
             emitted: false,
@@ -442,7 +459,7 @@ impl Selector {
         }
     }
 
-    /// Takes groups until the next chunk needs its text, the budget is filled
+    /// Takes chunks until the next one needs its text, the budget is filled
     /// or the lists end.
     ///
     /// # Errors
@@ -454,8 +471,8 @@ impl Selector {
         counter: &impl TokenCounter,
     ) -> Result<Step, ReadError> {
         for (side, list) in lists.iter().enumerate() {
-            if self.order[side].is_none() {
-                self.order[side] = Some(group_order(list));
+            if self.files[side].is_none() {
+                self.files[side] = Some(file_order(list));
             }
         }
         while self.open.iter().any(|o| *o) {
@@ -464,14 +481,16 @@ impl Selector {
                 self.turn = 1 - side;
                 continue;
             }
-            let order = self.order[side].as_ref().expect("built above");
-            let Some(indices) = order.get(self.cursor[side]) else {
-                self.open[side] = false;
-                continue;
-            };
-            let path = lists[side][indices[0]].row.path.as_str();
+            let files = self.files[side].as_mut().expect("built above");
             if self.files_only {
-                let cost = counter.count(path);
+                // Files-only is a single pass: a file's unit is its path and
+                // no text is read.
+                let Some(file) = files.get(self.cursor[side]) else {
+                    self.open[side] = false;
+                    continue;
+                };
+                let best = &lists[side][file.chunks[0]];
+                let cost = counter.count(&best.row.path);
                 if self.emitted && self.used + cost > self.budget {
                     self.open[side] = false;
                     continue;
@@ -479,57 +498,71 @@ impl Selector {
                 self.used += cost;
                 self.emitted = true;
                 self.groups[side].push(Group {
-                    path: path.to_owned(),
-                    score: lists[side][indices[0]].score,
+                    path: best.row.path.clone(),
+                    score: best.score,
                     chunks: Vec::new(),
                 });
                 self.cursor[side] += 1;
                 self.turn = 1 - side;
                 continue;
             }
-            // The group's chunks in rank order; a chunk that does not fit
-            // ends the list, the chunks already taken of it stay.
-            let mut pos = self.group_pos[side];
-            while pos < indices.len() {
-                let idx = indices[pos];
-                let chunk = &lists[side][idx];
-                let mut cost = usize::from(pos == 0) * counter.count(path);
-                match &chunk.text {
-                    None => {
-                        self.group_pos[side] = pos;
-                        return Ok(Step::Needs {
-                            side: SIDES[side],
-                            from: idx,
-                        });
-                    }
-                    Some(Err(e)) => return Err(e.clone()),
-                    Some(Ok(text)) => {
-                        cost += counter.count(&chunk.label(SIDES[side])) + counter.count(text);
-                    }
-                }
-                if self.emitted && self.used + cost > self.budget {
-                    self.open[side] = false;
+            // The next file of the pass with a chunk left; a file whose
+            // chunks are all taken is skipped, and a full cycle ends the
+            // side.
+            if files.is_empty() {
+                self.open[side] = false;
+                continue;
+            }
+            let mut g = self.cursor[side];
+            for _ in 0..files.len() {
+                if files[g].taken < files[g].chunks.len() {
                     break;
                 }
-                self.used += cost;
-                self.emitted = true;
-                self.pending[side].push(idx);
-                pos += 1;
+                g = if g + 1 == files.len() { 0 } else { g + 1 };
             }
-            self.group_pos[side] = pos;
-            if self.open[side] {
-                self.cursor[side] += 1;
-                self.group_pos[side] = 0;
-                self.turn = 1 - side;
+            if files[g].taken == files[g].chunks.len() {
+                self.open[side] = false;
+                continue;
             }
-            if !self.pending[side].is_empty() {
-                let taken = std::mem::take(&mut self.pending[side]);
-                self.groups[side].push(Group {
-                    path: path.to_owned(),
-                    score: lists[side][taken[0]].score,
-                    chunks: taken,
-                });
+            self.cursor[side] = g;
+            let file = &mut files[g];
+            let idx = file.chunks[file.taken];
+            let chunk = &lists[side][idx];
+            // A file's first chunk is also charged the path; a chunk that
+            // does not fit ends the list, the chunks already taken stay.
+            let mut cost = usize::from(file.taken == 0) * counter.count(&chunk.row.path);
+            match &chunk.text {
+                None => {
+                    return Ok(Step::Needs {
+                        side: SIDES[side],
+                        from: idx,
+                    });
+                }
+                Some(Err(e)) => return Err(e.clone()),
+                Some(Ok(text)) => {
+                    cost += counter.count(&chunk.label(SIDES[side])) + counter.count(text);
+                }
             }
+            if self.emitted && self.used + cost > self.budget {
+                self.open[side] = false;
+                continue;
+            }
+            self.used += cost;
+            self.emitted = true;
+            match file.group {
+                Some(group) => self.groups[side][group].chunks.push(idx),
+                None => {
+                    file.group = Some(self.groups[side].len());
+                    self.groups[side].push(Group {
+                        path: chunk.row.path.clone(),
+                        score: chunk.score,
+                        chunks: vec![idx],
+                    });
+                }
+            }
+            file.taken += 1;
+            self.cursor[side] = if g + 1 == files.len() { 0 } else { g + 1 };
+            self.turn = 1 - side;
         }
         Ok(Step::Done)
     }
@@ -667,17 +700,23 @@ mod tests {
     }
 
     #[test]
-    fn the_budget_cuts_a_list_at_the_first_chunk_that_does_not_fit() {
-        // A chunk costs its text (2) + label (1); the first one of a file also its path (1).
+    fn a_chunk_that_does_not_fit_ends_its_list_not_just_its_file() {
+        // First chunks cost 3 (path, symbol, one word), later chunks of a
+        // file 2. Pass one takes a, b, c for 9; b's second chunk (11) does
+        // not fit the budget of 11 and ends the whole list — c's second
+        // chunk, which would have fit, is never reached.
         let code = [
-            ranked("a.rs", "one", "x y", 0.9),
-            ranked("a.rs", "big", "w w w w w w w w w w", 0.8),
-            ranked("b.rs", "tiny", "x", 0.7),
+            ranked("a.rs", "one", "x", 0.9),
+            ranked("b.rs", "two", "x", 0.8),
+            ranked("b.rs", "big", "w w w w w w w w w w", 0.7),
+            ranked("c.rs", "three", "x", 0.6),
+            ranked("c.rs", "four", "x", 0.5),
         ];
-        let [groups, _] = select([&code, &[]], 8, false, &Words);
-        // 4 for the first chunk; the big one (11) does not fit, and nothing after it is taken.
-        assert_eq!(groups.len(), 1);
+        let [groups, _] = select([&code, &[]], 11, false, &Words);
+        assert_eq!(group_paths(&groups), ["a.rs", "b.rs", "c.rs"]);
         assert_eq!(groups[0].chunks, [0]);
+        assert_eq!(groups[1].chunks, [1]);
+        assert_eq!(groups[2].chunks, [3]);
     }
 
     #[test]
@@ -718,76 +757,142 @@ mod tests {
     }
 
     #[test]
-    fn file_groups_alternate_code_first_one_per_turn() {
-        // Each group costs 3 (path, symbol/heading, one word). Room for three
-        // groups: code 1, docs 1, code 2 — not code 1, 2, 3 and no docs.
-        let code = [
+    fn the_lists_take_turns_one_chunk_per_file_per_pass() {
+        // Code ranks a.rs, b.rs, a.rs; docs d.md, e.md, d.md. Leaving every
+        // text unread makes `advance` report the selection order: pass one
+        // takes a1, d1, b1, e1 — one chunk per file, code first — and pass
+        // two a2, d2.
+        let mut code = [
             ranked("a.rs", "one", "x", 0.9),
             ranked("b.rs", "two", "x", 0.8),
-            ranked("c.rs", "three", "x", 0.7),
+            ranked("a.rs", "three", "x", 0.7),
         ];
-        let docs = [doc("d.md", "H", "p", 0.5), doc("e.md", "I", "p", 0.4)];
-        let [c, d] = select([&code, &docs], 9, false, &Words);
+        let mut docs = [
+            doc("d.md", "H", "p", 0.5),
+            doc("e.md", "I", "p", 0.4),
+            doc("d.md", "J", "p", 0.3),
+        ];
+        for chunk in code.iter_mut().chain(&mut docs) {
+            chunk.text = None;
+        }
+        let mut selector = Selector::new(1000, false);
+        let mut taken = Vec::new();
+        loop {
+            match selector.advance([&code, &docs], &Words).unwrap() {
+                Step::Done => break,
+                Step::Needs { side, from } => {
+                    taken.push((side, from));
+                    let chunk = match side {
+                        Side::Code => &mut code[from],
+                        Side::Docs => &mut docs[from],
+                    };
+                    chunk.text = Some(Ok("w".to_owned()));
+                }
+            }
+        }
+        assert_eq!(
+            taken,
+            [
+                (Side::Code, 0),
+                (Side::Docs, 0),
+                (Side::Code, 1),
+                (Side::Docs, 1),
+                (Side::Code, 2),
+                (Side::Docs, 2),
+            ]
+        );
+        let [c, d] = selector.finish();
         assert_eq!(group_paths(&c), ["a.rs", "b.rs"]);
-        assert_eq!(group_paths(&d), ["d.md"]);
+        assert_eq!(c[0].chunks, [0, 2]);
+        assert_eq!(group_paths(&d), ["d.md", "e.md"]);
+        assert_eq!(d[0].chunks, [0, 2]);
     }
 
     #[test]
-    fn a_group_is_taken_whole_before_the_turn_passes() {
-        // a.rs ranks first and third on the code side: both of its chunks are
-        // emitted on code's first turn, ahead of the docs list's turn.
+    fn a_files_second_chunk_comes_only_after_every_files_first() {
+        // a.rs ranks first and third: its second chunk is reached only on the
+        // second pass, after b's first. a1 + d1 + b1 = 9 fills the budget, so
+        // a2 is never emitted — a whole-file take of a would have emitted it.
         let code = [
             ranked("a.rs", "one", "x", 0.9),
             ranked("b.rs", "two", "x", 0.8),
             ranked("a.rs", "three", "x", 0.7),
         ];
-        let docs = [doc("d.md", "H", "p", 0.5)];
-        // Group a costs 3+2, docs 3, group b 3: room for all.
-        let [c, d] = select([&code, &docs], 100, false, &Words);
+        let docs = [doc("d.md", "H", "p", 0.5), doc("e.md", "I", "p", 0.4)];
+        let [c, d] = select([&code, &docs], 9, false, &Words);
         assert_eq!(group_paths(&c), ["a.rs", "b.rs"]);
-        assert_eq!(c[0].chunks, [0, 2]);
+        assert_eq!(c[0].chunks, [0]);
+        assert_eq!(c[1].chunks, [1]);
         assert_eq!(group_paths(&d), ["d.md"]);
     }
 
     #[test]
-    fn an_exhausted_list_leaves_the_turns_to_the_other() {
+    fn output_groups_files_in_first_chosen_order_and_chunks_in_rank_order() {
+        // The passes emit a1, b1, c1, then a2, b2; the output groups each
+        // file's chunks in rank order and lists the files in the order they
+        // were first chosen.
+        let code = [
+            ranked("a.rs", "one", "x", 0.9),
+            ranked("b.rs", "two", "x", 0.8),
+            ranked("a.rs", "three", "x", 0.7),
+            ranked("b.rs", "four", "x", 0.6),
+            ranked("c.rs", "five", "x", 0.5),
+        ];
+        let [groups, _] = select([&code, &[]], 1000, false, &Words);
+        assert_eq!(group_paths(&groups), ["a.rs", "b.rs", "c.rs"]);
+        assert_eq!(groups[0].chunks, [0, 2]);
+        assert_eq!(groups[1].chunks, [1, 3]);
+        assert_eq!(groups[2].chunks, [4]);
+    }
+
+    #[test]
+    fn an_exhausted_list_leaves_the_turns_to_the_others_next_pass() {
+        // Code ends after a's only chunk; docs takes every remaining turn and
+        // reaches d's second chunk on its own second pass.
         let code = [ranked("a.rs", "one", "x", 0.9)];
         let docs = [
             doc("d.md", "H", "p", 0.5),
             doc("e.md", "I", "p", 0.4),
-            doc("f.md", "J", "p", 0.3),
+            doc("d.md", "J", "p", 0.3),
         ];
         let [c, d] = select([&code, &docs], 1000, false, &Words);
         assert_eq!(group_paths(&c), ["a.rs"]);
-        assert_eq!(group_paths(&d), ["d.md", "e.md", "f.md"]);
+        assert_eq!(group_paths(&d), ["d.md", "e.md"]);
+        assert_eq!(d[0].chunks, [0, 2]);
+        assert_eq!(d[1].chunks, [1]);
     }
 
     #[test]
-    fn the_budget_can_run_out_in_the_middle_of_a_group() {
-        // Group a's chunks cost 3 then 10: the first is taken, the second
-        // ends the code list mid-group; docs then takes its turn as usual.
+    fn the_budget_can_run_out_in_the_middle_of_a_pass() {
+        // a1 + d1 + b1 = 9 fills the budget inside pass one: e.md is never
+        // taken and a's second chunk is never reached.
         let code = [
             ranked("a.rs", "one", "x", 0.9),
-            ranked("a.rs", "two", "w w w w w w w w w", 0.8),
+            ranked("b.rs", "two", "x", 0.8),
+            ranked("a.rs", "three", "x", 0.7),
         ];
         let docs = [doc("d.md", "H", "p", 0.5), doc("e.md", "I", "p", 0.4)];
-        // a's first chunk (3) + docs d (3) = 6.
-        let [c, d] = select([&code, &docs], 6, false, &Words);
-        assert_eq!(group_paths(&c), ["a.rs"]);
+        let [c, d] = select([&code, &docs], 9, false, &Words);
+        assert_eq!(group_paths(&c), ["a.rs", "b.rs"]);
         assert_eq!(c[0].chunks, [0]);
+        assert_eq!(c[1].chunks, [1]);
         assert_eq!(group_paths(&d), ["d.md"]);
     }
 
     #[test]
     fn the_selection_uses_ranks_never_scores() {
+        // The same ranks under different scores — including a second-pass
+        // chunk — give the same selection.
         let code_a = [
             ranked("a.rs", "one", "x", 0.9),
             ranked("b.rs", "two", "x", 0.1),
+            ranked("a.rs", "three", "x", 0.05),
         ];
         let docs_a = [doc("d.md", "H", "p", 0.5), doc("e.md", "I", "p", 0.4)];
         let code_b = [
             ranked("a.rs", "one", "x", 0.01),
             ranked("b.rs", "two", "x", 0.99),
+            ranked("a.rs", "three", "x", 0.98),
         ];
         let docs_b = [doc("d.md", "H", "p", 0.001), doc("e.md", "I", "p", 1.0)];
         let shape = |[c, d]: [Vec<Group>; 2]| {
@@ -801,8 +906,8 @@ mod tests {
             )
         };
         assert_eq!(
-            shape(select([&code_a, &docs_a], 6, false, &Words)),
-            shape(select([&code_b, &docs_b], 6, false, &Words))
+            shape(select([&code_a, &docs_a], 11, false, &Words)),
+            shape(select([&code_b, &docs_b], 11, false, &Words))
         );
     }
 
