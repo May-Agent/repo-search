@@ -1,0 +1,31 @@
+name: pr-base-gate
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, edited]
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-base-gate-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  dev-only:
+    name: PR to main must come from dev
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check head branch
+        env:
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          REPO: ${{ github.repository }}
+        run: |
+          if [[ "$HEAD_REPO" != "$REPO" || "$HEAD_REF" != "dev" ]]; then
+            echo "::error::pull requests to main must come from this repository's dev branch (head: $HEAD_REPO:$HEAD_REF)"
+            exit 1
+          fi
