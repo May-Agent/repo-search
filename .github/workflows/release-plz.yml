@@ -22,6 +22,7 @@ jobs:
     permissions:
       contents: write
       pull-requests: write
+      actions: write
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -33,11 +34,26 @@ jobs:
         with:
           toolchain: stable
       - name: Run release-plz release-pr
+        id: release-plz
         uses: release-plz/action@8921286633dfa0c4020f7f30bd1c14fe19cbb10e # v0.5.142
         with:
           command: release-pr
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # A PR pushed with GITHUB_TOKEN triggers no pull_request workflows, so
+      # the required check runs through workflow_dispatch on the PR's head;
+      # auto-merge lands it once that check is green.
+      - name: Run CI on the release PR and enable auto-merge
+        if: steps.release-plz.outputs.prs_created == 'true'
+        env:
+          PR: ${{ steps.release-plz.outputs.pr }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          number=$(jq -er '.number' <<<"$PR")
+          head=$(jq -er '.head_branch' <<<"$PR")
+          gh workflow run ci.yml --repo "$GITHUB_REPOSITORY" --ref "$head"
+          gh pr merge "$number" --repo "$GITHUB_REPOSITORY" --auto --merge
 
   release:
     name: Tag releases and dispatch cargo-dist
