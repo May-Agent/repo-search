@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>{{ label }}</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>{{ program.display() }}</string>
+		<string>--daemon</string>
+		<string>--idle-exit-secs</string>
+		<string>{{ idle_exit.as_secs() }}</string>
+		{%- if let Some(cache) = model_cache %}
+		<string>--model-cache</string>
+		<string>{{ cache.display() }}</string>
+		{%- endif %}
+	</array>
+	<key>Sockets</key>
+	<dict>
+		<key>Listener</key>
+		<dict>
+			<key>SockPathName</key>
+			<string>{{ socket.display() }}</string>
+			<key>SockPathMode</key>
+			<integer>384</integer>
+		</dict>
+	</dict>
+	<key>StandardErrorPath</key>
+	<string>{{ stderr.display() }}</string>
+</dict>
+</plist>
