@@ -1,4 +1,5 @@
 //! The 512-token cap every chunk's embedded document is held to.
+#![cfg(feature = "lang-javascript")]
 
 mod counters;
 
@@ -10,7 +11,6 @@ const MAX_TOKENS: usize = 512;
 
 /// A generated minified-JavaScript line of 256 KB becomes many chunks, each
 /// under the cap — not one multi-megabyte chunk.
-#[cfg(feature = "lang-javascript")]
 #[test]
 fn a_minified_line_becomes_many_capped_chunks() {
     let src = format!("var x = \"{}\";\n", "a".repeat(256 << 10));
