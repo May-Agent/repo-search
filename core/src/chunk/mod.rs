@@ -12,16 +12,42 @@
 //! - [`DocChunker`] cuts documentation into heading sections.
 //! - [`ConfigChunker`] cuts TOML, YAML and JSON by top-level table or key.
 
+#[cfg(any(feature = "lang-c", feature = "lang-cpp"))]
+mod c;
 mod config;
 mod doc;
+#[cfg(any(feature = "lang-javascript", feature = "lang-typescript"))]
+mod ecma;
+#[cfg(feature = "lang-go")]
+mod go;
 mod language;
+#[cfg(feature = "lang-python")]
+mod python;
+#[cfg(feature = "lang-rust")]
 mod rust;
+#[cfg(feature = "lang-swift")]
+mod swift;
 mod units;
 
+#[cfg(feature = "lang-c")]
+pub use c::C;
+#[cfg(feature = "lang-cpp")]
+pub use c::Cpp;
 pub use config::ConfigChunker;
 pub use doc::DocChunker;
+#[cfg(feature = "lang-javascript")]
+pub use ecma::JavaScript;
+#[cfg(feature = "lang-typescript")]
+pub use ecma::{Tsx, TypeScript};
+#[cfg(feature = "lang-go")]
+pub use go::Go;
 pub use language::{ConfigFormat, DocFormat, Language};
+#[cfg(feature = "lang-python")]
+pub use python::Python;
+#[cfg(feature = "lang-rust")]
 pub use rust::Rust;
+#[cfg(feature = "lang-swift")]
+pub use swift::Swift;
 
 use std::borrow::Cow;
 use std::ops::{Range, RangeInclusive};
@@ -52,9 +78,18 @@ pub trait Grammar {
     /// or `impl Trait for Environment`.
     fn label(&self, src: &str, node: Node) -> String;
 
-    /// The body of a container that is split into members when it exceeds
-    /// the size limit; `None` for kinds that are emitted whole.
-    fn split_body<'a>(&self, node: Node<'a>) -> Option<Node<'a>>;
+    /// The node an item reports: an inner declaration for wrapper items
+    /// such as `export const`/`declare`/`@decorated`/`template<>` blocks;
+    /// `node` itself by default. The emitted byte span stays the outer
+    /// node's, so the wrapper text is part of the chunk.
+    fn subject<'a>(&self, node: Node<'a>) -> Node<'a> {
+        node
+    }
+
+    /// An oversized container's split: the byte offset where the header
+    /// unit ends and the body whose children become member items. `None`
+    /// for kinds that are emitted whole.
+    fn split<'a>(&self, node: Node<'a>) -> Option<(usize, Node<'a>)>;
 
     /// The segment this item contributes to a symbol path: its own name
     /// (`Environment` for `impl Environment`, `insert` for `fn insert`), or
@@ -378,18 +413,19 @@ impl<G: Grammar> Walker<'_, G> {
     /// Emits `node` (with `start` possibly earlier, at its leading trivia),
     /// splitting an oversized container into a header plus member items.
     fn item(&mut self, node: Node, start: usize, start_row: usize, ctx: &mut Vec<CtxFrame>) {
-        let label = self.grammar.label(self.src, node);
+        let subject = self.grammar.subject(node);
+        let label = self.grammar.label(self.src, subject);
         let split = (node.end_byte() - start > MAX_BYTES)
-            .then(|| self.grammar.split_body(node))
+            .then(|| self.grammar.split(subject))
             .flatten();
-        let kind = NodeKind::of(node);
-        if let Some(body) = split {
-            let symbol = self.grammar.symbol(self.src, node);
-            if body.start_byte() > start {
+        let kind = NodeKind::of(subject);
+        if let Some((header_end, body)) = split {
+            let symbol = self.grammar.symbol(self.src, subject);
+            if header_end > start {
                 let header_symbol = join_symbol(ctx, symbol.as_deref(), "::");
                 self.out.emit(
                     Span {
-                        bytes: start..body.start_byte(),
+                        bytes: start..header_end,
                         row: start_row,
                     },
                     ctx,
@@ -409,7 +445,7 @@ impl<G: Grammar> Walker<'_, G> {
             ctx.pop();
             return;
         }
-        let symbol = join_symbol(ctx, self.grammar.symbol(self.src, node).as_deref(), "::");
+        let symbol = join_symbol(ctx, self.grammar.symbol(self.src, subject).as_deref(), "::");
         self.out.emit(
             Span {
                 bytes: start..node.end_byte(),
@@ -424,5 +460,5 @@ impl<G: Grammar> Walker<'_, G> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "lang-rust"))]
 mod tests;

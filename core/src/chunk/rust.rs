@@ -83,11 +83,12 @@ impl Grammar for Rust {
         }
     }
 
-    fn split_body<'a>(&self, node: Node<'a>) -> Option<Node<'a>> {
-        match node.kind() {
-            "impl_item" | "trait_item" | "mod_item" => node.child_by_field_name("body"),
-            _ => None,
-        }
+    fn split<'a>(&self, node: Node<'a>) -> Option<(usize, Node<'a>)> {
+        let body = match node.kind() {
+            "impl_item" | "trait_item" | "mod_item" => node.child_by_field_name("body")?,
+            _ => return None,
+        };
+        Some((body.start_byte(), body))
     }
 
     fn symbol(&self, src: &str, node: Node) -> Option<String> {
