@@ -68,6 +68,16 @@ pub trait TokenCounter: Send + Sync {
     /// `text` joined — encodes to at most `max` tokens. Implementations may
     /// answer without encoding when a byte bound already decides it.
     fn fits(&self, title: &str, text: &[&str], max: usize) -> bool;
+
+    /// An estimate of where the document the model embeds for `title` —
+    /// `text` joined — runs out of tokens: the byte offset into the joined
+    /// `text` the document's first `max` tokens end at, special tokens
+    /// included. `None` when the document fits.
+    ///
+    /// This is an estimate, not a boundary: merges spanning the cut can
+    /// move where the `max`-th token truly ends, so callers confirm it with
+    /// [`TokenCounter::fits`].
+    fn fit_end(&self, title: &str, text: &[&str], max: usize) -> Option<usize>;
 }
 
 /// A text encoder. Calls block: callers run it on a thread they own and set its QoS.

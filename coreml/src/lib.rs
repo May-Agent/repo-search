@@ -189,17 +189,11 @@ impl DocumentCounter {
         let (before, between, after) = &self.document;
         format!("{before}{title}{between}{text}{after}")
     }
-}
 
-impl TokenCounter for DocumentCounter {
-    fn count(&self, text: &str) -> usize {
-        self.tokenizer
-            .encode(text, true)
-            .expect("a loaded tokenizer encodes every input")
-            .len()
-    }
-
-    fn fits(&self, title: &str, text: &[&str], max: usize) -> bool {
+    /// The document `title` and `text` encode to, when the byte bound does
+    /// not decide it first: `None` when it fits `max` tokens, else the
+    /// formatted prompt.
+    fn document_over(&self, title: &str, text: &[&str], max: usize) -> Option<String> {
         let (before, between, after) = &self.document;
         let bytes = before.len()
             + title.len()
@@ -209,7 +203,7 @@ impl TokenCounter for DocumentCounter {
         // Every token covers at least one byte, so a document whose bytes
         // plus the special tokens stay under `max` fits without an encode.
         if bytes + self.specials <= max {
-            return true;
+            return None;
         }
         let mut doc = String::with_capacity(bytes);
         doc.push_str(before);
@@ -219,7 +213,42 @@ impl TokenCounter for DocumentCounter {
             doc.push_str(part);
         }
         doc.push_str(after);
-        self.count(&doc) <= max
+        Some(doc)
+    }
+}
+
+impl TokenCounter for DocumentCounter {
+    fn count(&self, text: &str) -> usize {
+        self.tokenizer
+            .encode_fast(text, true)
+            .expect("a loaded tokenizer encodes every input")
+            .len()
+    }
+
+    fn fits(&self, title: &str, text: &[&str], max: usize) -> bool {
+        match self.document_over(title, text, max) {
+            None => true,
+            Some(doc) => self.count(&doc) <= max,
+        }
+    }
+
+    fn fit_end(&self, title: &str, text: &[&str], max: usize) -> Option<usize> {
+        let doc = self.document_over(title, text, max)?;
+        let encoding = self
+            .tokenizer
+            .encode(&*doc, true)
+            .expect("a loaded tokenizer encodes every input");
+        if encoding.len() <= max {
+            return None;
+        }
+        let head = self.document.0.len() + title.len() + self.document.1.len();
+        // The end of the `max`-th token in the document, mapped back into
+        // `text`. The estimate is exact only up to merges spanning the cut.
+        Some(
+            encoding.get_offsets()[max.saturating_sub(1)]
+                .1
+                .saturating_sub(head),
+        )
     }
 }
 

@@ -247,15 +247,68 @@ impl<'a> Cap<'a> {
         self.tokens
             .fits(&self.worst_title, &[prefix, text], MAX_TOKENS)
     }
+
+    /// An estimate of the byte offset into `prefix + text` where the cap's
+    /// [`MAX_TOKENS`] run out, from one encode with offsets; `None` when
+    /// the whole text fits. Merges spanning the cut can move the true
+    /// boundary, so callers confirm the estimate with [`Cap::fits`].
+    pub(super) fn fit_end(&self, prefix: &str, text: &str) -> Option<usize> {
+        self.tokens
+            .fit_end(&self.worst_title, &[prefix, text], MAX_TOKENS)
+    }
+}
+
+/// The largest `k` in `min..=n` with `fits(k)`: `fits` is monotone — every
+/// count up to the answer fits — and `fits(min)` already holds. From
+/// `guess` the probes step out 1, 2, 4, … until the answer is bracketed,
+/// then binary search inside the bracket.
+fn gallop_fit(min: usize, n: usize, guess: usize, fits: &impl Fn(usize) -> bool) -> usize {
+    debug_assert!(min <= n);
+    // `lo` fits (or is the unconditional floor), `hi` does not (or is `n + 1`).
+    let (mut lo, mut hi) = (min, n + 1);
+    let guess = guess.clamp(min, n);
+    if fits(guess) {
+        lo = guess;
+        let mut step = 1usize;
+        while let Some(probe) = lo.checked_add(step).filter(|&p| p <= n) {
+            if !fits(probe) {
+                hi = probe;
+                break;
+            }
+            lo = probe;
+            step = step.saturating_mul(2);
+        }
+    } else {
+        hi = guess;
+        let mut step = 1usize;
+        while let Some(probe) = guess.checked_sub(step).filter(|&p| p > min) {
+            if fits(probe) {
+                lo = probe;
+                break;
+            }
+            hi = probe;
+            step = step.saturating_mul(2);
+        }
+    }
+    while hi - lo > 1 {
+        let mid = lo + (hi - lo) / 2;
+        if fits(mid) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    lo
 }
 
 /// `body`'s pieces as byte ranges, after the reference's `fit_tokens`:
 /// every part is the longest prefix of the remaining pieces that stays
 /// under `max_bytes` and whose document — the cap's title, `first_prefix`
 /// on the first part or `rest_prefix` on the rest, then the part's text —
-/// fits the cap, found by binary search over the piece count so only the
-/// probes are encoded. A line that does not fit on its own is halved on
-/// char boundaries until its pieces do.
+/// fits the cap. One encode with offsets estimates where the cap runs out;
+/// the piece-count guess it gives is confirmed by [`Cap::fits`] probes —
+/// galloping out, then binary search. A line that does not fit on its own
+/// is halved on char boundaries until its pieces do.
 pub(super) fn token_split(
     cap: &Cap,
     first_prefix: &str,
@@ -283,18 +336,26 @@ pub(super) fn token_split(
             bytes += pieces[bound].len();
             bound += 1;
         }
-        // The greedy rule takes the first piece unconditionally; `lo` is a
-        // piece count that fits (or is that piece), `hi` the first count
-        // that cannot — one past the byte bound.
-        let (mut lo, mut hi) = (1usize, bound - pos + 1);
-        while hi - lo > 1 {
-            let mid = lo + (hi - lo) / 2;
-            if cap.fits(prefix, &body[start..pieces[pos + mid - 1].end]) {
-                lo = mid;
-            } else {
-                hi = mid;
+        let n = bound - pos;
+        let fits = |k: usize| cap.fits(prefix, &body[start..pieces[pos + k - 1].end]);
+        // The greedy rule takes the first piece unconditionally.
+        let lo = if n == 1 {
+            n
+        } else {
+            match cap.fit_end(prefix, &body[start..pieces[bound - 1].end]) {
+                // The whole byte-bounded candidate fits.
+                None => n,
+                Some(end) => {
+                    // `end` counts into `prefix + text`; drop the prefix and
+                    // guess the count of pieces ending inside it.
+                    let end = end.saturating_sub(prefix.len());
+                    let guess = pieces[pos..bound]
+                        .partition_point(|piece| piece.end - start <= end)
+                        .max(1);
+                    gallop_fit(1, n, guess, &fits)
+                }
             }
-        }
+        };
         parts.push(start..pieces[pos + lo - 1].end);
         pos += lo;
     }
@@ -302,8 +363,10 @@ pub(super) fn token_split(
 }
 
 /// The longest char prefix of the collapsed signature `sig` whose line —
-/// `<prefix> …\n` — fits a quarter of [`MAX_TOKENS`], found by binary
-/// search over the char count: the reference's `signature_prefix` budget.
+/// `<prefix> …\n` — fits a quarter of [`MAX_TOKENS`]: the reference's
+/// `signature_prefix` budget. One encode with offsets of the whole line
+/// estimates the cut; the char-count guess it gives is confirmed by counts —
+/// galloping out, then binary search.
 fn signature_cut(sig: &str, tokens: &dyn TokenCounter) -> usize {
     const BUDGET: usize = MAX_TOKENS / 4;
     let fits = |chars: usize| {
@@ -315,16 +378,12 @@ fn signature_cut(sig: &str, tokens: &dyn TokenCounter) -> usize {
         return total;
     }
     // ` …\n` alone always fits the budget, the whole signature does not.
-    let (mut lo, mut hi) = (0, total);
-    while hi - lo > 1 {
-        let mid = lo + (hi - lo) / 2;
-        if fits(mid) {
-            lo = mid;
-        } else {
-            hi = mid;
-        }
-    }
-    lo
+    let line = format!("{sig}{SIGNATURE_SUFFIX}");
+    let guess = match tokens.fit_end("", &[&line], BUDGET) {
+        None => total,
+        Some(end) => code_points_in(&sig.as_bytes()[..end.min(sig.len())]),
+    };
+    gallop_fit(0, total - 1, guess, &fits)
 }
 
 /// Pushes `range`'s pieces into `out`: `range` itself when it fits the cap
@@ -369,10 +428,12 @@ pub(super) fn without_bom(
 
 /// The number of Unicode code points: the non-continuation UTF-8 bytes.
 fn code_points(text: &str) -> usize {
-    text.as_bytes()
-        .iter()
-        .filter(|&&b| b & 0xC0 != 0x80)
-        .count()
+    code_points_in(text.as_bytes())
+}
+
+/// [`code_points`] of a byte slice, which need not split on a char boundary.
+fn code_points_in(bytes: &[u8]) -> usize {
+    bytes.iter().filter(|&&b| b & 0xC0 != 0x80).count()
 }
 
 /// Byte ranges of `text`'s lines including their terminators, on Python
@@ -775,7 +836,13 @@ pub(super) mod text {
 }
 #[cfg(test)]
 mod tests {
-    use super::{collapse, collapse_into};
+    use std::ops::Range;
+
+    use super::{
+        Cap, MAX_TOKENS, SIGNATURE_SUFFIX, code_points, collapse, collapse_into, cut_line,
+        python_lines, signature_cut, token_split,
+    };
+    use crate::TokenCounter;
 
     /// `collapse_into` is `collapse` cut to `cut` chars, for every cut.
     #[test]
@@ -794,6 +861,170 @@ mod tests {
                 let mut got = String::new();
                 collapse_into(text, cut, &mut got);
                 assert_eq!(got, want, "{text:?} cut {cut}");
+            }
+        }
+    }
+
+    /// A `TokenCounter` counting one token per `unit` bytes; its `fit_end`
+    /// is the honest estimate shifted by `skew`, so a wrong guess in either
+    /// direction exercises the gallop.
+    struct SkewedEnd {
+        unit: usize,
+        skew: isize,
+    }
+
+    impl TokenCounter for SkewedEnd {
+        fn count(&self, text: &str) -> usize {
+            text.len() / self.unit
+        }
+
+        fn fits(&self, title: &str, text: &[&str], max: usize) -> bool {
+            (title.len() + text.iter().map(|part| part.len()).sum::<usize>()) / self.unit <= max
+        }
+
+        fn fit_end(&self, title: &str, text: &[&str], max: usize) -> Option<usize> {
+            if self.fits(title, text, max) {
+                return None;
+            }
+            let len = text.iter().map(|part| part.len()).sum::<usize>();
+            let honest = max.saturating_mul(self.unit).saturating_sub(title.len());
+            Some((honest as isize + self.skew).clamp(0, len as isize) as usize)
+        }
+    }
+
+    /// `token_split`'s answer by linear probing: each part extends one piece
+    /// at a time while the byte bound and the cap hold; the first piece is
+    /// taken unconditionally.
+    fn greedy_split(
+        cap: &Cap,
+        first_prefix: &str,
+        rest_prefix: &str,
+        body: &str,
+        max_bytes: usize,
+    ) -> Vec<Range<usize>> {
+        let mut pieces = Vec::new();
+        for line in python_lines(body) {
+            cut_line(body, line, cap, rest_prefix, &mut pieces);
+        }
+        let mut parts = Vec::new();
+        let mut pos = 0;
+        while pos < pieces.len() {
+            let prefix = if parts.is_empty() {
+                first_prefix
+            } else {
+                rest_prefix
+            };
+            let start = pieces[pos].start;
+            let mut end = pos;
+            let mut bytes = 0;
+            while end < pieces.len()
+                && bytes + pieces[end].len() <= max_bytes
+                && cap.fits(prefix, &body[start..pieces[end].end])
+            {
+                bytes += pieces[end].len();
+                end += 1;
+            }
+            let end = end.max(pos + 1);
+            parts.push(start..pieces[end - 1].end);
+            pos = end;
+        }
+        parts
+    }
+
+    /// Deterministic bodies of pseudo-random line lengths; a few lines are
+    /// far over the cap so `cut_line` splits them.
+    fn bodies() -> Vec<String> {
+        let mut x = 0x9e3779b97f4a7c15u64;
+        let mut next = move || {
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            x = x.wrapping_mul(0x2545_f491_4f6c_dd1d);
+            (x >> 33) as usize
+        };
+        let mut bodies = vec![String::new(), "\n".to_owned()];
+        // One body of small lines only, so a part's piece count is large
+        // and the gallop has room to run.
+        let mut small = String::new();
+        for _ in 0..200 {
+            small.extend(std::iter::repeat_n(
+                char::from(b'a' + (next() % 26) as u8),
+                4 + next() % 36,
+            ));
+            small.push('\n');
+        }
+        bodies.push(small);
+        for _ in 0..12 {
+            let mut body = String::new();
+            for _ in 0..5 + next() % 40 {
+                let len = match next() % 8 {
+                    0 => 1500 + next() % 4000,
+                    1 => 0,
+                    _ => 1 + next() % 700,
+                };
+                body.extend(std::iter::repeat_n(
+                    char::from(b'a' + (next() % 26) as u8),
+                    len,
+                ));
+                body.push('\n');
+            }
+            bodies.push(body);
+        }
+        bodies
+    }
+
+    /// `token_split` takes as many pieces as fit, whatever the `fit_end`
+    /// estimate claims: the gallop corrects a guess skewed in either
+    /// direction, matching the piece-at-a-time greedy scan.
+    #[test]
+    fn token_split_matches_greedy_packing() {
+        for skew in [-4096, 0, 4096] {
+            let tokens = SkewedEnd { unit: 4, skew };
+            let cap = Cap::new(&tokens, "src/lib.rs › impl T › fn f (part 999/999)");
+            for body in bodies() {
+                for (first, rest) in [
+                    ("", ""),
+                    ("", "pub fn signature(&mut self, x: u32) -> bool …\n"),
+                ] {
+                    assert_eq!(
+                        token_split(&cap, first, rest, &body, super::MAX_BYTES),
+                        greedy_split(&cap, first, rest, &body, super::MAX_BYTES),
+                        "skew {skew} prefixes {first:?}/{rest:?} body {body:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// `signature_cut`'s answer, probed one char at a time.
+    fn brute_signature_cut(sig: &str, tokens: &dyn TokenCounter) -> usize {
+        const BUDGET: usize = MAX_TOKENS / 4;
+        (0..=code_points(sig))
+            .rev()
+            .find(|&chars| {
+                let end = sig.char_indices().nth(chars).map_or(sig.len(), |(i, _)| i);
+                tokens.count(&format!("{}{SIGNATURE_SUFFIX}", &sig[..end])) <= BUDGET
+            })
+            .expect("the suffix alone fits the budget")
+    }
+
+    /// `signature_cut` keeps the longest fitting char prefix under a wrong
+    /// `fit_end` guess in either direction.
+    #[test]
+    fn signature_cut_matches_brute_force() {
+        let mut sigs: Vec<String> = [0usize, 1, 3, 40, 129, 512, 517, 2000]
+            .into_iter()
+            .map(|len| "fn f".to_owned() + &"x".repeat(len))
+            .collect();
+        sigs.push("fn élan(x: ü, y: 🦀) -> ç ".repeat(80));
+        for skew in [-4096, 0, 4096] {
+            let tokens = SkewedEnd { unit: 4, skew };
+            for sig in &sigs {
+                assert_eq!(
+                    signature_cut(sig, &tokens),
+                    brute_signature_cut(sig, &tokens),
+                    "skew {skew} sig {sig:?}"
+                );
             }
         }
     }
