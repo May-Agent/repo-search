@@ -21,9 +21,12 @@ pub const MODEL_NAME: &str = "google/embeddinggemma-2 (Core ML conversion)";
 /// SPDX identifier of the model's license, shown by `search --version`.
 pub const MODEL_LICENSE: &str = "Apache-2.0";
 
-/// `--version` output: the binary version plus the model's identity.
+/// `--version` output: the binary version, the chunker fingerprint and the
+/// model's identity.
 pub const VERSION_INFO: &str = const_format::concatcp!(
     env!("CARGO_PKG_VERSION"),
+    "\nchunker: ",
+    repo_search_core::CHUNKER_FINGERPRINT,
     "\nmodel: ",
     MODEL_NAME,
     "\nlicense: ",

@@ -128,6 +128,9 @@ pub struct Report {
     pub chunks_total: u64,
     /// Chunk rows whose vector is in the cache for the model.
     pub chunks_with_vector: u64,
+    /// The index was built by another chunker (or token counter) and was
+    /// emptied, so every file was re-chunked this pass.
+    pub rechunked: bool,
     /// Walked files that could not be indexed.
     pub skipped: Vec<Skipped>,
 }
@@ -163,6 +166,10 @@ pub struct Reconciled {
 /// Brings `index` in line with the worktree at `worktree`, then lists the
 /// chunks that have no vector cached for `model_id`.
 ///
+/// `chunker` identifies the chunker, normally [`crate::CHUNKER_FINGERPRINT`].
+/// An index stored under another `(chunker, model_id)` is emptied first and
+/// the pass re-chunks every file; cached vectors are reused by content hash.
+///
 /// `tokens` is the model's token counter; the chunker holds every chunk's
 /// embedded document to the cap it counts.
 ///
@@ -177,10 +184,12 @@ pub async fn reconcile(
     index: &Index,
     cache: &VectorCache,
     model_id: &str,
+    chunker: &str,
     worktree: &Path,
     options: Options,
     tokens: Arc<dyn TokenCounter>,
 ) -> Result<Reconciled, Error> {
+    let rechunked = index.align_chunker(chunker, model_id).await?;
     let stored: HashMap<_, _> = index
         .file_states()
         .await?
@@ -256,6 +265,7 @@ pub async fn reconcile(
         chunks_removed: applied.chunks_removed,
         chunks_total: rows.len() as u64,
         chunks_with_vector,
+        rechunked,
         skipped: plan.skipped,
     };
     Ok(Reconciled { report, pending })
