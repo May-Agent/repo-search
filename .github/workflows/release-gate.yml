@@ -1,0 +1,110 @@
+name: release-gate
+
+on:
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-gate-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  model-tests:
+    name: model tests
+    runs-on: macos-15
+    # A cold coremltools build takes ~25-30 min on a hosted runner; with the
+    # wheel and archive caches warm the job finishes in ~20 min.
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install uv
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: stable
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: Read pinned model URL and sha256
+        id: model
+        run: |
+          set -euo pipefail
+          spec=src/model_store.rs
+          url=$(sed -nE 's/^ *url: "([^"]+)".*/\1/p' "$spec" | head -1)
+          sha256=$(sed -nE 's/^ *"([0-9a-f]{64})",? *$/\1/p' "$spec" | head -1)
+          if [[ -z "$url" || -z "$sha256" ]]; then
+            echo "::error::could not read the pinned model url/sha256 from $spec"
+            exit 1
+          fi
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+          echo "sha256=$sha256" >> "$GITHUB_OUTPUT"
+      - name: Cache model archive
+        id: model-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/model.tar.zst
+          key: model-archive-${{ steps.model.outputs.sha256 }}
+      - name: Download model archive
+        if: steps.model-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          curl -fL --retry 3 -o "$RUNNER_TEMP/model.tar.zst" "${{ steps.model.outputs.url }}"
+          echo "${{ steps.model.outputs.sha256 }}  $RUNNER_TEMP/model.tar.zst" | shasum -a 256 -c -
+      - name: Extract model archive
+        run: |
+          set -euo pipefail
+          echo "${{ steps.model.outputs.sha256 }}  $RUNNER_TEMP/model.tar.zst" | shasum -a 256 -c -
+          mkdir -p "$RUNNER_TEMP/model"
+          zstd -dc "$RUNNER_TEMP/model.tar.zst" | tar -x -C "$RUNNER_TEMP/model"
+
+      - name: Cache coremltools wheel
+        id: coremltools-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/coremltools/build/dist
+          key: coremltools-wheel-a207b1a3452eafe02f2d870f486287834af2c82d
+      # This build step goes once a coremltools release includes commit
+      # a207b1a3 (apple/coremltools#2829); the job then installs that
+      # release from PyPI instead.
+      - name: Build coremltools wheel
+        if: steps.coremltools-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          work="$RUNNER_TEMP/coremltools"
+          git init "$work/src"
+          git -C "$work/src" remote add origin https://github.com/apple/coremltools
+          git -C "$work/src" fetch --depth 1 origin a207b1a3452eafe02f2d870f486287834af2c82d
+          git -C "$work/src" checkout FETCH_HEAD
+          mkdir -p "$work/build"
+          uv venv --python 3.13 "$work/build/.venv"
+          uv pip install --python "$work/build/.venv/bin/python" -r "$work/src/reqs/build.pip"
+          cd "$work/build"
+          xcrun --sdk macosx cmake \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=12.3 \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DPYTHON_EXECUTABLE="$work/build/.venv/bin/python" \
+            -DPYTHON_INCLUDE_DIR="$("$work/build/.venv/bin/python" -c 'import sysconfig; print(sysconfig.get_paths()["include"])')" \
+            -DOVERWRITE_PB_SOURCE=0 \
+            "$work/src"
+          make -j"$(sysctl -n hw.logicalcpu)"
+          make dist
+
+      - name: Set up convert env
+        working-directory: convert
+        run: |
+          set -euo pipefail
+          uv sync --locked
+          wheel=$(ls "$RUNNER_TEMP"/coremltools/build/dist/coremltools-*.whl)
+          uv pip install --python .venv/bin/python --no-deps "$wheel"
+
+      - name: model tests
+        env:
+          REPO_SEARCH_MODEL_DIR: ${{ runner.temp }}/model
+        run: cargo test --locked -p repo-search-coreml --test embedder -- --ignored
