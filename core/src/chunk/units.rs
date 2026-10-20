@@ -890,6 +890,10 @@ mod tests {
             let honest = max.saturating_mul(self.unit).saturating_sub(title.len());
             Some((honest as isize + self.skew).clamp(0, len as isize) as usize)
         }
+
+        fn document_tokens(&self, title: &str, text: &str) -> usize {
+            (title.len() + text.len()) / self.unit
+        }
     }
 
     /// `token_split`'s answer by linear probing: each part extends one piece

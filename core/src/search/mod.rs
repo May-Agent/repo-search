@@ -6,8 +6,7 @@
 //! the repository's vector cache. The caller runs the freshness barrier
 //! (reconcile) first and passes its outcome in; the retriever embeds the
 //! query, and on the spot the best lexical candidates that still lack a
-//! vector, through the caller's [`Embedder`](crate::Embedder), which the
-//! retriever runs on a thread of its own.
+//! vector, through the caller's [`EmbedService`].
 
 mod embedder;
 mod fuse;
@@ -17,6 +16,7 @@ mod scope;
 mod terms;
 mod vectors;
 
+pub use embedder::EmbedService;
 pub use fuse::{Channel, Fused, RRF_K, fuse};
 pub use output::{
     CodeChunk, DocChunk, FileHit, Freshness, Reconciliation, Results, Unparsable, UnparsableReason,

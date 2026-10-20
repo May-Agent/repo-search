@@ -106,6 +106,18 @@ impl Coverage {
         }
     }
 
+    /// Chunks with a vector.
+    #[must_use]
+    pub fn with_vector(self) -> u64 {
+        self.with_vector
+    }
+
+    /// Chunks in total.
+    #[must_use]
+    pub fn total(self) -> u64 {
+        self.total
+    }
+
     /// The fraction of chunks with a vector; `1.0` for an empty index.
     #[must_use]
     pub fn fraction(self) -> f64 {
@@ -229,6 +241,10 @@ pub struct Results {
     pub docs: Option<Vec<FileHit<DocChunk>>>,
     /// How fresh the index was when the query ran.
     pub freshness: Freshness,
+    /// Chunks this query embedded on the spot; already counted in
+    /// `freshness.vectors`.
+    #[serde(skip)]
+    pub embedded_on_the_spot: u64,
 }
 
 impl Results {
@@ -999,6 +1015,7 @@ mod tests {
             code: code_hits(&code, cg),
             docs: doc_hits(&docs, dg),
             freshness: freshness(),
+            embedded_on_the_spot: 0,
         }
     }
 
@@ -1049,6 +1066,7 @@ mod tests {
             code: code_hits(&code, cg),
             docs: None,
             freshness: freshness(),
+            embedded_on_the_spot: 0,
         };
         let json: serde_json::Value = serde_json::from_str(&r.to_json()).unwrap();
         assert_eq!(json["code"][0]["path"], "a.rs");
@@ -1135,6 +1153,7 @@ docs/guide.md
             code: code_hits(&code, cg),
             docs: None,
             freshness: freshness(),
+            embedded_on_the_spot: 0,
         };
         assert_eq!(
             r.to_text(),

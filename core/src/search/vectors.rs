@@ -18,7 +18,8 @@ use std::thread;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::UnitVector;
-use crate::knn::{self, Calibration, KnnIndex, calibration_for, set_user_interactive};
+use crate::knn::{self, Calibration, KnnIndex, calibration_for};
+use crate::qos::{QosClass, set_current_thread};
 use crate::store::{ContentHash, Index, Side, VectorCache};
 
 use super::Error;
@@ -92,7 +93,7 @@ impl Vectors {
         thread::Builder::new()
             .name("repo-search-vectors-index".into())
             .spawn(move || {
-                set_user_interactive();
+                set_current_thread(QosClass::UserInteractive);
                 let mut state = State::default();
                 while let Some(request) = rx.blocking_recv() {
                     state.handle(request);

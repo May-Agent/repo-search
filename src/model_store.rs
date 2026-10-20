@@ -99,6 +99,16 @@ fn client_builder() -> reqwest::ClientBuilder {
         .read_timeout(READ_TIMEOUT)
 }
 
+/// Progress of an archive download, sent on the `watch` channel
+/// [`ModelStore::ensure`] takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Fetch {
+    /// Bytes received so far.
+    pub received: u64,
+    /// The server's declared length, when known.
+    pub total: Option<u64>,
+}
+
 /// A cache of verified, unpacked model archives.
 pub struct ModelStore {
     /// Cache root; each archive unpacks to a `<sha256>/` subdirectory.
@@ -132,6 +142,12 @@ impl ModelStore {
         self.root.join(self.spec.sha256.hex())
     }
 
+    /// The model build's identity: the archive's sha256, the `model_id` the
+    /// embedder and the vector cache name vectors with.
+    pub fn model_id(&self) -> String {
+        self.spec.sha256.hex()
+    }
+
     /// Path to the unpacked model, downloading it on first use.
     ///
     /// Idempotent: an existing directory is always a complete unpack, because
@@ -140,7 +156,12 @@ impl ModelStore {
     /// lock file: the caller holding the lock re-checks the final directory,
     /// sweeps leftovers of killed runs, downloads, and unpacks; callers that
     /// were waiting on the lock then find the finished directory.
-    pub async fn ensure(&self) -> Result<PathBuf, Error> {
+    ///
+    /// `progress` receives a [`Fetch`] after each downloaded chunk.
+    pub async fn ensure(
+        &self,
+        progress: &tokio::sync::watch::Sender<Fetch>,
+    ) -> Result<PathBuf, Error> {
         let dir = self.dir();
         if tokio::fs::try_exists(&dir).await? {
             return Ok(dir);
@@ -164,7 +185,7 @@ impl ModelStore {
         let Some(_lock) = lock else {
             return Ok(dir);
         };
-        let archive = self.download().await?;
+        let archive = self.download(progress).await?;
         self.unpack(archive, &dir).await?;
         Ok(dir)
     }
@@ -172,7 +193,10 @@ impl ModelStore {
     /// Stream the archive into a temp file inside the cache root, returning it
     /// only once its sha256 matches the pinned digest. The temp file deletes
     /// itself on drop; error paths run that drop on the blocking pool.
-    async fn download(&self) -> Result<NamedTempFile, Error> {
+    async fn download(
+        &self,
+        progress: &tokio::sync::watch::Sender<Fetch>,
+    ) -> Result<NamedTempFile, Error> {
         let mut response = self.client.get(&self.spec.url).send().await?;
         if !response.status().is_success() {
             return Err(Error::Status {
@@ -180,7 +204,8 @@ impl ModelStore {
                 status: response.status(),
             });
         }
-        if let Some(size) = response.content_length()
+        let total = response.content_length();
+        if let Some(size) = total
             && size > MAX_ARCHIVE_BYTES
         {
             return Err(Error::TooLarge {
@@ -210,6 +235,7 @@ impl ModelStore {
                 }
                 hasher.update(&chunk);
                 writer.write_all(&chunk).await?;
+                progress.send_replace(Fetch { received, total });
             }
             writer.flush().await?;
             Ok(())
@@ -351,12 +377,15 @@ pub enum Error {
 }
 
 #[cfg(test)]
+#[path = "../tests/support/http.rs"]
+mod http;
+
+#[cfg(test)]
 mod tests {
+    use super::http::{archive, serve_once, symlink_archive};
     use super::*;
 
-    use std::io::{Read, Write};
-    use std::net::TcpListener;
-    use std::thread;
+    use tokio::sync::watch;
 
     /// A store whose client comes through the same builder as production,
     /// with system proxies disabled so the local test server is reached
@@ -373,63 +402,12 @@ mod tests {
         Sha256Digest(Sha256::digest(bytes).into())
     }
 
-    /// A tar.zst archive in memory with `entries` as `(path, contents)` files.
-    fn archive(entries: &[(&str, &[u8])]) -> Vec<u8> {
-        let encoder = zstd::stream::write::Encoder::new(Vec::new(), 0).unwrap();
-        let mut builder = tar::Builder::new(encoder);
-        for (name, bytes) in entries {
-            let mut header = tar::Header::new_gnu();
-            header.set_size(bytes.len() as u64);
-            header.set_mode(0o644);
-            header.set_cksum();
-            builder.append_data(&mut header, name, *bytes).unwrap();
-        }
-        builder.into_inner().unwrap().finish().unwrap()
-    }
-
-    /// A tar.zst archive whose only entry is a symlink.
-    fn symlink_archive() -> Vec<u8> {
-        let encoder = zstd::stream::write::Encoder::new(Vec::new(), 0).unwrap();
-        let mut builder = tar::Builder::new(encoder);
-        let mut header = tar::Header::new_gnu();
-        header.set_entry_type(tar::EntryType::Symlink);
-        header.set_size(0);
-        header.set_mode(0o777);
-        builder
-            .append_link(&mut header, "evil", "/etc/passwd")
-            .unwrap();
-        builder.into_inner().unwrap().finish().unwrap()
-    }
-
-    /// One-shot HTTP/1.1 server: replies `status` and declares
-    /// `content_length`, then writes `body` and closes the connection.
-    fn serve_once(
-        status: &str,
-        content_length: u64,
-        body: Vec<u8>,
-    ) -> (String, thread::JoinHandle<()>) {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let url = format!("http://{}/model.tar.zst", listener.local_addr().unwrap());
-        let status = status.to_string();
-        let handle = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut request = Vec::new();
-            let mut buf = [0u8; 1024];
-            while !request.windows(4).any(|w| w == b"\r\n\r\n") {
-                match stream.read(&mut buf) {
-                    Ok(0) | Err(_) => return,
-                    Ok(n) => request.extend_from_slice(&buf[..n]),
-                }
-            }
-            let head = format!(
-                "HTTP/1.1 {status}\r\nContent-Length: {content_length}\r\nConnection: close\r\n\r\n"
-            );
-            if stream.write_all(head.as_bytes()).is_err() {
-                return;
-            }
-            let _ = stream.write_all(&body);
-        });
-        (url, handle)
+    /// The progress sink `ensure` reports to, seeded with zero progress.
+    fn sink() -> (watch::Sender<Fetch>, watch::Receiver<Fetch>) {
+        watch::channel(Fetch {
+            received: 0,
+            total: None,
+        })
     }
 
     /// The lock file is the one entry a failed or finished run may leave in
@@ -454,10 +432,19 @@ mod tests {
         let (url, server) = serve_once("200 OK", body.len() as u64, body.clone());
         let root = tempfile::tempdir().unwrap();
         let store = store(root.path().join("models"), url, digest_of(&body));
+        let (progress, mut received) = sink();
 
-        let dir = store.ensure().await.unwrap();
+        let dir = store.ensure(&progress).await.unwrap();
 
         assert_eq!(dir, store.dir());
+        received.borrow_and_update();
+        assert_eq!(
+            *received.borrow(),
+            Fetch {
+                received: body.len() as u64,
+                total: Some(body.len() as u64)
+            }
+        );
         assert_eq!(
             std::fs::read(dir.join("manifest.json")).unwrap(),
             b"{\"embedding_dim\": 768}"
@@ -477,8 +464,9 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let cache = root.path().join("models");
         let store = store(cache.clone(), url, digest_of(&good));
+        let (progress, _) = sink();
 
-        let err = store.ensure().await.unwrap_err();
+        let err = store.ensure(&progress).await.unwrap_err();
 
         match err {
             Error::HashMismatch { expected, actual } => {
@@ -503,8 +491,9 @@ mod tests {
         let dir = store.dir();
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("marker"), b"sentinel").unwrap();
+        let (progress, _) = sink();
 
-        assert_eq!(store.ensure().await.unwrap(), dir);
+        assert_eq!(store.ensure(&progress).await.unwrap(), dir);
         assert_eq!(std::fs::read(dir.join("marker")).unwrap(), b"sentinel");
     }
 
@@ -516,8 +505,9 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let cache = root.path().join("models");
         let store = store(cache.clone(), url, digest_of(&body));
+        let (progress, _) = sink();
 
-        let err = store.ensure().await.unwrap_err();
+        let err = store.ensure(&progress).await.unwrap_err();
 
         assert!(matches!(err, Error::Download(_)), "unexpected error: {err}");
         assert!(!store.dir().exists());
@@ -532,8 +522,9 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let cache = root.path().join("models");
         let store = store(cache.clone(), url, digest_of(b""));
+        let (progress, _) = sink();
 
-        let err = store.ensure().await.unwrap_err();
+        let err = store.ensure(&progress).await.unwrap_err();
 
         match err {
             Error::TooLarge { size, limit } => {
@@ -551,8 +542,9 @@ mod tests {
         let (url, server) = serve_once("503 Service Unavailable", 0, Vec::new());
         let root = tempfile::tempdir().unwrap();
         let store = store(root.path().join("models"), url, digest_of(b""));
+        let (progress, _) = sink();
 
-        let err = store.ensure().await.unwrap_err();
+        let err = store.ensure(&progress).await.unwrap_err();
 
         match err {
             Error::Status { status, .. } => {
@@ -569,8 +561,9 @@ mod tests {
         let (url, server) = serve_once("200 OK", body.len() as u64, body.clone());
         let root = tempfile::tempdir().unwrap();
         let store = store(root.path().join("models"), url, digest_of(&body));
+        let (progress, _) = sink();
 
-        let err = store.ensure().await.unwrap_err();
+        let err = store.ensure(&progress).await.unwrap_err();
 
         match err {
             Error::Io(e) => assert_eq!(e.kind(), io::ErrorKind::InvalidData),
@@ -588,8 +581,9 @@ mod tests {
         let (url, server) = serve_once("200 OK", body.len() as u64, body.clone());
         let root = tempfile::tempdir().unwrap();
         let store = store(root.path().join("models"), url, digest_of(&body));
+        let (progress, _) = sink();
 
-        let (first, second) = tokio::join!(store.ensure(), store.ensure());
+        let (first, second) = tokio::join!(store.ensure(&progress), store.ensure(&progress));
 
         assert_eq!(first.unwrap(), store.dir());
         assert_eq!(second.unwrap(), store.dir());

@@ -13,9 +13,9 @@ use crate::store::ContentHash;
 use super::calibration::Calibration;
 use super::fp16::Fp16File;
 use super::mask::RowMask;
-use super::set_user_interactive;
 use super::topk::TopK;
 use super::{Error, FIRST_PASS, RESULTS};
+use crate::qos::{QosClass, set_current_thread};
 
 /// Int8 codes of distinct content hashes, searchable by cosine similarity.
 ///
@@ -196,7 +196,7 @@ impl KnnIndex {
                 .map(|t| {
                     let range = (t * per_thread).min(rows)..((t + 1) * per_thread).min(rows);
                     scope.spawn(move || {
-                        set_user_interactive();
+                        set_current_thread(QosClass::UserInteractive);
                         self.scan(weights, range, mask)
                     })
                 })

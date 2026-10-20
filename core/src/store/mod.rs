@@ -18,7 +18,7 @@ use std::time::Duration;
 use rusqlite::{Connection, TransactionBehavior};
 use tokio::sync::{mpsc, oneshot};
 
-pub use index::{Applied, FileChange, Index, StoredChunk, StoredMember, StoredMemberKind};
+pub use index::{Applied, FileChange, Index, Phase, StoredChunk, StoredMember, StoredMemberKind};
 pub use query::{ChunkFilter, ChunkId, ChunkRow, MemberRow, Side};
 pub use records::{
     ChunkRecord, ContentHash, FileState, MemberRecord, Unchunkable, UnchunkableReason, fts_body,
@@ -47,6 +47,11 @@ pub enum Error {
     /// the actor surfaces here, never as a panic in the caller.
     #[error("store actor exited without answering")]
     ActorGone,
+
+    /// The phase was set before the index recorded its identity
+    /// ([`Index::align_chunker`] creates the row the phase lives in).
+    #[error("the index has no recorded identity to hold a phase")]
+    NotAligned,
 
     /// `open` was pointed at a path that is not a directory.
     #[error("{0:?} is not a directory")]

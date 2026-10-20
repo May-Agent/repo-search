@@ -78,6 +78,10 @@ pub trait TokenCounter: Send + Sync {
     /// move where the `max`-th token truly ends, so callers confirm it with
     /// [`TokenCounter::fits`].
     fn fit_end(&self, title: &str, text: &[&str], max: usize) -> Option<usize>;
+
+    /// Tokens of the document the model embeds for `title` and `text`,
+    /// special tokens included.
+    fn document_tokens(&self, title: &str, text: &str) -> usize;
 }
 
 /// A text encoder. Calls block: callers run it on a thread they own and set its QoS.
@@ -102,6 +106,16 @@ pub trait Embedder {
     ///
     /// When the backend fails to run the model.
     fn embed_query(&mut self, task: QueryTask, query: &str) -> Result<UnitVector, Self::Error>;
+}
+
+/// An encoder that embeds several documents in one model call.
+pub trait BatchEmbedder: Embedder {
+    /// One vector per `(title, text)`, in order. All documents fall in the same bucket.
+    ///
+    /// # Errors
+    ///
+    /// When the backend fails to run the model.
+    fn embed_documents(&mut self, docs: &[(&str, &str)]) -> Result<Vec<UnitVector>, Self::Error>;
 }
 
 #[cfg(test)]

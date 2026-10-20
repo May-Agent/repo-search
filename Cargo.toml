@@ -34,12 +34,25 @@ path = "src/main.rs"
 
 [dependencies]
 repo-search-core.workspace = true
+askama = { version = "0.16.1", default-features = false, features = [
+    "derive",
+    "std",
+] }
 clap.workspace = true
 const_format = { version = "0.2.36", default-features = false }
+futures-util = { version = "0.3.34", default-features = false, features = [
+    "sink",
+    "std",
+] }
 hex = { version = "0.4.3", default-features = false, features = ["alloc"] }
 reqwest = { version = "0.13.5", default-features = false, features = [
     "native-tls",
 ] }
+serde = { version = "1.0.229", default-features = false, features = [
+    "derive",
+    "std",
+] }
+serde_json = { version = "1.0.154", default-features = false, features = ["std"] }
 sha2 = { version = "0.11.1", default-features = false }
 tar = { version = "0.4.46", default-features = false }
 tempfile = { version = "3.27.0", default-features = false }
@@ -47,19 +60,37 @@ thiserror = { version = "2.0.21", default-features = false }
 tokio = { version = "1.54.0", default-features = false, features = [
     "fs",
     "io-util",
+    "macros",
+    "net",
+    "process",
     "rt",
+    "rt-multi-thread",
+    "signal",
+    "sync",
+    "time",
+] }
+tokio-util = { version = "0.7.20", default-features = false, features = [
+    "codec",
 ] }
 tracing = { version = "0.1.44", default-features = false }
+tracing-subscriber = { version = "0.3.23", default-features = false, features = [
+    "fmt",
+    "std",
+] }
 zstd = { version = "0.14.3", default-features = false }
 
 [dev-dependencies]
-tokio = { version = "1.54.0", default-features = false, features = [
-    "macros",
-    "rt",
-] }
+tokio = { version = "1.54.0", default-features = false, features = ["test-util"] }
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+libc = { version = "0.2.191", default-features = false, features = ["std"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 repo-search-coreml.workspace = true
+libc = { version = "0.2.191", default-features = false, features = ["std"] }
+notify = { version = "8.2.0", default-features = false, features = [
+    "macos_fsevent",
+] }
 
 [workspace.metadata.dist]
 cargo-dist-version = "0.33.0"

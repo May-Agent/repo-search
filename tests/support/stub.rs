@@ -1,0 +1,671 @@
+//! `StubBackend` and `StubEmbedder`: the test-side [`Backend`].
+//!
+//! Every embed call sleeps the configured per-bucket duration on the
+//! embedder's own thread and reports a [`Record`] on the `std::sync::mpsc`
+//! the test holds, so tests wait on `recv_timeout` and never poll.
+
+use std::collections::BTreeMap;
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc;
+use std::sync::{Arc, Barrier, OnceLock};
+use std::time::{Duration, Instant};
+
+use repo_search::daemon::{Backend, GpuOpen, Headroom};
+use repo_search_core::qos::{self, QosClass};
+use repo_search_core::store::ContentHash;
+use repo_search_core::{BatchEmbedder, Embedder, QueryTask, TokenCounter, UnitVector};
+use repo_search_coreml::GpuBlocked;
+
+/// Which embedder instance made a call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Instance {
+    /// The single-chunk ANE instance.
+    Ane,
+    /// The batch GPU instance.
+    Gpu,
+}
+
+/// What a [`Record`] describes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    /// A query embedding.
+    Query,
+    /// A document embedded as query work (on-the-spot): `embed_document` at
+    /// `UserInteractive`, which only query jobs run at.
+    QueryDocument,
+    /// A document embedded as indexing work.
+    Index,
+    /// The GPU embedder was dropped.
+    Dropped,
+    /// An embed call began, recorded before its sleep (and its gate).
+    Started,
+    /// An armed [`IndexGate`] holds an Index-kind call.
+    Held,
+}
+
+/// One embedded document. A batch call sends one record per document, all
+/// sharing `instance`, `kind`, `batch_len`, `qos`, `start` and `end`.
+#[derive(Debug)]
+pub struct Record {
+    /// The instance that embedded the document.
+    pub instance: Instance,
+    /// What the call was, derived from the method and the thread's QoS.
+    pub kind: Kind,
+    /// The document's content hash; `None` for queries.
+    pub hash: Option<ContentHash>,
+    /// The document's token count under [`StubCounter`].
+    pub tokens: usize,
+    /// The documents in the call: 1 for single embeds, up to 8 for batches.
+    pub batch_len: usize,
+    /// The thread's QoS when the call ran.
+    pub qos: QosClass,
+    /// The thread's effective scheduling priority, overrides included.
+    #[allow(dead_code)] // asserted by the scheduler-level tests
+    pub pri: i32,
+    /// When the call started.
+    pub start: Instant,
+    /// When the call ended.
+    #[allow(dead_code)] // asserted by the scheduler-level tests
+    pub end: Instant,
+}
+
+/// The bucket lengths `StubCounter` reports and `StubEmbedder` sleeps by.
+pub const BUCKETS: [usize; 3] = [128, 256, 512];
+
+/// A stub's failure; nothing in the stub fails today.
+#[derive(Debug, thiserror::Error)]
+#[error("stub backend failure: {0}")]
+pub struct StubError(&'static str);
+
+/// The callback `watch_headroom` stores and `push_headroom` drives.
+type OnChange = Box<dyn Fn(Headroom) + Send + Sync>;
+
+/// The headroom monitor's guard; dropping it stops nothing in the stub.
+pub struct StubMonitor;
+
+/// A [`TokenCounter`] counting `len / 4 + 1` tokens; `hold` parks the
+/// first call, which in a barrier lands inside `reconcile`'s walk.
+#[derive(Clone, Default)]
+pub struct StubCounter {
+    hold: Option<Arc<Hold>>,
+}
+
+impl StubCounter {
+    fn enter_hold(&self) {
+        if let Some(hold) = &self.hold {
+            hold.enter();
+        }
+    }
+
+    /// The bucket a document of `tokens` lands in.
+    fn bucket(tokens: usize) -> usize {
+        BUCKETS
+            .into_iter()
+            .find(|&b| tokens <= b)
+            .unwrap_or_else(|| panic!("{tokens} tokens is over the {}-token cap", BUCKETS[2]))
+    }
+}
+
+impl TokenCounter for StubCounter {
+    fn count(&self, text: &str) -> usize {
+        self.enter_hold();
+        text.len() / 4 + 1
+    }
+
+    fn fits(&self, title: &str, text: &[&str], max: usize) -> bool {
+        self.enter_hold();
+        self.document_tokens(title, &text.concat()) <= max
+    }
+
+    fn fit_end(&self, title: &str, text: &[&str], max: usize) -> Option<usize> {
+        self.enter_hold();
+        if self.fits(title, text, max) {
+            return None;
+        }
+        let joined = text.concat();
+        Some(
+            max.saturating_mul(4)
+                .saturating_sub(title.len())
+                .min(joined.len()),
+        )
+    }
+
+    fn document_tokens(&self, title: &str, text: &str) -> usize {
+        self.enter_hold();
+        (title.len() + text.len()) / 4 + 1
+    }
+}
+
+/// The effective priority below which a `Background` thread is settled at
+/// its own class: the kernel's `Background` band is 4, and a lifted or
+/// freshly woken thread reads 20.
+const BACKGROUND_SETTLED: i32 = 10;
+
+/// A gate on an instance's Index-kind calls: every call not at
+/// `UserInteractive` QoS. Disarmed it is inert; once [`IndexGate::arm`]ed,
+/// each such call sends a [`Kind::Held`] record and holds until
+/// [`IndexGate::open`], which releases everything for good.
+///
+/// A held `Background` call is also released by a queued query, which opens
+/// the gate for good: the scheduler lifts a `Background` thread's priority
+/// the moment a query waits behind it, and the gate watches for that lift. The `Held` record of such
+/// a call is sent only once its thread has settled at its own class, so a
+/// query sent after the record always shows up as a lift. A call at any
+/// other class holds until `open`: the lift does not change its priority.
+pub struct IndexGate {
+    armed: AtomicBool,
+    released: AtomicBool,
+}
+
+/// A test-installed hold on a stub hook: the first call into the hook
+/// signals `entered` and blocks until [`HoldHandle::open`]; every call
+/// after it passes.
+pub struct Hold {
+    entered: mpsc::Sender<()>,
+    open: Arc<Barrier>,
+    fired: AtomicBool,
+}
+
+/// The test's half of a [`Hold`].
+pub struct HoldHandle {
+    /// Resolves once the held call is inside the hook.
+    #[allow(dead_code)] // not every test target reads it
+    pub entered: mpsc::Receiver<()>,
+    open: Arc<Barrier>,
+}
+
+impl HoldHandle {
+    /// Releases the held call.
+    #[allow(dead_code)] // only the socket-level tests use it
+    pub fn open(&self) {
+        self.open.wait();
+    }
+}
+
+impl Hold {
+    fn install() -> (Arc<Self>, HoldHandle) {
+        let (entered_tx, entered) = mpsc::channel();
+        let open = Arc::new(Barrier::new(2));
+        (
+            Arc::new(Self {
+                entered: entered_tx,
+                open: open.clone(),
+                fired: AtomicBool::new(false),
+            }),
+            HoldHandle { entered, open },
+        )
+    }
+
+    /// The first call reports on `entered` and blocks until `open`; calls
+    /// after it — and every call once nobody is listening — pass.
+    fn enter(&self) {
+        if self.fired.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        if self.entered.send(()).is_err() {
+            return;
+        }
+        self.open.wait();
+    }
+}
+
+impl IndexGate {
+    /// Holds the Index-kind calls that start from now on.
+    #[allow(dead_code)] // only the socket-level tests use it
+    pub fn arm(&self) {
+        self.armed.store(true, Ordering::Release);
+    }
+
+    /// Releases every held and future call.
+    #[allow(dead_code)] // only the socket-level tests use it
+    pub fn open(&self) {
+        self.released.store(true, Ordering::Release);
+    }
+}
+
+fn held_record(instance: Instance, qos: QosClass, now: Instant) -> Record {
+    Record {
+        instance,
+        kind: Kind::Held,
+        hash: None,
+        tokens: 0,
+        batch_len: 0,
+        qos,
+        pri: 0,
+        start: now,
+        end: now,
+    }
+}
+
+/// The test-side [`Backend`]. `open_gpu` counts its calls and is `Blocked`
+/// while the pushed headroom says so; `watch_headroom` stores the callback
+/// `push_headroom` drives.
+pub struct StubBackend {
+    records: mpsc::Sender<Record>,
+    delays: BTreeMap<(Instance, usize), Duration>,
+    ane_opens: AtomicUsize,
+    ane_open_fails: AtomicBool,
+    open_ane_hold: Option<Arc<Hold>>,
+    counter_hold: Option<Arc<Hold>>,
+    gpu_opens: AtomicUsize,
+    gpu_open_fails: AtomicBool,
+    headroom: tokio::sync::watch::Sender<Headroom>,
+    /// Keeps the watch alive so `send_replace` stores; never read.
+    _headroom_rx: tokio::sync::watch::Receiver<Headroom>,
+    on_change: OnceLock<OnChange>,
+    gates: BTreeMap<Instance, Arc<Barrier>>,
+    index_gates: BTreeMap<Instance, Arc<IndexGate>>,
+    dim: usize,
+}
+
+impl StubBackend {
+    /// Routes the record log at `records`.
+    #[allow(dead_code)] // only the socket-level tests use it
+    pub fn records_to(&mut self, records: mpsc::Sender<Record>) {
+        self.records = records;
+    }
+
+    /// A stub whose embed calls return at once; `set_delay` adds sleeps.
+    pub fn new(records: mpsc::Sender<Record>) -> Self {
+        let (headroom, _headroom_rx) =
+            tokio::sync::watch::channel(Err(GpuBlocked::PowerSourceUnknown));
+        Self {
+            records,
+            delays: BTreeMap::new(),
+            ane_opens: AtomicUsize::new(0),
+            ane_open_fails: AtomicBool::new(false),
+            open_ane_hold: None,
+            counter_hold: None,
+            gpu_opens: AtomicUsize::new(0),
+            gpu_open_fails: AtomicBool::new(false),
+            headroom,
+            _headroom_rx,
+            on_change: OnceLock::new(),
+            gates: BTreeMap::new(),
+            index_gates: BTreeMap::new(),
+            dim: 64,
+        }
+    }
+
+    /// The sleep for calls of `instance` in every bucket.
+    pub fn set_instance_delay(&mut self, instance: Instance, delay: Duration) {
+        for bucket in BUCKETS {
+            self.delays.insert((instance, bucket), delay);
+        }
+    }
+
+    /// Gates `instance`'s first embed call on a barrier the test opens.
+    pub fn gate_first(&mut self, instance: Instance) -> Arc<Barrier> {
+        let gate = Arc::new(Barrier::new(2));
+        self.gates.insert(instance, gate.clone());
+        gate
+    }
+
+    /// Gates `instance`'s Index-kind calls on an [`IndexGate`], disarmed
+    /// until the test arms it.
+    #[allow(dead_code)] // only the socket-level tests use it
+    pub fn gate_first_index(&mut self, instance: Instance) -> Arc<IndexGate> {
+        let gate = Arc::new(IndexGate {
+            armed: AtomicBool::new(false),
+            released: AtomicBool::new(false),
+        });
+        self.index_gates.insert(instance, gate.clone());
+        gate
+    }
+
+    /// Holds the first `open_ane` call: it signals `entered` and blocks
+    /// until the handle's `open`.
+    #[allow(dead_code)] // only the socket-level tests use it
+    pub fn hold_open_ane(&mut self) -> HoldHandle {
+        let (hold, handle) = Hold::install();
+        self.open_ane_hold = Some(hold);
+        handle
+    }
+
+    /// Holds the first [`TokenCounter`] call the model's counter serves:
+    /// inside a barrier that is `reconcile`'s walk.
+    #[allow(dead_code)] // only the socket-level tests use it
+    pub fn hold_counter(&mut self) -> HoldHandle {
+        let (hold, handle) = Hold::install();
+        self.counter_hold = Some(hold);
+        handle
+    }
+
+    /// Makes `open_ane` fail, for the fatal-path test.
+    #[allow(dead_code)] // only the socket-level tests use it
+    pub fn fail_ane_open(&self) {
+        self.ane_open_fails.store(true, Ordering::Relaxed);
+    }
+
+    /// How often `open_ane` was called.
+    #[allow(dead_code)] // only the socket-level tests use it
+    pub fn ane_opens(&self) -> usize {
+        self.ane_opens.load(Ordering::Relaxed)
+    }
+
+    /// Makes `open_gpu` fail, for the fatal-path test.
+    #[allow(dead_code)] // used by the scheduler-level tests
+    pub fn fail_gpu_open(&self) {
+        self.gpu_open_fails.store(true, Ordering::Relaxed);
+    }
+
+    /// How often `open_gpu` was called.
+    pub fn gpu_opens(&self) -> usize {
+        self.gpu_opens.load(Ordering::Relaxed)
+    }
+
+    /// Pushes a headroom value: stored for `open_gpu` and delivered to the
+    /// callback `watch_headroom` registered.
+    ///
+    /// # Panics
+    ///
+    /// When `watch_headroom` has not been called yet.
+    pub fn push_headroom(&self, headroom: Headroom) {
+        let _ = self.headroom.send_replace(headroom.clone());
+        self.on_change.get().expect("watch_headroom was not called")(headroom);
+    }
+
+    fn embedder(&self, instance: Instance) -> StubEmbedder {
+        StubEmbedder {
+            instance,
+            counter: StubCounter::default(),
+            records: self.records.clone(),
+            delays: self.delays.clone(),
+            gate: self.gates.get(&instance).cloned(),
+            gated: false,
+            index_gate: self.index_gates.get(&instance).cloned(),
+            dim: self.dim,
+        }
+    }
+}
+
+impl Backend for StubBackend {
+    type Ane = StubEmbedder;
+    type Gpu = StubEmbedder;
+    type Counter = StubCounter;
+    type LoadError = StubError;
+    type Monitor = StubMonitor;
+
+    fn load_counter(&self, _: &Path) -> Result<(Self::Counter, Box<[usize]>), Self::LoadError> {
+        Ok((
+            StubCounter {
+                hold: self.counter_hold.clone(),
+            },
+            BUCKETS.into(),
+        ))
+    }
+
+    fn open_ane(&self, _: &Path, _: &str) -> Result<Self::Ane, Self::LoadError> {
+        self.ane_opens.fetch_add(1, Ordering::Relaxed);
+        if let Some(hold) = &self.open_ane_hold {
+            hold.enter();
+        }
+        if self.ane_open_fails.load(Ordering::Relaxed) {
+            return Err(StubError("injected ANE open failure"));
+        }
+        Ok(self.embedder(Instance::Ane))
+    }
+
+    fn open_gpu(&self, _: &Path, _: &str) -> Result<Self::Gpu, GpuOpen<Self::LoadError>> {
+        self.gpu_opens.fetch_add(1, Ordering::Relaxed);
+        if self.gpu_open_fails.load(Ordering::Relaxed) {
+            return Err(GpuOpen::Failed(StubError("injected GPU open failure")));
+        }
+        if let Err(blocked) = self.headroom.borrow().clone() {
+            return Err(GpuOpen::Blocked(blocked));
+        }
+        Ok(self.embedder(Instance::Gpu))
+    }
+
+    fn watch_headroom(&self, on_change: OnChange) -> Self::Monitor {
+        self.on_change
+            .set(on_change)
+            .ok()
+            .expect("watch_headroom called once");
+        let headroom = self.headroom.borrow().clone();
+        self.push_headroom(headroom);
+        StubMonitor
+    }
+}
+
+/// The stub embedder, for either instance. Every call reports a
+/// [`Kind::Started`] record, waits out its gate on the first call, sleeps its
+/// bucket's configured duration, then reports a [`Record`] per document.
+pub struct StubEmbedder {
+    instance: Instance,
+    counter: StubCounter,
+    records: mpsc::Sender<Record>,
+    delays: BTreeMap<(Instance, usize), Duration>,
+    gate: Option<Arc<Barrier>>,
+    /// The first call's gate was already waited on.
+    gated: bool,
+    index_gate: Option<Arc<IndexGate>>,
+    dim: usize,
+}
+
+impl StubEmbedder {
+    fn sleep(&self, tokens: usize) {
+        let delay = self
+            .delays
+            .get(&(self.instance, StubCounter::bucket(tokens)))
+            .copied()
+            .unwrap_or_default();
+        std::thread::sleep(delay);
+    }
+
+    /// Blocks the first embed call until the test opens the gate.
+    fn wait_gate(&mut self) {
+        if self.gated {
+            return;
+        }
+        self.gated = true;
+        if let Some(gate) = &self.gate {
+            gate.wait();
+        }
+    }
+
+    /// Holds an Index-kind call while the gate is armed and unreleased,
+    /// sending its [`Kind::Held`] record once the hold is in force.
+    fn hold_index_call(&self) {
+        let Some(gate) = &self.index_gate else {
+            return;
+        };
+        if !gate.armed.load(Ordering::Acquire) || gate.released.load(Ordering::Acquire) {
+            return;
+        }
+        let class = qos::current_thread();
+        if class != QosClass::Background {
+            let _ = self
+                .records
+                .send(held_record(self.instance, class, Instant::now()));
+            while !gate.released.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_micros(200));
+            }
+            return;
+        }
+        // The held thread blocks, so nothing about it wakes or boosts it: a
+        // watcher thread reads its priority from outside. It sends `Held`
+        // once the thread has settled at its own class, then releases the
+        // call on `open` or on the lift a queued query causes.
+        let me = qos::ThreadId::current();
+        let records = self.records.clone();
+        let instance = self.instance;
+        let (release, wake) = mpsc::channel::<()>();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                while qos::scheduling_priority(me) >= BACKGROUND_SETTLED {
+                    std::thread::sleep(Duration::from_micros(200));
+                }
+                let _ = records.send(held_record(instance, class, Instant::now()));
+                while !gate.released.load(Ordering::Acquire)
+                    && qos::scheduling_priority(me) < BACKGROUND_SETTLED
+                {
+                    std::thread::sleep(Duration::from_micros(200));
+                }
+                // A lift releases the gate for good: the query is queued
+                // and every later call runs free, so a follow-up job of the
+                // same search cannot hit a gate it could not lift.
+                gate.released.store(true, Ordering::Release);
+                release.send(()).expect("the held call is waiting");
+            });
+            wake.recv().expect("the gate releases the call");
+        });
+    }
+
+    /// Reports the call's start, before the gate and the sleep.
+    fn started(&self, hash: Option<ContentHash>, tokens: usize, batch_len: usize) {
+        let now = Instant::now();
+        self.record(Kind::Started, hash, tokens, batch_len, now, now);
+    }
+
+    fn kind(&self) -> Kind {
+        match qos::current_thread() {
+            QosClass::UserInteractive => Kind::QueryDocument,
+            _ => Kind::Index,
+        }
+    }
+
+    fn record(
+        &self,
+        kind: Kind,
+        hash: Option<ContentHash>,
+        tokens: usize,
+        batch_len: usize,
+        start: Instant,
+        end: Instant,
+    ) {
+        let _ = self.records.send(Record {
+            instance: self.instance,
+            kind,
+            hash,
+            tokens,
+            batch_len,
+            qos: qos::current_thread(),
+            pri: qos::scheduling_priority(qos::ThreadId::current()),
+            start,
+            end,
+        });
+    }
+}
+
+impl Drop for StubEmbedder {
+    fn drop(&mut self) {
+        let now = Instant::now();
+        self.record(Kind::Dropped, None, 0, 0, now, now);
+    }
+}
+
+impl Embedder for StubEmbedder {
+    type Error = StubError;
+
+    fn model_id(&self) -> &str {
+        "stub-model"
+    }
+
+    fn embed_document(&mut self, title: &str, text: &str) -> Result<UnitVector, Self::Error> {
+        let tokens = self.counter.document_tokens(title, text);
+        let kind = self.kind();
+        self.started(Some(ContentHash::of_chunk(title, text)), tokens, 1);
+        self.wait_gate();
+        if kind == Kind::Index {
+            self.hold_index_call();
+        }
+        let start = Instant::now();
+        self.sleep(tokens);
+        let end = Instant::now();
+        self.record(
+            kind,
+            Some(ContentHash::of_chunk(title, text)),
+            tokens,
+            1,
+            start,
+            end,
+        );
+        Ok(bag_of_words(&format!("{title} {text}"), self.dim))
+    }
+
+    fn embed_query(&mut self, task: QueryTask, query: &str) -> Result<UnitVector, Self::Error> {
+        let tokens = self.counter.count(&task.prompt(query));
+        self.started(None, tokens, 1);
+        self.wait_gate();
+        let start = Instant::now();
+        self.sleep(tokens);
+        let end = Instant::now();
+        self.record(Kind::Query, None, tokens, 1, start, end);
+        Ok(bag_of_words(query, self.dim))
+    }
+}
+
+impl BatchEmbedder for StubEmbedder {
+    fn embed_documents(&mut self, docs: &[(&str, &str)]) -> Result<Vec<UnitVector>, Self::Error> {
+        let tokens: Vec<usize> = docs
+            .iter()
+            .map(|(title, text)| self.counter.document_tokens(title, text))
+            .collect();
+        let mut buckets = tokens.iter().map(|&t| StubCounter::bucket(t));
+        if let Some(first) = buckets.next() {
+            assert!(
+                buckets.all(|b| b == first),
+                "a batch mixes token buckets: {tokens:?}"
+            );
+        }
+        for (&(title, text), tokens) in docs.iter().zip(&tokens) {
+            self.started(
+                Some(ContentHash::of_chunk(title, text)),
+                *tokens,
+                docs.len(),
+            );
+        }
+        self.wait_gate();
+        self.hold_index_call();
+        let start = Instant::now();
+        if let Some(&first) = tokens.first() {
+            self.sleep(first);
+        }
+        let end = Instant::now();
+        // The batch method is GPU-only indexing work: the kind is the
+        // method's, never a query's.
+        for ((title, text), tokens) in docs.iter().zip(tokens) {
+            self.record(
+                Kind::Index,
+                Some(ContentHash::of_chunk(title, text)),
+                tokens,
+                docs.len(),
+                start,
+                end,
+            );
+        }
+        Ok(docs
+            .iter()
+            .map(|(title, text)| bag_of_words(&format!("{title} {text}"), self.dim))
+            .collect())
+    }
+}
+
+/// A deterministic unit vector: FNV-1a per whitespace word, modulo `dim`.
+fn bag_of_words(text: &str, dim: usize) -> UnitVector {
+    let mut v = vec![0.0f32; dim];
+    for word in text.split_whitespace() {
+        let mut hash = 0xcbf2_9ce4_8422_2325u64;
+        for byte in word.as_bytes() {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        v[hash as usize % dim] += 1.0;
+    }
+    // A tiny dense jitter seeded by the whole text, so two different texts
+    // differ in every dimension: the knn calibration's per-dimension bounds
+    // are never flat and `query_weights` never degenerates.
+    let mut d = 0xcbf2_9ce4_8422_2325u64;
+    for byte in text.as_bytes() {
+        d ^= u64::from(*byte);
+        d = d.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    for x in &mut v {
+        d ^= d >> 33;
+        d = d.wrapping_mul(0xff51_afd7_ed55_8ccd);
+        *x += (d & 0xff) as f32 * 1e-3;
+    }
+    UnitVector::normalize(v)
+}

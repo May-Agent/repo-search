@@ -17,11 +17,12 @@ use objc2::AllocAnyThread;
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject};
 use objc2_core_ml::{
-    MLComputeUnits, MLDictionaryFeatureProvider, MLFeatureProvider, MLFeatureValue, MLModel,
-    MLModelConfiguration, MLMultiArray, MLMultiArrayDataType,
+    MLArrayBatchProvider, MLBatchProvider, MLComputeUnits, MLDictionaryFeatureProvider,
+    MLFeatureProvider, MLFeatureValue, MLModel, MLModelConfiguration, MLMultiArray,
+    MLMultiArrayDataType,
 };
 use objc2_foundation::{NSArray, NSDictionary, NSError, NSInteger, NSNumber, NSString, NSURL};
-use repo_search_core::{Embedder, QueryTask, TokenCounter, UnitVector};
+use repo_search_core::{BatchEmbedder, Embedder, QueryTask, TokenCounter, UnitVector};
 use tokenizers::{Tokenizer, TruncationParams};
 
 use manifest::Manifest;
@@ -29,7 +30,7 @@ use manifest::Manifest;
 mod manifest;
 mod power;
 
-pub use power::{GpuBlocked, gpu_headroom};
+pub use power::{GpuBlocked, HeadroomMonitor, gpu_headroom};
 
 /// The hardware a [`CoreMlEmbedder`]'s functions run on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -96,6 +97,14 @@ pub enum Error {
     /// The prediction produced no embedding multi-array.
     #[error("prediction returned no embedding multi-array")]
     NoEmbedding,
+    /// A batch prediction returned a different number of results than inputs.
+    #[error("batch returned {got} predictions for {want} inputs")]
+    BatchSize {
+        /// What the model produced.
+        got: usize,
+        /// The number of inputs.
+        want: usize,
+    },
     /// The embedding multi-array is not `float16` with unit last stride.
     #[error("embedding is {dtype:?} with last stride {stride}, expected contiguous float16")]
     EmbeddingLayout {
@@ -162,6 +171,8 @@ pub struct DocumentCounter {
     document: (String, String, String),
     /// Tokens the post-processor adds to every encoding (`<s>`, `</s>`).
     specials: usize,
+    /// The manifest's function lengths, ascending.
+    buckets: Box<[usize]>,
 }
 
 impl DocumentCounter {
@@ -181,7 +192,14 @@ impl DocumentCounter {
             tokenizer,
             document: document_parts(&manifest),
             specials,
+            buckets: bucket_lengths(&manifest),
         })
+    }
+
+    /// The model's bucket lengths in tokens, ascending: the sequence lengths
+    /// its functions accept.
+    pub fn buckets(&self) -> &[usize] {
+        &self.buckets
     }
 
     /// The document `prompts.document` formats for `title` and `text`.
@@ -249,6 +267,10 @@ impl TokenCounter for DocumentCounter {
                 .1
                 .saturating_sub(head),
         )
+    }
+
+    fn document_tokens(&self, title: &str, text: &str) -> usize {
+        self.count(&self.document(title, text))
     }
 }
 
@@ -329,6 +351,7 @@ impl CoreMlEmbedder {
         let counter = DocumentCounter {
             document: document_parts(&manifest),
             specials: specials(&tokenizer)?,
+            buckets: bucket_lengths(&manifest),
             tokenizer,
         };
         let embedding = manifest
@@ -348,6 +371,12 @@ impl CoreMlEmbedder {
         })
     }
 
+    /// The embedder's [`DocumentCounter`]: the model's tokenizer and document
+    /// prompt, and through `buckets()` its bucket lengths.
+    pub fn counter(&self) -> &DocumentCounter {
+        &self.counter
+    }
+
     /// Embeds already-tokenized prompt text: `ids` are token ids of a string
     /// the prompt format already produced (document or query prompt), routed
     /// to the smallest bucket that holds them.
@@ -357,100 +386,8 @@ impl CoreMlEmbedder {
     /// [`Error::TooLong`] when `ids` exceeds the largest bucket, and the Core
     /// ML failures above.
     pub fn embed_tokens(&mut self, ids: &[u32]) -> Result<UnitVector, Error> {
-        let bucket = self
-            .buckets
-            .iter()
-            .find(|b| ids.len() <= b.len)
-            .ok_or(Error::TooLong {
-                tokens: ids.len(),
-                max: self.max_len,
-            })?;
-        let len = bucket.len;
-        // ObjC handler blocks must not panic, so every conversion happens
-        // before they run and the blocks are plain copies.
-        let ids: Vec<i32> = ids
-            .iter()
-            .map(|&id| i32::try_from(id).map_err(|_| Error::TokenIdTooLarge(id)))
-            .collect::<Result<_, Error>>()?;
-        let pad = self.pad;
-        let shape =
-            NSArray::from_retained_slice(&[NSNumber::new_usize(1), NSNumber::new_usize(len)]);
-        // SAFETY: `alloc` and `initWithShape:dataType:` are sound here; the
-        // returned array owns `len` elements and stays alive through the
-        // feature provider, so Core ML's deferred release frees memory it owns.
-        let input_ids = unsafe {
-            MLMultiArray::initWithShape_dataType_error(
-                MLMultiArray::alloc(),
-                &shape,
-                MLMultiArrayDataType::Int32,
-            )
-        }
-        .map_err(core_ml)?;
-        let fill_ids = StackBlock::new(
-            |ptr: NonNull<c_void>, _size: NSInteger, strides: NonNull<NSArray<NSNumber>>| {
-                // SAFETY: `strides` is a live `NSArray` holding one entry per
-                // dimension of the rank-2 array, so index 1 is in bounds.
-                let stride = unsafe { strides.as_ref() }.objectAtIndex(1).as_isize() as usize;
-                // SAFETY: `ptr` is the backing store for `len` i32s `stride`
-                // elements apart, valid for the block's duration; every
-                // element is written exactly once.
-                unsafe {
-                    let p = ptr.as_ptr().cast::<i32>();
-                    for (i, &id) in ids.iter().enumerate() {
-                        p.add(i * stride).write(id);
-                    }
-                    for i in ids.len()..len {
-                        p.add(i * stride).write(pad);
-                    }
-                }
-            },
-        );
-        // SAFETY: `fill_ids` writes only within the `len` elements `ptr` and
-        // `strides` describe, and keeps no pointer past the block.
-        unsafe { input_ids.getMutableBytesWithHandler(&fill_ids) };
-        // SAFETY: as for `input_ids` above, with the float16 element type.
-        let mask = unsafe {
-            MLMultiArray::initWithShape_dataType_error(
-                MLMultiArray::alloc(),
-                &shape,
-                MLMultiArrayDataType::Float16,
-            )
-        }
-        .map_err(core_ml)?;
-        let one = f16::from_f32(1.0).0;
-        let fill_mask = StackBlock::new(
-            |ptr: NonNull<c_void>, _size: NSInteger, strides: NonNull<NSArray<NSNumber>>| {
-                // SAFETY: `strides` is a live `NSArray` holding one entry per
-                // dimension of the rank-2 array, so index 1 is in bounds.
-                let stride = unsafe { strides.as_ref() }.objectAtIndex(1).as_isize() as usize;
-                // SAFETY: `ptr` is the backing store for `len` fp16s `stride`
-                // elements apart, valid for the block's duration; every
-                // element is written exactly once.
-                unsafe {
-                    let p = ptr.as_ptr().cast::<u16>();
-                    for i in 0..len {
-                        p.add(i * stride).write(if i < ids.len() { one } else { 0 });
-                    }
-                }
-            },
-        );
-        // SAFETY: `fill_mask` writes only within the `len` elements `ptr` and
-        // `strides` describe, and keeps no pointer past the block.
-        unsafe { mask.getMutableBytesWithHandler(&fill_mask) };
-        let ids_v = feature_value(&input_ids);
-        let mask_v = feature_value(&mask);
-        let features: Retained<NSDictionary<NSString, AnyObject>> = NSDictionary::from_slices(
-            &[&*ns("input_ids"), &*ns("attention_mask")],
-            &[&ids_v, &mask_v],
-        );
-        // SAFETY: `features` pairs NSString keys with feature values.
-        let provider = unsafe {
-            MLDictionaryFeatureProvider::initWithDictionary_error(
-                MLDictionaryFeatureProvider::alloc(),
-                &features,
-            )
-        }
-        .map_err(core_ml)?;
+        let bucket = self.bucket_for(ids.len())?;
+        let provider = input_features(ids, bucket.len, self.pad)?;
         // SAFETY: `provider` is a valid MLFeatureProvider.
         let out = unsafe {
             bucket
@@ -458,45 +395,81 @@ impl CoreMlEmbedder {
                 .predictionFromFeatures_error(&ProtocolObject::from_retained(provider))
         }
         .map_err(core_ml)?;
-        // SAFETY: `out` is a feature provider the model returned.
-        let value =
-            unsafe { out.featureValueForName(&ns(&self.embedding)) }.ok_or(Error::NoEmbedding)?;
-        // SAFETY: `value` is a live feature value; `multiArrayValue` returns
-        // nil when the feature is not a multi-array.
-        let array = unsafe { value.multiArrayValue() }.ok_or(Error::NoEmbedding)?;
-        // SAFETY: `array` is a live multi-array.
-        let got = unsafe { array.count() } as usize;
-        if got != self.dim {
-            return Err(Error::EmbeddingDim {
-                got,
-                want: self.dim,
+        read_embedding(&out, &self.embedding, self.dim)
+    }
+
+    /// The smallest bucket that holds `tokens`.
+    fn bucket_for(&self, tokens: usize) -> Result<&Bucket, Error> {
+        self.buckets
+            .iter()
+            .find(|b| tokens <= b.len)
+            .ok_or(Error::TooLong {
+                tokens,
+                max: self.max_len,
+            })
+    }
+}
+
+impl BatchEmbedder for CoreMlEmbedder {
+    /// One Core ML batch prediction over `docs`.
+    ///
+    /// # Panics
+    ///
+    /// When the documents do not all fall in the first one's bucket: the
+    /// scheduler batches per bucket, so a mix is a caller bug.
+    fn embed_documents(&mut self, docs: &[(&str, &str)]) -> Result<Vec<UnitVector>, Error> {
+        let ids = docs
+            .iter()
+            .map(|(title, text)| {
+                encode(&self.counter.tokenizer, &self.counter.document(title, text))
+            })
+            .collect::<Result<Vec<_>, Error>>()?;
+        let Some(first) = ids.first() else {
+            return Ok(Vec::new());
+        };
+        let bucket = self.bucket_for(first.len())?;
+        let providers = ids
+            .iter()
+            .map(|ids| {
+                assert_eq!(
+                    self.bucket_for(ids.len())?.len,
+                    bucket.len,
+                    "documents of one batch must share a bucket"
+                );
+                let provider = input_features(ids, bucket.len, self.pad)?;
+                Ok(ProtocolObject::from_retained(provider))
+            })
+            .collect::<Result<Vec<_>, Error>>()?;
+        let providers = NSArray::from_retained_slice(&providers);
+        // SAFETY: `providers` holds valid MLFeatureProviders.
+        let batch = unsafe {
+            MLArrayBatchProvider::initWithFeatureProviderArray(
+                MLArrayBatchProvider::alloc(),
+                &providers,
+            )
+        };
+        // SAFETY: `batch` is a valid MLBatchProvider.
+        let out = unsafe {
+            bucket
+                .model
+                .predictionsFromBatch_error(&ProtocolObject::from_retained(batch))
+        }
+        .map_err(core_ml)?;
+        // SAFETY: `out` is a batch provider the model returned.
+        let count = unsafe { out.count() } as usize;
+        if count != docs.len() {
+            return Err(Error::BatchSize {
+                got: count,
+                want: docs.len(),
             });
         }
-        // SAFETY: `array` is a live multi-array.
-        let dtype = unsafe { array.dataType() };
-        // SAFETY: `array` is a live multi-array.
-        let strides = unsafe { array.strides() };
-        let stride = strides.lastObject().map_or(-1, |s| s.as_isize());
-        if dtype != MLMultiArrayDataType::Float16 || stride != 1 {
-            return Err(Error::EmbeddingLayout { dtype, stride });
-        }
-        let dim = self.dim;
-        let out = std::cell::Cell::new(Vec::new());
-        let read = StackBlock::new(|ptr: NonNull<c_void>, _size: NSInteger| {
-            // SAFETY: `ptr` is `size` bytes — `dim` contiguous fp16s given the
-            // dtype and stride checks above — valid for the block's duration;
-            // every element is read once.
-            let p = ptr.as_ptr().cast::<u16>();
-            out.set(
-                (0..dim)
-                    .map(|i| f16(unsafe { p.add(i).read() }).to_f32())
-                    .collect(),
-            );
-        });
-        // SAFETY: `read` reads only within `ptr`..`ptr + size` while the block
-        // runs and keeps no pointer past it.
-        unsafe { array.getBytesWithHandler(&read) };
-        Ok(UnitVector::normalize(out.into_inner()))
+        (0..docs.len())
+            .map(|i| {
+                // SAFETY: `i` is below `out.count()`.
+                let features = unsafe { out.featuresAtIndex(i as NSInteger) };
+                read_embedding(&features, &self.embedding, self.dim)
+            })
+            .collect()
     }
 }
 
@@ -527,6 +500,13 @@ fn encode(tokenizer: &Tokenizer, text: &str) -> Result<Vec<u32>, Error> {
 /// length of an empty encode.
 fn specials(tokenizer: &Tokenizer) -> Result<usize, Error> {
     Ok(tokenizer.encode("", true)?.len())
+}
+
+/// The manifest's function lengths, ascending.
+fn bucket_lengths(manifest: &Manifest) -> Box<[usize]> {
+    let mut lens: Vec<usize> = manifest.functions.values().copied().collect();
+    lens.sort_unstable();
+    lens.into_boxed_slice()
 }
 
 /// `prompts.document` split around `{title}` and `{text}`.
@@ -568,6 +548,140 @@ fn compiled_bundle(dir: &Path) -> Result<PathBuf, Error> {
         path: bundle,
         source,
     })
+}
+
+/// The model inputs for `ids` padded to the bucket length `len`.
+fn input_features(
+    ids: &[u32],
+    len: usize,
+    pad: i32,
+) -> Result<Retained<MLDictionaryFeatureProvider>, Error> {
+    // ObjC handler blocks must not panic, so every conversion happens
+    // before they run and the blocks are plain copies.
+    let ids: Vec<i32> = ids
+        .iter()
+        .map(|&id| i32::try_from(id).map_err(|_| Error::TokenIdTooLarge(id)))
+        .collect::<Result<_, Error>>()?;
+    let shape = NSArray::from_retained_slice(&[NSNumber::new_usize(1), NSNumber::new_usize(len)]);
+    // SAFETY: `alloc` and `initWithShape:dataType:` are sound here; the
+    // returned array owns `len` elements and stays alive through the
+    // feature provider, so Core ML's deferred release frees memory it owns.
+    let input_ids = unsafe {
+        MLMultiArray::initWithShape_dataType_error(
+            MLMultiArray::alloc(),
+            &shape,
+            MLMultiArrayDataType::Int32,
+        )
+    }
+    .map_err(core_ml)?;
+    let fill_ids = StackBlock::new(
+        |ptr: NonNull<c_void>, _size: NSInteger, strides: NonNull<NSArray<NSNumber>>| {
+            // SAFETY: `strides` is a live `NSArray` holding one entry per
+            // dimension of the rank-2 array, so index 1 is in bounds.
+            let stride = unsafe { strides.as_ref() }.objectAtIndex(1).as_isize() as usize;
+            // SAFETY: `ptr` is the backing store for `len` i32s `stride`
+            // elements apart, valid for the block's duration; every
+            // element is written exactly once.
+            unsafe {
+                let p = ptr.as_ptr().cast::<i32>();
+                for (i, &id) in ids.iter().enumerate() {
+                    p.add(i * stride).write(id);
+                }
+                for i in ids.len()..len {
+                    p.add(i * stride).write(pad);
+                }
+            }
+        },
+    );
+    // SAFETY: `fill_ids` writes only within the `len` elements `ptr` and
+    // `strides` describe, and keeps no pointer past the block.
+    unsafe { input_ids.getMutableBytesWithHandler(&fill_ids) };
+    // SAFETY: as for `input_ids` above, with the float16 element type.
+    let mask = unsafe {
+        MLMultiArray::initWithShape_dataType_error(
+            MLMultiArray::alloc(),
+            &shape,
+            MLMultiArrayDataType::Float16,
+        )
+    }
+    .map_err(core_ml)?;
+    let one = f16::from_f32(1.0).0;
+    let fill_mask = StackBlock::new(
+        |ptr: NonNull<c_void>, _size: NSInteger, strides: NonNull<NSArray<NSNumber>>| {
+            // SAFETY: `strides` is a live `NSArray` holding one entry per
+            // dimension of the rank-2 array, so index 1 is in bounds.
+            let stride = unsafe { strides.as_ref() }.objectAtIndex(1).as_isize() as usize;
+            // SAFETY: `ptr` is the backing store for `len` fp16s `stride`
+            // elements apart, valid for the block's duration; every
+            // element is written exactly once.
+            unsafe {
+                let p = ptr.as_ptr().cast::<u16>();
+                for i in 0..len {
+                    p.add(i * stride).write(if i < ids.len() { one } else { 0 });
+                }
+            }
+        },
+    );
+    // SAFETY: `fill_mask` writes only within the `len` elements `ptr` and
+    // `strides` describe, and keeps no pointer past the block.
+    unsafe { mask.getMutableBytesWithHandler(&fill_mask) };
+    let ids_v = feature_value(&input_ids);
+    let mask_v = feature_value(&mask);
+    let features: Retained<NSDictionary<NSString, AnyObject>> = NSDictionary::from_slices(
+        &[&*ns("input_ids"), &*ns("attention_mask")],
+        &[&ids_v, &mask_v],
+    );
+    // SAFETY: `features` pairs NSString keys with feature values.
+    unsafe {
+        MLDictionaryFeatureProvider::initWithDictionary_error(
+            MLDictionaryFeatureProvider::alloc(),
+            &features,
+        )
+    }
+    .map_err(core_ml)
+}
+
+/// The embedding `provider` holds under the feature name `embedding`.
+fn read_embedding(
+    provider: &ProtocolObject<dyn MLFeatureProvider>,
+    embedding: &str,
+    dim: usize,
+) -> Result<UnitVector, Error> {
+    // SAFETY: `provider` is a feature provider the model returned.
+    let value =
+        unsafe { provider.featureValueForName(&ns(embedding)) }.ok_or(Error::NoEmbedding)?;
+    // SAFETY: `value` is a live feature value; `multiArrayValue` returns
+    // nil when the feature is not a multi-array.
+    let array = unsafe { value.multiArrayValue() }.ok_or(Error::NoEmbedding)?;
+    // SAFETY: `array` is a live multi-array.
+    let got = unsafe { array.count() } as usize;
+    if got != dim {
+        return Err(Error::EmbeddingDim { got, want: dim });
+    }
+    // SAFETY: `array` is a live multi-array.
+    let dtype = unsafe { array.dataType() };
+    // SAFETY: `array` is a live multi-array.
+    let strides = unsafe { array.strides() };
+    let stride = strides.lastObject().map_or(-1, |s| s.as_isize());
+    if dtype != MLMultiArrayDataType::Float16 || stride != 1 {
+        return Err(Error::EmbeddingLayout { dtype, stride });
+    }
+    let out = std::cell::Cell::new(Vec::new());
+    let read = StackBlock::new(|ptr: NonNull<c_void>, _size: NSInteger| {
+        // SAFETY: `ptr` is `size` bytes — `dim` contiguous fp16s given the
+        // dtype and stride checks above — valid for the block's duration;
+        // every element is read once.
+        let p = ptr.as_ptr().cast::<u16>();
+        out.set(
+            (0..dim)
+                .map(|i| f16(unsafe { p.add(i).read() }).to_f32())
+                .collect(),
+        );
+    });
+    // SAFETY: `read` reads only within `ptr`..`ptr + size` while the block
+    // runs and keeps no pointer past it.
+    unsafe { array.getBytesWithHandler(&read) };
+    Ok(UnitVector::normalize(out.into_inner()))
 }
 
 fn ns(s: &str) -> Retained<NSString> {

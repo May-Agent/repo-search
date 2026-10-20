@@ -1,0 +1,1079 @@
+//! The per-worktree owner task.
+//!
+//! One task per worktree handles its inbox one message at a time, which the
+//! `Retriever`'s `&mut` search requires. It owns the index, the retriever
+//! built on [`AneHandle`], the last barrier's report, the FSEvents watcher,
+//! the HEAD commit and the index phase, and runs the freshness barrier that
+//! hands pending chunks to the scheduler.
+
+use std::num::NonZeroUsize;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use repo_search_core::qos::performance_cores;
+use repo_search_core::reconcile::{self, PendingChunk, Report};
+use repo_search_core::search::{self, EmbedService, Reconciliation, Retriever};
+use repo_search_core::store::{Index, Phase, VectorCache};
+use repo_search_core::{CHUNKER_FINGERPRINT, QueryTask, TokenCounter, UnitVector};
+use tokio::sync::{mpsc, oneshot, watch};
+
+use crate::protocol::{
+    Answer, ErrorKind, ErrorReport, Event, Final, Format, IndexStatus, ModelStatus, Progress,
+    QueryStats, SearchRequest, StatusReport, WirePhase,
+};
+
+use super::Backend;
+use super::model::{Model, ModelState};
+use super::registry::RegistryHandle;
+use super::scheduler::{
+    EmbedError, Enqueue, GpuState, IndexClass, PendingItem, QueryJob, RepoId, SchedulerMsg,
+    Stage1Done, WorktreeId,
+};
+use super::watch::{WatchMsg, Watcher};
+use super::writer::WriterHandle;
+
+/// `index --wait` coverage frames are sent at most this often.
+const COVERAGE_INTERVAL: Duration = Duration::from_millis(250);
+
+/// The owner's inbox: one message per connection's request.
+#[derive(Debug)]
+pub enum OwnerMsg {
+    /// A `search` request.
+    Search {
+        /// The wire request.
+        request: SearchRequest,
+        /// Progress and the closing `Final` go here.
+        events: mpsc::Sender<Event>,
+    },
+    /// An `index` request.
+    Index {
+        /// Whether to wait for full vector coverage.
+        wait: bool,
+        /// Events sink.
+        events: mpsc::Sender<Event>,
+    },
+    /// A `status` request; never creates `.repo-search/`.
+    Status {
+        /// Events sink.
+        events: mpsc::Sender<Event>,
+    },
+}
+
+impl OwnerMsg {
+    fn events(&self) -> mpsc::Sender<Event> {
+        match self {
+            Self::Search { events, .. } | Self::Index { events, .. } | Self::Status { events } => {
+                events.clone()
+            }
+        }
+    }
+}
+
+/// Everything the registry hands a new owner.
+pub struct OwnerConfig<B: Backend> {
+    /// The scheduler's worktree id.
+    pub id: WorktreeId,
+    /// Canonical worktree root.
+    pub root: PathBuf,
+    /// The repository's canonical git common dir.
+    pub common_dir: PathBuf,
+    /// The worktree's git dir (`--absolute-git-dir`).
+    pub git_dir: PathBuf,
+    /// The scheduler's repository id.
+    pub repo: RepoId,
+    /// The model-id vectors are stored under; known before the model loads.
+    pub model_id: String,
+    /// The model readiness watch.
+    pub model: watch::Receiver<ModelState<B>>,
+    /// The registry, for the shared cache and writer, `DaemonStatus`'s
+    /// worktree count, and `Forget`.
+    pub registry: RegistryHandle,
+    /// Daemon start, for `DaemonStatus::uptime_s`.
+    pub started: Instant,
+    /// Set when the daemon begins shutdown.
+    pub stopping: watch::Receiver<bool>,
+}
+
+/// Spawns the owner task; the returned sender is its inbox.
+pub fn spawn<B: Backend>(config: OwnerConfig<B>) -> mpsc::Sender<OwnerMsg> {
+    let (tx, rx) = mpsc::channel(64);
+    tokio::spawn(Owner::new(config, rx).run());
+    tx
+}
+
+struct Owner<B: Backend> {
+    id: WorktreeId,
+    root: PathBuf,
+    common_dir: PathBuf,
+    git_dir: PathBuf,
+    repo: RepoId,
+    cache: Option<VectorCache>,
+    writer: Option<WriterHandle>,
+    model_id: String,
+    model: watch::Receiver<ModelState<B>>,
+    registry: RegistryHandle,
+    started: Instant,
+    stopping: watch::Receiver<bool>,
+    rx: mpsc::Receiver<OwnerMsg>,
+    index: Option<Index>,
+    /// `(dev, ino)` of `index.db` as opened; a recreated file means the
+    /// handle points at an unlinked inode.
+    index_id: Option<(u64, u64)>,
+    phase: Phase,
+    retriever: Option<Retriever<AneHandle>>,
+    report: Option<Report>,
+    commit: String,
+    watcher: Option<Watcher>,
+    generation: u64,
+    stage1_tx: mpsc::Sender<Stage1Done>,
+    stage1_rx: mpsc::Receiver<Stage1Done>,
+}
+
+impl<B: Backend> Owner<B> {
+    fn new(config: OwnerConfig<B>, rx: mpsc::Receiver<OwnerMsg>) -> Self {
+        let (stage1_tx, stage1_rx) = mpsc::channel(8);
+        Self {
+            id: config.id,
+            root: config.root,
+            common_dir: config.common_dir,
+            git_dir: config.git_dir,
+            repo: config.repo,
+            cache: None,
+            writer: None,
+            model_id: config.model_id,
+            model: config.model,
+            registry: config.registry,
+            started: config.started,
+            stopping: config.stopping,
+            rx,
+            index: None,
+            index_id: None,
+            phase: Phase::FirstIndex,
+            retriever: None,
+            report: None,
+            commit: String::new(),
+            watcher: None,
+            generation: 0,
+            stage1_tx,
+            stage1_rx,
+        }
+    }
+
+    async fn run(mut self) {
+        loop {
+            let mut stopping = self.stopping.clone();
+            tokio::select! {
+                biased;
+                done = self.stage1_rx.recv() => {
+                    if done.is_none() {
+                        return;
+                    }
+                    self.apply_stage1_done().await;
+                }
+                msg = self.rx.recv() => {
+                    let Some(msg) = msg else { return };
+                    let events = msg.events();
+                    // The request runs to completion; a client hang-up cancels
+                    // only the parts that select on `events.closed()` — never
+                    // a barrier, whose busy marker must be cleared by its own
+                    // completion message.
+                    let quit = tokio::select! {
+                        _ = self.handle(msg) => false,
+                        _ = stopping.changed() => {
+                            send(&events, shutting_down()).await;
+                            true
+                        }
+                    };
+                    if quit {
+                        return;
+                    }
+                }
+                msg = async {
+                    match &mut self.watcher {
+                        Some(watcher) => watcher.changed.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    match msg {
+                        Some(WatchMsg::Changed) => self.changed().await,
+                        Some(WatchMsg::Gone) => {
+                            // The worktree root is gone: answer the queued
+                            // requests, tell the registry to forget the owner
+                            // and exit — the next request spawns a fresh one.
+                            self.rx.close();
+                            while let Ok(msg) = self.rx.try_recv() {
+                                send(&msg.events(), shutting_down()).await;
+                            }
+                            self.registry.forget(self.root.clone(), self.id).await;
+                            return;
+                        }
+                        // The debounce task died with the watcher; it cannot
+                        // happen while the `FsEventWatcher` lives.
+                        None => {
+                            tracing::error!(
+                                root = %self.root.display(),
+                                "the watcher ended; edits stop being embedded in the background"
+                            );
+                            self.watcher = None;
+                        }
+                    }
+                }
+                _ = self.stopping.changed() => return,
+            }
+        }
+    }
+
+    /// The `Ready` model, or `None` while it is still on its way.
+    fn ready(&self) -> Option<Arc<Model<B>>> {
+        match &*self.model.borrow() {
+            ModelState::Ready(model) => Some(model.clone()),
+            _ => None,
+        }
+    }
+
+    /// The repository's shared cache and writer, opened on first need so a
+    /// `Status` on a never-indexed repository creates nothing.
+    async fn shared(&mut self) -> Result<(VectorCache, WriterHandle), String> {
+        if self.cache.is_none() {
+            let shared = self
+                .registry
+                .shared(self.common_dir.clone())
+                .await
+                .ok_or_else(|| "the daemon is shutting down".to_owned())?
+                .map_err(|e| e.to_string())?;
+            self.cache = Some(shared.cache);
+            self.writer = Some(shared.writer);
+        }
+        Ok((
+            self.cache.clone().expect("opened above"),
+            self.writer.clone().expect("opened above"),
+        ))
+    }
+
+    /// Opens the index on first use, reading the stored phase and the file's
+    /// identity; a `Status` on a worktree with no index file never reaches
+    /// here.
+    async fn ensure_index(&mut self) -> Result<(), String> {
+        if self.index.is_none() {
+            let index = Index::open(&self.root).await.map_err(|e| e.to_string())?;
+            let meta = tokio::fs::metadata(self.root.join(".repo-search/index.db"))
+                .await
+                .map_err(|e| e.to_string())?;
+            self.phase = index.phase().await.map_err(|e| e.to_string())?;
+            self.index_id = Some(file_id(&meta));
+            self.index = Some(index);
+        }
+        Ok(())
+    }
+
+    /// Before every barrier: the index file must still be the inode it was
+    /// opened with — a recreated `.repo-search/` leaves the handle writing
+    /// into an unlinked file. On a mismatch the index and retriever are
+    /// dropped and reopened.
+    async fn verify_index(&mut self) -> Result<(), String> {
+        let Some(id) = self.index_id else {
+            return Ok(());
+        };
+        let meta = tokio::fs::metadata(self.root.join(".repo-search/index.db")).await;
+        if matches!(&meta, Ok(meta) if file_id(meta) == id) {
+            return Ok(());
+        }
+        self.index = None;
+        self.retriever = None;
+        self.index_id = None;
+        self.phase = Phase::FirstIndex;
+        self.ensure_index().await
+    }
+
+    /// The watcher starts on the first `Search` or `Index`, never on a
+    /// `Status`. A watcher that fails to start fails the request: without
+    /// it edits are never embedded in the background.
+    fn ensure_watcher(&mut self) -> Result<(), String> {
+        if self.watcher.is_none() {
+            self.watcher =
+                Some(super::watch::start(&self.root, &self.git_dir).map_err(|e| e.to_string())?);
+        }
+        Ok(())
+    }
+
+    async fn handle(&mut self, msg: OwnerMsg) {
+        match msg {
+            OwnerMsg::Search { request, events } => self.search(request, &events).await,
+            OwnerMsg::Index { wait, events } => self.index_request(wait, &events).await,
+            OwnerMsg::Status { events } => self.status(&events).await,
+        }
+    }
+
+    async fn search(&mut self, request: SearchRequest, events: &mpsc::Sender<Event>) {
+        let total_start = Instant::now();
+        let Some(model) = self.ready() else {
+            send(
+                events,
+                error(ErrorKind::Model, "the model is not ready".into()),
+            )
+            .await;
+            return;
+        };
+        if let Err(message) = self.ensure_index().await {
+            send(events, error(ErrorKind::Internal, message)).await;
+            return;
+        }
+        if let Err(message) = self.ensure_watcher() {
+            send(events, error(ErrorKind::Internal, message)).await;
+            return;
+        }
+        if self.shared().await.is_err() {
+            send(
+                events,
+                error(
+                    ErrorKind::ShuttingDown,
+                    "the daemon is shutting down".into(),
+                ),
+            )
+            .await;
+            return;
+        }
+        if !send(events, Event::Progress(Progress::Reconciling)).await {
+            return;
+        }
+        let barrier_start = Instant::now();
+        let (report, commit) = match self.barrier(&model, request.include_ignored, None).await {
+            Ok(done) => done,
+            Err(message) => {
+                send(events, error(ErrorKind::Search, message)).await;
+                return;
+            }
+        };
+        let barrier_us = barrier_start.elapsed().as_micros() as u64;
+
+        if self.retriever.is_none() {
+            let knn_threads = match performance_cores() {
+                Ok(cores) => NonZeroUsize::new(cores),
+                Err(e) => {
+                    send(events, error(ErrorKind::Internal, e.to_string())).await;
+                    return;
+                }
+            };
+            let Some(knn_threads) = knn_threads else {
+                send(
+                    events,
+                    error(ErrorKind::Internal, "no performance cores".into()),
+                )
+                .await;
+                return;
+            };
+            let handle = AneHandle {
+                worktree: self.id,
+                repo: self.repo,
+                model_id: model.id.clone(),
+                sched: model.scheduler.tx(),
+            };
+            match Retriever::new(
+                self.index.as_ref().expect("opened").clone(),
+                self.cache.clone().expect("opened above"),
+                handle,
+                self.root.clone(),
+                knn_threads,
+            ) {
+                Ok(retriever) => self.retriever = Some(retriever),
+                Err(e) => {
+                    send(events, error(ErrorKind::Internal, e.to_string())).await;
+                    return;
+                }
+            }
+        }
+        let core_request = search::Request {
+            query: request.query,
+            mode: request.mode.into(),
+            filters: search::Filters {
+                paths: request.paths,
+                langs: request.langs,
+                kinds: request.kinds,
+                symbol: request.symbol,
+            },
+            budget: request.budget as usize,
+            files_only: request.files_only,
+            include_ignored: request.include_ignored,
+        };
+        // Reset the accumulated query stats so a search reports only its own.
+        if let Err(()) = self.reset_stats(&model).await {
+            send(
+                events,
+                error(ErrorKind::ShuttingDown, "scheduler gone".into()),
+            )
+            .await;
+            return;
+        }
+        let counter = BudgetCounter::<B>(model.counter.clone());
+        // Only the retrieval cancels on a hang-up: the barrier above always
+        // runs to completion.
+        let result = tokio::select! {
+            result = self
+                .retriever
+                .as_mut()
+                .expect("built above")
+                .search(
+                    &core_request,
+                    Reconciliation::new(commit, &report),
+                    &counter,
+                ) => Some(result),
+            _ = events.closed() => None,
+        };
+        // The stats are taken on every path so a failed search cannot leak
+        // its wait or overtaken into the next one.
+        let stats = match self.take_stats(&model).await {
+            Ok(stats) => stats,
+            Err(()) => {
+                send(
+                    events,
+                    error(ErrorKind::ShuttingDown, "scheduler gone".into()),
+                )
+                .await;
+                return;
+            }
+        };
+        let Some(result) = result else {
+            return;
+        };
+        let results = match result {
+            Ok(results) => results,
+            Err(e) => {
+                let kind = match &e {
+                    search::Error::Embed(EmbedError::Model(_)) => ErrorKind::Model,
+                    search::Error::Embed(EmbedError::SchedulerGone) => ErrorKind::ShuttingDown,
+                    _ => ErrorKind::Search,
+                };
+                send(events, error(kind, e.to_string())).await;
+                return;
+            }
+        };
+        let answer = Answer {
+            output: match request.format {
+                Format::Text => results.to_text(),
+                Format::Json => results.to_json(),
+            },
+            has_results: !results.is_empty(),
+            stats: QueryStats {
+                barrier_us,
+                indexing_wait_us: stats.wait.as_micros() as u64,
+                indexing_overtaken: stats.overtaken,
+                embedded_on_the_spot: results.embedded_on_the_spot,
+                total_us: total_start.elapsed().as_micros() as u64,
+            },
+        };
+        let _ = send(events, Event::Final(Final::Answer(answer))).await;
+    }
+
+    /// Drops this worktree's accumulated query stats; `Err` when the
+    /// scheduler is gone.
+    async fn reset_stats(&self, model: &Arc<Model<B>>) -> Result<(), ()> {
+        model
+            .scheduler
+            .take_stats(self.id)
+            .await
+            .map(|_| ())
+            .map_err(|_| ())
+    }
+
+    /// Takes this worktree's accumulated query stats; `Err` when the
+    /// scheduler is gone.
+    async fn take_stats(&self, model: &Arc<Model<B>>) -> Result<super::scheduler::AneStats, ()> {
+        model.scheduler.take_stats(self.id).await.map_err(|_| ())
+    }
+
+    async fn index_request(&mut self, wait: bool, events: &mpsc::Sender<Event>) {
+        let Some(model) = self.ready() else {
+            send(
+                events,
+                error(ErrorKind::Model, "the model is not ready".into()),
+            )
+            .await;
+            return;
+        };
+        if let Err(message) = self.ensure_index().await {
+            send(events, error(ErrorKind::Internal, message)).await;
+            return;
+        }
+        if let Err(message) = self.ensure_watcher() {
+            send(events, error(ErrorKind::Internal, message)).await;
+            return;
+        }
+        if self.shared().await.is_err() {
+            send(
+                events,
+                error(
+                    ErrorKind::ShuttingDown,
+                    "the daemon is shutting down".into(),
+                ),
+            )
+            .await;
+            return;
+        }
+        if !send(events, Event::Progress(Progress::Reconciling)).await {
+            return;
+        }
+        let (ack_tx, ack_rx) = oneshot::channel::<()>();
+        let (report, _) = match self.barrier(&model, false, Some(ack_tx)).await {
+            Ok(done) => done,
+            Err(message) => {
+                send(events, error(ErrorKind::Internal, message)).await;
+                return;
+            }
+        };
+        let total = report.chunks_total;
+        if !wait {
+            let _ = send(
+                events,
+                Event::Final(Final::Indexed {
+                    with_vector: report.chunks_with_vector,
+                    total,
+                }),
+            )
+            .await;
+            return;
+        }
+        // The barrier's `Enqueue` must be in the scheduler's inbox before
+        // the `WatchCounts` the ack orders it behind; then the watch's seed
+        // already counts the enqueued items.
+        if ack_rx.await.is_err() {
+            send(
+                events,
+                error(ErrorKind::ShuttingDown, "scheduler gone".into()),
+            )
+            .await;
+            return;
+        }
+        let mut counts = match model.scheduler.watch_counts(self.id).await {
+            Ok(counts) => counts,
+            Err(_) => {
+                send(
+                    events,
+                    error(ErrorKind::ShuttingDown, "scheduler gone".into()),
+                )
+                .await;
+                return;
+            }
+        };
+        let index = self.index.as_ref().expect("opened").clone();
+        let cache = self.cache.clone().expect("opened above");
+        let hashes = match index.chunk_hashes(false).await {
+            Ok(hashes) => hashes,
+            Err(e) => {
+                send(events, error(ErrorKind::Internal, e.to_string())).await;
+                return;
+            }
+        };
+        let mut sent: Option<u64> = None;
+        let mut last_send_at: Option<Instant> = None;
+        let mut dirty = true;
+        loop {
+            let remaining = {
+                let counts = counts.borrow_and_update();
+                counts.queued_stage1 + counts.queued_background + counts.in_flight
+            };
+            if remaining == 0 {
+                break;
+            }
+            let throttled = last_send_at.is_some_and(|at| at.elapsed() < COVERAGE_INTERVAL);
+            if dirty && !throttled {
+                match self.measure(&cache, &hashes).await {
+                    Ok(with_vector) => {
+                        if sent != Some(with_vector) {
+                            if !send(
+                                events,
+                                Event::Progress(Progress::Coverage { with_vector, total }),
+                            )
+                            .await
+                            {
+                                return;
+                            }
+                            sent = Some(with_vector);
+                            last_send_at = Some(Instant::now());
+                        }
+                        dirty = false;
+                    }
+                    Err(message) => {
+                        send(events, error(ErrorKind::Internal, message)).await;
+                        return;
+                    }
+                }
+                continue;
+            }
+            // Wait for a counts change or, while a report is pending, the
+            // throttle deadline.
+            let deadline = last_send_at
+                .map(|at| at + COVERAGE_INTERVAL)
+                .unwrap_or_else(Instant::now);
+            tokio::select! {
+                changed = counts.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                    dirty = true;
+                }
+                _ = tokio::time::sleep_until(deadline.into()), if dirty => {}
+                _ = events.closed() => return,
+            }
+        }
+        // Every pending chunk is embedded; commit the last ones before
+        // answering so `Indexed` is a durable claim.
+        if self.writer.as_ref().expect("opened").flush().await.is_err() {
+            send(
+                events,
+                error(ErrorKind::Internal, "vector writer failed".into()),
+            )
+            .await;
+            return;
+        }
+        if self.phase == Phase::FirstIndex {
+            // Stage-1 completion is already in flight: the phase flips here
+            // rather than racing a `Status` sent right after.
+            tokio::select! {
+                done = self.stage1_rx.recv() => {
+                    if done.is_some() {
+                        self.apply_stage1_done().await;
+                    }
+                }
+                _ = events.closed() => return,
+            }
+        }
+        // `Indexed` is measured, not asserted: what the cache holds now.
+        match self.measure(&cache, &hashes).await {
+            Ok(with_vector) => {
+                let _ = send(events, Event::Final(Final::Indexed { with_vector, total })).await;
+            }
+            Err(message) => {
+                send(events, error(ErrorKind::Internal, message)).await;
+            }
+        }
+    }
+
+    /// Rows of `hashes` with a cached vector — the coverage count as
+    /// reconcile computes it.
+    async fn measure(
+        &self,
+        cache: &VectorCache,
+        hashes: &[repo_search_core::store::ContentHash],
+    ) -> Result<u64, String> {
+        let cached = cache
+            .cached(&self.model_id, hashes)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(hashes.iter().filter(|hash| cached.contains(hash)).count() as u64)
+    }
+
+    async fn status(&mut self, events: &mpsc::Sender<Event>) {
+        let db = self.root.join(".repo-search/index.db");
+        let index_exists = match tokio::fs::try_exists(&db).await {
+            Ok(exists) => exists,
+            Err(e) => {
+                send(events, error(ErrorKind::Internal, e.to_string())).await;
+                return;
+            }
+        };
+        // A `Status` never creates an index: only an existing file is opened,
+        // and an opened handle is checked against the file on disk.
+        if index_exists && let Err(message) = self.verify_index().await {
+            send(events, error(ErrorKind::Internal, message)).await;
+            return;
+        }
+        if index_exists && let Err(message) = self.ensure_index().await {
+            send(events, error(ErrorKind::Internal, message)).await;
+            return;
+        }
+        let sched = self.ready().map(|m| m.scheduler.clone());
+        let id = self.id;
+        let counts = async {
+            match &sched {
+                Some(sched) => sched.counts_for(id).await,
+                None => Ok(Default::default()),
+            }
+        };
+        let gpu = async {
+            match &sched {
+                Some(sched) => sched.gpu_status().await,
+                None => Ok(GpuState::Absent { blocked: None }),
+            }
+        };
+        let index = if index_exists {
+            self.index.clone()
+        } else {
+            None
+        };
+        let index_reads = async {
+            match &index {
+                Some(index) => {
+                    let (phase, hashes) = tokio::join!(index.phase(), index.chunk_hashes(false));
+                    Some((phase, hashes))
+                }
+                None => None,
+            }
+        };
+        // Independent reads run together; `cached` waits on `hashes`.
+        let (reads, counts, gpu, worktrees) =
+            tokio::join!(index_reads, counts, gpu, self.registry.count());
+        let (Ok(counts), Ok(gpu), Some(worktrees)) = (counts, gpu, worktrees) else {
+            send(events, shutting_down()).await;
+            return;
+        };
+        let index_status = match reads {
+            None => None,
+            Some((phase, hashes)) => {
+                let (phase, hashes) = match (phase, hashes) {
+                    (Ok(phase), Ok(hashes)) => (phase, hashes),
+                    (Err(e), _) => {
+                        send(events, error(ErrorKind::Internal, e.to_string())).await;
+                        return;
+                    }
+                    (_, Err(e)) => {
+                        send(events, error(ErrorKind::Internal, e.to_string())).await;
+                        return;
+                    }
+                };
+                // The scheduler already completed stage 1 but its
+                // `Stage1Done` has not been applied: wait for it so `Status`
+                // never reports a phase older than the scheduler's own.
+                let mut phase = phase;
+                if counts.stage1_done && phase == Phase::FirstIndex {
+                    if self.stage1_rx.recv().await.is_none() {
+                        send(events, shutting_down()).await;
+                        return;
+                    }
+                    self.apply_stage1_done().await;
+                    phase = self.phase;
+                }
+                let cached = match self.shared().await {
+                    Ok((cache, _)) => cache.cached(&self.model_id, &hashes).await,
+                    Err(message) => {
+                        send(events, error(ErrorKind::Internal, message)).await;
+                        return;
+                    }
+                };
+                let cached = match cached {
+                    Ok(cached) => cached,
+                    Err(e) => {
+                        send(events, error(ErrorKind::Internal, e.to_string())).await;
+                        return;
+                    }
+                };
+                Some(IndexStatus {
+                    phase: WirePhase::from(phase),
+                    chunks_total: hashes.len() as u64,
+                    chunks_with_vector: hashes.iter().filter(|hash| cached.contains(hash)).count()
+                        as u64,
+                    queued_stage1: counts.queued_stage1,
+                    queued_background: counts.queued_background,
+                    in_flight: counts.in_flight,
+                })
+            }
+        };
+        let model = match &*self.model.borrow() {
+            ModelState::Absent => ModelStatus::Downloading {
+                received: 0,
+                total: None,
+            },
+            ModelState::Downloading { received, total } => ModelStatus::Downloading {
+                received: *received,
+                total: *total,
+            },
+            ModelState::Loading => ModelStatus::Loading,
+            ModelState::Ready(model) => ModelStatus::Ready {
+                model_id: model.id.clone(),
+            },
+            ModelState::Failed(message) | ModelState::Fatal(message) => ModelStatus::Failed {
+                message: message.clone(),
+            },
+        };
+        let gpu = match gpu {
+            GpuState::Absent { blocked } => crate::protocol::GpuStatus::Absent { blocked },
+            GpuState::Loading => crate::protocol::GpuStatus::Loading,
+            GpuState::Running => crate::protocol::GpuStatus::Running,
+        };
+        let report = StatusReport {
+            worktree: self.root.clone(),
+            index: index_status,
+            model,
+            daemon: crate::protocol::DaemonStatus {
+                version: env!("CARGO_PKG_VERSION").to_owned(),
+                pid: std::process::id(),
+                uptime_s: self.started.elapsed().as_secs(),
+                worktrees,
+                gpu,
+            },
+        };
+        let _ = send(events, Event::Final(Final::Status(report))).await;
+    }
+
+    /// The freshness barrier: flush the writer, then `reconcile` and
+    /// `git rev-parse HEAD` concurrently, then hand the pending chunks to
+    /// the counting pool and the scheduler — spawned, so a query never
+    /// waits on the enqueue. It never cancels: its busy marker is cleared
+    /// only by its own completion message.
+    async fn barrier(
+        &mut self,
+        model: &Arc<Model<B>>,
+        include_ignored: bool,
+        ack: Option<oneshot::Sender<()>>,
+    ) -> Result<(Report, String), String> {
+        self.verify_index().await?;
+        let sched = model.scheduler.clone();
+        sched.barrier(self.id, true).await;
+        match self.barrier_steps(model, include_ignored).await {
+            Ok((report, commit, pending)) => {
+                self.report = Some(report.clone());
+                self.commit = commit.clone();
+                let counter = model.counter.clone();
+                let writer = self.writer.clone().expect("opened");
+                let stage1_done = self.stage1_tx.clone();
+                let worktree = self.id;
+                let repo = self.repo;
+                let class = match self.phase {
+                    Phase::FirstIndex => IndexClass::Stage1,
+                    Phase::Maintained => IndexClass::Background,
+                };
+                self.generation += 1;
+                let generation = self.generation;
+                let sched2 = sched.clone();
+                tokio::spawn(async move {
+                    let items = match count_pending::<B>(pending, counter).await {
+                        Ok(items) => items,
+                        Err(error) => {
+                            tracing::error!(%error, "counting pending chunks failed");
+                            sched2.barrier(worktree, false).await;
+                            return;
+                        }
+                    };
+                    let _ = sched2
+                        .enqueue(Enqueue {
+                            worktree,
+                            repo,
+                            class,
+                            generation,
+                            items,
+                            writer,
+                            stage1_done,
+                        })
+                        .await;
+                    if let Some(ack) = ack {
+                        let _ = ack.send(());
+                    }
+                    sched2.barrier(worktree, false).await;
+                });
+                Ok((report, commit))
+            }
+            Err(message) => {
+                drop(ack);
+                sched.barrier(self.id, false).await;
+                Err(message)
+            }
+        }
+    }
+
+    async fn barrier_steps(
+        &mut self,
+        model: &Arc<Model<B>>,
+        include_ignored: bool,
+    ) -> Result<(Report, String, Vec<PendingChunk>), String> {
+        self.writer
+            .as_ref()
+            .expect("opened")
+            .flush()
+            .await
+            .map_err(|e| format!("vector writer flush: {e}"))?;
+        let index = self.index.as_ref().expect("opened").clone();
+        let cache = self.cache.clone().expect("opened");
+        let model_id = model.id.clone();
+        let root = self.root.clone();
+        let counter = model.counter.clone();
+        let (reconciled, head) = tokio::join!(
+            reconcile::reconcile(
+                &index,
+                &cache,
+                &model_id,
+                CHUNKER_FINGERPRINT,
+                &root,
+                reconcile::Options { include_ignored },
+                counter,
+            ),
+            tokio::process::Command::new("git")
+                .arg("-C")
+                .arg(&self.root)
+                .args(["rev-parse", "HEAD"])
+                .output(),
+        );
+        let reconciled = reconciled.map_err(|e| e.to_string())?;
+        let head = head.map_err(|e| e.to_string())?;
+        if !head.status.success() {
+            return Err(format!(
+                "git rev-parse HEAD failed: {}",
+                String::from_utf8_lossy(&head.stderr)
+            ));
+        }
+        let commit = String::from_utf8_lossy(&head.stdout).trim().to_owned();
+        Ok((reconciled.report, commit, reconciled.pending))
+    }
+
+    /// A watcher burst: the same barrier as a query, answered nowhere and
+    /// always without ignored files.
+    async fn changed(&mut self) {
+        let Some(model) = self.ready() else {
+            return;
+        };
+        if let Err(error) = self.ensure_index().await {
+            tracing::error!(%error, root = %self.root.display(), "watcher barrier: index failed");
+            return;
+        }
+        if let Err(error) = self.shared().await {
+            tracing::error!(%error, root = %self.root.display(), "watcher barrier: shared state failed");
+            return;
+        }
+        if let Err(error) = self.barrier(&model, false, None).await {
+            tracing::error!(%error, root = %self.root.display(), "watcher barrier failed");
+        }
+    }
+
+    /// `Stage1Done`: the scheduler flushed every stage-1 vector. The
+    /// transition is idempotent — a `Stage1` `Enqueue` landing after
+    /// completion can deliver it twice.
+    async fn apply_stage1_done(&mut self) {
+        if self.phase == Phase::Maintained {
+            return;
+        }
+        let Some(index) = &self.index else {
+            return;
+        };
+        match index.set_phase(Phase::Maintained).await {
+            Ok(()) => self.phase = Phase::Maintained,
+            Err(error) => {
+                tracing::error!(%error, "set_phase(maintained) failed; the worktree stays first-index")
+            }
+        }
+    }
+}
+
+/// `(dev, ino)` of a file's metadata.
+fn file_id(meta: &std::fs::Metadata) -> (u64, u64) {
+    use std::os::unix::fs::MetadataExt;
+    (meta.dev(), meta.ino())
+}
+
+/// Sends `event` unless the request's client hung up.
+async fn send(events: &mpsc::Sender<Event>, event: Event) -> bool {
+    events.send(event).await.is_ok()
+}
+
+fn error(kind: ErrorKind, message: String) -> Event {
+    Event::Final(Final::Error(ErrorReport { kind, message }))
+}
+
+fn shutting_down() -> Event {
+    error(
+        ErrorKind::ShuttingDown,
+        "the daemon is shutting down".to_owned(),
+    )
+}
+
+/// The output-budget counter over the model's tokenizer.
+struct BudgetCounter<B: Backend>(Arc<B::Counter>);
+
+impl<B: Backend> search::TokenCounter for BudgetCounter<B> {
+    fn count(&self, text: &str) -> usize {
+        self.0.count(text)
+    }
+}
+
+/// The `Retriever`'s embedder: query work goes to the scheduler as
+/// [`QueryJob`]s, so the ANE thread shares queries and indexing and the GPU
+/// can never serve a query.
+#[derive(Clone)]
+struct AneHandle {
+    worktree: WorktreeId,
+    repo: RepoId,
+    model_id: String,
+    sched: mpsc::Sender<SchedulerMsg>,
+}
+
+impl EmbedService for AneHandle {
+    type Error = EmbedError;
+
+    fn model_id(&self) -> &str {
+        &self.model_id
+    }
+
+    async fn query(&self, task: QueryTask, text: String) -> Result<UnitVector, Self::Error> {
+        let (reply, rx) = oneshot::channel();
+        self.sched
+            .send(SchedulerMsg::Query(Box::new(QueryJob::Query {
+                worktree: self.worktree,
+                task,
+                text,
+                enqueued: Instant::now(),
+                stamp: 0,
+                reply,
+            })))
+            .await
+            .map_err(|_| EmbedError::SchedulerGone)?;
+        rx.await.map_err(|_| EmbedError::SchedulerGone)?
+    }
+
+    async fn documents(&self, chunks: Vec<PendingChunk>) -> Result<Vec<UnitVector>, Self::Error> {
+        let (reply, rx) = oneshot::channel();
+        self.sched
+            .send(SchedulerMsg::Query(Box::new(QueryJob::Documents {
+                worktree: self.worktree,
+                repo: self.repo,
+                chunks,
+                enqueued: Instant::now(),
+                stamp: 0,
+                reply,
+            })))
+            .await
+            .map_err(|_| EmbedError::SchedulerGone)?;
+        rx.await.map_err(|_| EmbedError::SchedulerGone)?
+    }
+}
+
+/// Counts each pending chunk's document tokens on a scoped worker pool of
+/// `performance_cores()` threads, off the executor.
+async fn count_pending<B: Backend>(
+    pending: Vec<PendingChunk>,
+    counter: Arc<B::Counter>,
+) -> Result<Vec<PendingItem>, String> {
+    if pending.is_empty() {
+        return Ok(Vec::new());
+    }
+    let threads = performance_cores()
+        .map_err(|e| e.to_string())?
+        .min(pending.len());
+    let (tx, rx) = oneshot::channel();
+    std::thread::spawn(move || {
+        let size = pending.len().div_ceil(threads);
+        std::thread::scope(|s| {
+            let handles: Vec<_> = pending
+                .chunks(size)
+                .map(|slice| {
+                    let counter = &counter;
+                    s.spawn(move || {
+                        slice
+                            .iter()
+                            .map(|chunk| PendingItem {
+                                tokens: u32::try_from(
+                                    counter.document_tokens(&chunk.title, &chunk.text),
+                                )
+                                .expect("a chunk is capped at 512 tokens"),
+                                chunk: chunk.clone(),
+                            })
+                            .collect::<Vec<PendingItem>>()
+                    })
+                })
+                .collect();
+            let items: Vec<PendingItem> = handles
+                .into_iter()
+                .flat_map(|handle| handle.join().expect("counting thread"))
+                .collect();
+            let _ = tx.send(items);
+        });
+    });
+    Ok(rx.await.expect("the counting pool answers"))
+}

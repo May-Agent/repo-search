@@ -843,3 +843,34 @@ fn the_extension_filter_is_ascii_case_insensitive() {
         )]
     );
 }
+
+#[test]
+fn the_phase_defaults_to_first_index_and_survives_reopen_and_realignment() {
+    use repo_search_core::store::Phase;
+
+    let dir = tempfile::tempdir().unwrap();
+    let index = block_on(Index::open(dir.path())).unwrap();
+    assert_eq!(block_on(index.phase()).unwrap(), Phase::FirstIndex);
+    assert!(matches!(
+        block_on(index.set_phase(Phase::Maintained)),
+        Err(store::Error::NotAligned)
+    ));
+    block_on(index.align_chunker("chunker-a", "model")).unwrap();
+    assert_eq!(block_on(index.phase()).unwrap(), Phase::FirstIndex);
+    block_on(index.set_phase(Phase::Maintained)).unwrap();
+    drop(index);
+
+    let index = block_on(Index::open(dir.path())).unwrap();
+    assert_eq!(block_on(index.phase()).unwrap(), Phase::Maintained);
+    // A chunker change re-chunks but keeps the phase.
+    block_on(index.align_chunker("chunker-b", "model")).unwrap();
+    assert_eq!(block_on(index.phase()).unwrap(), Phase::Maintained);
+    drop(index);
+
+    // A database at another schema version is rebuilt, phase included.
+    let conn = rusqlite::Connection::open(index_db(dir.path())).unwrap();
+    conn.pragma_update(None, "user_version", 5_i64).unwrap();
+    drop(conn);
+    let index = block_on(Index::open(dir.path())).unwrap();
+    assert_eq!(block_on(index.phase()).unwrap(), Phase::FirstIndex);
+}
