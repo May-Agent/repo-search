@@ -6,6 +6,10 @@
 
 #![cfg(target_os = "macos")]
 
+// `daemon.rs` uses `wait_for_exit`; this file only watches stdin.
+#[allow(dead_code)]
+#[path = "support/host.rs"]
+mod host;
 #[path = "support/model.rs"]
 mod model;
 
@@ -126,6 +130,7 @@ async fn daemon_host_coreml() {
     let raw = std::env::var("REPO_SEARCH_TEST_HOST")
         .expect("REPO_SEARCH_TEST_HOST is set by kill_and_resume_on_the_model");
     let config: HostConfig = serde_json::from_str(&raw).expect("HostConfig json");
+    host::watch_stdin();
     let store =
         ModelStore::new(config.model_cache, ModelSpec::embedding_gemma_2()).expect("model store");
     let listener = UnixListener::bind(&config.socket).expect("socket binds");
@@ -141,9 +146,13 @@ async fn daemon_host_coreml() {
     .expect("the host runs");
 }
 
-/// A spawned `daemon_host_coreml`: the child, reaped on drop.
+/// A spawned `daemon_host_coreml`: the child, reaped on drop, and the
+/// write end of the lifeline its stdin watch reads.
 struct Host {
     child: std::process::Child,
+    /// Held open and never written: the host exits when this end closes,
+    /// however the holding process dies.
+    _stdin: std::process::ChildStdin,
 }
 
 impl Host {
@@ -163,10 +172,12 @@ impl Host {
                 "REPO_SEARCH_TEST_HOST",
                 serde_json::to_string(config).expect("HostConfig json"),
             )
+            .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::inherit())
             .spawn()
             .expect("the daemon host spawns");
+        let stdin = child.stdin.take().expect("piped");
         let (ready_tx, ready) = std::sync::mpsc::channel();
         let stdout = child.stdout.take().expect("piped");
         std::thread::spawn(move || {
@@ -185,7 +196,10 @@ impl Host {
                 .recv_timeout(model::TIMEOUT)
                 .expect("the host prints READY after binding");
         });
-        Self { child }
+        Self {
+            child,
+            _stdin: stdin,
+        }
     }
 
     fn kill(&mut self) {

@@ -6,6 +6,10 @@
 
 #![cfg(target_os = "macos")]
 
+// `daemon.rs` uses `watch_stdin`; this file only waits for exits.
+#[allow(dead_code)]
+#[path = "support/host.rs"]
+mod host;
 #[path = "support/model.rs"]
 mod model;
 // `daemon.rs` uses the rest of the fixture.
@@ -19,58 +23,6 @@ use std::time::{Duration, Instant};
 use askama::Template;
 use repo_search::launchd::{LABEL, LaunchAgent};
 use repo_search::protocol::{Final, Request};
-
-/// Waits for `pid` to exit through a kqueue `EVFILT_PROC`/`NOTE_EXIT`
-/// registration — event-driven, not polled. Returns `false` on timeout.
-fn wait_for_exit(pid: u32, timeout: Duration) -> bool {
-    // SAFETY: kqueue() has no preconditions.
-    let kq = unsafe { libc::kqueue() };
-    assert!(
-        kq >= 0,
-        "kqueue failed: {}",
-        std::io::Error::last_os_error()
-    );
-    let change = libc::kevent {
-        ident: pid as libc::uintptr_t,
-        filter: libc::EVFILT_PROC,
-        flags: libc::EV_ADD | libc::EV_ONESHOT,
-        fflags: libc::NOTE_EXIT,
-        data: 0,
-        udata: std::ptr::null_mut(),
-    };
-    let mut event = libc::kevent {
-        ident: 0,
-        filter: 0,
-        flags: 0,
-        fflags: 0,
-        data: 0,
-        udata: std::ptr::null_mut(),
-    };
-    let deadline = libc::timespec {
-        tv_sec: timeout.as_secs() as libc::time_t,
-        tv_nsec: libc::c_long::from(timeout.subsec_nanos()),
-    };
-    // SAFETY: `kq` is a live kqueue fd; `change` and `event` name valid
-    // kevent structs of the counts given.
-    let n = unsafe { libc::kevent(kq, &change, 1, &mut event, 1, &deadline) };
-    // SAFETY: `kq` is owned by this call.
-    unsafe { libc::close(kq) };
-    match n {
-        1 => {
-            if event.flags & libc::EV_ERROR != 0 {
-                // Registration failed after the process went away.
-                return event.data == libc::ESRCH as libc::intptr_t;
-            }
-            true
-        }
-        0 => false,
-        _ => match std::io::Error::last_os_error().raw_os_error() {
-            // The process exited before the registration: that is the event.
-            Some(libc::ESRCH) => true,
-            other => panic!("kevent failed: {other:?}"),
-        },
-    }
-}
 
 /// Waits for `path` to appear through a kqueue `EVFILT_VNODE`/`NOTE_WRITE`
 /// watch on its parent directory — event-driven, not polled. `launchctl
@@ -243,7 +195,8 @@ async fn relaunch_after_idle_exit() {
     );
     let first = daemon_pid(&socket, &repo.root).await;
 
-    let exited = tokio::task::block_in_place(|| wait_for_exit(first, Duration::from_secs(30)));
+    let exited =
+        tokio::task::block_in_place(|| host::wait_for_exit(first, Duration::from_secs(30)));
     assert!(exited, "the daemon did not exit within 30 s of going idle");
 
     let events = model::request(&socket, model::search(&repo.root, "a function")).await;
