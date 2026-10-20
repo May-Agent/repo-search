@@ -1283,6 +1283,7 @@ async fn daemon_host() {
     let raw = std::env::var("REPO_SEARCH_TEST_HOST")
         .expect("REPO_SEARCH_TEST_HOST is set by kill_mid_index_resumes");
     let config: HostConfig = serde_json::from_str(&raw).expect("HostConfig json");
+    support::host::watch_stdin();
     let (records_tx, records) = mpsc::channel::<Record>();
     let mut backend = StubBackend::new(records_tx);
     backend.set_instance_delay(Instance::Ane, Duration::from_millis(config.ane_delay_ms));
@@ -1318,9 +1319,13 @@ async fn daemon_host() {
     .expect("the host runs");
 }
 
-/// A spawned `daemon_host`: the child and its records.
+/// A spawned `daemon_host`: the child, the write end of the lifeline its
+/// stdin watch reads, and its records.
 struct Host {
     child: std::process::Child,
+    /// Held open and never written: the host exits when this end closes,
+    /// however the holding process dies.
+    _stdin: std::process::ChildStdin,
     records: mpsc::Receiver<HostRecord>,
 }
 
@@ -1341,10 +1346,12 @@ impl Host {
                 "REPO_SEARCH_TEST_HOST",
                 serde_json::to_string(config).unwrap(),
             )
+            .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::inherit())
             .spawn()
             .expect("the daemon host spawns");
+        let stdin = child.stdin.take().expect("piped");
         let (ready_tx, ready) = mpsc::channel();
         let (tx, records) = mpsc::channel();
         let stdout = child.stdout.take().expect("piped");
@@ -1372,7 +1379,11 @@ impl Host {
                 .recv_timeout(TIMEOUT)
                 .expect("the host prints READY after binding");
         });
-        Self { child, records }
+        Self {
+            child,
+            _stdin: stdin,
+            records,
+        }
     }
 
     fn kill(&mut self) {
@@ -1394,6 +1405,93 @@ impl Drop for Host {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+/// A re-executed helper test: the intermediate process between the test
+/// and a `daemon_host`. Its stdout lines stream into `lines`, it watches
+/// its own stdin lifeline through the helper it runs, and the child is
+/// killed and reaped on drop.
+struct Intermediate {
+    child: std::process::Child,
+    lines: mpsc::Receiver<String>,
+}
+
+impl Intermediate {
+    /// Re-executes the test binary on the ignored `host_parent` helper
+    /// with `config` in `REPO_SEARCH_TEST_HOST`: stdin piped for the
+    /// helper's own stdin watch, stdout piped for its `TAG value` lines.
+    fn spawn(config: &HostConfig) -> Self {
+        let exe = std::env::current_exe().expect("the test binary");
+        let mut child = std::process::Command::new(exe)
+            .args([
+                "--exact",
+                "host_parent",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(
+                "REPO_SEARCH_TEST_HOST",
+                serde_json::to_string(config).unwrap(),
+            )
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::inherit())
+            .spawn()
+            .expect("the intermediate spawns");
+        let (tx, lines) = mpsc::channel();
+        let stdout = child.stdout.take().expect("piped");
+        let mut stdout = std::io::BufReader::new(stdout);
+        std::thread::spawn(move || {
+            use std::io::BufRead as _;
+            let mut line = String::new();
+            while let Ok(n) = stdout.read_line(&mut line) {
+                if n == 0 {
+                    break;
+                }
+                let _ = tx.send(line.trim_end().to_owned());
+                line.clear();
+            }
+        });
+        Self { child, lines }
+    }
+
+    /// The value after `tag` on the next stdout line carrying it.
+    fn tagged(&self, tag: &str) -> String {
+        loop {
+            let line = self
+                .lines
+                .recv_timeout(TIMEOUT)
+                .expect("the intermediate prints its line within the timeout");
+            if let Some(value) = line.strip_prefix(tag) {
+                return value.trim().to_owned();
+            }
+        }
+    }
+}
+
+impl Drop for Intermediate {
+    /// A panicking test must not leave the intermediate parked.
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// The ignored test re-executed as `host_exits_when_its_parent_is_killed`'s
+/// intermediate: spawns a `daemon_host`, prints `PID <pid>` for the outer
+/// test, then waits to be killed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "re-executed by host_exits_when_its_parent_is_killed"]
+async fn host_parent() {
+    support::host::watch_stdin();
+    let raw = std::env::var("REPO_SEARCH_TEST_HOST")
+        .expect("REPO_SEARCH_TEST_HOST is set by host_exits_when_its_parent_is_killed");
+    let config: HostConfig = serde_json::from_str(&raw).expect("HostConfig json");
+    let host = Host::spawn(&config);
+    // The harness left its `test ... ` prefix unterminated on this line.
+    println!("\nPID {}", host.child.id());
+    std::future::pending::<()>().await;
 }
 
 /// Sends `request` and returns the live event stream, uncollected.
@@ -1632,4 +1730,36 @@ async fn kill_mid_index_resumes() {
             embedded += 1;
         }
     }
+}
+
+/// The stdin watch ends a host whose parent dies without unwinding: the
+/// intermediate is SIGKILLed and its `daemon_host` — which the lifeline
+/// alone can now stop — exits on its own.
+#[test]
+fn host_exits_when_its_parent_is_killed() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let model_cache = tmp.path().join("models");
+    let spec = ModelSpec {
+        url: "http://127.0.0.1:1/unused".into(),
+        sha256: sha_7(),
+    };
+    let store = ModelStore::new(model_cache.clone(), spec).expect("model store");
+    std::fs::create_dir_all(store.dir()).expect("cached model dir");
+    let mut parent = Intermediate::spawn(&HostConfig {
+        socket: tmp.path().join("daemon.sock"),
+        model_cache,
+        ane_delay_ms: 0,
+        gpu_delay_ms: 0,
+    });
+    let pid: u32 = parent
+        .tagged("PID")
+        .parse()
+        .expect("the intermediate prints the host's pid");
+
+    parent.child.kill().expect("SIGKILL");
+    parent.child.wait().expect("wait");
+    assert!(
+        support::host::wait_for_exit(pid, Duration::from_secs(30)),
+        "the host outlived a SIGKILLed parent"
+    );
 }
