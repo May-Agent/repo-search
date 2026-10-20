@@ -21,7 +21,7 @@ use std::time::Duration;
 use repo_search::daemon::coreml::CoreMlBackend;
 use repo_search::daemon::{self, Config};
 use repo_search::model_store::{ModelSpec, ModelStore};
-use repo_search::protocol::Final;
+use repo_search::protocol::{Final, Request};
 use tokio::net::UnixListener;
 
 /// The corpus queries: behaviour descriptions, in the spirit of what a
@@ -89,6 +89,10 @@ async fn stage_1_query_on_the_ane() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "real model and a real kill; the release gate runs it"]
 async fn kill_and_resume_on_the_model() {
+    let _ = tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_max_level(tracing::Level::INFO)
+        .try_init();
     let tmp = tempfile::tempdir().expect("tmp");
     let worktree = model::clone_corpus(&tmp);
     let model_cache = tmp.path().join("models");
@@ -100,12 +104,32 @@ async fn kill_and_resume_on_the_model() {
     };
 
     let mut host = Host::spawn(&host_config("daemon1.sock"));
-    let mut stream = model::index_wait(&tmp.path().join("daemon1.sock"), &worktree).await;
+    let socket = tmp.path().join("daemon1.sock");
+    let mut stream = model::index_wait(&socket, &worktree).await;
     model::await_coverage(&mut stream, 500).await;
     drop(stream);
+
+    // A non-waiting index request runs the barrier, whose first step
+    // flushes the vector writer; its `Final` landing means every embedded
+    // chunk is committed, not still buffered.
+    let events = model::request(
+        &socket,
+        Request::Index {
+            worktree: worktree.clone(),
+            wait: false,
+        },
+    )
+    .await;
+    match model::final_of(&events) {
+        Final::Indexed { .. } => {}
+        other => panic!("the flush request failed: {other:?}"),
+    }
     host.kill();
 
     let committed = model::committed(&worktree, &worktree.join(".git"), &model_id).await;
+    tracing::info!(committed, "committed vectors after the flush");
+    // The barrier flushed the writer, so the 500 chunks coverage reported
+    // are committed on disk.
     assert!(committed >= 500, "{committed} committed vectors");
 
     let _host = Host::spawn(&host_config("daemon2.sock"));
