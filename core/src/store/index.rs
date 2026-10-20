@@ -15,7 +15,7 @@ use super::{
 };
 
 /// Schema generation; a database at any other version is deleted and rebuilt.
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 
 /// One file's change inside an atomic batch.
 #[derive(Debug)]
@@ -25,15 +25,16 @@ pub enum FileChange {
     Replace(FileState, Vec<ChunkRecord>),
     /// The file is gone from the worktree.
     Remove(String),
-    /// The file's bytes are unchanged but its stat fingerprint moved; the
-    /// stored chunks stay and only the fingerprint is rewritten. The path must
+    /// The file's bytes are unchanged but its stat fingerprint or ignored flag
+    /// moved; the stored chunks stay and only the fingerprint and flag are
+    /// rewritten. The path must
     /// already be stored.
     Restamp(FileState),
     /// The file fails to chunk: replaces whatever was stored for its path,
     /// chunks included, with an unchunkable record.
     Unchunkable(Unchunkable),
     /// An unchunkable file's bytes are unchanged but its stat fingerprint
-    /// moved; only the fingerprint is rewritten. The path must already be
+    /// or ignored flag moved; only those are rewritten. The path must already be
     /// recorded as unchunkable.
     RestampUnchunkable(FileState),
 }
@@ -94,6 +95,7 @@ enum Request {
         reply: oneshot::Sender<Result<Applied, Error>>,
     },
     ChunkHashes {
+        include_ignored: bool,
         reply: oneshot::Sender<Result<Vec<ContentHash>, Error>>,
     },
     ChunksByHash {
@@ -102,6 +104,9 @@ enum Request {
     },
     FileStates {
         reply: oneshot::Sender<Result<Vec<FileState>, Error>>,
+    },
+    HasIgnored {
+        reply: oneshot::Sender<Result<bool, Error>>,
     },
     Unchunkables {
         reply: oneshot::Sender<Result<Vec<Unchunkable>, Error>>,
@@ -128,6 +133,7 @@ enum Request {
     },
     Count {
         side: Side,
+        include_ignored: bool,
         reply: oneshot::Sender<Result<u64, Error>>,
     },
     HashSides {
@@ -219,6 +225,16 @@ impl Index {
         send_and_wait(&self.tx, |reply| Request::FileStates { reply }).await
     }
 
+    /// Whether any indexed file is present only because a pass included
+    /// ignored files; with none, a search has nothing to hide.
+    ///
+    /// # Errors
+    ///
+    /// When SQLite rejects the read or the actor is gone.
+    pub async fn has_ignored(&self) -> Result<bool, Error> {
+        send_and_wait(&self.tx, |reply| Request::HasIgnored { reply }).await
+    }
+
     /// Every file recorded as unchunkable, for reconcile to diff the worktree
     /// walk against.
     ///
@@ -265,13 +281,18 @@ impl Index {
     }
 
     /// The content hash of every stored chunk, one entry per chunk row in
-    /// index order; reconcile checks them against the vector cache.
+    /// index order; reconcile checks them against the vector cache. Chunks of
+    /// ignored files are listed only when `include_ignored`.
     ///
     /// # Errors
     ///
     /// When SQLite rejects the read or the actor is gone.
-    pub async fn chunk_hashes(&self) -> Result<Vec<ContentHash>, Error> {
-        send_and_wait(&self.tx, |reply| Request::ChunkHashes { reply }).await
+    pub async fn chunk_hashes(&self, include_ignored: bool) -> Result<Vec<ContentHash>, Error> {
+        send_and_wait(&self.tx, |reply| Request::ChunkHashes {
+            include_ignored,
+            reply,
+        })
+        .await
     }
 
     /// Up to `limit` chunks matching the FTS5 expression `query` and `filter`,
@@ -324,13 +345,19 @@ impl Index {
         send_and_wait(&self.tx, |reply| Request::Chunks { ids, reply }).await
     }
 
-    /// The number of chunk rows on `side`.
+    /// The number of chunk rows on `side`, those of ignored files only when
+    /// `include_ignored`.
     ///
     /// # Errors
     ///
     /// When SQLite rejects the read or the actor is gone.
-    pub async fn count(&self, side: Side) -> Result<u64, Error> {
-        send_and_wait(&self.tx, |reply| Request::Count { side, reply }).await
+    pub async fn count(&self, side: Side, include_ignored: bool) -> Result<u64, Error> {
+        send_and_wait(&self.tx, |reply| Request::Count {
+            side,
+            include_ignored,
+            reply,
+        })
+        .await
     }
 
     /// Every distinct chunk content hash with the side its chunks are on.
@@ -417,6 +444,9 @@ fn serve(mut conn: Connection, mut rx: mpsc::Receiver<Request>) {
             Request::FileStates { reply } => {
                 let _ = reply.send(file_states(&conn));
             }
+            Request::HasIgnored { reply } => {
+                let _ = reply.send(has_ignored(&conn));
+            }
             Request::Unchunkables { reply } => {
                 let _ = reply.send(unchunkables(&conn));
             }
@@ -430,8 +460,11 @@ fn serve(mut conn: Connection, mut rx: mpsc::Receiver<Request>) {
             Request::ChunksByHash { hashes, reply } => {
                 let _ = reply.send(chunks_by_hash(&conn, &hashes));
             }
-            Request::ChunkHashes { reply } => {
-                let _ = reply.send(chunk_hashes(&conn));
+            Request::ChunkHashes {
+                include_ignored,
+                reply,
+            } => {
+                let _ = reply.send(chunk_hashes(&conn, include_ignored));
             }
             Request::Bm25 {
                 query,
@@ -451,8 +484,12 @@ fn serve(mut conn: Connection, mut rx: mpsc::Receiver<Request>) {
             Request::Chunks { ids, reply } => {
                 let _ = reply.send(query::chunks(&conn, &ids));
             }
-            Request::Count { side, reply } => {
-                let _ = reply.send(query::count(&conn, side));
+            Request::Count {
+                side,
+                include_ignored,
+                reply,
+            } => {
+                let _ = reply.send(query::count(&conn, side, include_ignored));
             }
             Request::HashSides { reply } => {
                 let _ = reply.send(query::hash_sides(&conn));
@@ -530,14 +567,15 @@ fn align(conn: &mut Connection, chunker: &str, model_id: &str) -> Result<bool, E
 
 fn restamp(tx: &Transaction<'_>, state: &FileState) -> Result<(), Error> {
     let updated = tx.execute(
-        "UPDATE files SET size = ?2, mtime_ns = ?3, inode = ?4, content_hash = ?5 \
-         WHERE path = ?1",
+        "UPDATE files SET size = ?2, mtime_ns = ?3, inode = ?4, content_hash = ?5, \
+         ignored = ?6 WHERE path = ?1",
         params![
             state.path,
             i64_of(state.size)?,
             state.mtime_ns,
             i64_of(state.inode)?,
-            state.content_hash
+            state.content_hash,
+            state.ignored
         ],
     )?;
     if updated == 1 {
@@ -549,14 +587,15 @@ fn restamp(tx: &Transaction<'_>, state: &FileState) -> Result<(), Error> {
 
 fn restamp_unchunkable(tx: &Transaction<'_>, state: &FileState) -> Result<(), Error> {
     let updated = tx.execute(
-        "UPDATE unchunkable SET size = ?2, mtime_ns = ?3, inode = ?4, content_hash = ?5 \
-         WHERE path = ?1",
+        "UPDATE unchunkable SET size = ?2, mtime_ns = ?3, inode = ?4, content_hash = ?5, \
+         ignored = ?6 WHERE path = ?1",
         params![
             state.path,
             i64_of(state.size)?,
             state.mtime_ns,
             i64_of(state.inode)?,
-            state.content_hash
+            state.content_hash,
+            state.ignored
         ],
     )?;
     if updated == 1 {
@@ -572,14 +611,15 @@ fn record_unchunkable(tx: &Transaction<'_>, record: &Unchunkable) -> Result<u64,
     let state = &record.state;
     let removed = remove(tx, &state.path)?;
     tx.execute(
-        "INSERT INTO unchunkable (path, size, mtime_ns, inode, content_hash, reason) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        "INSERT INTO unchunkable (path, size, mtime_ns, inode, content_hash, ignored, reason) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         params![
             state.path,
             i64_of(state.size)?,
             state.mtime_ns,
             i64_of(state.inode)?,
             state.content_hash,
+            state.ignored,
             record.reason
         ],
     )?;
@@ -617,14 +657,15 @@ fn replace(
 ) -> Result<(u64, u64), Error> {
     let removed = remove(tx, &state.path)?;
     tx.execute(
-        "INSERT INTO files (path, size, mtime_ns, inode, content_hash) \
-         VALUES (?1, ?2, ?3, ?4, ?5)",
+        "INSERT INTO files (path, size, mtime_ns, inode, content_hash, ignored) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         params![
             state.path,
             i64_of(state.size)?,
             state.mtime_ns,
             i64_of(state.inode)?,
-            state.content_hash
+            state.content_hash,
+            state.ignored
         ],
     )?;
     let mut chunk_stmt = tx.prepare(
@@ -722,15 +763,18 @@ fn chunks_by_hash(conn: &Connection, hashes: &[ContentHash]) -> Result<Vec<Store
     Ok(out)
 }
 
-fn chunk_hashes(conn: &Connection) -> Result<Vec<ContentHash>, Error> {
-    let mut stmt = conn.prepare("SELECT content_hash FROM chunks ORDER BY id")?;
+fn chunk_hashes(conn: &Connection, include_ignored: bool) -> Result<Vec<ContentHash>, Error> {
+    let mut stmt = conn.prepare(
+        "SELECT content_hash FROM chunks WHERE ?1 OR path NOT IN \
+         (SELECT path FROM files WHERE ignored = 1) ORDER BY id",
+    )?;
     let rows = stmt
-        .query_map([], |row| row.get(0))?
+        .query_map([include_ignored], |row| row.get(0))?
         .collect::<Result<_, _>>()?;
     Ok(rows)
 }
 
-/// Reads the five fingerprint columns starting at column 0.
+/// Reads the six fingerprint columns starting at column 0.
 fn file_state(row: &rusqlite::Row<'_>) -> rusqlite::Result<FileState> {
     let size = row.get::<_, i64>(1)?;
     let inode = row.get::<_, i64>(3)?;
@@ -741,25 +785,35 @@ fn file_state(row: &rusqlite::Row<'_>) -> rusqlite::Result<FileState> {
         inode: u64::try_from(inode)
             .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(3, inode))?,
         content_hash: row.get(4)?,
+        ignored: row.get(5)?,
     })
 }
 
+fn has_ignored(conn: &Connection) -> Result<bool, Error> {
+    Ok(conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM files WHERE ignored = 1)",
+        [],
+        |row| row.get(0),
+    )?)
+}
+
 fn file_states(conn: &Connection) -> Result<Vec<FileState>, Error> {
-    let mut stmt = conn.prepare("SELECT path, size, mtime_ns, inode, content_hash FROM files")?;
+    let mut stmt =
+        conn.prepare("SELECT path, size, mtime_ns, inode, content_hash, ignored FROM files")?;
     let states = stmt.query_map([], file_state)?.collect::<Result<_, _>>()?;
     Ok(states)
 }
 
 fn unchunkables(conn: &Connection) -> Result<Vec<Unchunkable>, Error> {
     let mut stmt = conn.prepare(
-        "SELECT path, size, mtime_ns, inode, content_hash, reason FROM unchunkable \
+        "SELECT path, size, mtime_ns, inode, content_hash, ignored, reason FROM unchunkable \
          ORDER BY path",
     )?;
     let records = stmt
         .query_map([], |row| {
             Ok(Unchunkable {
                 state: file_state(row)?,
-                reason: row.get(5)?,
+                reason: row.get(6)?,
             })
         })?
         .collect::<Result<_, _>>()?;

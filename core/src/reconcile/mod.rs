@@ -67,7 +67,9 @@ pub enum Error {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Options {
     /// Index files that `.gitignore`, `.git/info/exclude`, global excludes and
-    /// `.ignore` files would hide (`--include-ignored`). Hidden files and
+    /// `.ignore` files would hide (`--include-ignored`), flagged as ignored.
+    /// A pass without it keeps the flagged files stored but does not look at
+    /// them, and queues none of their chunks for embedding. Hidden files and
     /// dot-directories are indexed either way; `.git/` and `.repo-search/`
     /// never are.
     pub include_ignored: bool,
@@ -129,10 +131,10 @@ pub struct Report {
     pub files_added: u64,
     /// Files re-chunked because their content changed.
     pub files_modified: u64,
-    /// Files dropped: deleted, newly ignored, or newly unchunkable.
+    /// Files dropped: deleted, or newly unchunkable.
     pub files_removed: u64,
-    /// Files whose stat moved but whose bytes did not; only the fingerprint
-    /// was rewritten.
+    /// Files whose stat or ignored flag moved but whose bytes did not; only
+    /// the fingerprint and flag were rewritten.
     pub files_restamped: u64,
     /// Files read and handed to a chunker this pass, whether it succeeded or
     /// not.
@@ -141,7 +143,7 @@ pub struct Report {
     pub chunks_added: u64,
     /// Chunk rows deleted, including those of re-chunked files.
     pub chunks_removed: u64,
-    /// Chunk rows in the index after the pass.
+    /// Chunk rows visible to a search with the pass's `include_ignored`.
     pub chunks_total: u64,
     /// Chunk rows whose vector is in the cache for the model.
     pub chunks_with_vector: u64,
@@ -241,7 +243,7 @@ pub async fn reconcile(
         "reconcile applied"
     );
 
-    let rows = index.chunk_hashes().await?;
+    let rows = index.chunk_hashes(options.include_ignored).await?;
     let distinct: Vec<ContentHash> = {
         let mut seen = HashSet::with_capacity(rows.len());
         rows.iter()

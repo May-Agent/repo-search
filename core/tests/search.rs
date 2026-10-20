@@ -179,6 +179,7 @@ const GUIDE: &str = "# Guide\n\n## Stacks\nStacks align their children along the
 /// The code filter that admits everything on the code side.
 fn code_filter() -> ChunkFilter {
     ChunkFilter {
+        include_ignored: true,
         side: Side::Code,
         paths: None,
         extensions: Vec::new(),
@@ -279,6 +280,7 @@ impl Fixture {
                     mtime_ns: 0,
                     inode: 0,
                     content_hash: ContentHash::of_file(GUIDE.as_bytes()),
+                    ignored: false,
                 },
                 records,
             ))
@@ -888,6 +890,7 @@ fn a_content_hash_shared_by_code_and_docs_is_searched_on_both_sides() {
             mtime_ns: 0,
             inode: 0,
             content_hash: ContentHash::of_file(shared.text.as_bytes()),
+            ignored: false,
         },
         vec![ChunkRecord {
             lines: 1..=shared.text.lines().count() as u32,
@@ -970,4 +973,98 @@ impl Fixture {
     fn retriever_embedder_documents(&self) -> usize {
         self.seen.documents()
     }
+}
+
+#[test]
+fn alternating_searches_show_ignored_files_only_when_asked() {
+    let tree = tempfile::tempdir().unwrap();
+    let common = tempfile::tempdir().unwrap();
+    fs::write(tree.path().join(".gitignore"), "secret.rs\n").unwrap();
+    fs::write(
+        tree.path().join("kept.rs"),
+        rust_item(
+            "Counts the widgets.",
+            "pub fn widget_count() -> usize {\n    1\n}",
+        ),
+    )
+    .unwrap();
+    fs::write(
+        tree.path().join("secret.rs"),
+        rust_item(
+            "Counts the widgets in secret.",
+            "pub fn secret_widgets() -> usize {\n    2\n}",
+        ),
+    )
+    .unwrap();
+    let index = block_on(Index::open(tree.path())).unwrap();
+    let cache = block_on(VectorCache::open(common.path())).unwrap();
+    let pass = |include_ignored| {
+        block_on(reconcile(
+            &index,
+            &cache,
+            MODEL,
+            CHUNKER_FINGERPRINT,
+            tree.path(),
+            Options { include_ignored },
+            Arc::new(CapOff),
+        ))
+        .unwrap()
+    };
+    let embed = |pending: &[PendingChunk]| {
+        let batch = pending
+            .iter()
+            .map(|p| (p.content_hash, document_vector(p)))
+            .collect();
+        block_on(cache.put_many(MODEL, batch)).unwrap();
+    };
+    let embedder = FakeEmbedder::default();
+    let seen = Arc::clone(&embedder.seen);
+    let mut retriever = Retriever::new(
+        index.clone(),
+        cache.clone(),
+        embedder,
+        PathBuf::from(tree.path()),
+        NonZeroUsize::new(2).unwrap(),
+    )
+    .unwrap();
+    let mut search = |include_ignored: bool, mode: Mode, files_only: bool| {
+        let reconciled = pass(include_ignored);
+        assert!(reconciled.pending.is_empty(), "everything is embedded");
+        let report = &reconciled.report;
+        assert_eq!(report.chunks_total, if include_ignored { 2 } else { 1 });
+        assert_eq!(report.chunks_with_vector, report.chunks_total);
+        let request = Request {
+            mode,
+            files_only,
+            include_ignored,
+            budget: 100_000,
+            ..Request::new("widgets count")
+        };
+        block_on(retriever.search(
+            &request,
+            Reconciliation::new("abc123", &reconciled.report),
+            &Words,
+        ))
+        .unwrap()
+    };
+
+    let first = pass(true);
+    assert!(first.pending.iter().any(|p| p.path == "secret.rs"));
+    embed(&first.pending);
+
+    for mode in [Mode::Lexical, Mode::Semantic, Mode::Hybrid] {
+        for files_only in [false, true] {
+            let plain = search(false, mode, files_only);
+            assert_eq!(paths(&plain.code), ["kept.rs"], "{mode:?} {files_only}");
+            let all = search(true, mode, files_only);
+            let mut found = paths(&all.code);
+            found.sort_unstable();
+            assert_eq!(found, ["kept.rs", "secret.rs"], "{mode:?} {files_only}");
+        }
+    }
+    assert_eq!(
+        seen.documents.load(Ordering::SeqCst),
+        0,
+        "nothing re-embedded"
+    );
 }
