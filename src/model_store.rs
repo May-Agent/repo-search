@@ -1,0 +1,599 @@
+//! First-use download of the published Core ML model archive.
+//!
+//! The archive is pinned to an immutable Hugging Face commit and a known
+//! sha256. [`ModelStore::ensure`] downloads it once into the per-user cache,
+//! verifies the hash before unpacking, and is a no-op when the model is
+//! already present.
+
+use std::fmt;
+use std::io;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use sha2::{Digest, Sha256};
+use tempfile::NamedTempFile;
+use thiserror::Error;
+use tokio::io::AsyncWriteExt;
+
+/// Human-readable name of the embedded model, shown by `search --version`.
+pub const MODEL_NAME: &str = "google/embeddinggemma-2 (Core ML conversion)";
+
+/// SPDX identifier of the model's license, shown by `search --version`.
+pub const MODEL_LICENSE: &str = "Apache-2.0";
+
+/// `--version` output: the binary version plus the model's identity.
+pub const VERSION_INFO: &str = const_format::concatcp!(
+    env!("CARGO_PKG_VERSION"),
+    "\nmodel: ",
+    MODEL_NAME,
+    "\nlicense: ",
+    MODEL_LICENSE
+);
+
+/// Upper bound on the archive size, far above the published archive.
+const MAX_ARCHIVE_BYTES: u64 = 4 << 30;
+
+/// Deadline for establishing the archive connection.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Deadline between received bytes; a stalled stream fails while a merely
+/// slow one keeps running.
+const READ_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// A sha256 digest; its hex form is used only for directory names and error
+/// text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Sha256Digest([u8; 32]);
+
+impl Sha256Digest {
+    /// Parse `text` as 64 hex digits.
+    pub fn from_hex(text: &str) -> Option<Self> {
+        let mut digest = [0u8; 32];
+        hex::decode_to_slice(text, &mut digest).ok()?;
+        Some(Self(digest))
+    }
+
+    /// Lowercase hex, e.g. for a directory name.
+    pub fn hex(&self) -> String {
+        hex::encode(self.0)
+    }
+}
+
+impl fmt::Display for Sha256Digest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.hex())
+    }
+}
+
+/// A model archive to fetch and the digest that verifies it.
+#[derive(Debug, Clone)]
+pub struct ModelSpec {
+    /// Download URL, pinned to an immutable upstream revision.
+    pub url: String,
+    /// Expected sha256 of the archive bytes.
+    pub sha256: Sha256Digest,
+}
+
+impl ModelSpec {
+    /// The published EmbeddingGemma 2 Core ML archive.
+    pub fn embedding_gemma_2() -> Self {
+        Self {
+            url: "https://huggingface.co/lexoliu/repo-search-embeddinggemma2-coreml/resolve/5bb9f08270c0e2968d048a0a35e120863f32962c/eg2-coreml-914f7f89-57287aaa.tar.zst".into(),
+            sha256: Sha256Digest::from_hex(
+                "57287aaa3fea181447dd2bd378d064aeef77684da0c722302e893dd95e43ab2c",
+            )
+            .expect("pinned archive digest is valid hex"),
+        }
+    }
+}
+
+/// HTTP client configuration shared by production and tests: a connect
+/// deadline and an idle-read deadline, never a total timeout that would cut
+/// off a large archive mid-download.
+fn client_builder() -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .read_timeout(READ_TIMEOUT)
+}
+
+/// A cache of verified, unpacked model archives.
+pub struct ModelStore {
+    /// Cache root; each archive unpacks to a `<sha256>/` subdirectory.
+    root: PathBuf,
+    spec: ModelSpec,
+    /// The store's own client, built through [`client_builder`].
+    client: reqwest::Client,
+}
+
+impl ModelStore {
+    /// A store under `root` serving `spec`.
+    pub fn new(root: PathBuf, spec: ModelSpec) -> Result<Self, Error> {
+        Ok(Self {
+            root,
+            spec,
+            client: client_builder().build()?,
+        })
+    }
+
+    /// The per-user store: `~/Library/Caches/repo-search/models`.
+    pub fn user_cache() -> Result<Self, Error> {
+        let home = std::env::home_dir().ok_or(Error::NoHomeDir)?;
+        Self::new(
+            home.join("Library/Caches/repo-search/models"),
+            ModelSpec::embedding_gemma_2(),
+        )
+    }
+
+    /// Directory the archive unpacks to.
+    pub fn dir(&self) -> PathBuf {
+        self.root.join(self.spec.sha256.hex())
+    }
+
+    /// Path to the unpacked model, downloading it on first use.
+    ///
+    /// Idempotent: an existing directory is always a complete unpack, because
+    /// the archive contents are staged in a sibling temp directory and moved
+    /// into place with one rename. Concurrent calls serialize on a per-archive
+    /// lock file: the caller holding the lock re-checks the final directory,
+    /// sweeps leftovers of killed runs, downloads, and unpacks; callers that
+    /// were waiting on the lock then find the finished directory.
+    pub async fn ensure(&self) -> Result<PathBuf, Error> {
+        let dir = self.dir();
+        if tokio::fs::try_exists(&dir).await? {
+            return Ok(dir);
+        }
+        let lock_path = self.root.join(format!("{}.lock", self.spec.sha256));
+        let root = self.root.clone();
+        let dest = dir.clone();
+        // The lock and its re-check run on the blocking pool; the guard file
+        // comes back locked and stays that way for the whole install.
+        let lock = tokio::task::spawn_blocking(move || -> io::Result<Option<std::fs::File>> {
+            std::fs::create_dir_all(&root)?;
+            let lock = std::fs::File::create(lock_path)?;
+            lock.lock()?;
+            if dest.exists() {
+                return Ok(None);
+            }
+            sweep_stale(&root)?;
+            Ok(Some(lock))
+        })
+        .await??;
+        let Some(_lock) = lock else {
+            return Ok(dir);
+        };
+        let archive = self.download().await?;
+        self.unpack(archive, &dir).await?;
+        Ok(dir)
+    }
+
+    /// Stream the archive into a temp file inside the cache root, returning it
+    /// only once its sha256 matches the pinned digest. The temp file deletes
+    /// itself on drop; error paths run that drop on the blocking pool.
+    async fn download(&self) -> Result<NamedTempFile, Error> {
+        let mut response = self.client.get(&self.spec.url).send().await?;
+        if !response.status().is_success() {
+            return Err(Error::Status {
+                url: self.spec.url.clone(),
+                status: response.status(),
+            });
+        }
+        if let Some(size) = response.content_length()
+            && size > MAX_ARCHIVE_BYTES
+        {
+            return Err(Error::TooLarge {
+                size,
+                limit: MAX_ARCHIVE_BYTES,
+            });
+        }
+        let root = self.root.clone();
+        let (temp, writer) = tokio::task::spawn_blocking(move || {
+            let temp = NamedTempFile::new_in(&root)?;
+            let writer = temp.reopen()?;
+            io::Result::Ok((temp, writer))
+        })
+        .await??;
+        let mut writer = tokio::fs::File::from_std(writer);
+        let mut hasher = Sha256::new();
+        let mut received = 0u64;
+        tracing::info!(url = %self.spec.url, "downloading model archive");
+        let streamed: Result<(), Error> = async {
+            while let Some(chunk) = response.chunk().await? {
+                received += chunk.len() as u64;
+                if received > MAX_ARCHIVE_BYTES {
+                    return Err(Error::TooLarge {
+                        size: received,
+                        limit: MAX_ARCHIVE_BYTES,
+                    });
+                }
+                hasher.update(&chunk);
+                writer.write_all(&chunk).await?;
+            }
+            writer.flush().await?;
+            Ok(())
+        }
+        .await;
+        let digest = match streamed {
+            Ok(()) => Sha256Digest(hasher.finalize().into()),
+            Err(e) => {
+                discard(temp).await;
+                return Err(e);
+            }
+        };
+        if digest != self.spec.sha256 {
+            discard(temp).await;
+            return Err(Error::HashMismatch {
+                expected: self.spec.sha256,
+                actual: digest,
+            });
+        }
+        Ok(temp)
+    }
+
+    /// Unpack a verified archive into `dir` via a sibling staging directory.
+    /// The caller holds the archive lock, so a rename error is a real error.
+    async fn unpack(&self, archive: NamedTempFile, dir: &Path) -> Result<(), Error> {
+        let root = self.root.clone();
+        let dest = dir.to_path_buf();
+        tokio::task::spawn_blocking(move || -> io::Result<()> {
+            let staging = tempfile::tempdir_in(&root)?;
+            unpack_archive(archive.as_file(), staging.path())?;
+            std::fs::rename(staging.path(), &dest)?;
+            let _ = staging.keep();
+            Ok(())
+        })
+        .await??;
+        tracing::info!(dir = %dir.display(), "model archive unpacked");
+        Ok(())
+    }
+}
+
+/// Run a temp archive's delete-on-drop off the async runtime.
+async fn discard(temp: NamedTempFile) {
+    let _ = tokio::task::spawn_blocking(move || drop(temp)).await;
+}
+
+/// Remove temp files and staging directories a killed run left behind. The
+/// caller holds the archive lock, so every `.tmp*` entry present is stale.
+fn sweep_stale(root: &Path) -> io::Result<()> {
+    for entry in std::fs::read_dir(root)? {
+        let entry = entry?;
+        if !entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.starts_with(".tmp"))
+        {
+            continue;
+        }
+        if entry.file_type()?.is_dir() {
+            std::fs::remove_dir_all(entry.path())?;
+        } else {
+            std::fs::remove_file(entry.path())?;
+        }
+    }
+    Ok(())
+}
+
+/// Unpack `archive` into `staging`, syncing every extracted file and then the
+/// staging directory itself so the rename that follows exposes durable
+/// contents. Anything but regular files and directories is rejected.
+fn unpack_archive(archive: &std::fs::File, staging: &Path) -> io::Result<()> {
+    let decoder = zstd::stream::read::Decoder::new(archive)?;
+    let mut tar = tar::Archive::new(decoder);
+    for entry in tar.entries()? {
+        let mut entry = entry?;
+        let path = entry.path()?.into_owned();
+        let kind = entry.header().entry_type();
+        if !matches!(kind, tar::EntryType::Regular | tar::EntryType::Directory) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unsupported tar entry type {kind:?}: {}", path.display()),
+            ));
+        }
+        if !entry.unpack_in(staging)? {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "tar entry escapes the staging directory: {}",
+                    path.display()
+                ),
+            ));
+        }
+        if kind == tar::EntryType::Regular {
+            std::fs::File::open(staging.join(&path))?.sync_all()?;
+        }
+    }
+    std::fs::File::open(staging)?.sync_all()?;
+    Ok(())
+}
+
+/// Failure modes of [`ModelStore::ensure`].
+#[derive(Debug, Error)]
+pub enum Error {
+    /// The downloaded bytes did not match the pinned archive digest.
+    #[error("model archive sha256 mismatch: expected {expected}, got {actual}")]
+    HashMismatch {
+        /// The pinned digest.
+        expected: Sha256Digest,
+        /// The digest of the downloaded bytes.
+        actual: Sha256Digest,
+    },
+    /// The server answered a non-success status.
+    #[error("download of {url} failed: {status}")]
+    Status {
+        /// The request URL.
+        url: String,
+        /// The response status.
+        status: reqwest::StatusCode,
+    },
+    /// The archive exceeds the size bound.
+    #[error("model archive size {size} exceeds the {limit} byte bound")]
+    TooLarge {
+        /// The declared or received size.
+        size: u64,
+        /// The configured bound.
+        limit: u64,
+    },
+    /// HTTP transport error.
+    #[error("model archive download failed: {0}")]
+    Download(#[from] reqwest::Error),
+    /// Filesystem or archive error.
+    #[error("model store error: {0}")]
+    Io(#[from] io::Error),
+    /// A blocking-pool task could not complete.
+    #[error("model store task failed: {0}")]
+    Task(#[from] tokio::task::JoinError),
+    /// No home directory to derive the cache path from.
+    #[error("cannot locate the user cache directory: no home directory")]
+    NoHomeDir,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
+
+    /// A store whose client comes through the same builder as production,
+    /// with system proxies disabled so the local test server is reached
+    /// directly.
+    fn store(root: PathBuf, url: String, sha256: Sha256Digest) -> ModelStore {
+        ModelStore {
+            root,
+            spec: ModelSpec { url, sha256 },
+            client: client_builder().no_proxy().build().unwrap(),
+        }
+    }
+
+    fn digest_of(bytes: &[u8]) -> Sha256Digest {
+        Sha256Digest(Sha256::digest(bytes).into())
+    }
+
+    /// A tar.zst archive in memory with `entries` as `(path, contents)` files.
+    fn archive(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let encoder = zstd::stream::write::Encoder::new(Vec::new(), 0).unwrap();
+        let mut builder = tar::Builder::new(encoder);
+        for (name, bytes) in entries {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(bytes.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder.append_data(&mut header, name, *bytes).unwrap();
+        }
+        builder.into_inner().unwrap().finish().unwrap()
+    }
+
+    /// A tar.zst archive whose only entry is a symlink.
+    fn symlink_archive() -> Vec<u8> {
+        let encoder = zstd::stream::write::Encoder::new(Vec::new(), 0).unwrap();
+        let mut builder = tar::Builder::new(encoder);
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Symlink);
+        header.set_size(0);
+        header.set_mode(0o777);
+        builder
+            .append_link(&mut header, "evil", "/etc/passwd")
+            .unwrap();
+        builder.into_inner().unwrap().finish().unwrap()
+    }
+
+    /// One-shot HTTP/1.1 server: replies `status` and declares
+    /// `content_length`, then writes `body` and closes the connection.
+    fn serve_once(
+        status: &str,
+        content_length: u64,
+        body: Vec<u8>,
+    ) -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/model.tar.zst", listener.local_addr().unwrap());
+        let status = status.to_string();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut buf = [0u8; 1024];
+            while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                match stream.read(&mut buf) {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => request.extend_from_slice(&buf[..n]),
+                }
+            }
+            let head = format!(
+                "HTTP/1.1 {status}\r\nContent-Length: {content_length}\r\nConnection: close\r\n\r\n"
+            );
+            if stream.write_all(head.as_bytes()).is_err() {
+                return;
+            }
+            let _ = stream.write_all(&body);
+        });
+        (url, handle)
+    }
+
+    /// The lock file is the one entry a failed or finished run may leave in
+    /// the cache root; everything else must be gone.
+    fn assert_only_lock_remains(cache: &Path) {
+        let names: Vec<String> = std::fs::read_dir(cache)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        assert!(
+            names.iter().all(|name| name.ends_with(".lock")),
+            "unexpected cache entries: {names:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn downloads_verifies_and_unpacks() {
+        let body = archive(&[
+            ("manifest.json", b"{\"embedding_dim\": 768}"),
+            ("eg2-coreml.mlmodelc/model.mlmodel", b"weights"),
+        ]);
+        let (url, server) = serve_once("200 OK", body.len() as u64, body.clone());
+        let root = tempfile::tempdir().unwrap();
+        let store = store(root.path().join("models"), url, digest_of(&body));
+
+        let dir = store.ensure().await.unwrap();
+
+        assert_eq!(dir, store.dir());
+        assert_eq!(
+            std::fs::read(dir.join("manifest.json")).unwrap(),
+            b"{\"embedding_dim\": 768}"
+        );
+        assert_eq!(
+            std::fs::read(dir.join("eg2-coreml.mlmodelc/model.mlmodel")).unwrap(),
+            b"weights"
+        );
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn corrupt_download_is_rejected_and_leaves_nothing() {
+        let good = archive(&[("manifest.json", b"{}")]);
+        let corrupt = archive(&[("manifest.json", b"corrupted")]);
+        let (url, server) = serve_once("200 OK", corrupt.len() as u64, corrupt.clone());
+        let root = tempfile::tempdir().unwrap();
+        let cache = root.path().join("models");
+        let store = store(cache.clone(), url, digest_of(&good));
+
+        let err = store.ensure().await.unwrap_err();
+
+        match err {
+            Error::HashMismatch { expected, actual } => {
+                assert_eq!(expected, digest_of(&good));
+                assert_eq!(actual, digest_of(&corrupt));
+            }
+            e => panic!("expected HashMismatch, got {e}"),
+        }
+        assert!(!store.dir().exists());
+        assert_only_lock_remains(&cache);
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn cached_model_skips_download() {
+        let root = tempfile::tempdir().unwrap();
+        let store = store(
+            root.path().to_path_buf(),
+            "http://127.0.0.1:1/unreachable".into(),
+            Sha256Digest([0; 32]),
+        );
+        let dir = store.dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("marker"), b"sentinel").unwrap();
+
+        assert_eq!(store.ensure().await.unwrap(), dir);
+        assert_eq!(std::fs::read(dir.join("marker")).unwrap(), b"sentinel");
+    }
+
+    #[tokio::test]
+    async fn interrupted_download_leaves_no_partial_dir() {
+        let body = archive(&[("big.bin", &[7u8; 8192])]);
+        let sent = body.len() / 2;
+        let (url, server) = serve_once("200 OK", body.len() as u64, body[..sent].to_vec());
+        let root = tempfile::tempdir().unwrap();
+        let cache = root.path().join("models");
+        let store = store(cache.clone(), url, digest_of(&body));
+
+        let err = store.ensure().await.unwrap_err();
+
+        assert!(matches!(err, Error::Download(_)), "unexpected error: {err}");
+        assert!(!store.dir().exists());
+        assert_only_lock_remains(&cache);
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn oversized_archive_is_refused() {
+        let body = archive(&[("manifest.json", b"{}")]);
+        let (url, server) = serve_once("200 OK", MAX_ARCHIVE_BYTES + 1, body);
+        let root = tempfile::tempdir().unwrap();
+        let cache = root.path().join("models");
+        let store = store(cache.clone(), url, digest_of(b""));
+
+        let err = store.ensure().await.unwrap_err();
+
+        match err {
+            Error::TooLarge { size, limit } => {
+                assert_eq!(size, MAX_ARCHIVE_BYTES + 1);
+                assert_eq!(limit, MAX_ARCHIVE_BYTES);
+            }
+            e => panic!("expected TooLarge, got {e}"),
+        }
+        assert!(!store.dir().exists());
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn http_error_status_is_reported() {
+        let (url, server) = serve_once("503 Service Unavailable", 0, Vec::new());
+        let root = tempfile::tempdir().unwrap();
+        let store = store(root.path().join("models"), url, digest_of(b""));
+
+        let err = store.ensure().await.unwrap_err();
+
+        match err {
+            Error::Status { status, .. } => {
+                assert_eq!(status, reqwest::StatusCode::SERVICE_UNAVAILABLE);
+            }
+            e => panic!("expected Status, got {e}"),
+        }
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn symlink_entries_are_rejected() {
+        let body = symlink_archive();
+        let (url, server) = serve_once("200 OK", body.len() as u64, body.clone());
+        let root = tempfile::tempdir().unwrap();
+        let store = store(root.path().join("models"), url, digest_of(&body));
+
+        let err = store.ensure().await.unwrap_err();
+
+        match err {
+            Error::Io(e) => assert_eq!(e.kind(), io::ErrorKind::InvalidData),
+            e => panic!("unexpected error: {e}"),
+        }
+        assert!(!store.dir().exists());
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn concurrent_ensure_downloads_once() {
+        let body = archive(&[("manifest.json", b"{}")]);
+        // The one-shot server answers exactly one request: a second download
+        // would hang and fail the test.
+        let (url, server) = serve_once("200 OK", body.len() as u64, body.clone());
+        let root = tempfile::tempdir().unwrap();
+        let store = store(root.path().join("models"), url, digest_of(&body));
+
+        let (first, second) = tokio::join!(store.ensure(), store.ensure());
+
+        assert_eq!(first.unwrap(), store.dir());
+        assert_eq!(second.unwrap(), store.dir());
+        assert_eq!(
+            std::fs::read(store.dir().join("manifest.json")).unwrap(),
+            b"{}"
+        );
+        server.join().unwrap();
+    }
+}
