@@ -63,6 +63,11 @@ impl ThreadId {
 #[cfg(target_os = "macos")]
 unsafe impl Send for ThreadId {}
 
+// SAFETY: sharing the identifier is sharing a read-only pthread_t; the same
+// calls take it from any thread.
+#[cfg(target_os = "macos")]
+unsafe impl Sync for ThreadId {}
+
 /// The opaque token `pthread_override_qos_class_end_np` takes.
 #[cfg(target_os = "macos")]
 type RawOverride = *mut std::ffi::c_void;
