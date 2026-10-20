@@ -564,8 +564,10 @@ struct Scheduler<B: Backend> {
     /// Freshness barriers running per worktree, counted: a barrier's end
     /// report can arrive after a later barrier already started.
     barriers: HashMap<WorktreeId, u64>,
-    /// `index --wait` watches, pushing each worktree's counts on change.
-    watchers: HashMap<WorktreeId, watch::Sender<Counts>>,
+    /// `index --wait` watches, pushing each worktree's counts on change —
+    /// one sender per waiting task, since waits no longer serialize on the
+    /// owner.
+    watchers: HashMap<WorktreeId, Vec<watch::Sender<Counts>>>,
     /// Query jobs on the ANE thread, not yet `QueryDone`.
     queries_in_flight: u64,
     /// The idle-exit tracker: every queued or in-flight unit of work reports
@@ -763,7 +765,7 @@ impl<B: Backend> Scheduler<B> {
             }
             SchedulerMsg::WatchCounts { worktree, reply } => {
                 let (watch, rx) = watch::channel(self.counts_for(worktree));
-                self.watchers.insert(worktree, watch);
+                self.watchers.entry(worktree).or_default().push(watch);
                 let _ = reply.send(rx);
             }
             SchedulerMsg::GpuStatus { reply } => {
@@ -1320,17 +1322,20 @@ impl<B: Backend> Scheduler<B> {
     /// senders whose `index --wait` went away.
     fn push_counts(&mut self) {
         let mut watchers = std::mem::take(&mut self.watchers);
-        watchers.retain(|worktree, watch| {
+        watchers.retain(|worktree, watches| {
             let counts = self.counts_for(*worktree);
-            let _ = watch.send_if_modified(|current| {
-                if *current != counts {
-                    *current = counts;
-                    true
-                } else {
-                    false
-                }
+            watches.retain(|watch| {
+                let _ = watch.send_if_modified(|current| {
+                    if *current != counts {
+                        *current = counts;
+                        true
+                    } else {
+                        false
+                    }
+                });
+                !watch.is_closed()
             });
-            !watch.is_closed()
+            !watches.is_empty()
         });
         self.watchers = watchers;
     }

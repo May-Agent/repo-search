@@ -721,6 +721,159 @@ async fn stage_2_runs_at_background_qos() {
     );
 }
 
+/// An `index --wait` must not occupy the owner: a `Search` and a `Status`
+/// for the same worktree answer while a held GPU batch parks the wait —
+/// queries never touch the GPU, so the ANE stays free for them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn search_answers_during_index_wait() {
+    // Enough chunks that the ANE cannot drain stage 1 before the GPU pulls
+    // its first batch.
+    let repo = fn_repo(120, SMALL_BYTES, 10);
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let mut backend = StubBackend::new(mpsc::channel().0);
+    backend.set_instance_delay(Instance::Ane, Duration::from_millis(10));
+    let gate = backend.gate_first_index(Instance::Gpu);
+    let d = daemon(tmp, backend, Model::Cached, Duration::from_secs(600)).await;
+
+    // Armed before the GPU is unblocked: its first Index call holds, and
+    // stage 1 can never finish, so the wait cannot complete.
+    gate.arm();
+    let socket = d.socket.clone();
+    let root = repo.root.clone();
+    let index_wait = tokio::spawn(async move {
+        request(
+            &socket,
+            Request::Index {
+                worktree: root,
+                wait: true,
+            },
+        )
+        .await
+    });
+    // The ANE's first record proves the daemon is up, so the headroom
+    // callback is registered before the push.
+    let mut log: Vec<Record> = Vec::new();
+    wait_for(&mut log, &d.records, |r| {
+        r.instance == Instance::Ane && r.kind == Kind::Started
+    });
+    d.backend.push_headroom(Ok(()));
+    wait_held(&mut log, &d.records);
+
+    // Both requests answer while the gate is still held.
+    let events = answer_search(&d, &repo.root, MARKER).await;
+    assert!(matches!(final_of(&events), Final::Answer(_)));
+    let events = request(
+        &d.socket,
+        Request::Status {
+            worktree: repo.root.clone(),
+        },
+    )
+    .await;
+    let status = match final_of(&events) {
+        Final::Status(status) => status,
+        other => panic!("expected a Status, got {other:?}"),
+    };
+    assert_eq!(
+        status.index.as_ref().expect("indexed").phase,
+        WirePhase::FirstIndex,
+        "the held batch keeps the phase at first-index"
+    );
+
+    // Releasing the batch drains the queue; the wait then reports full
+    // coverage.
+    gate.open();
+    let events = index_wait.await.expect("the index wait answers");
+    match final_of(&events) {
+        Final::Indexed { with_vector, total } => {
+            assert_eq!(with_vector, total, "every chunk has a vector")
+        }
+        other => panic!("expected Indexed, got {other:?}"),
+    }
+}
+
+/// Stage-1 completion reaches a parked `index --wait` through the owner's
+/// phase watch: a `Stage1Done` consumed off a channel could release only
+/// one of two waits, and the phase flips to `Maintained` exactly once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stage1_done_reaches_a_waiting_index() {
+    let repo = fn_repo(40, SMALL_BYTES, 10);
+    let (d, gate) = start_index_gated(Duration::from_millis(10)).await;
+    gate.arm();
+
+    let socket = d.socket.clone();
+    let root = repo.root.clone();
+    let first = tokio::spawn(async move {
+        request(
+            &socket,
+            Request::Index {
+                worktree: root,
+                wait: true,
+            },
+        )
+        .await
+    });
+    let socket = d.socket.clone();
+    let root = repo.root.clone();
+    let second = tokio::spawn(async move {
+        request(
+            &socket,
+            Request::Index {
+                worktree: root,
+                wait: true,
+            },
+        )
+        .await
+    });
+    let mut log: Vec<Record> = Vec::new();
+    wait_held(&mut log, &d.records);
+    // The held stage-1 call keeps the phase at first-index while both
+    // waits are parked.
+    let events = request(
+        &d.socket,
+        Request::Status {
+            worktree: repo.root.clone(),
+        },
+    )
+    .await;
+    let status = match final_of(&events) {
+        Final::Status(status) => status,
+        other => panic!("expected a Status, got {other:?}"),
+    };
+    assert_eq!(
+        status.index.as_ref().expect("indexed").phase,
+        WirePhase::FirstIndex
+    );
+
+    gate.open();
+    for wait in [first, second] {
+        let events = wait.await.expect("each wait answers");
+        match final_of(&events) {
+            Final::Indexed { with_vector, total } => {
+                assert_eq!(with_vector, total, "every chunk has a vector")
+            }
+            other => panic!("expected Indexed, got {other:?}"),
+        }
+    }
+    // One FirstIndex → Maintained flip, applied by the owner: the status
+    // taken after the waits reports `Maintained`.
+    let events = request(
+        &d.socket,
+        Request::Status {
+            worktree: repo.root.clone(),
+        },
+    )
+    .await;
+    let status = match final_of(&events) {
+        Final::Status(status) => status,
+        other => panic!("expected a Status, got {other:?}"),
+    };
+    assert_eq!(
+        status.index.as_ref().expect("indexed").phase,
+        WirePhase::Maintained,
+        "stage-1 completion flipped the phase once"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn edit_is_reflected_in_next_query() {
     let repo = fn_repo(40, SMALL_BYTES, 10);
