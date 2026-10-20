@@ -83,7 +83,7 @@ jobs:
           git -C "$work/src" fetch --depth 1 origin a207b1a3452eafe02f2d870f486287834af2c82d
           git -C "$work/src" checkout FETCH_HEAD
           mkdir -p "$work/build"
-          uv venv --python 3.13 "$work/build/.venv"
+          uv venv --seed --python 3.13 "$work/build/.venv"
           uv pip install --python "$work/build/.venv/bin/python" -r "$work/src/reqs/build.pip"
           cd "$work/build"
           xcrun --sdk macosx cmake \
