@@ -2,9 +2,12 @@
 
 use super::ConfigChunker;
 use crate::chunk::{Chunk, ChunkKind, ConfigFormat, Error, FileChunker, MemberKind};
+use crate::counters::CapOff;
 
 fn run(format: ConfigFormat, src: &str) -> Vec<Chunk> {
-    ConfigChunker::new(format).chunk_file("conf", src).unwrap()
+    ConfigChunker::new(format)
+        .chunk_file("conf", src, &CapOff)
+        .unwrap()
 }
 
 fn text(src: &str, chunk: &Chunk) -> String {
@@ -113,7 +116,7 @@ fn toml_large_value_splits_on_lines() {
 
 #[test]
 fn toml_syntax_error_is_an_error() {
-    let result = ConfigChunker::new(ConfigFormat::Toml).chunk_file("c.toml", "a = \n");
+    let result = ConfigChunker::new(ConfigFormat::Toml).chunk_file("c.toml", "a = \n", &CapOff);
     assert!(matches!(result, Err(Error::Toml(_))));
 }
 
@@ -176,7 +179,8 @@ fn yaml_non_ascii_offsets_are_bytes() {
 
 #[test]
 fn yaml_syntax_error_is_an_error() {
-    let result = ConfigChunker::new(ConfigFormat::Yaml).chunk_file("c.yaml", "a: [1, 2\nb: }\n");
+    let result =
+        ConfigChunker::new(ConfigFormat::Yaml).chunk_file("c.yaml", "a: [1, 2\nb: }\n", &CapOff);
     assert!(matches!(result, Err(Error::Yaml(_))));
 }
 
@@ -224,7 +228,7 @@ fn json_root_array_and_empty_files() {
 
 #[test]
 fn json_syntax_error_is_an_error() {
-    let result = ConfigChunker::new(ConfigFormat::Json).chunk_file("c.json", "{\"a\": }");
+    let result = ConfigChunker::new(ConfigFormat::Json).chunk_file("c.json", "{\"a\": }", &CapOff);
     assert!(matches!(result, Err(Error::Json(_))));
 }
 

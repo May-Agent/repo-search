@@ -14,8 +14,9 @@ mod yaml;
 use std::borrow::Cow;
 use std::ops::Range;
 
-use super::units::{CtxFrame, Emitter, LineIndex, MAX_BYTES, Span, trim_range, without_bom};
+use super::units::{CtxFrame, Emitter, Item, LineIndex, MAX_BYTES, Span, trim_range, without_bom};
 use super::{Chunk, ChunkKind, ConfigFormat, Error, FileChunker, MemberKind};
+use crate::TokenCounter;
 
 /// Separates key path segments in a symbol.
 const SYMBOL_SEPARATOR: &str = ".";
@@ -67,7 +68,12 @@ impl ConfigChunker {
 }
 
 impl FileChunker for ConfigChunker {
-    fn chunk_file(&mut self, path: &str, src: &str) -> Result<Vec<Chunk>, Error> {
+    fn chunk_file(
+        &mut self,
+        path: &str,
+        src: &str,
+        tokens: &dyn TokenCounter,
+    ) -> Result<Vec<Chunk>, Error> {
         without_bom(src, |src| {
             let (entries, comment) = match self.format {
                 ConfigFormat::Toml => (toml::entries(src)?, "#"),
@@ -78,7 +84,7 @@ impl FileChunker for ConfigChunker {
                 src,
                 comment,
                 lines: LineIndex::new(src),
-                out: Emitter::new(path, src),
+                out: Emitter::new(path, src, tokens, None),
             };
             let mut floor = 0;
             walker.walk(&entries, &mut Vec::new(), &mut floor);
@@ -87,17 +93,23 @@ impl FileChunker for ConfigChunker {
     }
 
     fn chunk_kind_name(&self, kind: ChunkKind) -> Cow<'_, str> {
-        Cow::Borrowed(
-            kind.static_name()
-                .expect("a configuration chunker produces only `config` and `packed` chunks"),
-        )
+        match kind {
+            ChunkKind::Config | ChunkKind::Packed => Cow::Borrowed(
+                kind.static_name()
+                    .expect("config and packed chunks have static names"),
+            ),
+            _ => panic!("a configuration chunker produces only `config` and `packed` chunks"),
+        }
     }
 
     fn member_kind_name(&self, kind: MemberKind) -> Cow<'_, str> {
-        Cow::Borrowed(
-            kind.static_name()
-                .expect("a configuration chunker produces only `config` members"),
-        )
+        match kind {
+            MemberKind::Config => Cow::Borrowed(
+                kind.static_name()
+                    .expect("a config member has a static name"),
+            ),
+            _ => panic!("a configuration chunker produces only `config` members"),
+        }
     }
 }
 
@@ -164,8 +176,11 @@ impl Walker<'_> {
             ctx,
             &entry.label,
             ChunkKind::Config,
-            MemberKind::Config,
-            symbol,
+            Item {
+                kind: MemberKind::Config,
+                symbol,
+                signature: None,
+            },
         );
     }
 

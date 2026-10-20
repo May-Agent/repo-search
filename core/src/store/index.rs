@@ -15,7 +15,7 @@ use super::{
 };
 
 /// Schema generation; a database at any other version is deleted and rebuilt.
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 /// One file's change inside an atomic batch.
 #[derive(Debug)]
@@ -50,11 +50,35 @@ pub struct StoredChunk {
     pub title: String,
     /// 1-based line range, inclusive.
     pub lines: RangeInclusive<u32>,
-    /// Byte ranges of the chunk's members, in order; the text is the slices
-    /// joined by `\n`.
-    pub ranges: Vec<Range<u64>>,
+    /// The chunk's members, in order; the text is the slices joined by `\n`,
+    /// a signature member emitting its slice whitespace-collapsed plus
+    /// ` …\n`.
+    pub members: Vec<StoredMember>,
     /// The vector cache key.
     pub content_hash: ContentHash,
+}
+
+/// One stored member's byte range and how its slice is emitted when the
+/// chunk's text is rebuilt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredMember {
+    /// Byte range in the file.
+    pub bytes: Range<u64>,
+    /// How the member's slice becomes text.
+    pub kind: StoredMemberKind,
+}
+
+/// How a stored member's slice becomes text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StoredMemberKind {
+    /// The slice verbatim, joined by `\n` with the other members.
+    Text,
+    /// A split part's signature: the slice whitespace-collapsed, cut to
+    /// `cut` characters, plus ` …\n`.
+    Signature {
+        /// Characters of the collapsed signature the prefix carries.
+        cut: usize,
+    },
 }
 
 enum Request {
@@ -471,8 +495,8 @@ fn replace(
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
     )?;
     let mut member_stmt = tx.prepare(
-        "INSERT INTO chunk_members (chunk_id, ord, start_byte, end_byte, kind, symbol) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        "INSERT INTO chunk_members (chunk_id, ord, start_byte, end_byte, kind, cut, symbol) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
     )?;
     let mut fts_stmt = tx.prepare("INSERT INTO fts (rowid, title, body) VALUES (?1, ?2, ?3)")?;
     for chunk in chunks {
@@ -495,6 +519,7 @@ fn replace(
                 start,
                 end,
                 member.kind,
+                i64_of(member.cut)?,
                 member.symbol,
             ])?;
         }
@@ -509,7 +534,7 @@ fn chunks_by_hash(conn: &Connection, hashes: &[ContentHash]) -> Result<Vec<Store
          WHERE content_hash = ?1 ORDER BY id LIMIT 1",
     )?;
     let mut member_stmt = conn.prepare(
-        "SELECT start_byte, end_byte FROM chunk_members WHERE chunk_id = ?1 ORDER BY ord",
+        "SELECT start_byte, end_byte, kind, cut FROM chunk_members WHERE chunk_id = ?1 ORDER BY ord",
     )?;
     let mut out = Vec::with_capacity(hashes.len());
     for hash in hashes {
@@ -527,21 +552,33 @@ fn chunks_by_hash(conn: &Connection, hashes: &[ContentHash]) -> Result<Vec<Store
         let Some((id, path, title, start, end)) = row else {
             continue;
         };
-        let ranges = member_stmt
+        let members = member_stmt
             .query_map([id], |row| {
                 let start = row.get::<_, i64>(0)?;
                 let end = row.get::<_, i64>(1)?;
-                Ok(u64::try_from(start)
-                    .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(0, start))?
-                    ..u64::try_from(end)
-                        .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(1, end))?)
+                let cut = row.get::<_, i64>(3)?;
+                let kind = if row.get::<_, String>(2)? == crate::chunk::MemberKind::SIGNATURE_NAME {
+                    StoredMemberKind::Signature {
+                        cut: usize::try_from(cut)
+                            .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(3, cut))?,
+                    }
+                } else {
+                    StoredMemberKind::Text
+                };
+                Ok(StoredMember {
+                    bytes: u64::try_from(start)
+                        .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(0, start))?
+                        ..u64::try_from(end)
+                            .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(1, end))?,
+                    kind,
+                })
             })?
             .collect::<Result<_, _>>()?;
         out.push(StoredChunk {
             path,
             title,
             lines: start..=end,
-            ranges,
+            members,
             content_hash: *hash,
         });
     }

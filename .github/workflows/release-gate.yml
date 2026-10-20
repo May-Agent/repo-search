@@ -113,3 +113,69 @@ jobs:
         env:
           REPO_SEARCH_MODEL_DIR: ${{ runner.temp }}/model
         run: cargo test --locked -p repo-search-coreml --test embedder -- --ignored
+
+  corpus-cap:
+    name: corpus token cap
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: stable
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: Read pinned model URL and sha256
+        id: model
+        run: |
+          set -euo pipefail
+          spec=src/model_store.rs
+          url=$(sed -nE 's/^ *url: "([^"]+)".*/\1/p' "$spec" | head -1)
+          sha256=$(sed -nE 's/^ *"([0-9a-f]{64})",? *$/\1/p' "$spec" | head -1)
+          if [[ -z "$url" || -z "$sha256" ]]; then
+            echo "::error::could not read the pinned model url/sha256 from $spec"
+            exit 1
+          fi
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+          echo "sha256=$sha256" >> "$GITHUB_OUTPUT"
+      - name: Cache model archive
+        id: model-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/model.tar.zst
+          key: model-archive-${{ steps.model.outputs.sha256 }}
+      - name: Download model archive
+        if: steps.model-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          curl -fL --retry 3 -o "$RUNNER_TEMP/model.tar.zst" "${{ steps.model.outputs.url }}"
+          echo "${{ steps.model.outputs.sha256 }}  $RUNNER_TEMP/model.tar.zst" | shasum -a 256 -c -
+      - name: Extract model archive
+        run: |
+          set -euo pipefail
+          echo "${{ steps.model.outputs.sha256 }}  $RUNNER_TEMP/model.tar.zst" | shasum -a 256 -c -
+          mkdir -p "$RUNNER_TEMP/model"
+          zstd -dc "$RUNNER_TEMP/model.tar.zst" | tar -x -C "$RUNNER_TEMP/model"
+
+      - name: Fetch corpora at pinned commits
+        run: |
+          set -euo pipefail
+          fetch() {
+            repo="$1" sha="$2"
+            work="$RUNNER_TEMP/corpora/$repo"
+            git init "$work"
+            git -C "$work" remote add origin "https://github.com/water-rs/$repo"
+            git -C "$work" fetch --depth 1 origin "$sha"
+            git -C "$work" checkout FETCH_HEAD
+          }
+          fetch waterui fea489f15755d73679727099cbd4a5222929fe3d
+          fetch book 1a4e4201141c22e7ac049480e04896e706c7aa22
+
+      - name: corpus cap tests
+        env:
+          REPO_SEARCH_CORPUS: ${{ runner.temp }}/corpora/waterui:${{ runner.temp }}/corpora/book
+          REPO_SEARCH_MODEL_DIR: ${{ runner.temp }}/model
+        run: cargo test --locked --release -p repo-search-coreml --test cap -- --ignored

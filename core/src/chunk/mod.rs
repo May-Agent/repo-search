@@ -55,7 +55,10 @@ use std::ops::{Range, RangeInclusive};
 use smallvec::SmallVec;
 use tree_sitter::{Language as TsLanguage, Node, Parser};
 
-use units::{CtxFrame, Emitter, MAX_BYTES, Span, ctx_symbol, join_symbol};
+use units::{CtxFrame, Emitter, Item, MAX_BYTES, Span, ctx_symbol, first_sentence, join_symbol};
+pub(crate) use units::{MemberEmit, write_members};
+
+use crate::TokenCounter;
 
 /// Everything language-specific the chunking algorithm needs.
 pub trait Grammar {
@@ -73,6 +76,14 @@ pub trait Grammar {
     /// `true` when a leading-trivia node's text is an inner (module) doc
     /// comment.
     fn is_inner_doc(&self, text: &str) -> bool;
+
+    /// `text`, the source of an inner-docs node, with its delimiters
+    /// stripped for the file note's first sentence: a Python docstring
+    /// loses its quotes. Comment markers are left for the sentence rule to
+    /// clean line by line.
+    fn inner_doc_text<'a>(&self, text: &'a str) -> &'a str {
+        text
+    }
 
     /// The label a chunk's title ends with for this item, such as `fn insert`
     /// or `impl Trait for Environment`.
@@ -138,6 +149,13 @@ pub enum ChunkKind {
 pub enum MemberKind {
     /// A syntax node of the chunker's tree-sitter language.
     Node(NodeKind),
+    /// A line-split part's signature: its slice is emitted
+    /// whitespace-collapsed — cut to `cut` characters — plus ` …\n`, ahead
+    /// of the part's own text.
+    Signature {
+        /// Characters of the collapsed signature the prefix carries.
+        cut: usize,
+    },
     /// Documentation text.
     Doc,
     /// A configuration entry.
@@ -145,7 +163,7 @@ pub enum MemberKind {
 }
 
 /// One syntactic item's run of bytes inside a chunk.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Member {
     /// The member's byte range in the file.
     pub bytes: Range<usize>,
@@ -174,11 +192,15 @@ impl ChunkKind {
 }
 
 impl MemberKind {
-    /// The kind string of a member that is no tree-sitter node: `doc` or
-    /// `config`; `None` for [`MemberKind::Node`].
+    /// The stored kind string of a signature member.
+    pub(crate) const SIGNATURE_NAME: &'static str = "signature";
+
+    /// The kind string of a member that is no tree-sitter node:
+    /// `signature`, `doc` or `config`; `None` for [`MemberKind::Node`].
     pub fn static_name(self) -> Option<&'static str> {
         match self {
             Self::Node(_) => None,
+            Self::Signature { .. } => Some(Self::SIGNATURE_NAME),
             Self::Doc => Some("doc"),
             Self::Config => Some("config"),
         }
@@ -197,25 +219,35 @@ pub struct Chunk {
     /// First and last line of the chunk, 1-based.
     pub lines: RangeInclusive<u32>,
     /// One member for a single item, a header, module docs or a line-split
-    /// part; one per packed item, in order, for a packed chunk.
-    pub members: SmallVec<[Member; 1]>,
+    /// part — a signature member plus the part for parts after the first;
+    /// one per packed item, in order, for a packed chunk.
+    pub members: SmallVec<[Member; 2]>,
 }
 
 impl Chunk {
-    /// Appends the chunk's text — its members' slices joined with `"\n"` —
-    /// to `out`.
+    /// Appends the chunk's text — its members' slices joined with `"\n"`,
+    /// a signature member emitting its slice whitespace-collapsed plus
+    /// ` …\n` — to `out`.
     ///
     /// # Panics
     ///
     /// If `src` is not the file this chunk was produced from.
     pub fn write_text(&self, src: &str, out: &mut String) {
-        let mut first = true;
-        for member in &self.members {
-            if !first {
-                out.push('\n');
-            }
-            first = false;
-            out.push_str(&src[member.bytes.clone()]);
+        units::write_members(
+            src,
+            self.members.iter().map(|m| (m.bytes.clone(), m.emit())),
+            out,
+        )
+        .expect("a chunk's member ranges lie in its file");
+    }
+}
+
+impl Member {
+    /// How this member's slice becomes text.
+    fn emit(&self) -> MemberEmit {
+        match self.kind {
+            MemberKind::Signature { cut } => MemberEmit::Signature { cut },
+            _ => MemberEmit::Text,
         }
     }
 }
@@ -278,11 +310,18 @@ pub enum Error {
 pub trait FileChunker {
     /// Chunks `src`, the text of the file at `path` relative to the
     /// repository root. `src` is the file's content; chunks never copy it.
+    /// `tokens` counts the model's tokens for the cap every chunk's
+    /// embedded document is held to.
     ///
     /// # Errors
     ///
     /// When `src` is not valid in the chunker's format.
-    fn chunk_file(&mut self, path: &str, src: &str) -> Result<Vec<Chunk>, Error>;
+    fn chunk_file(
+        &mut self,
+        path: &str,
+        src: &str,
+        tokens: &dyn TokenCounter,
+    ) -> Result<Vec<Chunk>, Error>;
 
     /// The kind string of a chunk this chunker produced.
     ///
@@ -300,15 +339,31 @@ pub trait FileChunker {
 }
 
 impl<G: Grammar> FileChunker for Chunker<G> {
-    fn chunk_file(&mut self, path: &str, src: &str) -> Result<Vec<Chunk>, Error> {
+    fn chunk_file(
+        &mut self,
+        path: &str,
+        src: &str,
+        tokens: &dyn TokenCounter,
+    ) -> Result<Vec<Chunk>, Error> {
         let tree = self
             .parser
             .parse(src, None)
             .expect("tree-sitter parsing cannot fail: no timeout is set");
+        // The file note is the first sentence of the module docs at file
+        // level; nested inner docs do not take part in it.
+        let mut docs = Vec::new();
+        let mut cursor = tree.root_node().walk();
+        for node in tree.root_node().children(&mut cursor) {
+            let text = &src[node.byte_range()];
+            if self.grammar.is_leading(node) && self.grammar.is_inner_doc(text) {
+                docs.push(self.grammar.inner_doc_text(text));
+            }
+        }
+        let note = first_sentence(&docs.join("\n"));
         let mut walker = Walker {
             grammar: &self.grammar,
             src,
-            out: Emitter::new(path, src),
+            out: Emitter::new(path, src, tokens, note.as_deref()),
         };
         walker.walk_children(tree.root_node(), &mut Vec::new());
         Ok(walker.out.finish())
@@ -337,6 +392,10 @@ impl<G: Grammar> FileChunker for Chunker<G> {
     fn member_kind_name(&self, kind: MemberKind) -> Cow<'_, str> {
         match kind {
             MemberKind::Node(kind) => Cow::Borrowed(self.kind_name(kind)),
+            MemberKind::Signature { .. } => Cow::Borrowed(
+                kind.static_name()
+                    .expect("a signature member has a static name"),
+            ),
             MemberKind::Doc | MemberKind::Config => {
                 panic!("a tree-sitter chunker produces no {kind:?} members")
             }
@@ -404,8 +463,11 @@ impl<G: Grammar> Walker<'_, G> {
                 ctx,
                 "module docs",
                 ChunkKind::ModuleDocs,
-                MemberKind::Node(NodeKind::of(first)),
-                ctx_symbol(ctx),
+                Item {
+                    kind: MemberKind::Node(NodeKind::of(first)),
+                    symbol: ctx_symbol(ctx),
+                    signature: None,
+                },
             );
         }
     }
@@ -431,8 +493,11 @@ impl<G: Grammar> Walker<'_, G> {
                     ctx,
                     &label,
                     ChunkKind::Header(kind),
-                    MemberKind::Node(kind),
-                    header_symbol,
+                    Item {
+                        kind: MemberKind::Node(kind),
+                        symbol: header_symbol,
+                        signature: None,
+                    },
                 );
             }
             let scope = self.out.new_scope();
@@ -454,10 +519,24 @@ impl<G: Grammar> Walker<'_, G> {
             ctx,
             &label,
             ChunkKind::Item(kind),
-            MemberKind::Node(kind),
-            symbol,
+            Item {
+                kind: MemberKind::Node(kind),
+                symbol,
+                signature: Some(signature_range(self.src, subject)),
+            },
         );
     }
+}
+
+/// The byte range of `node`'s signature: its start to the start of its
+/// `body` field, or its first line when it has no body — the text a later
+/// part of a line-split item carries, whitespace-collapsed, as ` …\n`.
+fn signature_range(src: &str, node: Node) -> Range<usize> {
+    if let Some(body) = node.child_by_field_name("body") {
+        return node.start_byte()..body.start_byte();
+    }
+    let text = &src[node.byte_range()];
+    node.start_byte()..node.start_byte() + text.find('\n').unwrap_or(text.len())
 }
 
 #[cfg(all(test, feature = "lang-rust"))]

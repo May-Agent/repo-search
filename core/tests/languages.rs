@@ -3,13 +3,16 @@
 //! to cross the 2400-byte split limit.
 #![allow(dead_code, unused_imports)]
 
+mod counters;
+
+use counters::CapOff;
 use repo_search_core::chunk::{Chunk, ChunkKind, Chunker, FileChunker, Grammar};
 
 const MAX: usize = 2400;
 
 fn chunks<G: Grammar>(grammar: G, src: &str) -> (Chunker<G>, Vec<Chunk>) {
     let mut chunker = Chunker::new(grammar);
-    let out = chunker.chunk_file(PATH, src).unwrap();
+    let out = chunker.chunk_file(PATH, src, &CapOff).unwrap();
     (chunker, out)
 }
 
@@ -17,6 +20,17 @@ fn text(src: &str, chunk: &Chunk) -> String {
     let mut out = String::new();
     chunk.write_text(src, &mut out);
     out
+}
+
+/// A chunk's source lines: its text minus a line-split part's signature
+/// prefix — the last member's slice.
+fn source_lines<'a>(src: &'a str, chunk: &Chunk) -> &'a str {
+    &src[chunk
+        .members
+        .last()
+        .expect("a chunk has a member")
+        .bytes
+        .clone()]
 }
 
 fn kind<G: Grammar>(chunker: &Chunker<G>, chunk: &Chunk) -> String {
@@ -175,8 +189,11 @@ mod swift {
         let (_, all) = chunks_of(&src);
         assert!(all.len() > 1);
         assert_eq!(all[0].title, "src/main.x › func big (part 1/2)");
-        let joined: String = all.iter().map(|c| text(&src, c)).collect();
+        // parts after the first carry the signature prefix; their own
+        // lines rejoin to the source
+        let joined: String = all.iter().map(|c| source_lines(&src, c)).collect();
         assert_eq!(joined, src.strip_suffix('\n').unwrap());
+        assert!(text(&src, &all[1]).starts_with("func big() …\n"));
     }
 
     /// Non-ASCII identifiers and directives chunk safely.
@@ -321,8 +338,11 @@ mod typescript {
         let src = format!("function big() {{\n{}}}\n", line.repeat(50));
         let (_, all) = chunks_of(&src);
         assert_eq!(all[0].title, "src/main.x › function big (part 1/2)");
-        let joined: String = all.iter().map(|c| text(&src, c)).collect();
+        // parts after the first carry the signature prefix; their own
+        // lines rejoin to the source
+        let joined: String = all.iter().map(|c| source_lines(&src, c)).collect();
         assert_eq!(joined, src.strip_suffix('\n').unwrap());
+        assert!(text(&src, &all[1]).starts_with("function big() …\n"));
     }
 
     /// Non-ASCII source never splits a UTF-8 sequence.
@@ -425,7 +445,7 @@ mod python {
         assert_eq!(all[0].title, "src/main.x › module docs");
         assert_eq!(text(&src, &all[0]), "\"\"\"Module doc.\"\"\"");
         assert_eq!(kind(&chunker, &all[1]), "function_definition");
-        assert_eq!(all[1].title, "src/main.x › def f");
+        assert_eq!(all[1].title, "src/main.x — Module doc. › def f");
         assert_eq!(all[1].lines, 5..=8);
         assert!(text(&src, &all[1]).starts_with("# a note\n@decorator\ndef f():"));
         assert_eq!(member_symbols(&all[1]), ["f"]);
@@ -449,7 +469,7 @@ mod python {
                 .flat_map(|c| c.members.iter())
                 .all(|m| !src[m.bytes.clone()].contains("#!"))
         );
-        assert_eq!(all[1].title, "src/main.x › x");
+        assert_eq!(all[1].title, "src/main.x — Module doc. › x");
     }
 
     /// Assignments report the `assignment` kind and the target's name.
@@ -517,8 +537,11 @@ mod python {
         let src = format!("def big():\n{}", line.repeat(50));
         let (_, all) = chunks_of(&src);
         assert_eq!(all[0].title, "src/main.x › def big (part 1/2)");
-        let joined: String = all.iter().map(|c| text(&src, c)).collect();
+        // parts after the first carry the signature prefix; their own
+        // lines rejoin to the source
+        let joined: String = all.iter().map(|c| source_lines(&src, c)).collect();
         assert_eq!(joined, src.strip_suffix('\n').unwrap());
+        assert!(text(&src, &all[1]).starts_with("def big(): …\n"));
     }
 
     /// A non-ASCII docstring and identifiers chunk safely.
@@ -531,7 +554,7 @@ mod python {
         let (chunker, all) = chunks_of(&src);
         assert_eq!(all[0].kind, ChunkKind::ModuleDocs);
         assert_eq!(kind(&chunker, &all[0]), "docs");
-        assert_eq!(all[1].title, "src/main.x › valor");
+        assert_eq!(all[1].title, "src/main.x — Döcùmént 注释。 › valor");
     }
 }
 
@@ -700,8 +723,11 @@ mod c {
         let src = format!("int big(void) {{\n{}}}\n", line.repeat(50));
         let (_, all) = chunks_of(&src);
         assert_eq!(all[0].title, "src/main.x › fn big (part 1/2)");
-        let joined: String = all.iter().map(|c| text(&src, c)).collect();
+        // parts after the first carry the signature prefix; their own
+        // lines rejoin to the source
+        let joined: String = all.iter().map(|c| source_lines(&src, c)).collect();
         assert_eq!(joined, src.strip_suffix('\n').unwrap());
+        assert!(text(&src, &all[1]).starts_with("int big(void) …\n"));
     }
 }
 
@@ -942,7 +968,10 @@ mod go {
         let src = format!("func big() {{\n{}}}\n", line.repeat(50));
         let (_, all) = chunks_of(&src);
         assert_eq!(all[0].title, "src/main.x › func big (part 1/2)");
-        let joined: String = all.iter().map(|c| text(&src, c)).collect();
+        // parts after the first carry the signature prefix; their own
+        // lines rejoin to the source
+        let joined: String = all.iter().map(|c| source_lines(&src, c)).collect();
         assert_eq!(joined, src.strip_suffix('\n').unwrap());
+        assert!(text(&src, &all[1]).starts_with("func big() …\n"));
     }
 }

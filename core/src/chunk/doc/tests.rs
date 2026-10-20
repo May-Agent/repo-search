@@ -2,7 +2,9 @@
 //! prototype `chunk_md.py` except where noted.
 
 use super::DocChunker;
+use crate::TokenCounter;
 use crate::chunk::{Chunk, ChunkKind, DocFormat, FileChunker, MemberKind};
+use crate::counters::{CapOff, CharTokens};
 
 fn chunks(format: DocFormat, path: &str, src: &str) -> Vec<(String, String)> {
     chunks_full(format, path, src)
@@ -16,7 +18,9 @@ fn chunks_full(
     path: &str,
     src: &str,
 ) -> Vec<(String, std::ops::RangeInclusive<u32>, String)> {
-    let all = DocChunker::new(format).chunk_file(path, src).unwrap();
+    let all = DocChunker::new(format)
+        .chunk_file(path, src, &CapOff)
+        .unwrap();
     all.iter()
         .map(|chunk| (chunk.title.clone(), chunk.lines.clone(), text(src, chunk)))
         .collect()
@@ -201,7 +205,7 @@ fn split_parts_have_their_own_line_ranges_and_two_members() {
     let para = |c: char| format!("{}\n", c.to_string().repeat(1500));
     let src = format!("intro\n\n# Big\n{}\n{}", para('a'), para('b'));
     let pieces = DocChunker::new(DocFormat::Markdown)
-        .chunk_file("a.md", &src)
+        .chunk_file("a.md", &src, &CapOff)
         .unwrap();
     assert_eq!(pieces.len(), 3);
     assert_eq!(pieces[1].kind, ChunkKind::Doc);
@@ -215,7 +219,7 @@ fn split_parts_have_their_own_line_ranges_and_two_members() {
 #[test]
 fn symbol_is_the_heading_path() {
     let pieces = DocChunker::new(DocFormat::Markdown)
-        .chunk_file("a.md", "# A\n## B\ntext\n")
+        .chunk_file("a.md", "# A\n## B\ntext\n", &CapOff)
         .unwrap();
     assert_eq!(pieces[0].members[0].symbol, "A › B");
 }
@@ -397,7 +401,7 @@ fn a_byte_order_mark_is_ignored_by_every_format() {
     assert_eq!(all[0].2, "# H\n\nb");
     // Member ranges are offsets into the original text.
     let chunk = &DocChunker::new(DocFormat::Markdown)
-        .chunk_file("a.md", src)
+        .chunk_file("a.md", src, &CapOff)
         .unwrap()[0];
     assert_eq!(chunk.members[0].bytes.start, 3);
     assert_eq!(chunk.lines, 1..=3);
@@ -429,14 +433,24 @@ fn cjk_sections_are_split_by_bytes() {
     }
 }
 
+/// A single line whose document exceeds the token cap is cut inside the
+/// line on char boundaries.
 #[test]
-fn a_single_line_over_the_limit_splits_on_char_boundaries() {
+fn a_single_line_over_the_cap_splits_on_char_boundaries() {
     let src = format!("# H\n\n{}\n", "名".repeat(2000));
-    let all = md(&src);
+    let all = DocChunker::new(DocFormat::Markdown)
+        .chunk_file("a.md", &src, &CharTokens(1))
+        .unwrap();
     assert!(all.len() > 2);
     let mut total = 0;
-    for (_, text) in &all {
-        assert!(text.len() <= 2400, "{}", text.len());
+    for chunk in &all {
+        let mut text = String::new();
+        chunk.write_text(&src, &mut text);
+        assert!(
+            CharTokens(1).fits(&chunk.title, &[&text], 512),
+            "{title} is over the cap",
+            title = chunk.title
+        );
         total += text.matches('名').count();
     }
     assert_eq!(total, 2000);

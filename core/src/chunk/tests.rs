@@ -2,18 +2,19 @@
 //! Expected values were produced by the reference chunker `chunk_ts.py`.
 
 use super::{Chunk, ChunkKind, Chunker, FileChunker, Rust};
+use crate::counters::CapOff;
 
 const PATH: &str = "src/lib.rs";
 
 fn chunks(src: &str) -> (Chunker<Rust>, Vec<Chunk>) {
     let mut chunker = Chunker::new(Rust);
-    let out = chunker.chunk_file(PATH, src).unwrap();
+    let out = chunker.chunk_file(PATH, src, &CapOff).unwrap();
     (chunker, out)
 }
 
 fn chunks_at(path: &str, src: &str) -> (Chunker<Rust>, Vec<Chunk>) {
     let mut chunker = Chunker::new(Rust);
-    let out = chunker.chunk_file(path, src).unwrap();
+    let out = chunker.chunk_file(path, src, &CapOff).unwrap();
     (chunker, out)
 }
 
@@ -65,10 +66,12 @@ fn module_docs_are_their_own_chunk() {
     assert_eq!(text(&src, &all[0]), "//! line one\n//! line two\n");
     assert_eq!(all[0].members[0].symbol, "");
     assert_eq!(kind(&chunker, &all[1]), "function_item");
-    assert_eq!(all[1].title, "src/lib.rs › fn f");
+    // the file note is the first sentence of the file's inner docs — the
+    // first `//!` line, since nodes join with a blank line between them
+    assert_eq!(all[1].title, "src/lib.rs — line one › fn f");
     assert_eq!(all[2].kind, ChunkKind::ModuleDocs);
     assert_eq!(text(&src, &all[2]), "/*! block */");
-    assert_eq!(all[3].title, "src/lib.rs › fn g");
+    assert_eq!(all[3].title, "src/lib.rs — line one › fn g");
 }
 
 /// An inner doc inside a trivia run is emitted before the item; the rest of
@@ -85,7 +88,7 @@ fn inner_doc_inside_trivia_splits_off() {
     assert_eq!(all[0].kind, ChunkKind::ModuleDocs);
     assert_eq!(all[0].lines, 2..=2);
     assert_eq!(text(&src, &all[0]), "//! inner\n");
-    assert_eq!(all[1].title, "src/lib.rs › fn f");
+    assert_eq!(all[1].title, "src/lib.rs — inner › fn f");
     assert_eq!(all[1].lines, 1..=3);
     assert_eq!(
         text(&src, &all[1]),
@@ -272,15 +275,26 @@ fn oversized_item_splits_on_lines() {
         "tests/fixtures/oversized_fn.rs › fn big (part 2/2)"
     );
     assert_eq!(all[1].lines, 26..=35);
+    // a part after the first opens with the item's signature + ` …\n`;
+    // its first member is the signature's own byte range
+    assert_eq!(all[1].members.len(), 2);
+    assert_eq!(
+        chunker.member_kind_name(all[1].members[0].kind),
+        "signature"
+    );
     let part2 = text(src, &all[1]);
-    assert_eq!(part2.len(), 867);
+    assert_eq!(part2.len(), 867 + "fn big() -> usize …\n".len());
+    assert!(part2.starts_with("fn big() -> usize …\n"));
     // the multi-byte line (50 code points of é, 100 bytes) is whole in part 2
     assert!(part2.contains("ééé"));
     assert!(part2.ends_with('}'));
 
-    // the parts partition the item's text exactly; the file's final newline
-    // lies outside the item
-    assert_eq!(format!("{part1}{part2}"), src.strip_suffix('\n').unwrap());
+    // the parts partition the item's text exactly apart from the signature
+    // prefix; the file's final newline lies outside the item
+    assert_eq!(
+        format!("{part1}{}", &part2["fn big() -> usize …\n".len()..]),
+        src.strip_suffix('\n').unwrap()
+    );
 }
 
 /// An oversized trait and an oversized inline mod split the same way as an
@@ -441,24 +455,28 @@ impl<T> Cache<T> for Store<T> {
 #[test]
 fn parser_reuse() {
     let mut chunker = Chunker::new(Rust);
-    let a = chunker.chunk_file("a.rs", "fn a() {}\n").unwrap();
-    let b = chunker.chunk_file("b.rs", "fn b() {}\n").unwrap();
+    let a = chunker.chunk_file("a.rs", "fn a() {}\n", &CapOff).unwrap();
+    let b = chunker.chunk_file("b.rs", "fn b() {}\n", &CapOff).unwrap();
     assert_eq!(a[0].title, "a.rs › fn a");
     assert_eq!(b[0].title, "b.rs › fn b");
 }
 
-/// The size limit counts code points: 1800 two-byte characters plus
-/// padding is 3634 bytes but under 2400 code points, so it stays one chunk.
+/// The size limit counts bytes: 1800 two-byte characters plus padding is
+/// 3634 bytes, so the item splits on lines — under the 2400-byte budget,
+/// never mind that it is under 2400 code points.
 #[test]
-fn line_split_counts_code_points_not_bytes() {
+fn line_split_counts_bytes_not_code_points() {
     let e = "é".repeat(600);
     let src = format!("fn m() {{\n    // {e}\n    // {e}\n    // {e}\n}}\n");
     let (chunker, all) = chunks(&src);
-    assert_eq!(all.len(), 1);
-    assert_eq!(all[0].title, "src/lib.rs › fn m");
+    assert_eq!(all.len(), 3);
     assert_eq!(kind(&chunker, &all[0]), "function_item");
-    assert_eq!(all[0].lines, 1..=5);
-    assert_eq!(text(&src, &all[0]).len(), 3634);
+    assert_eq!(all[0].title, "src/lib.rs › fn m (part 1/3)");
+    assert_eq!(all[0].lines, 1..=2);
+    assert_eq!(all[1].lines, 3..=3);
+    assert_eq!(all[2].lines, 4..=5);
+    // later parts open with the item's signature
+    assert!(text(&src, &all[2]).starts_with("fn m() …\n"));
 }
 
 /// Lines split on every Python `splitlines` boundary; `\r\n` is one
@@ -505,7 +523,9 @@ fn crlf_file_line_split() {
     assert_eq!(text(&src, &all[0]).len(), 2366);
     assert_eq!(all[1].title, "src/lib.rs › fn c (part 2/2)");
     assert_eq!(all[1].lines, 46..=62);
-    assert_eq!(text(&src, &all[1]).len(), 865);
+    let part2 = text(&src, &all[1]);
+    assert!(part2.starts_with("fn c() …\n"));
+    assert_eq!(part2.len(), 865 + "fn c() …\n".len());
 }
 
 /// An impl's symbol is its type's name with references, pointers and
@@ -523,4 +543,171 @@ fn impl_symbol_strips_reference_types() {
         .collect();
     assert_eq!(symbols[0], "Foo");
     assert_eq!(symbols[1], "Foo::r0");
+}
+
+/// `first_sentence` strips comment markers, stops at a blank line, a
+/// heading or a code fence, cuts after the first `.`/`!`/`?` followed by
+/// whitespace or end, truncates at 160 chars on a word boundary and turns
+/// `›` into `>`. Each `//!` node ends in a newline, so nodes join into a
+/// text with blank lines between them — the note is the first line of a
+/// `//!` run, matching the reference.
+#[test]
+fn first_sentence_rule() {
+    use super::units::first_sentence;
+
+    // sentence ends at the first terminator followed by whitespace
+    assert_eq!(
+        first_sentence(
+            "//! One. Two.
+
+//! Three.
+"
+        )
+        .as_deref(),
+        Some("One.")
+    );
+    // a terminator at end-of-text counts too
+    assert_eq!(first_sentence("//! Last!").as_deref(), Some("Last!"));
+    // a `.` inside a word does not cut
+    assert_eq!(
+        first_sentence(
+            "//! a.b c.d
+"
+        )
+        .as_deref(),
+        Some("a.b c.d")
+    );
+    // a `//!` node's trailing newline makes a blank line between nodes:
+    // the note is only the first doc line
+    assert_eq!(
+        first_sentence(
+            "//! First.
+
+//! Second.
+"
+        )
+        .as_deref(),
+        Some("First.")
+    );
+    // blank doc lines inside one node stop the note the same way
+    assert_eq!(
+        first_sentence(
+            "//!
+//! First.
+//!
+//! Second.
+"
+        )
+        .as_deref(),
+        Some("First.")
+    );
+    // a heading or a code fence stops the note
+    assert_eq!(
+        first_sentence("//! Words.\n//! # Section\n//! More.").as_deref(),
+        Some("Words.")
+    );
+    assert_eq!(
+        first_sentence("//! Words.\n//! ```rust\n//! More.").as_deref(),
+        Some("Words.")
+    );
+    // a file whose docs open with a heading has no note
+    assert_eq!(
+        first_sentence(
+            "//! # Title
+//! Body.
+"
+        ),
+        None
+    );
+    // block-comment markers and a trailing `*/` are stripped; a `/*!` node
+    // has no inter-line blanks, so its first sentence spans lines
+    assert_eq!(
+        first_sentence(
+            "/*! Block.
+ * more
+ */"
+        )
+        .as_deref(),
+        Some("Block.")
+    );
+    // docs with no sentence terminator keep everything collected
+    assert_eq!(
+        first_sentence(
+            "//! one
+//! two"
+        )
+        .as_deref(),
+        Some("one two")
+    );
+    // 160 chars, cut on a word boundary, ` …` appended
+    let long = format!("//! {}", "word ".repeat(60));
+    let note = first_sentence(&long).unwrap();
+    let head = note.strip_suffix(" …").unwrap();
+    assert!(head.chars().count() <= 160);
+    assert!(head.chars().count() > 140);
+    // `›` is not allowed in a title segment
+    assert_eq!(
+        first_sentence(
+            "//! a › b.
+"
+        )
+        .as_deref(),
+        Some("a > b.")
+    );
+    // no docs, no note
+    assert_eq!(first_sentence(""), None);
+    assert_eq!(
+        first_sentence(
+            "//!
+//!"
+        ),
+        None
+    );
+}
+
+/// The first sentence of a file's module docs goes into every other chunk's
+/// title after the path — `path — <sentence> › …`; the docs chunk itself
+/// keeps the plain `path`.
+#[test]
+fn module_docs_sentence_joins_titles() {
+    let src = format!(
+        "//! First sentence. Rest.\n\nfn f() {{ {} }}\n\nfn g() {{ {} }}\n",
+        "x".repeat(400),
+        "y".repeat(400)
+    );
+    let (chunker, all) = chunks(&src);
+    assert_eq!(all.len(), 3);
+    assert_eq!(all[0].title, "src/lib.rs › module docs");
+    assert_eq!(all[1].title, "src/lib.rs — First sentence. › fn f");
+    assert_eq!(all[2].title, "src/lib.rs — First sentence. › fn g");
+    assert_eq!(kind(&chunker, &all[0]), "docs");
+}
+
+/// A line-split part after the first opens with the item's signature —
+/// whitespace collapsed — plus ` …\n`; the part's own line range does not
+/// count the prefix. The signature is a member of its own, so the stored
+/// byte ranges rebuild the same text.
+#[test]
+fn split_parts_carry_the_signature() {
+    let src = format!(
+        "fn f(  a: u32,\n       b: u32\n) -> u32 {{\n{}\n}}\n",
+        "x".repeat(5000)
+    );
+    let (chunker, all) = chunks(&src);
+    assert!(all.len() > 2);
+    // the collapsed signature
+    let signature = "fn f( a: u32, b: u32 ) -> u32 …\n";
+    for (index, chunk) in all.iter().enumerate().skip(1) {
+        assert_eq!(chunker.chunk_kind_name(chunk.kind), "function_item");
+        assert!(text(&src, chunk).starts_with(signature));
+        assert_eq!(chunk.members.len(), 2);
+        assert_eq!(chunker.member_kind_name(chunk.members[0].kind), "signature");
+        assert_eq!(
+            &src[chunk.members[0].bytes.clone()],
+            "fn f(  a: u32,\n       b: u32\n) -> u32 "
+        );
+        let _ = index;
+    }
+    // the first part has no signature member
+    assert_eq!(all[0].members.len(), 1);
 }

@@ -103,6 +103,9 @@ pub struct MemberRecord {
     pub bytes: Range<u64>,
     /// The item's syntactic kind, for `--kind` filtering.
     pub kind: String,
+    /// For a signature member: the characters of the collapsed signature
+    /// its emitted prefix carries; meaningless and 0 for other kinds.
+    pub cut: u64,
     /// The item's symbol path, for `--symbol` filtering.
     pub symbol: String,
 }

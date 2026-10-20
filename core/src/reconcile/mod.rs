@@ -12,10 +12,12 @@ mod scan;
 use std::collections::{HashMap, HashSet};
 use std::ops::RangeInclusive;
 use std::path::Path;
+use std::sync::Arc;
 use std::thread;
 
 use tokio::sync::oneshot;
 
+use crate::TokenCounter;
 use crate::store::{self, Applied, ContentHash, Index, VectorCache};
 
 /// Failures of a reconcile pass.
@@ -161,6 +163,9 @@ pub struct Reconciled {
 /// Brings `index` in line with the worktree at `worktree`, then lists the
 /// chunks that have no vector cached for `model_id`.
 ///
+/// `tokens` is the model's token counter; the chunker holds every chunk's
+/// embedded document to the cap it counts.
+///
 /// Every change to files, chunks and FTS commits in one transaction; a pass
 /// that finds nothing changed performs no write.
 ///
@@ -174,6 +179,7 @@ pub async fn reconcile(
     model_id: &str,
     worktree: &Path,
     options: Options,
+    tokens: Arc<dyn TokenCounter>,
 ) -> Result<Reconciled, Error> {
     let stored: HashMap<_, _> = index
         .file_states()
@@ -182,7 +188,8 @@ pub async fn reconcile(
         .map(|state| (state.path.clone(), state))
         .collect();
     let root = worktree.to_path_buf();
-    let plan = run_blocking(move || scan::plan(&root, options.include_ignored, stored)).await??;
+    let plan = run_blocking(move || scan::plan(&root, options.include_ignored, stored, &*tokens))
+        .await??;
 
     let applied = if plan.changes.is_empty() {
         Applied::default()

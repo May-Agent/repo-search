@@ -55,6 +55,21 @@ impl QueryTask {
     }
 }
 
+/// Counts the model's tokens. The chunker enforces its cap on every chunk's
+/// embedded document through this interface; the tokenizer and the document
+/// prompt the count applies to live in the embedding crate, so core never
+/// formats a prompt.
+pub trait TokenCounter: Send + Sync {
+    /// The number of tokens `text` encodes to, special tokens included — the
+    /// count the model consumes.
+    fn count(&self, text: &str) -> usize;
+
+    /// Whether the document the model embeds for `title` — its text is
+    /// `text` joined — encodes to at most `max` tokens. Implementations may
+    /// answer without encoding when a byte bound already decides it.
+    fn fits(&self, title: &str, text: &[&str], max: usize) -> bool;
+}
+
 /// A text encoder. Calls block: callers run it on a thread they own and set its QoS.
 pub trait Embedder {
     /// The backend's failure.
