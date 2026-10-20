@@ -137,25 +137,17 @@ impl TokenCounter for StubCounter {
     }
 }
 
-/// The effective priority below which a `Background` thread is settled at
-/// its own class: the kernel's `Background` band is 4, and a lifted or
-/// freshly woken thread reads 20.
-const BACKGROUND_SETTLED: i32 = 10;
-
-/// A gate on an instance's Index-kind calls: every call not at
-/// `UserInteractive` QoS. Disarmed it is inert; once [`IndexGate::arm`]ed,
-/// each such call sends a [`Kind::Held`] record and holds until
-/// [`IndexGate::open`], which releases everything for good.
-///
-/// A held `Background` call is also released by a queued query, which opens
-/// the gate for good: the scheduler lifts a `Background` thread's priority
-/// the moment a query waits behind it, and the gate watches for that lift. The `Held` record of such
-/// a call is sent only once its thread has settled at its own class, so a
-/// query sent after the record always shows up as a lift. A call at any
-/// other class holds until `open`: the lift does not change its priority.
+/// A gate on an instance's Index-kind calls. Disarmed it is inert; once
+/// [`IndexGate::arm`]ed, each such call registers its release channel,
+/// sends a [`Kind::Held`] record and blocks until [`IndexGate::open`],
+/// which releases every held and future call for good. A `Held` record
+/// lands only after the release channel is registered, so a test that sees
+/// it can `open` without racing the wait. The embedder thread is the gate's
+/// only caller, so at most one call is ever held.
 pub struct IndexGate {
     armed: AtomicBool,
     released: AtomicBool,
+    release: OnceLock<mpsc::Sender<()>>,
 }
 
 /// A test-installed hold on a stub hook: the first call into the hook
@@ -221,6 +213,9 @@ impl IndexGate {
     #[allow(dead_code)] // only the socket-level tests use it
     pub fn open(&self) {
         self.released.store(true, Ordering::Release);
+        if let Some(release) = self.release.get() {
+            let _ = release.send(());
+        }
     }
 }
 
@@ -244,6 +239,9 @@ fn held_record(instance: Instance, qos: QosClass, now: Instant) -> Record {
 pub struct StubBackend {
     records: mpsc::Sender<Record>,
     delays: BTreeMap<(Instance, usize), Duration>,
+    /// Published by `open_ane`, which runs on the ANE thread itself: how a
+    /// daemon-level test reaches the thread `loaded` does not surface.
+    ane_thread: OnceLock<qos::ThreadId>,
     ane_opens: AtomicUsize,
     ane_open_fails: AtomicBool,
     open_ane_hold: Option<Arc<Hold>>,
@@ -273,6 +271,7 @@ impl StubBackend {
         Self {
             records,
             delays: BTreeMap::new(),
+            ane_thread: OnceLock::new(),
             ane_opens: AtomicUsize::new(0),
             ane_open_fails: AtomicBool::new(false),
             open_ane_hold: None,
@@ -295,6 +294,12 @@ impl StubBackend {
         }
     }
 
+    /// The sleep for calls of `instance` in one token `bucket`.
+    #[allow(dead_code)] // only the socket-level tests use it
+    pub fn set_delay(&mut self, instance: Instance, bucket: usize, delay: Duration) {
+        self.delays.insert((instance, bucket), delay);
+    }
+
     /// Gates `instance`'s first embed call on a barrier the test opens.
     pub fn gate_first(&mut self, instance: Instance) -> Arc<Barrier> {
         let gate = Arc::new(Barrier::new(2));
@@ -309,6 +314,7 @@ impl StubBackend {
         let gate = Arc::new(IndexGate {
             armed: AtomicBool::new(false),
             released: AtomicBool::new(false),
+            release: OnceLock::new(),
         });
         self.index_gates.insert(instance, gate.clone());
         gate
@@ -330,6 +336,18 @@ impl StubBackend {
         let (hold, handle) = Hold::install();
         self.counter_hold = Some(hold);
         handle
+    }
+
+    /// The ANE thread's id, published by `open_ane` from that thread.
+    ///
+    /// # Panics
+    ///
+    /// When `open_ane` has not run yet; any stub record proves it has.
+    pub fn ane_thread(&self) -> qos::ThreadId {
+        *self
+            .ane_thread
+            .get()
+            .expect("open_ane publishes the ANE thread")
     }
 
     /// Makes `open_ane` fail, for the fatal-path test.
@@ -397,6 +415,7 @@ impl Backend for StubBackend {
     }
 
     fn open_ane(&self, _: &Path, _: &str) -> Result<Self::Ane, Self::LoadError> {
+        let _ = self.ane_thread.set(qos::ThreadId::current());
         self.ane_opens.fetch_add(1, Ordering::Relaxed);
         if let Some(hold) = &self.open_ane_hold {
             hold.enter();
@@ -466,7 +485,9 @@ impl StubEmbedder {
     }
 
     /// Holds an Index-kind call while the gate is armed and unreleased,
-    /// sending its [`Kind::Held`] record once the hold is in force.
+    /// sending its [`Kind::Held`] record once the release channel is
+    /// registered. The call blocks on that channel until
+    /// [`IndexGate::open`].
     fn hold_index_call(&self) {
         let Some(gate) = &self.index_gate else {
             return;
@@ -474,43 +495,21 @@ impl StubEmbedder {
         if !gate.armed.load(Ordering::Acquire) || gate.released.load(Ordering::Acquire) {
             return;
         }
-        let class = qos::current_thread();
-        if class != QosClass::Background {
-            let _ = self
-                .records
-                .send(held_record(self.instance, class, Instant::now()));
-            while !gate.released.load(Ordering::Acquire) {
-                std::thread::sleep(Duration::from_micros(200));
-            }
+        let (release, wait) = mpsc::channel::<()>();
+        gate.release
+            .set(release)
+            .expect("the embedder thread holds one call per gate");
+        let _ = self.records.send(held_record(
+            self.instance,
+            qos::current_thread(),
+            Instant::now(),
+        ));
+        // `open` may have landed between the armed check and registering:
+        // then this call passes without waiting.
+        if gate.released.load(Ordering::Acquire) {
             return;
         }
-        // The held thread blocks, so nothing about it wakes or boosts it: a
-        // watcher thread reads its priority from outside. It sends `Held`
-        // once the thread has settled at its own class, then releases the
-        // call on `open` or on the lift a queued query causes.
-        let me = qos::ThreadId::current();
-        let records = self.records.clone();
-        let instance = self.instance;
-        let (release, wake) = mpsc::channel::<()>();
-        std::thread::scope(|scope| {
-            scope.spawn(|| {
-                while qos::scheduling_priority(me) >= BACKGROUND_SETTLED {
-                    std::thread::sleep(Duration::from_micros(200));
-                }
-                let _ = records.send(held_record(instance, class, Instant::now()));
-                while !gate.released.load(Ordering::Acquire)
-                    && qos::scheduling_priority(me) < BACKGROUND_SETTLED
-                {
-                    std::thread::sleep(Duration::from_micros(200));
-                }
-                // A lift releases the gate for good: the query is queued
-                // and every later call runs free, so a follow-up job of the
-                // same search cannot hit a gate it could not lift.
-                gate.released.store(true, Ordering::Release);
-                release.send(()).expect("the held call is waiting");
-            });
-            wake.recv().expect("the gate releases the call");
-        });
+        wait.recv().expect("open releases every held call");
     }
 
     /// Reports the call's start, before the gate and the sleep.
@@ -641,6 +640,15 @@ impl BatchEmbedder for StubEmbedder {
             .map(|(title, text)| bag_of_words(&format!("{title} {text}"), self.dim))
             .collect())
     }
+}
+
+/// Holds `class` over the backend's ANE thread for the caller's scope: the
+/// thread's effective priority lifts while its requested class — what the
+/// stub's records report — stays unchanged. `open_ane` must already have
+/// run; any stub record proves it did.
+#[must_use]
+pub fn lift_ane(backend: &StubBackend, class: QosClass) -> qos::Override {
+    qos::Override::start(backend.ane_thread(), class)
 }
 
 /// A deterministic unit vector: FNV-1a per whitespace word, modulo `dim`.

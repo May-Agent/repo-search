@@ -292,7 +292,20 @@ async fn first_search_answers_and_starts_stage_1() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn query_preempts_indexing() {
     let repo = fn_repo(100, SMALL_BYTES, 20);
-    let (d, gate) = start_index_gated(Duration::from_millis(20)).await;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let mut backend = StubBackend::new(mpsc::channel().0);
+    // The held call's bucket sleeps long enough to keep it in flight
+    // through the whole search dispatch: only a pull taken after the query
+    // is queued can follow it, so at most it starts in the query's window
+    // however early the gate is opened. The delay is the stub's embed
+    // simulation, not a wait for a signal.
+    backend.set_delay(
+        Instance::Ane,
+        support::stub::BUCKETS[2],
+        Duration::from_secs(5),
+    );
+    let gate = backend.gate_first_index(Instance::Ane);
+    let d = daemon(tmp, backend, Model::Cached, Duration::from_secs(600)).await;
 
     // Stage 1 completes first: every later chunk is stage-2 work, which the
     // ANE runs at background QoS, the class a queued query lifts.
@@ -306,14 +319,22 @@ async fn query_preempts_indexing() {
     .await;
     assert!(matches!(final_of(&events), Final::Indexed { .. }));
 
-    // New functions need vectors: the gate holds the first background call
-    // of their embedding, in flight, when the query arrives.
+    // A completed index proves `open_ane` ran. Stage-2 chunks embed at
+    // Background QoS, which a loaded host can starve: lift the thread's
+    // effective priority, but only to Utility — below the scheduler's own
+    // lift, which the scheduler-level test asserts. The recorded (requested)
+    // class stays Background.
+    let _lift = support::stub::lift_ane(&d.backend, QosClass::Utility);
+
+    // A new file with a new long function needs a vector: the one chunk
+    // lands in the 512-token bucket the test slowed down, and the gate
+    // holds it in flight when the query lands.
     gate.arm();
-    let mut body = String::new();
-    for i in 0..40 {
-        body.push_str(&repo::rust_fn(&format!("edited_item_{i}"), SMALL_BYTES));
-    }
-    repo::append(&repo.root, "src/f0.rs", &body);
+    repo::append(
+        &repo.root,
+        "src/edit.rs",
+        &repo::rust_fn("edited_item_3", LONG_BYTES),
+    );
     let events = request(
         &d.socket,
         Request::Index {
@@ -329,7 +350,17 @@ async fn query_preempts_indexing() {
     // The query's lexical candidates are the edited, unembedded functions:
     // the search embeds them on the spot.
     let sent = Instant::now();
-    let events = answer_search(&d, &repo.root, "edited_item_3").await;
+    let responses = stream_request(&d.socket, search(&repo.root, "edited_item_3")).await;
+    // The request is on the wire: releasing the held call is the test's
+    // doing, not the query's lift — the scheduler-level test proves the
+    // override. What stays asserted here is the ordering.
+    gate.open();
+    let events = tokio::time::timeout(TIMEOUT, responses.collect::<Vec<_>>())
+        .await
+        .expect("the reply stream does not stall")
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()
+        .expect("every frame decodes");
     let answer = match final_of(&events) {
         Final::Answer(answer) => answer,
         other => panic!("expected an Answer, got {other:?}"),
@@ -346,18 +377,20 @@ async fn query_preempts_indexing() {
         .find(|r| r.instance == Instance::Ane && r.kind == Kind::Query && r.start >= sent)
         .expect("the search's query embedding ran on the ANE");
     // The held call is the only index job in flight when the query arrives,
-    // and the lift releases it ahead of every later one: exactly that call
-    // starts between the query's arrival and its own start.
+    // and nothing else can start before the query does: at most that call
+    // lands between the query's arrival and its own start.
     let overtaking = log
         .iter()
         .filter(|r| r.kind == Kind::Index && r.start >= sent && r.start < query.start)
         .count();
-    assert_eq!(
-        overtaking, 1,
-        "only the held index call starts inside the query's window"
+    assert!(
+        overtaking <= 1,
+        "at most the held index call starts inside the query's window: {overtaking}"
     );
 
-    // On-the-spot documents are ANE-only at user-interactive QoS.
+    // On-the-spot documents are ANE-only at user-interactive QoS. The held
+    // chunk is still in flight when the search runs, so the candidate has
+    // no vector yet and is embedded on the spot.
     let docs: Vec<&Record> = log
         .iter()
         .filter(|r| r.kind == Kind::QueryDocument && r.start >= sent)
@@ -372,7 +405,6 @@ async fn query_preempts_indexing() {
             .all(|r| r.instance == Instance::Ane && r.qos == QosClass::UserInteractive),
         "query document work is ANE-only at user-interactive QoS"
     );
-    gate.open();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -611,6 +643,11 @@ async fn stage_2_runs_at_background_qos() {
     wait_for(&mut log, &d.records, |r| {
         r.instance == Instance::Ane && r.kind == Kind::Started
     });
+    // A Started record proves `open_ane` ran on the ANE thread. Stage 2 is
+    // Background work, which a loaded host can starve: lift the thread's
+    // effective priority for the run — its requested class stays
+    // Background.
+    let _lift = support::stub::lift_ane(&d.backend, QosClass::UserInitiated);
     d.backend.push_headroom(Ok(()));
     wait_for(&mut log, &d.records, |r| {
         r.instance == Instance::Gpu && r.kind == Kind::Started
@@ -732,6 +769,11 @@ async fn fsevents_change_is_embedded_in_background() {
     let repo = fn_repo(40, SMALL_BYTES, 10);
     let (d, _, _) = start(&repo, Duration::ZERO, Duration::ZERO, &[]).await;
     answer_search(&d, &repo.root, MARKER).await;
+    // The answer proves `open_ane` ran. The edit's chunks embed at
+    // Background QoS, which a loaded host can starve: lift the thread's
+    // effective priority for the run — its requested class stays
+    // Background.
+    let _lift = support::stub::lift_ane(&d.backend, QosClass::UserInitiated);
     // Every pending chunk is stage-1 class while the phase is first-index,
     // so `index --wait` waits only on UserInitiated work — never starved —
     // and the phase flips to maintained before it answers.

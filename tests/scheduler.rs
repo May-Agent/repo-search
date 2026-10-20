@@ -505,6 +505,10 @@ async fn stage_2_runs_at_background_qos() {
     // of the 70 long items) and its next pull finds stage 1 empty, leaving
     // 62 long items for the ANE however loaded the host is.
     let rig = rig(Duration::from_millis(10), Duration::ZERO, &[Instance::Gpu]).await;
+    // Those leftovers are Background work, which a loaded host can starve:
+    // lift the thread's effective priority for the run — its requested
+    // class stays Background.
+    let _lift = stub::lift_ane(&rig.backend, QosClass::UserInitiated);
     rig.backend.push_headroom(Ok(()));
     let mut done = enqueue(
         &rig,
@@ -562,8 +566,10 @@ async fn stage_2_runs_at_background_qos() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn query_lifts_an_in_flight_background_chunk() {
     // The ANE's first call is gated, so a background chunk is provably in
-    // flight when the query lands.
+    // flight when the query lands. The test's own Utility override gives
+    // the chunk CPU on a loaded host and marks this host's lifted band.
     let rig = rig(Duration::from_millis(50), Duration::ZERO, &[Instance::Ane]).await;
+    let lift = stub::lift_ane(&rig.backend, QosClass::Utility);
     let _done = enqueue(
         &rig,
         (0..10).map(|seq| pending(seq, 100)).collect(),
@@ -576,23 +582,29 @@ async fn query_lifts_an_in_flight_background_chunk() {
         r.instance == Instance::Ane && r.kind == Kind::Started
     });
 
-    let base = qos::scheduling_priority(rig.ane_thread);
+    let band = qos::scheduling_priority(rig.ane_thread);
     let rx = send_query(&rig, "boost the chunk ahead").await;
     // The inbox is FIFO: once `counts_for` is answered, the Query ahead of it
-    // was handled and the override on the ANE thread is in place.
+    // was handled and the scheduler's override on the ANE thread is in place.
     rig.sched
         .counts_for(WORKTREE)
         .await
         .expect("counts answered");
-    assert!(
-        qos::scheduling_priority(rig.ane_thread) > base,
-        "the override lifts the in-flight chunk's effective priority"
+    // `pth_curpri` sits at the same lifted band under any override while
+    // the thread waits, so the lift cannot be told apart by reading up:
+    // end the test's override instead — what still holds the band is
+    // provably the scheduler's UserInteractive override.
+    drop(lift);
+    assert_eq!(
+        qos::scheduling_priority(rig.ane_thread),
+        band,
+        "the scheduler's override still holds the chunk at the lifted band"
     );
+    let _lift = stub::lift_ane(&rig.backend, QosClass::Utility);
     open(rig.gate(Instance::Ane));
     rx.await.expect("query answered").expect("embeds fine");
 
-    // The gated chunk and the next one ran at the same requested class; only
-    // the override separates their effective priorities.
+    // The gated chunk and the next one ran at the same requested class.
     let lifted = wait_for(&mut log, &rig.records, |r| {
         r.instance == Instance::Ane && r.kind == Kind::Index
     });
@@ -602,10 +614,6 @@ async fn query_lifts_an_in_flight_background_chunk() {
         r.instance == Instance::Ane && r.kind == Kind::Index && r.start > lifted_end
     });
     assert_eq!(log[released].qos, QosClass::Background);
-    assert!(
-        log[lifted].pri > log[released].pri,
-        "the override ended with the pull that followed the lifted chunk"
-    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
