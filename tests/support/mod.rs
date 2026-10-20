@@ -2,5 +2,6 @@
 //! and its integration tests (`mod support;`).
 
 pub mod http;
+pub mod repo;
 #[cfg(target_os = "macos")]
 pub mod stub;

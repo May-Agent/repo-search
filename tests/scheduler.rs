@@ -42,7 +42,7 @@ struct Rig {
     ane_thread: qos::ThreadId,
     _monitor: StubMonitor,
     _tmp: tempfile::TempDir,
-    _ane: std::thread::JoinHandle<()>,
+    _ane: tokio::sync::watch::Receiver<bool>,
 }
 
 impl Rig {
@@ -74,30 +74,41 @@ async fn rig(ane_delay: Duration, gpu_delay: Duration, gated: &[Instance]) -> Ri
     }));
 
     let (fatal_tx, fatal) = tokio::sync::mpsc::channel(8);
-    let (_, buckets) = backend
-        .load_counter(tmp.path())
-        .expect("stub counter loads");
-    let sched = scheduler::spawn(
+    let (busy_tx, _busy_rx) = tokio::sync::watch::channel(false);
+    let ane::AneThread {
+        counted,
+        sched: ane_sched,
+        loaded,
+        exited,
+    } = ane::spawn(
         backend.clone(),
         tmp.path().to_path_buf(),
         "stub-model".to_owned(),
+    );
+    let (_, buckets) = counted
+        .await
+        .expect("ane thread reports")
+        .expect("stub load_counter does not fail");
+    let (sched, _sched_exited) = scheduler::spawn(scheduler::SchedulerConfig {
+        backend: backend.clone(),
+        dir: tmp.path().to_path_buf(),
+        model_id: "stub-model".to_owned(),
         buckets,
-        headroom_rx,
-        fatal_tx.clone(),
-    );
-    let ane::AneThread { loaded, join } = ane::spawn(
-        backend.clone(),
-        tmp.path().to_path_buf(),
-        "stub-model".to_owned(),
-        sched.tx(),
-    );
+        headroom: headroom_rx,
+        fatal: fatal_tx.clone(),
+        busy: busy_tx.clone(),
+        ane_exited: exited.clone(),
+    });
+    ane_sched.send(sched.tx()).expect("scheduler sender");
     let ane_thread = loaded
         .await
         .expect("ane thread reports")
         .expect("stub open_ane does not fail");
 
     let cache = VectorCache::open(&git).await.expect("vector cache opens");
-    let writer = writer::spawn(cache, "stub-model".to_owned(), fatal_tx);
+    let (writer_busy_tx, _writer_busy_rx) = tokio::sync::watch::channel(false);
+    let (writer, _writer_task) =
+        writer::spawn(cache, "stub-model".to_owned(), fatal_tx, writer_busy_tx);
 
     Rig {
         sched,
@@ -109,7 +120,7 @@ async fn rig(ane_delay: Duration, gpu_delay: Duration, gated: &[Instance]) -> Ri
         ane_thread,
         _monitor: monitor,
         _tmp: tmp,
-        _ane: join,
+        _ane: exited,
     }
 }
 

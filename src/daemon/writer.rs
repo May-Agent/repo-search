@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use repo_search_core::UnitVector;
 use repo_search_core::store::{ContentHash, Error as StoreError, VectorCache};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::Instant;
 
 use super::Error;
@@ -92,36 +92,47 @@ pub enum FlushError {
 
 /// Spawns the writer task for one repository. `fatal` is the daemon's
 /// shared fatal channel: a `put_many` error is reported there and the task
-/// exits.
-pub fn spawn(cache: VectorCache, model_id: String, fatal: mpsc::Sender<Error>) -> WriterHandle {
+/// exits. `busy` is the daemon's idle-exit tracker: the task reports while
+/// vectors sit unflushed, so `source` — the writer's repository id — keeps
+/// the daemon alive until the commit. The returned join handle resolves
+/// after the close-flush once every [`WriterHandle`] is dropped.
+pub fn spawn(
+    cache: VectorCache,
+    model_id: String,
+    fatal: mpsc::Sender<Error>,
+    busy: watch::Sender<bool>,
+) -> (WriterHandle, tokio::task::JoinHandle<()>) {
     let (tx, mut rx) = mpsc::channel::<WriterMsg>(INBOX);
-    tokio::spawn(async move {
+    let task = tokio::spawn(async move {
         let mut buffer: Vec<(ContentHash, UnitVector)> = Vec::new();
         let mut first_at: Option<Instant> = None;
         loop {
             tokio::select! {
                 msg = rx.recv() => match msg {
                     None => {
-                        let _ = flush(&cache, &model_id, &mut buffer, &fatal).await;
-                        return;
+                        let _ = flush(&cache, &model_id, &mut buffer, &fatal, &busy).await;
+                        break;
                     }
                     Some(WriterMsg::Vector(hash, vector)) => {
                         if buffer.is_empty() {
                             first_at = Some(Instant::now());
+                            busy.send_replace(true);
                         }
                         buffer.push((hash, vector));
                         if buffer.len() >= FLUSH_VECTORS
-                            && flush(&cache, &model_id, &mut buffer, &fatal).await.is_err()
+                            && flush(&cache, &model_id, &mut buffer, &fatal, &busy)
+                                .await
+                                .is_err()
                         {
-                            return;
+                            break;
                         }
                     }
                     Some(WriterMsg::Flush { reply }) => {
-                        let result = flush(&cache, &model_id, &mut buffer, &fatal).await;
+                        let result = flush(&cache, &model_id, &mut buffer, &fatal, &busy).await;
                         let failed = result.is_err();
                         let _ = reply.send(result);
                         if failed {
-                            return;
+                            break;
                         }
                     }
                 },
@@ -132,8 +143,11 @@ pub fn spawn(cache: VectorCache, model_id: String, fatal: mpsc::Sender<Error>) -
                     }
                 } =>
                 {
-                    if flush(&cache, &model_id, &mut buffer, &fatal).await.is_err() {
-                        return;
+                    if flush(&cache, &model_id, &mut buffer, &fatal, &busy)
+                        .await
+                        .is_err()
+                    {
+                        break;
                     }
                 }
             }
@@ -141,8 +155,11 @@ pub fn spawn(cache: VectorCache, model_id: String, fatal: mpsc::Sender<Error>) -
                 first_at = None;
             }
         }
+        // Whether it flushed or failed, the writer holds no unflushed work
+        // once it is gone.
+        busy.send_replace(false);
     });
-    WriterHandle { tx }
+    (WriterHandle { tx }, task)
 }
 
 /// Commits the buffer; on error it is reported fatal and returned. Empty
@@ -152,6 +169,7 @@ async fn flush(
     model_id: &str,
     buffer: &mut Vec<(ContentHash, UnitVector)>,
     fatal: &mpsc::Sender<Error>,
+    busy: &watch::Sender<bool>,
 ) -> Result<(), StoreError> {
     if buffer.is_empty() {
         return Ok(());
@@ -161,5 +179,6 @@ async fn flush(
         let _ = fatal.send(Error::Writer(error.to_string())).await;
         return Err(error);
     }
+    busy.send_replace(false);
     Ok(())
 }

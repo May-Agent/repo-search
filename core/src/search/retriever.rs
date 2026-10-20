@@ -200,6 +200,7 @@ impl<S: EmbedService> Retriever<S> {
             code: output::code_hits(&ranked[0], code_groups),
             docs: output::doc_hits(&ranked[1], doc_groups),
             freshness,
+            embedded_on_the_spot: embedded,
         })
     }
 

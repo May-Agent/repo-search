@@ -8,7 +8,6 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::thread::JoinHandle;
 
 use repo_search_core::BatchEmbedder;
 use repo_search_core::qos::{self, QosClass};
@@ -17,17 +16,24 @@ use tokio::sync::{mpsc, oneshot};
 use super::scheduler::{GpuJob, SchedulerMsg};
 use super::{Backend, GpuOpen};
 
-/// Spawns the `repo-search-gpu` thread at user-initiated QoS.
+/// Spawns the `repo-search-gpu` thread at user-initiated QoS. The returned
+/// receiver resolves when the thread exits — after the embedder's `Drop`
+/// released the Core ML GPU instance — and is the shutdown join.
 pub fn spawn<B: Backend>(
     backend: Arc<B>,
     dir: PathBuf,
     model_id: String,
     sched: mpsc::Sender<SchedulerMsg>,
-) -> JoinHandle<()> {
+) -> oneshot::Receiver<()> {
+    let (exited_tx, exited) = oneshot::channel();
     std::thread::Builder::new()
         .name("repo-search-gpu".to_owned())
-        .spawn(move || run(backend.as_ref(), &dir, &model_id, &sched))
-        .expect("failed to spawn repo-search-gpu")
+        .spawn(move || {
+            run(backend.as_ref(), &dir, &model_id, &sched);
+            let _ = exited_tx.send(());
+        })
+        .expect("failed to spawn repo-search-gpu");
+    exited
 }
 
 fn run<B: Backend>(backend: &B, dir: &Path, model_id: &str, sched: &mpsc::Sender<SchedulerMsg>) {

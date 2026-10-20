@@ -73,22 +73,23 @@ impl Calibration {
 
     /// Quantizes a query for the int8 dot with [`encode`](Self::encode)d rows:
     /// weights `q * scale` divided by their one scale `max|w| / 127`, rounded
-    /// and clamped to `-127..=127`.
+    /// and clamped to `-127..=127`. A flat calibration — one stored vector,
+    /// or identical ones — leaves `out` all zero: the first pass then ties
+    /// and the fp16 re-rank orders the rows it sees.
     ///
     /// # Panics
     ///
-    /// When `q` or `out` is not [`dim`](Self::dim) long, or every weight is
-    /// zero — impossible for a unit query against a calibration of real data.
+    /// When `q` or `out` is not [`dim`](Self::dim) long.
     pub fn query_weights(&self, q: &UnitVector, out: &mut [i8]) {
         let q = q.as_slice();
         assert_eq!(q.len(), self.dim(), "query dimension");
         assert_eq!(out.len(), self.dim(), "output dimension");
         let weights: Vec<f32> = q.iter().zip(&self.scale).map(|(q, s)| q * s).collect();
         let step = weights.iter().fold(0f32, |m, w| m.max(w.abs())) / 127.0;
-        assert!(
-            step > 0.0,
-            "query weights are all zero: the calibration is degenerate"
-        );
+        if step == 0.0 {
+            out.fill(0);
+            return;
+        }
         for (out, w) in out.iter_mut().zip(&weights) {
             *out = (w / step).round().clamp(-127.0, 127.0) as i8;
         }

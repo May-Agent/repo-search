@@ -71,8 +71,18 @@ tokio-util = { version = "0.7.20", default-features = false, features = [
 tracing = { version = "0.1.44", default-features = false }
 zstd = { version = "0.14.3", default-features = false }
 
+[dev-dependencies]
+tokio = { version = "1.54.0", default-features = false, features = ["test-util"] }
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+libc = { version = "0.2.191", default-features = false, features = ["std"] }
+
 [target.'cfg(target_os = "macos")'.dependencies]
 repo-search-coreml.workspace = true
+libc = { version = "0.2.191", default-features = false, features = ["std"] }
+notify = { version = "8.2.0", default-features = false, features = [
+    "macos_fsevent",
+] }
 
 [workspace.metadata.dist]
 cargo-dist-version = "0.33.0"

@@ -226,6 +226,23 @@ pub struct Counts {
     pub queued_background: u64,
     /// Items handed to an embedder, not yet done.
     pub in_flight: u64,
+    /// Stage-1 completion already ran for this worktree; its `Stage1Done`
+    /// is on its way to the owner once the writer flush lands.
+    pub stage1_done: bool,
+}
+
+/// The GPU instance's state, as `Status` reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GpuState {
+    /// No GPU instance exists; `blocked` names why, when a check ran.
+    Absent {
+        /// Why the GPU cannot be opened, when known.
+        blocked: Option<String>,
+    },
+    /// The GPU thread is opening its instance (a multi-second cold start).
+    Loading,
+    /// Embedding stage-1 index work.
+    Running,
 }
 
 /// The scheduler's inbox. Every component the pipeline owns talks to the
@@ -296,6 +313,28 @@ pub enum SchedulerMsg {
         /// Where the counts go.
         reply: oneshot::Sender<Counts>,
     },
+    /// A worktree's freshness barrier is running (`running`) or ended:
+    /// barrier work keeps the daemon busy for the idle exit.
+    Barrier {
+        /// The worktree reporting.
+        worktree: WorktreeId,
+        /// Whether the barrier is running.
+        running: bool,
+    },
+    /// An `index --wait` asks for the worktree's counts pushed on change;
+    /// the scheduler builds the watch at handling — behind the worktree's
+    /// `Enqueue` in this inbox — seeded with the live counts.
+    WatchCounts {
+        /// The worktree asking.
+        worktree: WorktreeId,
+        /// Where the watch receiver goes.
+        reply: oneshot::Sender<watch::Receiver<Counts>>,
+    },
+    /// The GPU instance's state, for `Status`.
+    GpuStatus {
+        /// Where the state goes.
+        reply: oneshot::Sender<GpuState>,
+    },
     /// Stop dispatching; pulls are answered `Stop`.
     Stop,
 }
@@ -360,6 +399,50 @@ impl SchedulerHandle {
         let (reply, rx) = oneshot::channel();
         self.tx
             .send(SchedulerMsg::CountsFor { worktree, reply })
+            .await
+            .map_err(|_| Closed)?;
+        rx.await.map_err(|_| Closed)
+    }
+
+    /// Reports a worktree's freshness barrier running or ended; a running
+    /// barrier keeps the daemon busy for the idle exit.
+    pub async fn barrier(&self, worktree: WorktreeId, running: bool) {
+        let _ = self
+            .tx
+            .send(SchedulerMsg::Barrier { worktree, running })
+            .await;
+    }
+
+    /// The worktree's counts, pushed on change until the receiver is
+    /// dropped; for `index --wait`.
+    ///
+    /// # Errors
+    ///
+    /// When the scheduler is gone.
+    pub async fn watch_counts(
+        &self,
+        worktree: WorktreeId,
+    ) -> Result<watch::Receiver<Counts>, Closed> {
+        // The scheduler creates the watch at `WatchCounts` handling —
+        // FIFO-behind the worktree's `Enqueue` — seeded with the live
+        // counts, and replies with the receiver.
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(SchedulerMsg::WatchCounts { worktree, reply })
+            .await
+            .map_err(|_| Closed)?;
+        rx.await.map_err(|_| Closed)
+    }
+
+    /// The GPU instance's state, for `Status`.
+    ///
+    /// # Errors
+    ///
+    /// When the scheduler is gone.
+    pub async fn gpu_status(&self) -> Result<GpuState, Closed> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(SchedulerMsg::GpuStatus { reply })
             .await
             .map_err(|_| Closed)?;
         rx.await.map_err(|_| Closed)
@@ -460,32 +543,80 @@ struct Scheduler<B: Backend> {
     /// The override lifting the ANE thread while a query waits on its
     /// in-flight index job; dropped on the next `AnePull`.
     ane_override: Option<qos::Override>,
-    /// `Stop` was sent to the ANE thread.
+    /// `Stop` was sent to the ANE thread, or the thread is gone.
     ane_stopped: bool,
+    /// Fires when the ANE thread exits: a thread that died before its first
+    /// pull can never be answered `Stop`, and a panic unwinds past the send.
+    ane_exited: watch::Receiver<bool>,
     /// `(repo, hash)` pairs to drop from both queues when the in-flight
     /// `Documents` query job completes.
     in_flight_docs: Vec<(RepoId, ContentHash)>,
     gpu: Gpu,
-    gpu_thread: Option<std::thread::JoinHandle<()>>,
+    /// Exit receivers of every GPU thread ever spawned; handed to the
+    /// caller at exit so it can join them without blocking the executor.
+    gpu_exited: Vec<oneshot::Receiver<()>>,
+    /// Where the GPU exit receivers go when the actor exits.
+    exit_tx: Option<oneshot::Sender<Vec<oneshot::Receiver<()>>>>,
     /// `open_gpu` was `Blocked`; no respawn until headroom changes.
     gpu_blocked: bool,
     dispatched_indexing: u64,
     stats: HashMap<WorktreeId, AneStats>,
+    /// Freshness barriers running per worktree, counted: a barrier's end
+    /// report can arrive after a later barrier already started.
+    barriers: HashMap<WorktreeId, u64>,
+    /// `index --wait` watches, pushing each worktree's counts on change.
+    watchers: HashMap<WorktreeId, watch::Sender<Counts>>,
+    /// Query jobs on the ANE thread, not yet `QueryDone`.
+    queries_in_flight: u64,
+    /// The idle-exit tracker: every queued or in-flight unit of work reports
+    /// busy through it.
+    busy: watch::Sender<bool>,
+    /// What the tracker was last told.
+    last_busy: bool,
     stopping: bool,
+}
+
+/// What the scheduler is built from.
+pub struct SchedulerConfig<B: Backend> {
+    /// The embedding backend.
+    pub backend: Arc<B>,
+    /// The unpacked model directory.
+    pub dir: PathBuf,
+    /// The model-id vectors are stored under.
+    pub model_id: String,
+    /// The model's bucket lengths, ascending.
+    pub buckets: Box<[usize]>,
+    /// Host headroom for the GPU instance.
+    pub headroom: watch::Receiver<Headroom>,
+    /// Fatal errors go to `run` here.
+    pub fatal: mpsc::Sender<Error>,
+    /// The scheduler's busy state for the idle-exit tracker.
+    pub busy: watch::Sender<bool>,
+    /// Fires when the ANE thread exits.
+    pub ane_exited: watch::Receiver<bool>,
 }
 
 /// Spawns the scheduler task. The ANE thread is spawned separately by the
 /// caller; the GPU thread is spawned here whenever stage-1 work and headroom
 /// allow it.
 pub fn spawn<B: Backend>(
-    backend: Arc<B>,
-    dir: PathBuf,
-    model_id: String,
-    buckets: Box<[usize]>,
-    headroom: watch::Receiver<Headroom>,
-    fatal: mpsc::Sender<Error>,
-) -> SchedulerHandle {
+    config: SchedulerConfig<B>,
+) -> (
+    SchedulerHandle,
+    oneshot::Receiver<Vec<oneshot::Receiver<()>>>,
+) {
+    let SchedulerConfig {
+        backend,
+        dir,
+        model_id,
+        buckets,
+        headroom,
+        fatal,
+        busy,
+        ane_exited,
+    } = config;
     let (tx, rx) = mpsc::channel(INBOX);
+    let (exit_tx, exited) = oneshot::channel();
     let scheduler = Scheduler {
         tx: tx.downgrade(),
         backend,
@@ -508,20 +639,35 @@ pub fn spawn<B: Backend>(
         ane_in_flight: None,
         ane_override: None,
         ane_stopped: false,
+        ane_exited,
         in_flight_docs: Vec::new(),
         gpu: Gpu::Absent,
-        gpu_thread: None,
+        gpu_exited: Vec::new(),
+        exit_tx: Some(exit_tx),
         gpu_blocked: false,
         dispatched_indexing: 0,
         stats: HashMap::new(),
+        barriers: HashMap::new(),
+        watchers: HashMap::new(),
+        queries_in_flight: 0,
+        busy,
+        last_busy: false,
         stopping: false,
     };
-    tokio::spawn(scheduler.run(rx));
-    SchedulerHandle { tx }
+    tokio::spawn(async move {
+        let mut scheduler = scheduler;
+        scheduler.run(rx).await;
+        // Every GPU thread's exit receiver goes to the owner of the
+        // pipeline, which joins them without blocking the executor.
+        if let Some(tx) = scheduler.exit_tx.take() {
+            let _ = tx.send(scheduler.gpu_exited);
+        }
+    });
+    (SchedulerHandle { tx }, exited)
 }
 
 impl<B: Backend> Scheduler<B> {
-    async fn run(mut self, mut rx: mpsc::Receiver<SchedulerMsg>) {
+    async fn run(&mut self, mut rx: mpsc::Receiver<SchedulerMsg>) {
         loop {
             tokio::select! {
                 msg = rx.recv() => {
@@ -536,9 +682,20 @@ impl<B: Backend> Scheduler<B> {
                     self.gpu_blocked = false;
                     self.eval_gpu();
                 }
+                gone = self.ane_exited.changed(), if !self.ane_stopped => {
+                    self.ane_stopped = true;
+                    if gone.is_err() {
+                        // Unwound past the exit report: a panic on the ANE
+                        // thread, fatal like any embedder failure.
+                        self.on_fatal("the ANE thread died".to_owned()).await;
+                    }
+                }
             }
             self.dispatch_waiting();
+            self.push_counts();
+            self.update_busy();
             if self.stopping && self.ane_stopped && matches!(self.gpu, Gpu::Absent) {
+                self.clear_busy();
                 return;
             }
         }
@@ -572,12 +729,10 @@ impl<B: Backend> Scheduler<B> {
             SchedulerMsg::GpuStarted => self.gpu = Gpu::Running,
             SchedulerMsg::GpuGone => {
                 self.gpu = Gpu::Absent;
-                self.gpu_thread = None;
                 self.eval_gpu();
             }
             SchedulerMsg::GpuBlocked => {
                 self.gpu = Gpu::Absent;
-                self.gpu_thread = None;
                 self.gpu_blocked = true;
             }
             SchedulerMsg::GpuDone { items } => {
@@ -591,6 +746,35 @@ impl<B: Backend> Scheduler<B> {
             }
             SchedulerMsg::CountsFor { worktree, reply } => {
                 let _ = reply.send(self.counts_for(worktree));
+            }
+            SchedulerMsg::Barrier { worktree, running } => {
+                if running {
+                    *self.barriers.entry(worktree).or_default() += 1;
+                } else {
+                    let count = self
+                        .barriers
+                        .get_mut(&worktree)
+                        .expect("unreported barrier");
+                    *count = count.checked_sub(1).expect("barrier count underflow");
+                    if *count == 0 {
+                        self.barriers.remove(&worktree);
+                    }
+                }
+            }
+            SchedulerMsg::WatchCounts { worktree, reply } => {
+                let (watch, rx) = watch::channel(self.counts_for(worktree));
+                self.watchers.insert(worktree, watch);
+                let _ = reply.send(rx);
+            }
+            SchedulerMsg::GpuStatus { reply } => {
+                let state = match self.gpu {
+                    Gpu::Absent => GpuState::Absent {
+                        blocked: self.headroom.borrow().clone().err().map(|b| b.to_string()),
+                    },
+                    Gpu::Starting => GpuState::Loading,
+                    Gpu::Running => GpuState::Running,
+                };
+                let _ = reply.send(state);
             }
             SchedulerMsg::Stop => {
                 self.stopping = true;
@@ -626,14 +810,14 @@ impl<B: Backend> Scheduler<B> {
         let Some(tx) = self.tx.upgrade() else {
             return;
         };
-        let thread = gpu::spawn(
+        let exited = gpu::spawn(
             self.backend.clone(),
             self.dir.clone(),
             self.model_id.clone(),
             tx,
         );
         self.gpu = Gpu::Starting;
-        self.gpu_thread = Some(thread);
+        self.gpu_exited.push(exited);
     }
 
     /// The GPU is wanted when stage-1 work is queued, the host has headroom
@@ -913,6 +1097,7 @@ impl<B: Backend> Scheduler<B> {
             if let QueryJob::Documents { repo, chunks, .. } = &job {
                 self.in_flight_docs = chunks.iter().map(|c| (*repo, c.content_hash)).collect();
             }
+            self.queries_in_flight += 1;
             let _ = reply.send(AneJob::Query { job, overtaken });
             return;
         }
@@ -1020,6 +1205,10 @@ impl<B: Backend> Scheduler<B> {
     /// A query job completed: drop the queue entries its `Documents` vectors
     /// make redundant, and accumulate the worktree's stats.
     fn on_query_done(&mut self, worktree: WorktreeId, wait: Duration, overtaken: u32) {
+        self.queries_in_flight = self
+            .queries_in_flight
+            .checked_sub(1)
+            .expect("a QueryDone without an in-flight query");
         for (repo, hash) in std::mem::take(&mut self.in_flight_docs) {
             self.remove_queued(repo, hash);
         }
@@ -1116,6 +1305,7 @@ impl<B: Backend> Scheduler<B> {
         let Some(state) = self.worktrees.get(&worktree) else {
             return counts;
         };
+        counts.stage1_done = state.stage1_done;
         for item in &state.interest {
             match self.items[item].queue {
                 Queue::Stage1 => counts.queued_stage1 += 1,
@@ -1124,5 +1314,46 @@ impl<B: Backend> Scheduler<B> {
             }
         }
         counts
+    }
+
+    /// Pushes each watched worktree's counts when they changed, dropping
+    /// senders whose `index --wait` went away.
+    fn push_counts(&mut self) {
+        let mut watchers = std::mem::take(&mut self.watchers);
+        watchers.retain(|worktree, watch| {
+            let counts = self.counts_for(*worktree);
+            let _ = watch.send_if_modified(|current| {
+                if *current != counts {
+                    *current = counts;
+                    true
+                } else {
+                    false
+                }
+            });
+            !watch.is_closed()
+        });
+        self.watchers = watchers;
+    }
+
+    /// Queued or in-flight work of any kind keeps the daemon busy: query
+    /// jobs, indexing items and running barriers.
+    fn update_busy(&mut self) {
+        let busy = !self.queries.is_empty()
+            || self.queries_in_flight > 0
+            || !self.items.is_empty()
+            || !self.barriers.is_empty();
+        if busy != self.last_busy {
+            self.last_busy = busy;
+            self.busy.send_replace(busy);
+        }
+    }
+
+    /// A stopped scheduler holds no work; clear the report so the idle-exit
+    /// tracker never keeps a dead source.
+    fn clear_busy(&mut self) {
+        if self.last_busy {
+            self.last_busy = false;
+            self.busy.send_replace(false);
+        }
     }
 }

@@ -97,11 +97,14 @@ fn query_weights_fold_the_scale_and_quantize_to_one_step() {
 }
 
 #[test]
-#[should_panic(expected = "all zero")]
-fn query_weights_reject_an_all_zero_fold() {
+fn query_weights_fold_an_all_zero_fold_to_zeros() {
     let c = calibration_3d();
-    // Only the constant dimension is non-zero, and its scale is 0.
-    c.query_weights(&UnitVector::normalize(vec![0.0, 1.0, 0.0]), &mut [0; 3]);
+    // Only the constant dimension is non-zero, and its scale is 0: a flat
+    // calibration — a one-vector index — leaves every weight at zero and the
+    // fp16 re-rank decides.
+    let mut out = [7i8; 3];
+    c.query_weights(&UnitVector::normalize(vec![0.0, 1.0, 0.0]), &mut out);
+    assert_eq!(out, [0, 0, 0]);
 }
 
 #[test]

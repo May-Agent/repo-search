@@ -7,49 +7,82 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::thread::JoinHandle;
 use std::time::Instant;
 
 use repo_search_core::Embedder;
 use repo_search_core::qos::{self, QosClass};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 
-use super::Backend;
 use super::scheduler::{AneJob, EmbedError, QueryJob, SchedulerMsg};
+use super::{Backend, CounterLoad};
 
 /// The running ANE thread.
-pub struct AneThread {
+pub struct AneThread<C> {
+    /// Resolves once `load_counter` returned on the thread: the model's
+    /// counter and bucket lengths, or the load error's message.
+    pub counted: oneshot::Receiver<CounterLoad<C, String>>,
+    /// The scheduler's inbox goes here once it is spawned; dropping it
+    /// exits the thread once `loaded` was sent.
+    pub sched: oneshot::Sender<mpsc::Sender<SchedulerMsg>>,
     /// Resolves once `open_ane` returned: the thread's [`qos::ThreadId`], or
-    /// the load error's message so the model loader can publish `Failed`.
+    /// the load error's message.
     pub loaded: oneshot::Receiver<Result<qos::ThreadId, String>>,
-    /// The thread's join handle.
-    pub join: JoinHandle<()>,
+    /// Fires `true` when the thread exits and errs when it dies without
+    /// reporting — a panic unwinds past the send. Shared between the
+    /// scheduler, which ends its run when the thread is gone, and the
+    /// loader, which joins the thread at shutdown.
+    pub exited: watch::Receiver<bool>,
 }
 
-/// Spawns the `repo-search-ane` thread. It opens the ANE instance on its own
-/// thread, reports `loaded`, then pulls jobs off the scheduler until `Stop`
-/// or a dropped channel.
-pub fn spawn<B: Backend>(
-    backend: Arc<B>,
-    dir: PathBuf,
-    model_id: String,
-    sched: mpsc::Sender<SchedulerMsg>,
-) -> AneThread {
-    let (loaded_tx, loaded) = oneshot::channel::<Result<qos::ThreadId, String>>();
-    let join = std::thread::Builder::new()
+/// Spawns the `repo-search-ane` thread. It loads the counter and opens the
+/// ANE instance on its own thread — the blocking calls stay off the
+/// executor — reports each over its oneshot, then pulls jobs off the
+/// scheduler it is handed until `Stop` or a dropped channel.
+pub fn spawn<B: Backend>(backend: Arc<B>, dir: PathBuf, model_id: String) -> AneThread<B::Counter> {
+    let (counted_tx, counted) = oneshot::channel();
+    let (sched_tx, sched_rx) = oneshot::channel();
+    let (loaded_tx, loaded) = oneshot::channel();
+    let (exited_tx, exited) = watch::channel(false);
+    std::thread::Builder::new()
         .name("repo-search-ane".to_owned())
-        .spawn(move || run(backend.as_ref(), &dir, &model_id, &sched, loaded_tx))
+        .spawn(move || {
+            run(
+                backend.as_ref(),
+                &dir,
+                &model_id,
+                counted_tx,
+                sched_rx,
+                loaded_tx,
+            );
+            let _ = exited_tx.send(true);
+        })
         .expect("failed to spawn repo-search-ane");
-    AneThread { loaded, join }
+    AneThread {
+        counted,
+        sched: sched_tx,
+        loaded,
+        exited,
+    }
 }
 
 fn run<B: Backend>(
     backend: &B,
     dir: &Path,
     model_id: &str,
-    sched: &mpsc::Sender<SchedulerMsg>,
+    counted: oneshot::Sender<CounterLoad<B::Counter, String>>,
+    sched_rx: oneshot::Receiver<mpsc::Sender<SchedulerMsg>>,
     loaded: oneshot::Sender<Result<qos::ThreadId, String>>,
 ) {
+    let loaded_out = match backend.load_counter(dir) {
+        Ok(out) => out,
+        Err(error) => {
+            let _ = counted.send(Err(error.to_string()));
+            return;
+        }
+    };
+    if counted.send(Ok(loaded_out)).is_err() {
+        return;
+    }
     let mut embedder = match backend.open_ane(dir, model_id) {
         Ok(embedder) => embedder,
         Err(error) => {
@@ -59,11 +92,19 @@ fn run<B: Backend>(
     };
     let me = qos::ThreadId::current();
     let _ = loaded.send(Ok(me));
-
-    // The job's QoS applies only around its embed call; the pull and the wait
-    // for the next job run at user-interactive, so a queued query never waits
-    // on a thread the scheduler dropped to background priority.
+    // The job's QoS applies only around its embed call; the pull and the
+    // wait for the next job run at user-interactive, so a queued query never
+    // waits on a thread the scheduler dropped to background priority.
     let mut qos = None;
+    set_qos(&mut qos, QosClass::UserInteractive);
+    // The loader hands over the scheduler once it exists; a dropped channel
+    // means the pipeline was never wanted.
+    let sched = match sched_rx.blocking_recv() {
+        Ok(sched) => sched,
+        Err(_) => return,
+    };
+    let sched = &sched;
+
     // End of the last index job; the wait of a query job is measured from it.
     let mut last_index_end = None;
     loop {
