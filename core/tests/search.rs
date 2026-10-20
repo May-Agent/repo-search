@@ -323,6 +323,7 @@ impl Fixture {
             changed_files: changed + u64::from(with_docs),
             chunks_total: total,
             chunks_with_vector: embedded.min(total),
+            unparsable: Vec::new(),
         };
         let embedder = FakeEmbedder::default();
         let seen = Arc::clone(&embedder.seen);

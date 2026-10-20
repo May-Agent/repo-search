@@ -20,7 +20,10 @@ use tokio::sync::{mpsc, oneshot};
 
 pub use index::{Applied, FileChange, Index, StoredChunk, StoredMember, StoredMemberKind};
 pub use query::{ChunkFilter, ChunkId, ChunkRow, MemberRow, Side};
-pub use records::{ChunkRecord, ContentHash, FileState, MemberRecord, fts_body, split_identifiers};
+pub use records::{
+    ChunkRecord, ContentHash, FileState, MemberRecord, Unchunkable, UnchunkableReason, fts_body,
+    split_identifiers,
+};
 pub use vectors::{CachedSlot, CachedVector, ModelInfo, StoredCalibration, VectorCache};
 
 /// Bound on each actor's request queue.

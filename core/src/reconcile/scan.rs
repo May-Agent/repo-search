@@ -41,7 +41,7 @@ use crate::chunk::{self, ConfigChunker, DocChunker, FileChunker, Language, Membe
 use crate::chunk::{Tsx, TypeScript};
 use crate::store::{
     ChunkRecord, ContentHash, FileChange, FileState, MemberRecord, StoredChunk, StoredMember,
-    StoredMemberKind, fts_body,
+    StoredMemberKind, Unchunkable, UnchunkableReason, fts_body,
 };
 
 /// Directories that are never part of the indexed tree, even when ignore rules
@@ -178,7 +178,23 @@ pub(super) struct Plan {
     pub files_modified: u64,
     pub files_removed: u64,
     pub files_restamped: u64,
+    pub files_chunked: u64,
     pub skipped: Vec<Skipped>,
+}
+
+impl Plan {
+    /// Records `record` as the file's new state. `was_chunked` is whether the
+    /// index held chunks for it, which the change drops.
+    fn unchunkable(&mut self, was_chunked: bool, record: Unchunkable) {
+        if was_chunked {
+            self.files_removed += 1;
+        }
+        self.skipped.push(Skipped {
+            path: record.state.path.clone(),
+            reason: record.reason.clone().into(),
+        });
+        self.changes.push(FileChange::Unchunkable(record));
+    }
 }
 
 /// A walked file that passed the filters: worktree-relative path, language,
@@ -208,15 +224,21 @@ enum Work {
     Restamp(FileState),
     /// Re-chunk: its new state and source, and the file's index in `jobs`.
     Chunk(FileState, String, usize),
-    /// Not indexable: the reason it is skipped.
-    Skip(SkipReason),
+    /// Recorded as unchunkable with this fingerprint: stays as it is.
+    KeepUnchunkable(UnchunkableReason),
+    /// Recorded as unchunkable, same bytes, moved fingerprint.
+    RestampUnchunkable(FileState, UnchunkableReason),
+    /// Newly found not to be UTF-8.
+    NotUtf8(FileState),
 }
 
-/// Walks `root` and diffs it against `stored`.
+/// Walks `root` and diffs it against `stored`, the chunked files, and
+/// `recorded`, the files that failed to chunk.
 pub(super) fn plan(
     root: &Path,
     include_ignored: bool,
     stored: HashMap<String, FileState>,
+    recorded: HashMap<String, Unchunkable>,
     tokens: &dyn TokenCounter,
 ) -> Result<Plan, Error> {
     let Walked {
@@ -231,8 +253,11 @@ pub(super) fn plan(
         files_modified: 0,
         files_removed: 0,
         files_restamped: 0,
+        files_chunked: 0,
         skipped,
     };
+    // Paths whose stored rows this pass keeps, rewrites or replaces; any
+    // other stored path is gone.
     let mut live: HashSet<String> = HashSet::with_capacity(candidates.len());
     // First the fingerprint diff decides every file's fate and reads the
     // ones that need chunking.
@@ -240,9 +265,16 @@ pub(super) fn plan(
     let mut jobs = Vec::new();
     for cand in candidates {
         let previous = stored.get(&cand.rel);
+        let failed = recorded.get(&cand.rel);
         if previous.is_some_and(|state| cand.matches(state)) {
             live.insert(cand.rel.clone());
             work.push((cand, Work::Live));
+            continue;
+        }
+        if let Some(record) = failed.filter(|record| cand.matches(&record.state)) {
+            live.insert(cand.rel.clone());
+            let reason = record.reason.clone();
+            work.push((cand, Work::KeepUnchunkable(reason)));
             continue;
         }
         let bytes = match fs::read(root.join(&cand.rel)) {
@@ -274,9 +306,17 @@ pub(super) fn plan(
             work.push((cand, Work::Restamp(state)));
             continue;
         }
+        if let Some(record) = failed.filter(|record| record.state.content_hash == content_hash) {
+            live.insert(cand.rel.clone());
+            plan.files_restamped += 1;
+            let reason = record.reason.clone();
+            work.push((cand, Work::RestampUnchunkable(state, reason)));
+            continue;
+        }
         let Ok(src) = String::from_utf8(bytes) else {
-            tracing::warn!(path = %cand.rel, "skipping a file that is not valid UTF-8");
-            work.push((cand, Work::Skip(SkipReason::NotUtf8)));
+            tracing::warn!(path = %cand.rel, "recording a file that is not valid UTF-8");
+            live.insert(cand.rel.clone());
+            work.push((cand, Work::NotUtf8(state)));
             continue;
         };
         jobs.push(work.len());
@@ -284,6 +324,7 @@ pub(super) fn plan(
     }
     // The files to chunk go to a worker per core, each with its own
     // chunkers; chunk order is preserved by job index.
+    plan.files_chunked = jobs.len() as u64;
     let next = std::sync::atomic::AtomicUsize::new(0);
     let workers = std::thread::available_parallelism()
         .map_or(1, std::num::NonZero::get)
@@ -321,21 +362,37 @@ pub(super) fn plan(
         match item {
             Work::Live => {}
             Work::Restamp(state) => plan.changes.push(FileChange::Restamp(state)),
-            Work::Skip(reason) => {
+            Work::KeepUnchunkable(reason) => plan.skipped.push(Skipped {
+                path: cand.rel,
+                reason: reason.into(),
+            }),
+            Work::RestampUnchunkable(state, reason) => {
                 plan.skipped.push(Skipped {
                     path: cand.rel,
-                    reason,
+                    reason: reason.into(),
                 });
+                plan.changes.push(FileChange::RestampUnchunkable(state));
             }
+            Work::NotUtf8(state) => plan.unchunkable(
+                stored.contains_key(&cand.rel),
+                Unchunkable {
+                    state,
+                    reason: UnchunkableReason::NotUtf8,
+                },
+            ),
             Work::Chunk(state, _src, job) => {
                 let chunked = match results[job].take().expect("every job ran") {
                     Ok(chunked) => chunked,
                     Err(error) => {
-                        tracing::warn!(path = %cand.rel, %error, "skipping a file that is not valid");
-                        plan.skipped.push(Skipped {
-                            path: cand.rel,
-                            reason: SkipReason::Malformed,
-                        });
+                        tracing::warn!(path = %cand.rel, %error, "recording a file that does not parse");
+                        live.insert(cand.rel.clone());
+                        plan.unchunkable(
+                            stored.contains_key(&cand.rel),
+                            Unchunkable {
+                                state,
+                                reason: UnchunkableReason::Malformed(error.to_string()),
+                            },
+                        );
                         continue;
                     }
                 };
@@ -363,13 +420,16 @@ pub(super) fn plan(
         }
     }
     // Whatever was stored but not seen alive is gone: deleted (including
-    // vanished mid-pass), newly ignored, no longer valid UTF-8, or malformed.
+    // vanished mid-pass) or newly ignored. A chunked file that now fails to
+    // chunk was counted as removed when it was recorded.
     let mut gone: Vec<String> = stored
-        .into_keys()
-        .filter(|path| !live.contains(path))
+        .keys()
+        .chain(recorded.keys())
+        .filter(|path| !live.contains(*path))
+        .cloned()
         .collect();
     gone.sort_unstable();
-    plan.files_removed = gone.len() as u64;
+    plan.files_removed += gone.iter().filter(|p| stored.contains_key(*p)).count() as u64;
     plan.changes
         .extend(gone.into_iter().map(FileChange::Remove));
     Ok(plan)

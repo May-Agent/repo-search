@@ -10,12 +10,12 @@ use tokio::sync::{mpsc, oneshot};
 
 use super::query::{self, ChunkFilter, ChunkId, ChunkRow, Side};
 use super::{
-    ChunkRecord, ContentHash, Error, FileState, ensure_version, open_conn, remove_db_files,
-    send_and_wait, spawn_actor,
+    ChunkRecord, ContentHash, Error, FileState, Unchunkable, ensure_version, open_conn,
+    remove_db_files, send_and_wait, spawn_actor,
 };
 
 /// Schema generation; a database at any other version is deleted and rebuilt.
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 
 /// One file's change inside an atomic batch.
 #[derive(Debug)]
@@ -29,6 +29,13 @@ pub enum FileChange {
     /// stored chunks stay and only the fingerprint is rewritten. The path must
     /// already be stored.
     Restamp(FileState),
+    /// The file fails to chunk: replaces whatever was stored for its path,
+    /// chunks included, with an unchunkable record.
+    Unchunkable(Unchunkable),
+    /// An unchunkable file's bytes are unchanged but its stat fingerprint
+    /// moved; only the fingerprint is rewritten. The path must already be
+    /// recorded as unchunkable.
+    RestampUnchunkable(FileState),
 }
 
 /// What an applied batch did to the chunk rows.
@@ -95,6 +102,9 @@ enum Request {
     },
     FileStates {
         reply: oneshot::Sender<Result<Vec<FileState>, Error>>,
+    },
+    Unchunkables {
+        reply: oneshot::Sender<Result<Vec<Unchunkable>, Error>>,
     },
     Align {
         chunker: String,
@@ -209,9 +219,20 @@ impl Index {
         send_and_wait(&self.tx, |reply| Request::FileStates { reply }).await
     }
 
+    /// Every file recorded as unchunkable, for reconcile to diff the worktree
+    /// walk against.
+    ///
+    /// # Errors
+    ///
+    /// When SQLite rejects the read or the actor is gone.
+    pub async fn unchunkables(&self) -> Result<Vec<Unchunkable>, Error> {
+        send_and_wait(&self.tx, |reply| Request::Unchunkables { reply }).await
+    }
+
     /// Records that the index is built by the chunker `fingerprint` with the
     /// token counter of `model_id`. An index stored under another identity is
-    /// emptied — files, chunks, members and full-text rows, in one
+    /// emptied — files, chunks, members, full-text rows and the recorded
+    /// unchunkable files, which another chunker may parse, in one
     /// transaction — so the next pass re-chunks every file; vectors live in
     /// the shared cache and are untouched. A fresh index only stores the
     /// identity; a matching one is left alone.
@@ -396,6 +417,9 @@ fn serve(mut conn: Connection, mut rx: mpsc::Receiver<Request>) {
             Request::FileStates { reply } => {
                 let _ = reply.send(file_states(&conn));
             }
+            Request::Unchunkables { reply } => {
+                let _ = reply.send(unchunkables(&conn));
+            }
             Request::Align {
                 chunker,
                 model_id,
@@ -458,6 +482,10 @@ fn apply(conn: &mut Connection, changes: &[FileChange]) -> Result<Applied, Error
             }
             FileChange::Remove(path) => applied.chunks_removed += remove(&tx, path)?,
             FileChange::Restamp(state) => restamp(&tx, state)?,
+            FileChange::Unchunkable(record) => {
+                applied.chunks_removed += record_unchunkable(&tx, record)?;
+            }
+            FileChange::RestampUnchunkable(state) => restamp_unchunkable(&tx, state)?,
         }
     }
     tx.commit()?;
@@ -477,14 +505,18 @@ fn align(conn: &mut Connection, chunker: &str, model_id: &str) -> Result<bool, E
     {
         return Ok(false);
     }
-    let populated: bool =
-        tx.query_row("SELECT EXISTS (SELECT 1 FROM files)", [], |row| row.get(0))?;
+    let populated: bool = tx.query_row(
+        "SELECT EXISTS (SELECT 1 FROM files) OR EXISTS (SELECT 1 FROM unchunkable)",
+        [],
+        |row| row.get(0),
+    )?;
     if populated {
         tx.execute_batch(
             "INSERT INTO fts (fts) VALUES ('delete-all');
              DELETE FROM chunk_members;
              DELETE FROM chunks;
-             DELETE FROM files;",
+             DELETE FROM files;
+             DELETE FROM unchunkable;",
         )?;
     }
     tx.execute(
@@ -515,6 +547,45 @@ fn restamp(tx: &Transaction<'_>, state: &FileState) -> Result<(), Error> {
     }
 }
 
+fn restamp_unchunkable(tx: &Transaction<'_>, state: &FileState) -> Result<(), Error> {
+    let updated = tx.execute(
+        "UPDATE unchunkable SET size = ?2, mtime_ns = ?3, inode = ?4, content_hash = ?5 \
+         WHERE path = ?1",
+        params![
+            state.path,
+            i64_of(state.size)?,
+            state.mtime_ns,
+            i64_of(state.inode)?,
+            state.content_hash
+        ],
+    )?;
+    if updated == 1 {
+        Ok(())
+    } else {
+        Err(Error::NotStored(state.path.clone()))
+    }
+}
+
+/// Replaces every stored row of the file with its unchunkable record. Returns
+/// the chunk rows deleted.
+fn record_unchunkable(tx: &Transaction<'_>, record: &Unchunkable) -> Result<u64, Error> {
+    let state = &record.state;
+    let removed = remove(tx, &state.path)?;
+    tx.execute(
+        "INSERT INTO unchunkable (path, size, mtime_ns, inode, content_hash, reason) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            state.path,
+            i64_of(state.size)?,
+            state.mtime_ns,
+            i64_of(state.inode)?,
+            state.content_hash,
+            record.reason
+        ],
+    )?;
+    Ok(removed)
+}
+
 /// Deletes every stored row of `path`, FTS first: the contentless table only
 /// forgets the rows it is told to by rowid. Returns the chunk rows deleted.
 fn remove(tx: &Transaction<'_>, path: &str) -> Result<u64, Error> {
@@ -528,6 +599,7 @@ fn remove(tx: &Transaction<'_>, path: &str) -> Result<u64, Error> {
     )?;
     let removed = tx.execute("DELETE FROM chunks WHERE path = ?1", [path])?;
     tx.execute("DELETE FROM files WHERE path = ?1", [path])?;
+    tx.execute("DELETE FROM unchunkable WHERE path = ?1", [path])?;
     Ok(removed as u64)
 }
 
@@ -658,22 +730,38 @@ fn chunk_hashes(conn: &Connection) -> Result<Vec<ContentHash>, Error> {
     Ok(rows)
 }
 
+/// Reads the five fingerprint columns starting at column 0.
+fn file_state(row: &rusqlite::Row<'_>) -> rusqlite::Result<FileState> {
+    let size = row.get::<_, i64>(1)?;
+    let inode = row.get::<_, i64>(3)?;
+    Ok(FileState {
+        path: row.get(0)?,
+        size: u64::try_from(size).map_err(|_| rusqlite::Error::IntegralValueOutOfRange(1, size))?,
+        mtime_ns: row.get(2)?,
+        inode: u64::try_from(inode)
+            .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(3, inode))?,
+        content_hash: row.get(4)?,
+    })
+}
+
 fn file_states(conn: &Connection) -> Result<Vec<FileState>, Error> {
     let mut stmt = conn.prepare("SELECT path, size, mtime_ns, inode, content_hash FROM files")?;
-    let states = stmt
+    let states = stmt.query_map([], file_state)?.collect::<Result<_, _>>()?;
+    Ok(states)
+}
+
+fn unchunkables(conn: &Connection) -> Result<Vec<Unchunkable>, Error> {
+    let mut stmt = conn.prepare(
+        "SELECT path, size, mtime_ns, inode, content_hash, reason FROM unchunkable \
+         ORDER BY path",
+    )?;
+    let records = stmt
         .query_map([], |row| {
-            let size = row.get::<_, i64>(1)?;
-            let inode = row.get::<_, i64>(3)?;
-            Ok(FileState {
-                path: row.get(0)?,
-                size: u64::try_from(size)
-                    .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(1, size))?,
-                mtime_ns: row.get(2)?,
-                inode: u64::try_from(inode)
-                    .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(3, inode))?,
-                content_hash: row.get(4)?,
+            Ok(Unchunkable {
+                state: file_state(row)?,
+                reason: row.get(5)?,
             })
         })?
         .collect::<Result<_, _>>()?;
-    Ok(states)
+    Ok(records)
 }

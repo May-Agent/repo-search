@@ -10,7 +10,7 @@ use serde::Serialize;
 
 use super::fuse::Channel;
 use super::{Error, TokenCounter};
-use crate::reconcile::Report;
+use crate::reconcile::{Report, SkipReason};
 use crate::store::{ChunkRow, Side};
 
 impl fmt::Display for Channel {
@@ -33,6 +33,29 @@ pub struct Reconciliation {
     pub chunks_total: u64,
     /// Chunk rows whose vector is cached.
     pub chunks_with_vector: u64,
+    /// Files the index holds but could not chunk.
+    pub unparsable: Vec<Unparsable>,
+}
+
+/// Why an unparsable file could not be chunked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnparsableReason {
+    /// The content is not valid UTF-8.
+    NotUtf8,
+    /// A configuration file that does not parse in its format.
+    Malformed,
+}
+
+/// A file the index holds but could not chunk, as `--json` lists it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Unparsable {
+    /// Worktree-relative path.
+    pub path: String,
+    /// What was wrong with it.
+    pub reason: UnparsableReason,
+    /// The parser's message, for a malformed file.
+    pub error: Option<String>,
 }
 
 impl Reconciliation {
@@ -44,6 +67,24 @@ impl Reconciliation {
             changed_files: report.files_changed(),
             chunks_total: report.chunks_total,
             chunks_with_vector: report.chunks_with_vector,
+            unparsable: report
+                .skipped
+                .iter()
+                .filter_map(|skipped| {
+                    let (reason, error) = match &skipped.reason {
+                        SkipReason::NotUtf8 => (UnparsableReason::NotUtf8, None),
+                        SkipReason::Malformed(error) => {
+                            (UnparsableReason::Malformed, Some(error.clone()))
+                        }
+                        SkipReason::NotUtf8Path => return None,
+                    };
+                    Some(Unparsable {
+                        path: skipped.path.clone(),
+                        reason,
+                        error,
+                    })
+                })
+                .collect(),
         }
     }
 }
@@ -104,6 +145,8 @@ pub struct Freshness {
     /// Chunks with a vector after this query's on-the-spot embedding;
     /// serialized as a fraction.
     pub vectors: Coverage,
+    /// Files the index holds but could not chunk.
+    pub unparsable: Vec<Unparsable>,
 }
 
 impl Freshness {
@@ -115,6 +158,7 @@ impl Freshness {
                 reconciliation.chunks_with_vector + embedded_on_the_spot,
                 reconciliation.chunks_total,
             ),
+            unparsable: reconciliation.unparsable,
         }
     }
 
@@ -122,6 +166,15 @@ impl Freshness {
     #[must_use]
     pub fn percent(&self) -> u32 {
         self.vectors.percent()
+    }
+
+    /// The text line's unparsable-files suffix: empty when every file chunked.
+    fn unparsable_note(&self) -> String {
+        match self.unparsable.len() {
+            0 => String::new(),
+            1 => "; 1 file unparsable".to_owned(),
+            n => format!("; {n} files unparsable"),
+        }
     }
 }
 
@@ -679,6 +732,7 @@ mod tests {
                 changed_files: 2,
                 chunks_total: 10,
                 chunks_with_vector: 9,
+                unparsable: Vec::new(),
             },
             0,
         )
@@ -1021,6 +1075,55 @@ docs/guide.md
         assert_eq!(results().to_text(), expected);
     }
 
+    fn with_unparsable() -> Results {
+        let mut r = results();
+        r.freshness.unparsable = vec![
+            Unparsable {
+                path: "conf/app.toml".to_owned(),
+                reason: UnparsableReason::Malformed,
+                error: Some("invalid TOML: expected `=`".to_owned()),
+            },
+            Unparsable {
+                path: "data/blob.json".to_owned(),
+                reason: UnparsableReason::NotUtf8,
+                error: None,
+            },
+        ];
+        r
+    }
+
+    #[test]
+    fn the_freshness_line_counts_unparsable_files() {
+        assert!(
+            with_unparsable().to_text().ends_with(
+                "-- fresh @ abc123 +2 changed files reconciled; vectors 90%; 2 files unparsable\n"
+            ),
+            "{}",
+            with_unparsable().to_text()
+        );
+        let mut one = with_unparsable();
+        one.freshness.unparsable.pop();
+        assert!(one.to_text().ends_with("vectors 90%; 1 file unparsable\n"));
+    }
+
+    #[test]
+    fn json_lists_unparsable_files_with_their_errors() {
+        let json: serde_json::Value = serde_json::from_str(&with_unparsable().to_json()).unwrap();
+        assert_eq!(
+            json["freshness"]["unparsable"],
+            serde_json::json!([
+                {
+                    "path": "conf/app.toml",
+                    "reason": "malformed",
+                    "error": "invalid TOML: expected `=`"
+                },
+                { "path": "data/blob.json", "reason": "not_utf8", "error": null },
+            ])
+        );
+        let clean: serde_json::Value = serde_json::from_str(&results().to_json()).unwrap();
+        assert_eq!(clean["freshness"]["unparsable"], serde_json::json!([]));
+    }
+
     #[test]
     fn text_omits_an_empty_section_and_lists_files_alone() {
         let code = [
@@ -1048,6 +1151,7 @@ docs/guide.md
                     changed_files: 0,
                     chunks_total: 1000,
                     chunks_with_vector: with_vector,
+                    unparsable: Vec::new(),
                 },
                 embedded,
             )
@@ -1063,6 +1167,7 @@ docs/guide.md
                 changed_files: 0,
                 chunks_total: 0,
                 chunks_with_vector: 0,
+                unparsable: Vec::new(),
             },
             0,
         );
