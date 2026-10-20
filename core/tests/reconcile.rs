@@ -239,9 +239,133 @@ fn ignored_files_are_skipped_unless_asked_for() {
     assert_eq!(fx.fts_hits("generated"), 1);
     assert_eq!(fx.fts_hits("inner"), 0, ".git is never indexed");
 
-    // Back to the default: the ignored files leave the index.
+    // Back to the default: the ignored files stay stored but are hidden.
     let again = fx.pass();
-    assert_eq!(again.report.files_removed, 2);
+    assert_eq!(again.report.files_removed, 0);
+    assert_eq!(again.report.files_scanned, 1);
+    assert_eq!(again.report.chunks_total, 1);
+    assert_eq!(fx.query::<i64>("SELECT count(*) FROM files"), 3);
+    assert_eq!(
+        fx.query::<i64>("SELECT count(*) FROM files WHERE ignored = 1"),
+        2
+    );
+}
+
+const WITH_IGNORED: Options = Options {
+    include_ignored: true,
+};
+
+/// A tree with one normal file and one ignored file, indexed with the flag
+/// and embedded.
+fn ignored_fixture() -> Fixture {
+    let fx = Fixture::new();
+    fx.write(".gitignore", "secret.rs\n");
+    fx.write("kept.rs", "fn kept() {}\n");
+    fx.write("secret.rs", "fn hidden() {}\n");
+    let first = fx.run(WITH_IGNORED);
+    assert_eq!(first.report.files_added, 2, "kept.rs and secret.rs");
+    assert!(paths(&first.pending).contains(&"secret.rs"));
+    fx.embed(&first.pending);
+    fx
+}
+
+#[test]
+fn alternating_passes_keep_ignored_rows_without_rework() {
+    let fx = ignored_fixture();
+    let ignored =
+        |fx: &Fixture| fx.query::<i64>("SELECT ignored FROM files WHERE path = 'secret.rs'");
+    assert_eq!(ignored(&fx), 1);
+    let both = fx.run(WITH_IGNORED).report.chunks_total;
+
+    // Without the flag nothing is removed or re-chunked, the ignored chunks
+    // are not counted and none is queued for embedding.
+    let plain = fx.pass();
+    let r = &plain.report;
+    assert_eq!(
+        (r.files_removed, r.files_chunked, r.chunks_added),
+        (0, 0, 0)
+    );
+    assert_eq!(r.chunks_removed, 0);
+    assert_eq!(r.chunks_total, 1);
+    assert!(r.chunks_total < both);
+    assert!(plain.pending.is_empty());
+    assert_eq!(ignored(&fx), 1);
+
+    // An ignored file edited meanwhile is not read by a pass without the flag
+    // and never queued; the flagged pass picks the edit up.
+    fx.write("secret.rs", "fn hidden() {}\nfn extra() {}\n");
+    let plain = fx.pass();
+    assert_eq!(plain.report.files_chunked, 0);
+    assert!(plain.pending.is_empty());
+    let again = fx.run(WITH_IGNORED);
+    assert_eq!(again.report.files_modified, 1);
+    assert!(paths(&again.pending).iter().all(|p| *p == "secret.rs"));
+    fx.embed(&again.pending);
+
+    // The next flagged pass has nothing to chunk or embed.
+    let settled = fx.run(WITH_IGNORED);
+    assert_eq!(settled.report.files_changed(), 0);
+    assert_eq!(settled.report.files_chunked, 0);
+    assert_eq!(settled.report.chunks_added, 0);
+    assert!(settled.pending.is_empty());
+    assert_eq!(
+        settled.report.chunks_with_vector,
+        settled.report.chunks_total
+    );
+}
+
+#[test]
+fn an_unignored_file_is_flipped_without_rechunking() {
+    let fx = ignored_fixture();
+    let chunk_ids: String = fx.query("SELECT group_concat(id) FROM chunks");
+    fx.write(".gitignore", "");
+    let r = fx.pass();
+    assert_eq!(r.report.files_scanned, 2, "kept.rs and secret.rs");
+    assert_eq!((r.report.files_chunked, r.report.files_removed), (0, 0));
+    assert_eq!(r.report.files_restamped, 1);
+    assert_eq!(
+        fx.query::<i64>("SELECT ignored FROM files WHERE path = 'secret.rs'"),
+        0
+    );
+    assert_eq!(
+        fx.query::<String>("SELECT group_concat(id) FROM chunks"),
+        chunk_ids
+    );
+    assert!(r.pending.is_empty());
+    assert_eq!(r.report.chunks_with_vector, r.report.chunks_total);
+}
+
+#[test]
+fn a_newly_ignored_file_is_flagged_by_a_pass_that_includes_ignored() {
+    let fx = Fixture::new();
+    fx.write("a.rs", "fn alpha() {}\n");
+    fx.pass();
+    fx.write(".gitignore", "a.rs\n");
+    let r = fx.run(WITH_IGNORED);
+    assert_eq!((r.report.files_chunked, r.report.files_removed), (0, 0));
+    assert_eq!(
+        fx.query::<i64>("SELECT ignored FROM files WHERE path = 'a.rs'"),
+        1
+    );
+    // A pass without the flag no longer sees it, and keeps it.
+    let plain = fx.pass();
+    assert_eq!(plain.report.files_removed, 0);
+    assert_eq!(fx.query::<i64>("SELECT count(*) FROM files"), 1);
+}
+
+#[test]
+fn an_ignored_file_is_removed_when_deleted_and_a_flagged_pass_runs() {
+    let fx = ignored_fixture();
+    fs::remove_file(fx.tree.path().join("secret.rs")).unwrap();
+
+    // Not walked without the flag: the row waits for the next flagged pass.
+    let plain = fx.pass();
+    assert_eq!(plain.report.files_removed, 0);
+    assert_eq!(fx.query::<i64>("SELECT count(*) FROM files"), 2);
+
+    let flagged = fx.run(WITH_IGNORED);
+    assert_eq!(flagged.report.files_removed, 1);
+    assert_eq!(fx.query::<i64>("SELECT count(*) FROM files"), 1);
     assert_eq!(fx.fts_hits("hidden"), 0);
 }
 

@@ -198,10 +198,12 @@ impl Plan {
 }
 
 /// A walked file that passed the filters: worktree-relative path, language,
-/// and its fingerprint minus the content hash.
+/// whether only an unfiltered walk reaches it, and its fingerprint minus the
+/// content hash.
 struct Candidate {
     rel: String,
     language: Language,
+    ignored: bool,
     size: u64,
     mtime_ns: i64,
     inode: u64,
@@ -266,15 +268,34 @@ pub(super) fn plan(
     for cand in candidates {
         let previous = stored.get(&cand.rel);
         let failed = recorded.get(&cand.rel);
-        if previous.is_some_and(|state| cand.matches(state)) {
+        if let Some(state) = previous.filter(|state| cand.matches(state)) {
             live.insert(cand.rel.clone());
-            work.push((cand, Work::Live));
+            if state.ignored == cand.ignored {
+                work.push((cand, Work::Live));
+            } else {
+                // Only the flag moved: no read, no re-chunk.
+                plan.files_restamped += 1;
+                let state = FileState {
+                    ignored: cand.ignored,
+                    ..state.clone()
+                };
+                work.push((cand, Work::Restamp(state)));
+            }
             continue;
         }
         if let Some(record) = failed.filter(|record| cand.matches(&record.state)) {
             live.insert(cand.rel.clone());
             let reason = record.reason.clone();
-            work.push((cand, Work::KeepUnchunkable(reason)));
+            if record.state.ignored == cand.ignored {
+                work.push((cand, Work::KeepUnchunkable(reason)));
+            } else {
+                plan.files_restamped += 1;
+                let state = FileState {
+                    ignored: cand.ignored,
+                    ..record.state.clone()
+                };
+                work.push((cand, Work::RestampUnchunkable(state, reason)));
+            }
             continue;
         }
         let bytes = match fs::read(root.join(&cand.rel)) {
@@ -299,6 +320,7 @@ pub(super) fn plan(
             mtime_ns: cand.mtime_ns,
             inode: cand.inode,
             content_hash,
+            ignored: cand.ignored,
         };
         if previous.is_some_and(|old| old.content_hash == content_hash) {
             live.insert(cand.rel.clone());
@@ -421,12 +443,13 @@ pub(super) fn plan(
     }
     // Whatever was stored but not seen alive is gone: deleted (including
     // vanished mid-pass) or newly ignored. A chunked file that now fails to
-    // chunk was counted as removed when it was recorded.
+    // chunk was counted as removed when it was recorded. A pass that does not
+    // include ignored files cannot see the flagged ones, so it keeps them.
     let mut gone: Vec<String> = stored
-        .keys()
-        .chain(recorded.keys())
-        .filter(|path| !live.contains(*path))
-        .cloned()
+        .values()
+        .chain(recorded.values().map(|record| &record.state))
+        .filter(|state| (include_ignored || !state.ignored) && !live.contains(&state.path))
+        .map(|state| state.path.clone())
         .collect();
     gone.sort_unstable();
     plan.files_removed += gone.iter().filter(|p| stored.contains_key(*p)).count() as u64;
@@ -521,10 +544,37 @@ fn is_vanished(err: &ignore::Error) -> bool {
             .is_some_and(|e| e.kind() == io::ErrorKind::NotFound)
 }
 
+/// Walks `root`. With `include_ignored` the tree is walked twice, with the
+/// ignore filters on and off, concurrently; a file only the unfiltered walk
+/// reaches is flagged ignored. Without it only the filtered walk runs.
 fn walk(root: &Path, include_ignored: bool) -> Result<Walked, Error> {
+    if !include_ignored {
+        return walk_once(root, true);
+    }
+    let (filtered, all) = std::thread::scope(|scope| {
+        let filtered = scope.spawn(|| walk_once(root, true));
+        let all = walk_once(root, false);
+        (
+            filtered.join().expect("the filtered walk does not panic"),
+            all,
+        )
+    });
+    let (filtered, mut all) = (filtered?, all?);
+    let visible: HashSet<&str> = filtered
+        .candidates
+        .iter()
+        .map(|cand| cand.rel.as_str())
+        .collect();
+    for cand in &mut all.candidates {
+        cand.ignored = !visible.contains(cand.rel.as_str());
+    }
+    Ok(all)
+}
+
+fn walk_once(root: &Path, standard_filters: bool) -> Result<Walked, Error> {
     let mut builder = WalkBuilder::new(root);
     builder
-        .standard_filters(!include_ignored)
+        .standard_filters(standard_filters)
         // Dot-files and dot-directories are source too.
         .hidden(false)
         // `.gitignore` applies in any tree, with or without a `.git` marker.
@@ -577,6 +627,7 @@ fn walk(root: &Path, include_ignored: bool) -> Result<Walked, Error> {
         candidates.push(Candidate {
             rel: rel_utf8,
             language,
+            ignored: false,
             size: meta.len(),
             mtime_ns,
             inode: meta.ino(),
