@@ -17,9 +17,9 @@ jobs:
   model-tests:
     name: model tests
     runs-on: macos-15
-    # A cold coremltools build takes ~25-30 min on a hosted runner; with the
-    # wheel and archive caches warm the job finishes in ~20 min.
-    timeout-minutes: 60
+    # Cold (no caches) the job takes ~6 min: ~3 min for the coremltools
+    # build, ~2.5 min for the model tests.
+    timeout-minutes: 20
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -84,7 +84,12 @@ jobs:
           git -C "$work/src" checkout FETCH_HEAD
           mkdir -p "$work/build"
           uv venv --python 3.13 "$work/build/.venv"
-          uv pip install --python "$work/build/.venv/bin/python" -r "$work/src/reqs/build.pip"
+          # kmeans1d's setup.py needs setuptools, which reqs/build.pip omits
+          # and a Python 3.12+ venv does not ship.
+          uv pip install --python "$work/build/.venv/bin/python" setuptools wheel -r "$work/src/reqs/build.pip"
+          # The build runs a bare `python3` (kmeans1d), as upstream's build.sh
+          # does inside an activated env; put the venv first on PATH.
+          export PATH="$work/build/.venv/bin:$PATH"
           cd "$work/build"
           xcrun --sdk macosx cmake \
             -DCMAKE_OSX_DEPLOYMENT_TARGET=12.3 \
