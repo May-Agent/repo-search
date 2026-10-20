@@ -87,6 +87,9 @@ jobs:
           # kmeans1d's setup.py needs setuptools, which reqs/build.pip omits
           # and a Python 3.12+ venv does not ship.
           uv pip install --python "$work/build/.venv/bin/python" setuptools wheel -r "$work/src/reqs/build.pip"
+          # The build runs a bare `python3` (kmeans1d), as upstream's build.sh
+          # does inside an activated env; put the venv first on PATH.
+          export PATH="$work/build/.venv/bin:$PATH"
           cd "$work/build"
           xcrun --sdk macosx cmake \
             -DCMAKE_OSX_DEPLOYMENT_TARGET=12.3 \
