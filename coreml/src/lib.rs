@@ -371,6 +371,12 @@ impl CoreMlEmbedder {
         })
     }
 
+    /// The embedder's [`DocumentCounter`]: the model's tokenizer and document
+    /// prompt, and through `buckets()` its bucket lengths.
+    pub fn counter(&self) -> &DocumentCounter {
+        &self.counter
+    }
+
     /// Embeds already-tokenized prompt text: `ids` are token ids of a string
     /// the prompt format already produced (document or query prompt), routed
     /// to the smallest bucket that holds them.
