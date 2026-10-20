@@ -479,7 +479,111 @@ fn malformed_configuration_is_reported_and_dropped() {
     let r = fx.pass();
     assert_eq!(r.report.skipped.len(), 1);
     assert_eq!(r.report.skipped[0].path, "c.json");
-    assert_eq!(r.report.skipped[0].reason, SkipReason::Malformed);
+    assert!(
+        matches!(&r.report.skipped[0].reason, SkipReason::Malformed(error) if !error.is_empty()),
+        "{:?}",
+        r.report.skipped[0].reason
+    );
     assert_eq!(r.report.files_removed, 1);
     assert_eq!(r.report.chunks_total, 0);
+}
+
+fn malformed_error(r: &Reconciled) -> &str {
+    match &r.report.skipped[0].reason {
+        SkipReason::Malformed(error) => error,
+        other => panic!("expected a malformed file, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_malformed_file_is_recorded_and_not_parsed_again() {
+    let fx = Fixture::new();
+    fx.write("ok.json", "{\"a\": 1}");
+    fx.write("c.json", "{\"a\": ");
+
+    let first = fx.pass();
+    assert_eq!(first.report.files_chunked, 2);
+    let error = malformed_error(&first).to_owned();
+    assert_eq!(fx.query::<i64>("SELECT count(*) FROM unchunkable"), 1);
+    assert_eq!(fx.query::<i64>("SELECT count(*) FROM files"), 1);
+    assert_eq!(
+        fx.query::<String>("SELECT reason FROM unchunkable"),
+        format!("malformed:{error}")
+    );
+
+    // Nothing changed: the recorded file is neither read nor parsed, yet is
+    // still reported.
+    let second = fx.pass();
+    assert_eq!(second.report.files_chunked, 0);
+    assert_eq!(second.report.files_restamped, 0);
+    assert_eq!(second.report.skipped.len(), 1);
+    assert_eq!(second.report.skipped[0].path, "c.json");
+    assert_eq!(malformed_error(&second), error);
+
+    // Fixing the file chunks it and clears its row.
+    fx.write("c.json", "{\"a\": 2, \"b\": 3}");
+    let third = fx.pass();
+    assert_eq!(third.report.files_chunked, 1);
+    assert_eq!(third.report.files_added, 1);
+    assert!(third.report.skipped.is_empty());
+    assert_eq!(fx.query::<i64>("SELECT count(*) FROM unchunkable"), 0);
+    assert_eq!(fx.query::<i64>("SELECT count(*) FROM files"), 2);
+}
+
+#[test]
+fn a_malformed_file_with_moved_stat_is_restamped_not_parsed() {
+    let fx = Fixture::new();
+    fx.write("c.json", "{\"a\": ");
+    fx.pass();
+    let before: i64 = fx.query("SELECT inode FROM unchunkable");
+
+    // Same bytes, new inode and mtime.
+    let path = fx.tree.path().join("c.json");
+    let bytes = fs::read(&path).unwrap();
+    fs::remove_file(&path).unwrap();
+    fs::write(&path, bytes).unwrap();
+
+    let r = fx.pass();
+    assert_eq!(r.report.files_chunked, 0);
+    assert_eq!(r.report.files_restamped, 1);
+    assert_eq!(r.report.skipped.len(), 1);
+    assert_eq!(fx.query::<i64>("SELECT count(*) FROM unchunkable"), 1);
+    let after: i64 = fx.query("SELECT inode FROM unchunkable");
+    assert_ne!(before, after, "the fingerprint was rewritten");
+    assert_eq!(fx.pass().report.files_restamped, 0);
+}
+
+#[test]
+fn a_changed_malformed_file_is_tried_again_and_updates_its_row() {
+    let fx = Fixture::new();
+    fx.write("c.json", "{\"a\": ");
+    let first = fx.pass();
+    fx.write("c.json", "{\"a\": 1,, ");
+    let r = fx.pass();
+    assert_eq!(r.report.files_chunked, 1);
+    assert_eq!(r.report.skipped.len(), 1);
+    assert_ne!(malformed_error(&r), malformed_error(&first));
+    assert_eq!(fx.query::<i64>("SELECT count(*) FROM unchunkable"), 1);
+}
+
+#[test]
+fn a_deleted_unchunkable_file_loses_its_row() {
+    let fx = Fixture::new();
+    fx.write("c.json", "{\"a\": ");
+    fx.write("b.rs", "fn b() {}\n");
+    fs::write(fx.tree.path().join("a.rs"), [0xff, 0xfe, 0x00]).unwrap();
+    let first = fx.pass();
+    assert_eq!(first.report.skipped.len(), 2);
+    assert_eq!(fx.query::<i64>("SELECT count(*) FROM unchunkable"), 2);
+
+    let again = fx.pass();
+    assert_eq!(again.report.files_chunked, 0);
+    assert_eq!(again.report.skipped.len(), 2);
+
+    fs::remove_file(fx.tree.path().join("c.json")).unwrap();
+    fs::remove_file(fx.tree.path().join("a.rs")).unwrap();
+    let r = fx.pass();
+    assert!(r.report.skipped.is_empty());
+    assert_eq!(fx.query::<i64>("SELECT count(*) FROM unchunkable"), 0);
+    assert_eq!(fx.query::<i64>("SELECT count(*) FROM files"), 1);
 }

@@ -63,6 +63,55 @@ impl FromSql for ContentHash {
     }
 }
 
+/// Why a file could not be chunked, decided by its content alone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UnchunkableReason {
+    /// The file's content is not valid UTF-8.
+    NotUtf8,
+    /// A configuration file that does not parse; carries the parser's error.
+    Malformed(String),
+}
+
+impl UnchunkableReason {
+    const NOT_UTF8: &'static str = "not_utf8";
+    const MALFORMED: &'static str = "malformed:";
+}
+
+impl ToSql for UnchunkableReason {
+    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
+        Ok(ToSqlOutput::Owned(
+            match self {
+                Self::NotUtf8 => Self::NOT_UTF8.to_owned(),
+                Self::Malformed(error) => format!("{}{error}", Self::MALFORMED),
+            }
+            .into(),
+        ))
+    }
+}
+
+impl FromSql for UnchunkableReason {
+    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
+        let text = value.as_str()?;
+        if text == Self::NOT_UTF8 {
+            Ok(Self::NotUtf8)
+        } else if let Some(error) = text.strip_prefix(Self::MALFORMED) {
+            Ok(Self::Malformed(error.to_owned()))
+        } else {
+            Err(FromSqlError::InvalidType)
+        }
+    }
+}
+
+/// A file recorded as unchunkable: its fingerprint, like [`FileState`], and
+/// why it failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unchunkable {
+    /// The file's fingerprint.
+    pub state: FileState,
+    /// Why chunking failed.
+    pub reason: UnchunkableReason,
+}
+
 /// One indexed file's stat fingerprint, what reconcile diffs the walk against.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileState {

@@ -4,8 +4,11 @@
 //! One pass walks the worktree, stats every supported file and diffs it
 //! against the stored file table. Only files whose size, mtime or inode moved
 //! are read; of those, files whose bytes hash the same as before just get a
-//! fresh fingerprint, and the rest are re-chunked. All changes land in one
-//! transaction. A first index is the same pass over an empty table.
+//! fresh fingerprint, and the rest are re-chunked. A file that fails to chunk
+//! is recorded with its fingerprint and error and then treated the same way:
+//! left unread while its stat holds, restamped when only the stat moved, and
+//! tried again when its content changed. All changes land in one transaction.
+//! A first index is the same pass over an empty table.
 
 mod scan;
 
@@ -18,7 +21,7 @@ use std::thread;
 use tokio::sync::oneshot;
 
 use crate::TokenCounter;
-use crate::store::{self, Applied, ContentHash, Index, VectorCache};
+use crate::store::{self, Applied, ContentHash, Index, UnchunkableReason, VectorCache};
 
 /// Failures of a reconcile pass.
 #[derive(Debug, thiserror::Error)]
@@ -86,14 +89,25 @@ pub struct PendingChunk {
 }
 
 /// Why a file was left out of the index this pass.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SkipReason {
-    /// The file's content is not valid UTF-8.
+    /// The file's content is not valid UTF-8. Recorded in the index.
     NotUtf8,
-    /// The file's path is not valid UTF-8; [`Skipped::path`] is lossy.
+    /// The file's path is not valid UTF-8; [`Skipped::path`] is lossy. Decided
+    /// by the path, so not recorded.
     NotUtf8Path,
-    /// A configuration file that does not parse in its format.
-    Malformed,
+    /// A configuration file that does not parse in its format; carries the
+    /// parser's error. Recorded in the index.
+    Malformed(String),
+}
+
+impl From<UnchunkableReason> for SkipReason {
+    fn from(reason: UnchunkableReason) -> Self {
+        match reason {
+            UnchunkableReason::NotUtf8 => Self::NotUtf8,
+            UnchunkableReason::Malformed(error) => Self::Malformed(error),
+        }
+    }
 }
 
 /// A walked file that was not indexed; any chunks it had are dropped. A file
@@ -115,11 +129,14 @@ pub struct Report {
     pub files_added: u64,
     /// Files re-chunked because their content changed.
     pub files_modified: u64,
-    /// Files dropped: deleted, newly ignored, or skipped.
+    /// Files dropped: deleted, newly ignored, or newly unchunkable.
     pub files_removed: u64,
     /// Files whose stat moved but whose bytes did not; only the fingerprint
     /// was rewritten.
     pub files_restamped: u64,
+    /// Files read and handed to a chunker this pass, whether it succeeded or
+    /// not.
+    pub files_chunked: u64,
     /// Chunk rows inserted.
     pub chunks_added: u64,
     /// Chunk rows deleted, including those of re-chunked files.
@@ -128,7 +145,8 @@ pub struct Report {
     pub chunks_total: u64,
     /// Chunk rows whose vector is in the cache for the model.
     pub chunks_with_vector: u64,
-    /// Walked files that could not be indexed.
+    /// Every walked file that is not indexed: the unchunkable files known to
+    /// the index, recorded this pass or before, and paths that are not UTF-8.
     pub skipped: Vec<Skipped>,
 }
 
@@ -187,9 +205,17 @@ pub async fn reconcile(
         .into_iter()
         .map(|state| (state.path.clone(), state))
         .collect();
+    let recorded: HashMap<_, _> = index
+        .unchunkables()
+        .await?
+        .into_iter()
+        .map(|record| (record.state.path.clone(), record))
+        .collect();
     let root = worktree.to_path_buf();
-    let plan = run_blocking(move || scan::plan(&root, options.include_ignored, stored, &*tokens))
-        .await??;
+    let plan = run_blocking(move || {
+        scan::plan(&root, options.include_ignored, stored, recorded, &*tokens)
+    })
+    .await??;
 
     let applied = if plan.changes.is_empty() {
         Applied::default()
@@ -202,6 +228,7 @@ pub async fn reconcile(
         modified = plan.files_modified,
         removed = plan.files_removed,
         restamped = plan.files_restamped,
+        chunked = plan.files_chunked,
         "reconcile applied"
     );
 
@@ -252,6 +279,7 @@ pub async fn reconcile(
         files_modified: plan.files_modified,
         files_removed: plan.files_removed,
         files_restamped: plan.files_restamped,
+        files_chunked: plan.files_chunked,
         chunks_added: applied.chunks_added,
         chunks_removed: applied.chunks_removed,
         chunks_total: rows.len() as u64,

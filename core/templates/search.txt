@@ -7,5 +7,5 @@
 {% endfor -%}
 {% endfor %}
 {% endfor -%}
--- fresh @ {{ freshness.commit }} +{{ freshness.changed_files }} changed files reconciled; vectors {{ freshness.percent() }}%
+-- fresh @ {{ freshness.commit }} +{{ freshness.changed_files }} changed files reconciled; vectors {{ freshness.percent() }}%{{ freshness.unparsable_note() }}
 

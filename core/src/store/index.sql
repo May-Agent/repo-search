@@ -9,6 +9,17 @@ CREATE TABLE files (
     content_hash BLOB NOT NULL
 ) WITHOUT ROWID;
 
+-- Files that fail to chunk, fingerprinted like `files` so a pass can skip
+-- them unread. `reason` is the text form of `UnchunkableReason`.
+CREATE TABLE unchunkable (
+    path         TEXT PRIMARY KEY,
+    size         INTEGER NOT NULL,
+    mtime_ns     INTEGER NOT NULL,
+    inode        INTEGER NOT NULL,
+    content_hash BLOB NOT NULL,
+    reason       TEXT NOT NULL
+) WITHOUT ROWID;
+
 CREATE TABLE chunks (
     id           INTEGER PRIMARY KEY,
     path         TEXT NOT NULL,

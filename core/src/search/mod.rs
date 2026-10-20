@@ -18,7 +18,9 @@ mod terms;
 mod vectors;
 
 pub use fuse::{Channel, Fused, RRF_K, fuse};
-pub use output::{CodeChunk, DocChunk, FileHit, Freshness, Reconciliation, Results};
+pub use output::{
+    CodeChunk, DocChunk, FileHit, Freshness, Reconciliation, Results, Unparsable, UnparsableReason,
+};
 pub use retriever::Retriever;
 pub use scope::Scope;
 pub use terms::{QueryTerms, SymbolName};
