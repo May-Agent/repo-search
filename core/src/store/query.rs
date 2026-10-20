@@ -7,7 +7,7 @@ use rusqlite::{Connection, named_params, params};
 
 use crate::chunk::ChunkKind;
 
-use super::{ContentHash, Error};
+use super::{ContentHash, Error, StoredMemberKind};
 
 /// The kind string of a documentation chunk: the one chunker kind the store
 /// itself gives meaning to. It is the one source of the `doc` string; SQL
@@ -117,6 +117,8 @@ pub struct MemberRow {
     pub bytes: Range<u64>,
     /// The member's syntactic kind.
     pub kind: String,
+    /// How the member's slice becomes text when the chunk's text is rebuilt.
+    pub emit: StoredMemberKind,
     /// The member's symbol path; empty when it has none.
     pub symbol: String,
 }
@@ -205,7 +207,7 @@ pub(super) fn chunks(conn: &Connection, ids: &[ChunkId]) -> Result<Vec<ChunkRow>
         "SELECT path, title, kind, start_line, end_line, content_hash FROM chunks WHERE id = ?1",
     )?;
     let mut member_stmt = conn.prepare(
-        "SELECT start_byte, end_byte, kind, symbol FROM chunk_members \
+        "SELECT start_byte, end_byte, kind, cut, symbol FROM chunk_members \
          WHERE chunk_id = ?1 ORDER BY ord",
     )?;
     let mut out = Vec::with_capacity(ids.len());
@@ -230,13 +232,16 @@ pub(super) fn chunks(conn: &Connection, ids: &[ChunkId]) -> Result<Vec<ChunkRow>
             .query_map([id.0], |m| {
                 let start: i64 = m.get(0)?;
                 let end: i64 = m.get(1)?;
+                let kind: String = m.get(2)?;
+                let emit = StoredMemberKind::from_columns(&kind, m.get(3)?)?;
                 Ok(MemberRow {
                     bytes: u64::try_from(start)
                         .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(0, start))?
                         ..u64::try_from(end)
                             .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(1, end))?,
-                    kind: m.get(2)?,
-                    symbol: m.get(3)?,
+                    kind,
+                    emit,
+                    symbol: m.get(4)?,
                 })
             })?
             .collect::<Result<_, _>>()?;

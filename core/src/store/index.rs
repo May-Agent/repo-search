@@ -77,7 +77,7 @@ pub struct StoredMember {
 }
 
 /// How a stored member's slice becomes text.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StoredMemberKind {
     /// The slice verbatim, joined by `\n` with the other members.
     Text,
@@ -87,6 +87,22 @@ pub enum StoredMemberKind {
         /// Characters of the collapsed signature the prefix carries.
         cut: usize,
     },
+}
+
+impl StoredMemberKind {
+    /// The `kind`/`cut` member columns decoded: a `signature` row emits its
+    /// collapsed prefix, every other kind its slice verbatim. Every member
+    /// query selects `cut` as column 3, the index the range error reports.
+    pub(crate) fn from_columns(kind: &str, cut: i64) -> rusqlite::Result<Self> {
+        if kind == crate::chunk::MemberKind::SIGNATURE_NAME {
+            Ok(Self::Signature {
+                cut: usize::try_from(cut)
+                    .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(3, cut))?,
+            })
+        } else {
+            Ok(Self::Text)
+        }
+    }
 }
 
 /// How far the index has come: whether indexing has ever caught up with the
@@ -816,15 +832,7 @@ fn chunks_by_hash(conn: &Connection, hashes: &[ContentHash]) -> Result<Vec<Store
             .query_map([id], |row| {
                 let start = row.get::<_, i64>(0)?;
                 let end = row.get::<_, i64>(1)?;
-                let cut = row.get::<_, i64>(3)?;
-                let kind = if row.get::<_, String>(2)? == crate::chunk::MemberKind::SIGNATURE_NAME {
-                    StoredMemberKind::Signature {
-                        cut: usize::try_from(cut)
-                            .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(3, cut))?,
-                    }
-                } else {
-                    StoredMemberKind::Text
-                };
+                let kind = StoredMemberKind::from_columns(&row.get::<_, String>(2)?, row.get(3)?)?;
                 Ok(StoredMember {
                     bytes: u64::try_from(start)
                         .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(0, start))?

@@ -689,7 +689,7 @@ fn hits<C>(groups: Vec<Group>, chunk: impl Fn(usize) -> C) -> Option<Vec<FileHit
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::{ChunkId, ContentHash, MemberRow};
+    use crate::store::{ChunkId, ContentHash, MemberRow, StoredMemberKind};
 
     /// Runs the whole selection; every text is already read.
     fn select(
@@ -723,6 +723,7 @@ mod tests {
                 members: vec![MemberRow {
                     bytes: 0..1,
                     kind: "function_item".to_owned(),
+                    emit: StoredMemberKind::Text,
                     symbol: symbol.to_owned(),
                 }],
             },
@@ -1291,6 +1292,7 @@ docs/guide.md
         chunk.row.members.push(MemberRow {
             bytes: 1..2,
             kind: "function_item".to_owned(),
+            emit: StoredMemberKind::Text,
             symbol: "two".to_owned(),
         });
         chunk.row.members.push(chunk.row.members[0].clone());

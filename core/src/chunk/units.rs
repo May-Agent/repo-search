@@ -7,6 +7,7 @@ use std::ops::{Range, RangeInclusive};
 use smallvec::SmallVec;
 
 use crate::TokenCounter;
+use crate::store::StoredMemberKind;
 
 use super::{Chunk, ChunkKind, Member, MemberKind};
 
@@ -486,6 +487,15 @@ pub enum MemberEmit {
     },
 }
 
+impl From<StoredMemberKind> for MemberEmit {
+    fn from(kind: StoredMemberKind) -> Self {
+        match kind {
+            StoredMemberKind::Signature { cut } => Self::Signature { cut },
+            StoredMemberKind::Text => Self::Text,
+        }
+    }
+}
+
 /// Appends the text `members` emit — their slices joined by `\n`, a
 /// signature member emitting its slice whitespace-collapsed (cut to `cut`
 /// chars) plus ` …\n` — to `out`. `None` when a range leaves `src` or
@@ -514,6 +524,27 @@ pub(crate) fn write_members(
         }
     }
     Some(())
+}
+
+/// The text a chunk's stored members emit from `bytes`, rebuilt exactly as
+/// [`write_members`] — and so `Chunk::write_text` — produced it at index
+/// time; `None` when `bytes` is not UTF-8 or a member's range no longer
+/// fits it.
+pub(crate) fn rebuild_text(
+    bytes: &[u8],
+    members: impl IntoIterator<Item = (Range<u64>, StoredMemberKind)>,
+) -> Option<String> {
+    let src = std::str::from_utf8(bytes).ok()?;
+    let mut emit = Vec::new();
+    for (range, kind) in members {
+        emit.push((
+            usize::try_from(range.start).ok()?..usize::try_from(range.end).ok()?,
+            kind.into(),
+        ));
+    }
+    let mut text = String::new();
+    write_members(src, emit, &mut text)?;
+    Some(text)
 }
 
 /// Packs the emitted units: a unit under [`SMALL_BYTES`] joins the current

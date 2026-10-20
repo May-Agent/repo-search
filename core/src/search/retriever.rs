@@ -566,18 +566,11 @@ fn read_text<'a>(
         files.insert(&row.path, bytes);
     }
     let bytes = &files[row.path.as_str()];
-    let mut text = Vec::new();
-    for (i, member) in row.members.iter().enumerate() {
-        if i > 0 {
-            text.push(b'\n');
-        }
-        let range = usize::try_from(member.bytes.start)
-            .ok()
-            .zip(usize::try_from(member.bytes.end).ok());
-        let slice = range.and_then(|(s, e)| bytes.get(s..e)).ok_or_else(stale)?;
-        text.extend_from_slice(slice);
-    }
-    let text = String::from_utf8(text).map_err(|_| stale())?;
+    let Some(text) =
+        crate::chunk::rebuild_text(bytes, row.members.iter().map(|m| (m.bytes.clone(), m.emit)))
+    else {
+        return Err(stale());
+    };
     if ContentHash::of_chunk(&row.title, &text) != row.content_hash {
         return Err(stale());
     }
@@ -603,7 +596,7 @@ async fn run_blocking<T: Send + 'static, E: std::error::Error + 'static>(
 mod tests {
     use super::*;
     use crate::search::fuse::Channel;
-    use crate::store::{ContentHash, MemberRow};
+    use crate::store::{ContentHash, MemberRow, StoredMemberKind};
 
     fn chunk(id: i64, symbol: &str, kind: &str, score: f64) -> RankedChunk {
         RankedChunk {
@@ -617,6 +610,7 @@ mod tests {
                 members: vec![MemberRow {
                     bytes: 0..1,
                     kind: kind.to_owned(),
+                    emit: StoredMemberKind::Text,
                     symbol: symbol.to_owned(),
                 }],
             },
