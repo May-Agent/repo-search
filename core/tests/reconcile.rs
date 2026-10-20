@@ -1,3 +1,6 @@
+//! These fixtures write `.rs` files: without `lang-rust` nothing scans.
+#![cfg(feature = "lang-rust")]
+
 use std::fs;
 
 use futures_executor::block_on;

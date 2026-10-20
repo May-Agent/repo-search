@@ -11,7 +11,34 @@ use std::path::Path;
 use ignore::WalkBuilder;
 
 use super::{Error, PendingChunk, SkipReason, Skipped};
-use crate::chunk::{self, Chunker, ConfigChunker, DocChunker, FileChunker, Language, Rust};
+#[cfg(feature = "lang-c")]
+use crate::chunk::C;
+#[cfg(any(
+    feature = "lang-c",
+    feature = "lang-cpp",
+    feature = "lang-go",
+    feature = "lang-javascript",
+    feature = "lang-python",
+    feature = "lang-rust",
+    feature = "lang-swift",
+    feature = "lang-typescript"
+))]
+use crate::chunk::Chunker;
+#[cfg(feature = "lang-cpp")]
+use crate::chunk::Cpp;
+#[cfg(feature = "lang-go")]
+use crate::chunk::Go;
+#[cfg(feature = "lang-javascript")]
+use crate::chunk::JavaScript;
+#[cfg(feature = "lang-python")]
+use crate::chunk::Python;
+#[cfg(feature = "lang-rust")]
+use crate::chunk::Rust;
+#[cfg(feature = "lang-swift")]
+use crate::chunk::Swift;
+use crate::chunk::{self, ConfigChunker, DocChunker, FileChunker, Language};
+#[cfg(feature = "lang-typescript")]
+use crate::chunk::{Tsx, TypeScript};
 use crate::store::{
     ChunkRecord, ContentHash, FileChange, FileState, MemberRecord, StoredChunk, fts_body,
 };
@@ -20,16 +47,50 @@ use crate::store::{
 /// are switched off.
 const RESERVED_DIRS: [&str; 2] = [".git", ".repo-search"];
 
-/// The chunkers that carry state across files: the tree-sitter parser is
-/// reused, the documentation and configuration chunkers are stateless.
+/// The chunkers that carry state across files: the tree-sitter parsers
+/// are reused, the documentation and configuration chunkers are stateless.
 struct Chunkers {
+    #[cfg(feature = "lang-c")]
+    c: Chunker<C>,
+    #[cfg(feature = "lang-cpp")]
+    cpp: Chunker<Cpp>,
+    #[cfg(feature = "lang-go")]
+    go: Chunker<Go>,
+    #[cfg(feature = "lang-javascript")]
+    javascript: Chunker<JavaScript>,
+    #[cfg(feature = "lang-python")]
+    python: Chunker<Python>,
+    #[cfg(feature = "lang-rust")]
     rust: Chunker<Rust>,
+    #[cfg(feature = "lang-swift")]
+    swift: Chunker<Swift>,
+    #[cfg(feature = "lang-typescript")]
+    typescript: Chunker<TypeScript>,
+    #[cfg(feature = "lang-typescript")]
+    tsx: Chunker<Tsx>,
 }
 
 impl Chunkers {
     fn new() -> Self {
         Self {
+            #[cfg(feature = "lang-c")]
+            c: Chunker::new(C),
+            #[cfg(feature = "lang-cpp")]
+            cpp: Chunker::new(Cpp),
+            #[cfg(feature = "lang-go")]
+            go: Chunker::new(Go),
+            #[cfg(feature = "lang-javascript")]
+            javascript: Chunker::new(JavaScript),
+            #[cfg(feature = "lang-python")]
+            python: Chunker::new(Python),
+            #[cfg(feature = "lang-rust")]
             rust: Chunker::new(Rust),
+            #[cfg(feature = "lang-swift")]
+            swift: Chunker::new(Swift),
+            #[cfg(feature = "lang-typescript")]
+            typescript: Chunker::new(TypeScript),
+            #[cfg(feature = "lang-typescript")]
+            tsx: Chunker::new(Tsx),
         }
     }
 
@@ -41,7 +102,24 @@ impl Chunkers {
         src: &str,
     ) -> Result<Vec<(ChunkRecord, String)>, chunk::Error> {
         match language {
+            #[cfg(feature = "lang-c")]
+            Language::C => chunk_with(&mut self.c, path, src),
+            #[cfg(feature = "lang-cpp")]
+            Language::Cpp => chunk_with(&mut self.cpp, path, src),
+            #[cfg(feature = "lang-go")]
+            Language::Go => chunk_with(&mut self.go, path, src),
+            #[cfg(feature = "lang-javascript")]
+            Language::JavaScript => chunk_with(&mut self.javascript, path, src),
+            #[cfg(feature = "lang-python")]
+            Language::Python => chunk_with(&mut self.python, path, src),
+            #[cfg(feature = "lang-rust")]
             Language::Rust => chunk_with(&mut self.rust, path, src),
+            #[cfg(feature = "lang-swift")]
+            Language::Swift => chunk_with(&mut self.swift, path, src),
+            #[cfg(feature = "lang-typescript")]
+            Language::TypeScript => chunk_with(&mut self.typescript, path, src),
+            #[cfg(feature = "lang-typescript")]
+            Language::Tsx => chunk_with(&mut self.tsx, path, src),
             Language::Doc(format) => chunk_with(&mut DocChunker::new(format), path, src),
             Language::Config(format) => chunk_with(&mut ConfigChunker::new(format), path, src),
         }

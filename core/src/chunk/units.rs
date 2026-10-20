@@ -414,3 +414,43 @@ pub(super) fn trim_range(src: &str, range: Range<usize>) -> Range<usize> {
     let end = range.end - (text.len() - text.trim_end().len());
     start.min(end)..end
 }
+
+/// Node-text helpers shared by the tree-sitter grammar implementations;
+/// each is compiled only when a grammar using it exists.
+#[cfg(any(
+    feature = "lang-c",
+    feature = "lang-cpp",
+    feature = "lang-go",
+    feature = "lang-javascript",
+    feature = "lang-python",
+    feature = "lang-swift",
+    feature = "lang-typescript"
+))]
+pub(super) mod text {
+    use tree_sitter::Node;
+
+    /// The text of `node` in `src`.
+    pub fn node_text<'a>(src: &'a str, node: Node) -> &'a str {
+        &src[node.byte_range()]
+    }
+
+    /// The text of `node`'s `field` child, or `None` when it has none.
+    pub fn field_text<'a>(src: &'a str, node: Node, field: &str) -> Option<&'a str> {
+        node.child_by_field_name(field)
+            .map(|child| node_text(src, child))
+    }
+
+    /// The text of `node`'s first unnamed child: the keyword that opens the
+    /// item, such as `var`, `func` or `class`.
+    #[cfg(any(
+        feature = "lang-javascript",
+        feature = "lang-swift",
+        feature = "lang-typescript"
+    ))]
+    pub fn first_token<'a>(src: &'a str, node: Node) -> Option<&'a str> {
+        let mut cursor = node.walk();
+        node.children(&mut cursor)
+            .find(|child| !child.is_named())
+            .map(|child| node_text(src, child))
+    }
+}
