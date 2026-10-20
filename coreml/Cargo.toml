@@ -6,3 +6,17 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+
+[dependencies]
+block2 = { version = "0.6.2", default-features = false }
+numkong = { version = "7.8.5", default-features = false }
+objc2 = { version = "0.6.5", default-features = false }
+objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["CFString"] }
+objc2-core-ml = { version = "0.3.2", default-features = false, features = ["MLDictionaryFeatureProvider", "MLFeatureProvider", "MLFeatureValue", "MLModel", "MLModelConfiguration", "MLMultiArray", "block2"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["NSArray", "NSDictionary", "NSError", "NSProcessInfo", "NSString", "NSURL"] }
+objc2-io-kit = { version = "0.3.2", default-features = false, features = ["ps"] }
+repo-search-core.workspace = true
+serde = { version = "1.0.229", default-features = false, features = ["derive", "std"] }
+serde_json = { version = "1.0.154", default-features = false, features = ["std"] }
+thiserror = { version = "2.0.21", default-features = false }
+tokenizers = { version = "0.23.2", default-features = false, features = ["fancy-regex"] }
