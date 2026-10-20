@@ -162,7 +162,7 @@ impl ChunkKind {
     /// The kind string of a kind that names no tree-sitter node: `docs` for
     /// module docs, `packed`, `doc` and `config`; `None` for the node-named
     /// `Item` and `Header`.
-    pub fn static_name(self) -> Option<&'static str> {
+    pub const fn static_name(self) -> Option<&'static str> {
         match self {
             Self::Item(_) | Self::Header(_) => None,
             Self::ModuleDocs => Some("docs"),

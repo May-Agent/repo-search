@@ -61,7 +61,7 @@ fn an_index_built_from_the_cache_finds_the_stored_vectors() {
     )
     .unwrap();
 
-    let hits = index.search(&vector_of(7), 2);
+    let hits = index.search(&vector_of(7), 2, None);
     assert_eq!(hits.len(), 50);
     assert!(hits[0].1 > 0.999, "{hits:?}");
 }

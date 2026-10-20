@@ -1,0 +1,234 @@
+[
+  {
+    "query": "cherenkov-oracle: blur backdrops with the oracle's true Gaussian",
+    "match": "\"cherenkov\" OR \"oracle\" OR \"blur\" OR \"backdrops\" OR \"true\" OR \"gaussian\""
+  },
+  {
+    "query": "cherenkov-gpu: count registered images against the GPU budget",
+    "match": "\"cherenkov\" OR \"gpu\" OR \"count\" OR \"registered\" OR \"images\" OR \"against\" OR \"budget\""
+  },
+  {
+    "query": "reconstruct YUV chroma bilinearly at the sited position",
+    "match": "\"reconstruct\" OR \"yuv\" OR \"chroma\" OR \"bilinearly\" OR \"sited\" OR \"position\""
+  },
+  {
+    "query": "cherenkov-gpu: resolve the EngineError link in open_vulkan_device's docs",
+    "match": "\"cherenkov\" OR \"gpu\" OR \"resolve\" OR \"engineerror\" OR \"link\" OR \"open\" OR \"vulkan\" OR \"device\" OR \"docs\" OR \"engine\" OR \"error\""
+  },
+  {
+    "query": "cherenkov-gpu: expect the Android-only thread_local lint false positive",
+    "match": "\"cherenkov\" OR \"gpu\" OR \"expect\" OR \"android\" OR \"thread\" OR \"local\" OR \"lint\" OR \"false\" OR \"positive\""
+  },
+  {
+    "query": "cherenkov: pass the equivalence harness its font instead of reading a file",
+    "match": "\"cherenkov\" OR \"pass\" OR \"equivalence\" OR \"harness\" OR \"font\" OR \"reading\" OR \"file\""
+  },
+  {
+    "query": "cherenkov: rasterize paths in sparse four-row bands",
+    "match": "\"cherenkov\" OR \"rasterize\" OR \"paths\" OR \"sparse\" OR \"four\" OR \"row\" OR \"bands\""
+  },
+  {
+    "query": "cherenkov-bench: compare Pixel builds at pinned clocks with a resolution check",
+    "match": "\"cherenkov\" OR \"bench\" OR \"compare\" OR \"pixel\" OR \"builds\" OR \"pinned\" OR \"clocks\" OR \"resolution\" OR \"check\""
+  },
+  {
+    "query": "hydrolysis web: place accessibility mirror nodes at their drawn positions",
+    "match": "\"hydrolysis\" OR \"web\" OR \"place\" OR \"accessibility\" OR \"mirror\" OR \"nodes\" OR \"their\" OR \"drawn\" OR \"positions\""
+  },
+  {
+    "query": "cherenkov-cpu: plan nested backdrop captures for the rows later captures read",
+    "match": "\"cherenkov\" OR \"cpu\" OR \"plan\" OR \"nested\" OR \"backdrop\" OR \"captures\" OR \"rows\" OR \"later\" OR \"read\""
+  },
+  {
+    "query": "cherenkov-gpu: retire the shared AHB frame in the release-fence test the way producers hold it",
+    "match": "\"cherenkov\" OR \"gpu\" OR \"retire\" OR \"shared\" OR \"ahb\" OR \"frame\" OR \"release\" OR \"fence\" OR \"test\" OR \"way\" OR \"producers\" OR \"hold\""
+  },
+  {
+    "query": "cherenkov-gpu: fill semi-planar NV12 test buffers at their pixel stride",
+    "match": "\"cherenkov\" OR \"gpu\" OR \"fill\" OR \"semi\" OR \"planar\" OR \"nv12\" OR \"test\" OR \"buffers\" OR \"their\" OR \"pixel\" OR \"stride\""
+  },
+  {
+    "query": "cherenkov-gpu: keep every pending cell of a leaf in release builds",
+    "match": "\"cherenkov\" OR \"gpu\" OR \"pending\" OR \"cell\" OR \"leaf\" OR \"release\" OR \"builds\""
+  },
+  {
+    "query": "hydrolysis web: handle the non-exhaustive video enums in the web video bridge",
+    "match": "\"hydrolysis\" OR \"web\" OR \"handle\" OR \"non\" OR \"exhaustive\" OR \"video\" OR \"enums\" OR \"bridge\""
+  },
+  {
+    "query": "cherenkov: unconfigure a DOM surface's canvas contexts when its parts drop",
+    "match": "\"cherenkov\" OR \"unconfigure\" OR \"dom\" OR \"surface\" OR \"canvas\" OR \"contexts\" OR \"parts\" OR \"drop\""
+  },
+  {
+    "query": "cherenkov-oracle: sRGB transfer is odd through zero",
+    "match": "\"cherenkov\" OR \"oracle\" OR \"srgb\" OR \"transfer\" OR \"odd\" OR \"through\" OR \"zero\" OR \"rgb\""
+  },
+  {
+    "query": "release cached fonts and images when no recording names them",
+    "match": "\"release\" OR \"cached\" OR \"fonts\" OR \"images\" OR \"recording\" OR \"names\" OR \"them\""
+  },
+  {
+    "query": "cherenkov-gpu: round Metal float stores to nearest even",
+    "match": "\"cherenkov\" OR \"gpu\" OR \"round\" OR \"metal\" OR \"float\" OR \"stores\" OR \"nearest\" OR \"even\""
+  },
+  {
+    "query": "Photo reports Loaded only once the frame is registered",
+    "match": "\"photo\" OR \"reports\" OR \"loaded\" OR \"once\" OR \"frame\" OR \"registered\""
+  },
+  {
+    "query": "expect the Android-only thread_local lint false positive",
+    "match": "\"expect\" OR \"android\" OR \"thread\" OR \"local\" OR \"lint\" OR \"false\" OR \"positive\""
+  },
+  {
+    "query": "cherenkov-gpu: start each pass's GPU timing on an encoder timestamp on Vulkan",
+    "match": "\"cherenkov\" OR \"gpu\" OR \"start\" OR \"pass\" OR \"timing\" OR \"encoder\" OR \"timestamp\" OR \"vulkan\""
+  },
+  {
+    "query": "cherenkov-gpu: count radix passes without the unstable bit_width",
+    "match": "\"cherenkov\" OR \"gpu\" OR \"count\" OR \"radix\" OR \"passes\" OR \"without\" OR \"unstable\" OR \"bit\" OR \"width\""
+  },
+  {
+    "query": "cherenkov-oracle: blend an encoded member's sample against the content beneath it",
+    "match": "\"cherenkov\" OR \"oracle\" OR \"blend\" OR \"encoded\" OR \"member\" OR \"sample\" OR \"against\" OR \"content\" OR \"beneath\""
+  },
+  {
+    "query": "cherenkov-scene: corpus scene for an sRGB gradient with a negative component",
+    "match": "\"cherenkov\" OR \"scene\" OR \"corpus\" OR \"srgb\" OR \"gradient\" OR \"negative\" OR \"component\" OR \"rgb\""
+  },
+  {
+    "query": "cherenkov-gpu: upload images larger than max_buffer_size in row bands",
+    "match": "\"cherenkov\" OR \"gpu\" OR \"upload\" OR \"images\" OR \"larger\" OR \"max\" OR \"buffer\" OR \"size\" OR \"row\" OR \"bands\""
+  },
+  {
+    "query": "stop the app cleanly when the terminal sends an interrupt or hangup on macOS",
+    "match": "\"stop\" OR \"app\" OR \"cleanly\" OR \"terminal\" OR \"sends\" OR \"interrupt\" OR \"hangup\" OR \"macos\" OR \"mac\" OR \"os\""
+  },
+  {
+    "query": "fetch fixed versions of external developer programs and check their hashes, no homebrew needed",
+    "match": "\"fetch\" OR \"fixed\" OR \"versions\" OR \"external\" OR \"developer\" OR \"programs\" OR \"check\" OR \"their\" OR \"hashes\" OR \"homebrew\" OR \"needed\""
+  },
+  {
+    "query": "debug panel that shows which pieces of reactive state update most often",
+    "match": "\"debug\" OR \"panel\" OR \"shows\" OR \"which\" OR \"pieces\" OR \"reactive\" OR \"state\" OR \"update\" OR \"most\" OR \"often\""
+  },
+  {
+    "query": "make a Mac display refresh at its highest rate for smooth animation in the windowed runner",
+    "match": "\"mac\" OR \"display\" OR \"refresh\" OR \"highest\" OR \"rate\" OR \"smooth\" OR \"animation\" OR \"windowed\" OR \"runner\""
+  },
+  {
+    "query": "bring in a GPU image shared from another Linux process through a file descriptor",
+    "match": "\"bring\" OR \"gpu\" OR \"image\" OR \"shared\" OR \"another\" OR \"linux\" OR \"process\" OR \"through\" OR \"file\" OR \"descriptor\""
+  },
+  {
+    "query": "use camera or video frames that Android hands over as native graphics buffers in the renderer",
+    "match": "\"camera\" OR \"video\" OR \"frames\" OR \"android\" OR \"hands\" OR \"over\" OR \"native\" OR \"graphics\" OR \"buffers\" OR \"renderer\""
+  },
+  {
+    "query": "render part of the tree with a perspective tilt into its own texture and composite it back",
+    "match": "\"render\" OR \"part\" OR \"tree\" OR \"perspective\" OR \"tilt\" OR \"own\" OR \"texture\" OR \"composite\" OR \"back\""
+  },
+  {
+    "query": "draw multicolor emoji glyphs in the software renderer",
+    "match": "\"draw\" OR \"multicolor\" OR \"emoji\" OR \"glyphs\" OR \"software\" OR \"renderer\""
+  },
+  {
+    "query": "show a source snippet with syntax colors, a language label and a copy button",
+    "match": "\"show\" OR \"source\" OR \"snippet\" OR \"syntax\" OR \"colors\" OR \"language\" OR \"label\" OR \"copy\" OR \"button\""
+  },
+  {
+    "query": "modal warning dialog attached to a window on the Mac",
+    "match": "\"modal\" OR \"warning\" OR \"dialog\" OR \"attached\" OR \"window\" OR \"mac\""
+  },
+  {
+    "query": "spinner or bar showing how far along a task is on iPhone",
+    "match": "\"spinner\" OR \"bar\" OR \"showing\" OR \"how\" OR \"far\" OR \"along\" OR \"task\" OR \"iphone\" OR \"phone\""
+  },
+  {
+    "query": "on/off switch or tick box control for Mac apps",
+    "match": "\"off\" OR \"switch\" OR \"tick\" OR \"box\" OR \"control\" OR \"mac\" OR \"apps\""
+  },
+  {
+    "query": "plus and minus buttons that change a number shown next to a label",
+    "match": "\"plus\" OR \"minus\" OR \"buttons\" OR \"change\" OR \"number\" OR \"shown\" OR \"next\" OR \"label\""
+  },
+  {
+    "query": "notice when the mouse moves over a view and change the cursor",
+    "match": "\"notice\" OR \"mouse\" OR \"moves\" OR \"over\" OR \"view\" OR \"change\" OR \"cursor\""
+  },
+  {
+    "query": "frosted translucent window background",
+    "match": "\"frosted\" OR \"translucent\" OR \"window\" OR \"background\""
+  },
+  {
+    "query": "produce the screen reader tree without a GPU, styling or layout, for tests",
+    "match": "\"produce\" OR \"screen\" OR \"reader\" OR \"tree\" OR \"without\" OR \"gpu\" OR \"styling\" OR \"layout\" OR \"tests\""
+  },
+  {
+    "query": "every Kotlin method the native side calls by name is listed in one place so a stripped method fails early",
+    "match": "\"kotlin\" OR \"method\" OR \"native\" OR \"side\" OR \"calls\" OR \"name\" OR \"listed\" OR \"one\" OR \"place\" OR \"stripped\" OR \"fails\" OR \"early\""
+  },
+  {
+    "query": "let apps embed their own GPU drawing such as particles or a 3D viewport inside a view",
+    "match": "\"let\" OR \"apps\" OR \"embed\" OR \"their\" OR \"own\" OR \"gpu\" OR \"drawing\" OR \"such\" OR \"particles\" OR \"3d\" OR \"viewport\" OR \"inside\" OR \"view\""
+  },
+  {
+    "query": "backend pushes rendered frames to the developer inspector only while someone is watching",
+    "match": "\"backend\" OR \"pushes\" OR \"rendered\" OR \"frames\" OR \"developer\" OR \"inspector\" OR \"someone\" OR \"watching\""
+  },
+  {
+    "query": "attach extra data to a view that a renderer is allowed to skip",
+    "match": "\"attach\" OR \"extra\" OR \"data\" OR \"view\" OR \"renderer\" OR \"allowed\" OR \"skip\""
+  },
+  {
+    "query": "ComputedSignal",
+    "match": "\"computedsignal\" OR \"computed\" OR \"signal\""
+  },
+  {
+    "query": "parse HTTPServer and XMLHttpRequest2",
+    "match": "\"parse\" OR \"httpserver\" OR \"xmlhttprequest2\" OR \"http\" OR \"server\" OR \"xml\" OR \"request2\""
+  },
+  {
+    "query": "env_insert Environment::insert",
+    "match": "\"env\" OR \"insert\" OR \"environment\""
+  },
+  {
+    "query": "isEmpty? what is the",
+    "match": "\"isempty\" OR \"what\" OR \"empty\""
+  },
+  {
+    "query": "is the of",
+    "match": null
+  },
+  {
+    "query": "Größe der Ströme",
+    "match": "\"größe\" OR \"der\" OR \"ströme\""
+  },
+  {
+    "query": "naïve café résumé",
+    "match": "\"naïve\" OR \"café\" OR \"résumé\""
+  },
+  {
+    "query": "İstanbul KELVIN",
+    "match": "\"istanbul\" OR \"kelvin\""
+  },
+  {
+    "query": "x y z a1 b2",
+    "match": "\"a1\" OR \"b2\""
+  },
+  {
+    "query": "snake_case_name with  odd--punctuation!!",
+    "match": "\"snake\" OR \"case\" OR \"name\" OR \"odd\" OR \"punctuation\""
+  },
+  {
+    "query": "Vec<T>::push(&mut self)",
+    "match": "\"vec\" OR \"push\" OR \"mut\" OR \"self\""
+  },
+  {
+    "query": "日本語 のクエリ",
+    "match": "\"日本語\" OR \"のクエリ\""
+  },
+  {
+    "query": "use using used make makes",
+    "match": null
+  }
+]
