@@ -6,7 +6,7 @@ use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use repo_search_core::{Embedder, QueryTask, UnitVector};
+use repo_search_core::{BatchEmbedder, Embedder, QueryTask, UnitVector};
 use repo_search_coreml::{ComputeUnits, CoreMlEmbedder, Error, gpu_headroom};
 use serde::Deserialize;
 
@@ -198,4 +198,56 @@ fn document_over_cap_errors_and_query_truncates() {
     embedder
         .embed_query(QueryTask::CodeRetrieval, &long_doc)
         .expect("query is truncated at the cap");
+}
+
+/// Eight documents of one bucket.
+fn batch_documents() -> Vec<(String, String)> {
+    (0..8)
+        .map(|i| {
+            (
+                format!("file{i}.rs"),
+                format!("fn function_{i}() {{ index_everything({i}); }}"),
+            )
+        })
+        .collect()
+}
+
+#[test]
+#[ignore = "needs REPO_SEARCH_MODEL_DIR; run with --ignored"]
+fn a_batch_of_eight_equals_eight_single_embeds() {
+    let dir = model_dir();
+    let docs = batch_documents();
+    let docs: Vec<(&str, &str)> = docs.iter().map(|(t, x)| (t.as_str(), x.as_str())).collect();
+    let mut ane = CoreMlEmbedder::open(&dir, MODEL_ID, ComputeUnits::CpuAndNeuralEngine).unwrap();
+    let singles: Vec<UnitVector> = docs
+        .iter()
+        .map(|(title, text)| ane.embed_document(title, text).unwrap())
+        .collect();
+    let batch = ane.embed_documents(&docs).unwrap();
+    assert_eq!(batch.len(), docs.len());
+    for (i, (b, s)) in batch.iter().zip(&singles).enumerate() {
+        let c = cosine(b.as_slice(), s.as_slice());
+        assert!(c >= MIN_COSINE, "document {i}: cosine {c} < {MIN_COSINE}");
+    }
+    match gpu_headroom() {
+        Ok(()) => {
+            let mut gpu = CoreMlEmbedder::open(&dir, MODEL_ID, ComputeUnits::CpuAndGpu).unwrap();
+            let batch = gpu.embed_documents(&docs).unwrap();
+            assert_eq!(batch.len(), docs.len());
+            for (i, (b, s)) in batch.iter().zip(&singles).enumerate() {
+                let c = cosine(b.as_slice(), s.as_slice());
+                assert!(c > 0.99, "document {i}: GPU batch vs ANE cosine {c}");
+            }
+        }
+        Err(blocked) => {
+            let err = match CoreMlEmbedder::open(&dir, MODEL_ID, ComputeUnits::CpuAndGpu) {
+                Err(e) => e,
+                Ok(_) => panic!("GPU embedder must not open without headroom"),
+            };
+            assert!(
+                matches!(err, Error::GpuBlocked(ref b) if *b == blocked),
+                "{err}"
+            );
+        }
+    }
 }
