@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 
 mod counters;
+mod support;
 
 use counters::CapOff;
 use futures_executor::block_on;
@@ -23,6 +24,7 @@ use repo_search_core::store::{
     fts_body,
 };
 use repo_search_core::{CHUNKER_FINGERPRINT, Embedder, QueryTask, UnitVector};
+use support::EmbedThread;
 use tempfile::TempDir;
 
 const MODEL: &str = "fake-bag-of-words";
@@ -119,7 +121,7 @@ struct Fixture {
     tree: TempDir,
     _common: TempDir,
     index: Index,
-    retriever: Retriever<FakeEmbedder>,
+    retriever: Retriever<EmbedThread<FakeEmbedder>>,
     seen: Arc<Seen>,
     reconciliation: Reconciliation,
     cache: VectorCache,
@@ -330,7 +332,7 @@ impl Fixture {
         let retriever = Retriever::new(
             index.clone(),
             cache.clone(),
-            embedder,
+            EmbedThread::spawn(embedder).unwrap(),
             PathBuf::from(tree.path()),
             NonZeroUsize::new(2).unwrap(),
         )

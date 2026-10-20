@@ -250,6 +250,10 @@ impl TokenCounter for DocumentCounter {
                 .saturating_sub(head),
         )
     }
+
+    fn document_tokens(&self, title: &str, text: &str) -> usize {
+        self.count(&self.document(title, text))
+    }
 }
 
 // SAFETY: `MLModel` and `MLMultiArray` may be used from any thread provided

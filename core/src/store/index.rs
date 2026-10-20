@@ -15,7 +15,7 @@ use super::{
 };
 
 /// Schema generation; a database at any other version is deleted and rebuilt.
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 
 /// One file's change inside an atomic batch.
 #[derive(Debug)]
@@ -88,6 +88,37 @@ pub enum StoredMemberKind {
     },
 }
 
+/// How far the index has come: whether indexing has ever caught up with the
+/// worktree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Phase {
+    /// The first pass over the worktree has not finished.
+    FirstIndex,
+    /// The index has been complete once and is kept up to date.
+    Maintained,
+}
+
+impl Phase {
+    const fn column(self) -> i64 {
+        match self {
+            Self::FirstIndex => 0,
+            Self::Maintained => 1,
+        }
+    }
+
+    fn from_column(value: i64) -> rusqlite::Result<Self> {
+        match value {
+            0 => Ok(Self::FirstIndex),
+            1 => Ok(Self::Maintained),
+            other => Err(rusqlite::Error::FromSqlConversionFailure(
+                0,
+                rusqlite::types::Type::Integer,
+                format!("unknown index phase {other}").into(),
+            )),
+        }
+    }
+}
+
 enum Request {
     Apply {
         changes: Vec<FileChange>,
@@ -105,6 +136,13 @@ enum Request {
     },
     Unchunkables {
         reply: oneshot::Sender<Result<Vec<Unchunkable>, Error>>,
+    },
+    Phase {
+        reply: oneshot::Sender<Result<Phase, Error>>,
+    },
+    SetPhase {
+        phase: Phase,
+        reply: oneshot::Sender<Result<(), Error>>,
     },
     Align {
         chunker: String,
@@ -249,6 +287,27 @@ impl Index {
             reply,
         })
         .await
+    }
+
+    /// The index's phase; [`Phase::FirstIndex`] until one is set, including
+    /// before the index has recorded its identity.
+    ///
+    /// # Errors
+    ///
+    /// When SQLite rejects the read or the actor is gone.
+    pub async fn phase(&self) -> Result<Phase, Error> {
+        send_and_wait(&self.tx, |reply| Request::Phase { reply }).await
+    }
+
+    /// Stores the index's phase. A chunker change keeps it: the re-chunked
+    /// files are embedded in the class the stored phase already names.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotAligned`] before [`Index::align_chunker`] has run; or when
+    /// SQLite rejects the change or the actor is gone.
+    pub async fn set_phase(&self, phase: Phase) -> Result<(), Error> {
+        send_and_wait(&self.tx, |reply| Request::SetPhase { phase, reply }).await
     }
 
     /// The first stored chunk (by id) of each of `hashes`, in the order given;
@@ -420,6 +479,12 @@ fn serve(mut conn: Connection, mut rx: mpsc::Receiver<Request>) {
             Request::Unchunkables { reply } => {
                 let _ = reply.send(unchunkables(&conn));
             }
+            Request::Phase { reply } => {
+                let _ = reply.send(phase(&conn));
+            }
+            Request::SetPhase { phase, reply } => {
+                let _ = reply.send(set_phase(&conn, phase));
+            }
             Request::Align {
                 chunker,
                 model_id,
@@ -490,6 +555,23 @@ fn apply(conn: &mut Connection, changes: &[FileChange]) -> Result<Applied, Error
     }
     tx.commit()?;
     Ok(applied)
+}
+
+fn phase(conn: &Connection) -> Result<Phase, Error> {
+    let stored: Option<i64> = conn
+        .query_row("SELECT phase FROM meta", [], |row| row.get(0))
+        .optional()?;
+    Ok(stored
+        .map(Phase::from_column)
+        .transpose()?
+        .unwrap_or(Phase::FirstIndex))
+}
+
+fn set_phase(conn: &Connection, phase: Phase) -> Result<(), Error> {
+    match conn.execute("UPDATE meta SET phase = ?1", params![phase.column()])? {
+        1 => Ok(()),
+        _ => Err(Error::NotAligned),
+    }
 }
 
 fn align(conn: &mut Connection, chunker: &str, model_id: &str) -> Result<bool, Error> {

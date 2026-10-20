@@ -20,6 +20,10 @@ impl TokenCounter for CapOff {
     fn fit_end(&self, _: &str, _: &[&str], _: usize) -> Option<usize> {
         None
     }
+
+    fn document_tokens(&self, _: &str, _: &str) -> usize {
+        0
+    }
 }
 
 /// A `TokenCounter` counting one token per `unit` chars.
@@ -51,5 +55,9 @@ impl TokenCounter for CharTokens {
                 .nth(chars)
                 .map_or(joined.len(), |(i, _)| i),
         )
+    }
+
+    fn document_tokens(&self, title: &str, text: &str) -> usize {
+        self.count(&format!("title: {title} | text: {text}"))
     }
 }

@@ -11,15 +11,11 @@ mod calibration;
 mod fp16;
 mod index;
 mod mask;
-mod qos;
 mod topk;
 
 pub use calibration::{Calibration, calibration_for};
 pub use index::KnnIndex;
 pub use mask::RowMask;
-#[cfg(target_os = "macos")]
-pub use qos::performance_cores;
-pub(crate) use qos::set_user_interactive;
 
 use std::io;
 

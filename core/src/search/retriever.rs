@@ -10,12 +10,12 @@ use std::thread;
 
 use tokio::sync::oneshot;
 
-use crate::knn::set_user_interactive;
+use crate::qos::{QosClass, set_current_thread};
 use crate::reconcile::PendingChunk;
 use crate::store::{ChunkFilter, ChunkId, ChunkRow, ContentHash, Index, Side, VectorCache};
-use crate::{Embedder, QueryTask, UnitVector};
+use crate::{QueryTask, UnitVector};
 
-use super::embedder::EmbedderHandle;
+use super::EmbedService;
 use super::fuse::{Fused, fuse};
 use super::output::{
     self, Freshness, RankedChunk, ReadError, Reconciliation, Results, Selector, Step,
@@ -36,23 +36,23 @@ const NON_DEFINITION_KINDS: &[&str] = &["impl_item"];
 
 /// Answers queries against one worktree.
 ///
-/// Owns the embedder (on a thread of its own) and the in-memory vector
-/// indexes of the worktree's chunks, one per list (on another), kept in step
-/// with the index and the cache by every search. Neither thread blocks the
-/// executor, and a search dropped half way leaves both usable.
-pub struct Retriever<E: Embedder + Send + 'static> {
+/// Embeds through the caller's [`EmbedService`] and owns the in-memory vector
+/// indexes of the worktree's chunks, one per list (on a thread of its own),
+/// kept in step with the index and the cache by every search. The thread does
+/// not block the executor, and a search dropped half way leaves it usable.
+pub struct Retriever<S: EmbedService> {
     index: Index,
     cache: VectorCache,
-    embedder: EmbedderHandle<E>,
+    service: S,
     worktree: PathBuf,
     threads: NonZeroUsize,
     vectors: Vectors,
 }
 
-impl<E: Embedder + Send + 'static> Retriever<E> {
+impl<S: EmbedService> Retriever<S> {
     /// A retriever over `worktree`, whose chunks `index` stores, extending
-    /// `cache` through `embedder`. KNN scans run on `knn_threads` threads
-    /// (the performance cores, see [`knn::performance_cores`](crate::knn)).
+    /// `cache` through `service`. KNN scans run on `knn_threads` threads
+    /// (the performance cores, see [`qos::performance_cores`](crate::qos)).
     ///
     /// # Errors
     ///
@@ -60,14 +60,14 @@ impl<E: Embedder + Send + 'static> Retriever<E> {
     pub fn new(
         index: Index,
         cache: VectorCache,
-        embedder: E,
+        service: S,
         worktree: PathBuf,
         knn_threads: NonZeroUsize,
     ) -> io::Result<Self> {
         Ok(Self {
             index,
             cache,
-            embedder: EmbedderHandle::spawn(embedder)?,
+            service,
             worktree,
             threads: knn_threads,
             vectors: Vectors::spawn()?,
@@ -89,7 +89,7 @@ impl<E: Embedder + Send + 'static> Retriever<E> {
         request: &Request,
         reconciliation: Reconciliation,
         counter: &impl TokenCounter,
-    ) -> Result<Results, Error<E::Error>> {
+    ) -> Result<Results, Error<S::Error>> {
         let query = request.query.trim();
         if query.is_empty() {
             return Err(Error::EmptyQuery);
@@ -125,11 +125,11 @@ impl<E: Embedder + Send + 'static> Retriever<E> {
 
         // Lexical candidates, query vectors and the in-memory index sync are
         // independent.
-        let model = self.embedder.model_id().to_owned();
+        let model = self.service.model_id().to_owned();
         let bm25_expr = terms.fts_match().filter(|_| use_bm25);
         let (bm25_code, bm25_docs, query_code, query_docs, synced) = tokio::join!(
-            bm25::<E::Error>(&self.index, bm25_expr.as_deref(), filters[0].as_ref()),
-            bm25::<E::Error>(&self.index, bm25_expr.as_deref(), filters[1].as_ref()),
+            bm25::<S::Error>(&self.index, bm25_expr.as_deref(), filters[0].as_ref()),
+            bm25::<S::Error>(&self.index, bm25_expr.as_deref(), filters[1].as_ref()),
             self.query_vector(
                 QueryTask::CodeRetrieval,
                 query,
@@ -143,7 +143,7 @@ impl<E: Embedder + Send + 'static> Retriever<E> {
             async {
                 if use_vector {
                     self.vectors
-                        .sync::<E::Error>(&self.index, &self.cache, &model)
+                        .sync::<S::Error>(&self.index, &self.cache, &model)
                         .await
                 } else {
                     Ok(())
@@ -196,11 +196,15 @@ impl<E: Embedder + Send + 'static> Retriever<E> {
         task: QueryTask,
         query: &str,
         wanted: bool,
-    ) -> Result<Option<UnitVector>, Error<E::Error>> {
+    ) -> Result<Option<UnitVector>, Error<S::Error>> {
         if !wanted {
             return Ok(None);
         }
-        self.embedder.query(task, query).await.map(Some)
+        self.service
+            .query(task, query.to_owned())
+            .await
+            .map(Some)
+            .map_err(Error::Embed)
     }
 
     /// Embeds the lexical candidates that have no vector among the first
@@ -215,7 +219,7 @@ impl<E: Embedder + Send + 'static> Retriever<E> {
         &self,
         bm25_lists: &[Vec<ChunkId>; 2],
         model: &str,
-    ) -> Result<u64, Error<E::Error>> {
+    ) -> Result<u64, Error<S::Error>> {
         let mut missing: Vec<ChunkRow> = Vec::new();
         let mut seen: HashSet<ContentHash> = HashSet::new();
         let mut sides: HashMap<ContentHash, Vec<Side>> = HashMap::new();
@@ -232,8 +236,8 @@ impl<E: Embedder + Send + 'static> Retriever<E> {
             .each_ref()
             .map(|rows| rows.iter().map(|row| row.content_hash).collect::<Vec<_>>());
         let (code_lacking, doc_lacking) = tokio::join!(
-            self.vectors.lacking::<E::Error>(code_hashes),
-            self.vectors.lacking::<E::Error>(doc_hashes),
+            self.vectors.lacking::<S::Error>(code_hashes),
+            self.vectors.lacking::<S::Error>(doc_hashes),
         );
         let lacking = [
             code_lacking?.into_iter().collect::<HashSet<_>>(),
@@ -256,7 +260,7 @@ impl<E: Embedder + Send + 'static> Retriever<E> {
         if missing.is_empty() {
             return Ok(0);
         }
-        let texts = read_texts::<E::Error>(&self.worktree, missing.clone()).await?;
+        let texts = read_texts::<S::Error>(&self.worktree, missing.clone()).await?;
         let pending: Vec<PendingChunk> = missing
             .iter()
             .zip(texts)
@@ -281,7 +285,11 @@ impl<E: Embedder + Send + 'static> Retriever<E> {
         if pending.is_empty() {
             return Ok(0);
         }
-        let vectors = self.embedder.documents(pending.clone()).await?;
+        let vectors = self
+            .service
+            .documents(pending.clone())
+            .await
+            .map_err(Error::Embed)?;
         assert_eq!(
             vectors.len(),
             pending.len(),
@@ -300,7 +308,7 @@ impl<E: Embedder + Send + 'static> Retriever<E> {
         let hashes: Vec<ContentHash> = pending.iter().map(|p| p.content_hash).collect();
         let stored = self.cache.get_many(model, &hashes).await?;
         self.vectors
-            .adopt::<E::Error>(
+            .adopt::<S::Error>(
                 &self.cache,
                 model,
                 stored
@@ -346,7 +354,7 @@ impl<E: Embedder + Send + 'static> Retriever<E> {
         side: Side,
         query: Option<&UnitVector>,
         filter: Option<&ChunkFilter>,
-    ) -> Result<Vec<ChunkId>, Error<E::Error>> {
+    ) -> Result<Vec<ChunkId>, Error<S::Error>> {
         let (Some(query), Some(filter)) = (query, filter) else {
             return Ok(Vec::new());
         };
@@ -357,7 +365,7 @@ impl<E: Embedder + Send + 'static> Retriever<E> {
         };
         let hashes = self
             .vectors
-            .search::<E::Error>(side, query.clone(), self.threads.get(), restrict)
+            .search::<S::Error>(side, query.clone(), self.threads.get(), restrict)
             .await?;
         // Hits are mapped to this worktree's chunks of the side that pass the
         // filter (a content hash can be shared with a chunk outside it).
@@ -380,7 +388,7 @@ impl<E: Embedder + Send + 'static> Retriever<E> {
         &self,
         fused: [Vec<Fused>; 2],
         symbols: &[SymbolName],
-    ) -> Result<[Vec<RankedChunk>; 2], Error<E::Error>> {
+    ) -> Result<[Vec<RankedChunk>; 2], Error<S::Error>> {
         let ids: Vec<ChunkId> = fused.iter().flatten().map(|f| f.id).collect();
         let mut rows: HashMap<ChunkId, ChunkRow> = self
             .index
@@ -428,10 +436,10 @@ impl<E: Embedder + Send + 'static> Retriever<E> {
         &self,
         list: &mut [RankedChunk],
         from: usize,
-    ) -> Result<(), Error<E::Error>> {
+    ) -> Result<(), Error<S::Error>> {
         let window = from..list.len().min(from + TEXT_WINDOW);
         let rows = list[window.clone()].iter().map(|c| c.row.clone()).collect();
-        let texts = read_texts::<E::Error>(&self.worktree, rows).await?;
+        let texts = read_texts::<S::Error>(&self.worktree, rows).await?;
         for (chunk, text) in list[window].iter_mut().zip(texts) {
             chunk.text = Some(text);
         }
@@ -569,7 +577,7 @@ async fn run_blocking<T: Send + 'static, E: std::error::Error + 'static>(
     thread::Builder::new()
         .name("repo-search-query".into())
         .spawn(move || {
-            set_user_interactive();
+            set_current_thread(QosClass::UserInteractive);
             let _ = tx.send(work());
         })
         .map_err(Error::Spawn)?;
