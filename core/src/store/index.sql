@@ -1,6 +1,14 @@
 -- Per-worktree index. Chunk text is never stored: `files` + `chunks` +
 -- `chunk_members` describe where text lives, `fts` only indexes it.
 
+-- The chunker identity the rows were built under: the chunker fingerprint and
+-- the model whose tokenizer caps every chunk. At most one row.
+CREATE TABLE meta (
+    id          INTEGER PRIMARY KEY CHECK (id = 1),
+    chunker     TEXT NOT NULL,
+    model_id    TEXT NOT NULL
+);
+
 CREATE TABLE files (
     path         TEXT PRIMARY KEY,
     size         INTEGER NOT NULL,

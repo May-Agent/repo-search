@@ -22,7 +22,7 @@ use repo_search_core::store::{
     ChunkFilter, ChunkRecord, ContentHash, FileState, Index, MemberRecord, Side, VectorCache,
     fts_body,
 };
-use repo_search_core::{Embedder, QueryTask, UnitVector};
+use repo_search_core::{CHUNKER_FINGERPRINT, Embedder, QueryTask, UnitVector};
 use tempfile::TempDir;
 
 const MODEL: &str = "fake-bag-of-words";
@@ -218,6 +218,7 @@ impl Fixture {
             &index,
             &cache,
             MODEL,
+            CHUNKER_FINGERPRINT,
             tree.path(),
             Options::default(),
             Arc::new(CapOff),

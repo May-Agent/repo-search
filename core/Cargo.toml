@@ -27,6 +27,10 @@ lang-rust = ["dep:tree-sitter-rust"]
 lang-swift = ["dep:tree-sitter-swift"]
 lang-typescript = ["dep:tree-sitter-typescript"]
 
+[build-dependencies]
+sha2 = { version = "0.11.1", default-features = false }
+toml_edit = { version = "0.25.17", default-features = false, features = ["parse"] }
+
 [dependencies]
 askama = { version = "0.16.1", default-features = false, features = ["derive", "std"] }
 blake3 = { version = "1.8.7", default-features = false }
