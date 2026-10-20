@@ -1,3 +1,4 @@
+    AND (:include_ignored OR c.path NOT IN (SELECT path FROM files WHERE ignored = 1))
     AND (CASE WHEN :docs THEN c.kind = :doc_kind ELSE c.kind <> :doc_kind END)
     AND (:paths IS NULL OR c.path IN (SELECT value FROM json_each(:paths)))
     AND (:extensions IS NULL

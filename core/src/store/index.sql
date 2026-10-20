@@ -16,7 +16,10 @@ CREATE TABLE files (
     size         INTEGER NOT NULL,
     mtime_ns     INTEGER NOT NULL,
     inode        INTEGER NOT NULL,
-    content_hash BLOB NOT NULL
+    content_hash BLOB NOT NULL,
+    -- 1 for a file only a pass that includes ignored files reaches; its chunks
+    -- stay stored but are hidden from searches that exclude ignored files.
+    ignored      INTEGER NOT NULL CHECK (ignored IN (0, 1))
 ) WITHOUT ROWID;
 
 -- Files that fail to chunk, fingerprinted like `files` so a pass can skip
@@ -27,6 +30,7 @@ CREATE TABLE unchunkable (
     mtime_ns     INTEGER NOT NULL,
     inode        INTEGER NOT NULL,
     content_hash BLOB NOT NULL,
+    ignored      INTEGER NOT NULL CHECK (ignored IN (0, 1)),
     reason       TEXT NOT NULL
 ) WITHOUT ROWID;
 

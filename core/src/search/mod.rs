@@ -79,6 +79,9 @@ pub struct Request {
     pub budget: usize,
     /// Emit ranked files only (`-l`).
     pub files_only: bool,
+    /// Search chunks of ignored files too (`--include-ignored`); the caller's
+    /// reconcile pass must have been run with the same flag.
+    pub include_ignored: bool,
 }
 
 impl Request {
@@ -91,6 +94,7 @@ impl Request {
             filters: Filters::default(),
             budget: DEFAULT_BUDGET,
             files_only: false,
+            include_ignored: false,
         }
     }
 }

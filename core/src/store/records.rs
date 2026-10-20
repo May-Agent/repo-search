@@ -125,6 +125,8 @@ pub struct FileState {
     pub inode: u64,
     /// BLAKE3 of the file's bytes.
     pub content_hash: ContentHash,
+    /// Whether only a pass that includes ignored files reaches the file.
+    pub ignored: bool,
 }
 
 /// A chunk of a file: one or more byte ranges under one title.

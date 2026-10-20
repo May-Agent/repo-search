@@ -33,7 +33,8 @@ pub struct Scope {
 }
 
 impl Scope {
-    /// Resolves `filters` against the indexed `files` and the node `kinds`
+    /// Resolves `filters`, with chunks of ignored files visible when
+    /// `include_ignored`, against the indexed `files` and the node `kinds`
     /// the index holds (`Index::kinds`).
     ///
     /// `--kind doc` selects documentation and a syntactic kind selects code;
@@ -47,6 +48,7 @@ impl Scope {
     /// one of `kinds`, or a path glob does not compile.
     pub fn resolve(
         filters: &Filters,
+        include_ignored: bool,
         files: &[FileState],
         kinds: &[String],
     ) -> Result<Self, FilterError> {
@@ -93,6 +95,7 @@ impl Scope {
                     .collect();
                 ChunkFilter {
                     side,
+                    include_ignored,
                     paths: globs.as_ref().map(|globs| {
                         files
                             .iter()
@@ -183,6 +186,7 @@ mod tests {
                 mtime_ns: 0,
                 inode: 0,
                 content_hash: ContentHash::of_file(b""),
+                ignored: false,
             })
             .collect()
     }
@@ -198,7 +202,7 @@ mod tests {
 
     #[test]
     fn no_filters_keep_both_lists_unrestricted() {
-        let scope = Scope::resolve(&Filters::default(), &files(&["a.rs"]), &[]).unwrap();
+        let scope = Scope::resolve(&Filters::default(), true, &files(&["a.rs"]), &[]).unwrap();
         let code = scope.code.unwrap();
         assert_eq!(code.side, Side::Code);
         assert_eq!(code.paths, None);
@@ -212,7 +216,7 @@ mod tests {
             kinds: strings(&["fn", "custom_kind"]),
             ..Filters::default()
         };
-        let scope = Scope::resolve(&filters, &[], &held()).unwrap();
+        let scope = Scope::resolve(&filters, true, &[], &held()).unwrap();
         assert!(scope.docs.is_none());
         assert_eq!(
             scope.code.unwrap().kinds,
@@ -226,7 +230,7 @@ mod tests {
             kinds: strings(&["doc"]),
             ..Filters::default()
         };
-        let scope = Scope::resolve(&filters, &[], &held()).unwrap();
+        let scope = Scope::resolve(&filters, true, &[], &held()).unwrap();
         assert!(scope.code.is_none());
         assert!(scope.docs.unwrap().kinds.is_empty());
     }
@@ -237,7 +241,7 @@ mod tests {
             kinds: strings(&["doc", "struct"]),
             ..Filters::default()
         };
-        let scope = Scope::resolve(&filters, &[], &held()).unwrap();
+        let scope = Scope::resolve(&filters, true, &[], &held()).unwrap();
         assert_eq!(scope.code.unwrap().kinds, ["struct_item"]);
         assert!(scope.docs.is_some());
     }
@@ -248,7 +252,7 @@ mod tests {
             langs: strings(&["Markdown"]),
             ..Filters::default()
         };
-        let scope = Scope::resolve(&filters, &[], &[]).unwrap();
+        let scope = Scope::resolve(&filters, true, &[], &[]).unwrap();
         assert!(scope.code.is_none());
         let docs = scope.docs.unwrap();
         assert_eq!(docs.extensions, ["md", "markdown", "mdx"]);
@@ -261,7 +265,7 @@ mod tests {
             langs: strings(&["rust", "toml"]),
             ..Filters::default()
         };
-        let scope = Scope::resolve(&filters, &[], &[]).unwrap();
+        let scope = Scope::resolve(&filters, true, &[], &[]).unwrap();
         assert!(scope.docs.is_none());
         let code = scope.code.unwrap();
         assert_eq!(code.extensions, ["rs", "toml"]);
@@ -275,8 +279,13 @@ mod tests {
             paths: strings(&["core/src"]),
             ..Filters::default()
         };
-        let scope =
-            Scope::resolve(&filters, &files(&["core/src/a.rs", "core/src/b.md"]), &[]).unwrap();
+        let scope = Scope::resolve(
+            &filters,
+            true,
+            &files(&["core/src/a.rs", "core/src/b.md"]),
+            &[],
+        )
+        .unwrap();
         let code = scope.code.unwrap();
         assert_eq!(code.extensions, ["rs"]);
         assert_eq!(code.paths.unwrap(), ["core/src/a.rs", "core/src/b.md"]);
@@ -289,7 +298,7 @@ mod tests {
             langs: strings(&["markdown"]),
             ..Filters::default()
         };
-        let scope = Scope::resolve(&filters, &[], &held()).unwrap();
+        let scope = Scope::resolve(&filters, true, &[], &held()).unwrap();
         assert!(scope.code.is_none() && scope.docs.is_none());
     }
 
@@ -299,7 +308,7 @@ mod tests {
             symbol: Some("Environment::*".into()),
             ..Filters::default()
         };
-        let scope = Scope::resolve(&filters, &[], &held()).unwrap();
+        let scope = Scope::resolve(&filters, true, &[], &held()).unwrap();
         assert!(scope.docs.is_none());
         assert_eq!(
             scope.code.unwrap().symbol.as_deref(),
@@ -319,7 +328,7 @@ mod tests {
             "docs/c.md",
             "core/src/x/d.rs",
         ]);
-        let scope = Scope::resolve(&filters, &all, &[]).unwrap();
+        let scope = Scope::resolve(&filters, true, &all, &[]).unwrap();
         assert_eq!(
             scope.code.unwrap().paths.unwrap(),
             ["core/src/a.rs", "docs/c.md", "core/src/x/d.rs"]
@@ -339,7 +348,7 @@ mod tests {
             "docs/x/y/d.md",
             "other/e.rs",
         ]);
-        let scope = Scope::resolve(&filters, &all, &[]).unwrap();
+        let scope = Scope::resolve(&filters, true, &all, &[]).unwrap();
         assert_eq!(
             scope.code.unwrap().paths.unwrap(),
             ["core/a.rs", "docs/c.md", "docs/x/y/d.md"]
@@ -352,7 +361,7 @@ mod tests {
             kinds: strings(&["fn", "nonsense_kind"]),
             ..Filters::default()
         };
-        let err = Scope::resolve(&unknown, &[], &held()).unwrap_err();
+        let err = Scope::resolve(&unknown, true, &[], &held()).unwrap_err();
         assert!(
             matches!(&err, FilterError::UnknownKind(k) if k == "nonsense_kind"),
             "{err}"
@@ -363,7 +372,7 @@ mod tests {
             kinds: strings(&["union", "custom_kind", "doc"]),
             ..Filters::default()
         };
-        assert!(Scope::resolve(&known, &[], &held()).is_ok());
+        assert!(Scope::resolve(&known, true, &[], &held()).is_ok());
     }
 
     #[test]
@@ -372,11 +381,11 @@ mod tests {
             langs: strings(&["cobol"]),
             ..Filters::default()
         };
-        assert!(Scope::resolve(&bad_lang, &[], &[]).is_err());
+        assert!(Scope::resolve(&bad_lang, true, &[], &[]).is_err());
         let bad_glob = Filters {
             paths: strings(&["[a"]),
             ..Filters::default()
         };
-        assert!(Scope::resolve(&bad_glob, &[], &[]).is_err());
+        assert!(Scope::resolve(&bad_glob, true, &[], &[]).is_err());
     }
 }
