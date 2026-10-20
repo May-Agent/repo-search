@@ -9,7 +9,7 @@ use std::process::ExitCode;
 #[derive(Parser)]
 #[command(
     name = "search",
-    version,
+    version = repo_search::model_store::VERSION_INFO,
     subcommand_precedence_over_arg = true,
     subcommand_negates_reqs = true
 )]
@@ -95,4 +95,21 @@ fn main() -> ExitCode {
     } = Cli::parse();
     eprintln!("error: the search daemon is not built yet");
     ExitCode::from(2)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use clap::CommandFactory;
+    use repo_search::model_store::{MODEL_LICENSE, MODEL_NAME, VERSION_INFO};
+
+    #[test]
+    fn version_flag_reports_binary_and_model() {
+        assert_eq!(Cli::command().get_version(), Some(VERSION_INFO));
+        let text = VERSION_INFO;
+        assert!(text.contains(env!("CARGO_PKG_VERSION")));
+        assert!(text.contains(MODEL_NAME));
+        assert!(text.contains(MODEL_LICENSE));
+    }
 }
