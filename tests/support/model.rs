@@ -163,13 +163,12 @@ pub async fn await_coverage(stream: &mut Responses, min: u64) -> u64 {
 /// in the vector cache — what `Coverage` reports, read straight from disk.
 pub async fn committed(worktree: &Path, common_dir: &Path, model_id: &str) -> u64 {
     let index = Index::open(worktree).await.expect("index opens");
-    let hashes = index.chunk_hashes(true).await.expect("chunk hashes");
+    let hashes = index.chunk_hashes(false).await.expect("chunk hashes");
     let cache = VectorCache::open(common_dir).await.expect("cache opens");
-    cache
-        .cached(model_id, &hashes)
-        .await
-        .expect("cached reads")
-        .len() as u64
+    let cached = cache.cached(model_id, &hashes).await.expect("cached reads");
+    // Count chunk rows, as coverage does: two chunks with identical content
+    // share one cached vector, so the distinct count would fall short.
+    hashes.iter().filter(|hash| cached.contains(hash)).count() as u64
 }
 
 /// The resume assertions shared by `daemon_host_coreml` and the launchd
