@@ -17,9 +17,9 @@ jobs:
   model-tests:
     name: model tests
     runs-on: macos-15
-    # A cold coremltools build takes ~25-30 min on a hosted runner; with the
-    # wheel and archive caches warm the job finishes in ~20 min.
-    timeout-minutes: 60
+    # Cold (no caches) the job takes ~6 min: ~3 min for the coremltools
+    # build, ~2.5 min for the model tests.
+    timeout-minutes: 20
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
