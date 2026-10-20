@@ -5,7 +5,7 @@ use std::fs;
 use std::ops::{Range, RangeInclusive};
 use std::path::Path;
 
-use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use tokio::sync::{mpsc, oneshot};
 
 use super::query::{self, ChunkFilter, ChunkId, ChunkRow, Side};
@@ -15,7 +15,7 @@ use super::{
 };
 
 /// Schema generation; a database at any other version is deleted and rebuilt.
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 
 /// One file's change inside an atomic batch.
 #[derive(Debug)]
@@ -95,6 +95,11 @@ enum Request {
     },
     FileStates {
         reply: oneshot::Sender<Result<Vec<FileState>, Error>>,
+    },
+    Align {
+        chunker: String,
+        model_id: String,
+        reply: oneshot::Sender<Result<bool, Error>>,
     },
     Bm25 {
         query: String,
@@ -202,6 +207,27 @@ impl Index {
     /// When SQLite rejects the read or the actor is gone.
     pub async fn file_states(&self) -> Result<Vec<FileState>, Error> {
         send_and_wait(&self.tx, |reply| Request::FileStates { reply }).await
+    }
+
+    /// Records that the index is built by the chunker `fingerprint` with the
+    /// token counter of `model_id`. An index stored under another identity is
+    /// emptied — files, chunks, members and full-text rows, in one
+    /// transaction — so the next pass re-chunks every file; vectors live in
+    /// the shared cache and are untouched. A fresh index only stores the
+    /// identity; a matching one is left alone.
+    ///
+    /// Returns whether a populated index under another identity was emptied.
+    ///
+    /// # Errors
+    ///
+    /// When SQLite rejects the change or the actor is gone.
+    pub async fn align_chunker(&self, fingerprint: &str, model_id: &str) -> Result<bool, Error> {
+        send_and_wait(&self.tx, |reply| Request::Align {
+            chunker: fingerprint.to_owned(),
+            model_id: model_id.to_owned(),
+            reply,
+        })
+        .await
     }
 
     /// The first stored chunk (by id) of each of `hashes`, in the order given;
@@ -370,6 +396,13 @@ fn serve(mut conn: Connection, mut rx: mpsc::Receiver<Request>) {
             Request::FileStates { reply } => {
                 let _ = reply.send(file_states(&conn));
             }
+            Request::Align {
+                chunker,
+                model_id,
+                reply,
+            } => {
+                let _ = reply.send(align(&mut conn, &chunker, &model_id));
+            }
             Request::ChunksByHash { hashes, reply } => {
                 let _ = reply.send(chunks_by_hash(&conn, &hashes));
             }
@@ -429,6 +462,38 @@ fn apply(conn: &mut Connection, changes: &[FileChange]) -> Result<Applied, Error
     }
     tx.commit()?;
     Ok(applied)
+}
+
+fn align(conn: &mut Connection, chunker: &str, model_id: &str) -> Result<bool, Error> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let stored: Option<(String, String)> = tx
+        .query_row("SELECT chunker, model_id FROM meta", [], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })
+        .optional()?;
+    if stored
+        .as_ref()
+        .is_some_and(|(c, m)| c == chunker && m == model_id)
+    {
+        return Ok(false);
+    }
+    let populated: bool =
+        tx.query_row("SELECT EXISTS (SELECT 1 FROM files)", [], |row| row.get(0))?;
+    if populated {
+        tx.execute_batch(
+            "INSERT INTO fts (fts) VALUES ('delete-all');
+             DELETE FROM chunk_members;
+             DELETE FROM chunks;
+             DELETE FROM files;",
+        )?;
+    }
+    tx.execute(
+        "INSERT INTO meta (id, chunker, model_id) VALUES (1, ?1, ?2) \
+         ON CONFLICT (id) DO UPDATE SET chunker = ?1, model_id = ?2",
+        params![chunker, model_id],
+    )?;
+    tx.commit()?;
+    Ok(populated)
 }
 
 fn restamp(tx: &Transaction<'_>, state: &FileState) -> Result<(), Error> {

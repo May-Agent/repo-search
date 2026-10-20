@@ -8,9 +8,9 @@ mod counters;
 
 use counters::CapOff;
 use futures_executor::block_on;
-use repo_search_core::UnitVector;
 use repo_search_core::reconcile::{Options, PendingChunk, Reconciled, SkipReason, reconcile};
 use repo_search_core::store::{ContentHash, Index, VectorCache};
+use repo_search_core::{CHUNKER_FINGERPRINT, UnitVector};
 use tempfile::TempDir;
 
 const MODEL: &str = "test-model";
@@ -43,10 +43,15 @@ impl Fixture {
     }
 
     fn run(&self, options: Options) -> Reconciled {
+        self.run_as(&self.index, CHUNKER_FINGERPRINT, options)
+    }
+
+    fn run_as(&self, index: &Index, chunker: &str, options: Options) -> Reconciled {
         block_on(reconcile(
-            &self.index,
+            index,
             &self.cache,
             MODEL,
+            chunker,
             self.tree.path(),
             options,
             Arc::new(CapOff),
@@ -280,6 +285,7 @@ fn a_failing_transaction_lands_nothing() {
         &fx.index,
         &fx.cache,
         MODEL,
+        CHUNKER_FINGERPRINT,
         fx.tree.path(),
         Options::default(),
         Arc::new(CapOff),
@@ -397,6 +403,7 @@ fn a_missing_worktree_is_an_error_and_leaves_the_index_untouched() {
         &fx.index,
         &fx.cache,
         MODEL,
+        CHUNKER_FINGERPRINT,
         &missing,
         Options::default(),
         Arc::new(CapOff),
@@ -482,4 +489,54 @@ fn malformed_configuration_is_reported_and_dropped() {
     assert_eq!(r.report.skipped[0].reason, SkipReason::Malformed);
     assert_eq!(r.report.files_removed, 1);
     assert_eq!(r.report.chunks_total, 0);
+}
+
+#[test]
+fn another_chunker_rechunks_and_reuses_cached_vectors() {
+    let fx = Fixture::new();
+    fx.write("a.rs", "fn alpha() { 1; }\n\nstruct Gamma;\n");
+    fx.write("b.rs", "fn beta() { 2; }\n");
+    let first = fx.run_as(&fx.index, "chunker-a", Options::default());
+    assert!(!first.report.rechunked);
+    fx.embed(&first.pending);
+    // Mark the stored rows; a rebuilt index must not carry the mark.
+    rusqlite::Connection::open(fx.db())
+        .unwrap()
+        .execute("UPDATE chunks SET title = 'stale'", [])
+        .unwrap();
+    let total = first.report.chunks_total;
+
+    let reopened = block_on(Index::open(fx.tree.path())).unwrap();
+    let second = fx.run_as(&reopened, "chunker-b", Options::default());
+    let r = &second.report;
+    assert!(r.rechunked);
+    assert_eq!((r.files_added, r.files_modified), (2, 0));
+    assert_eq!(r.chunks_added, total);
+    assert_eq!(r.chunks_total, total);
+    assert_eq!(r.chunks_with_vector, total);
+    assert!(second.pending.is_empty(), "no chunk needs embedding again");
+    assert_eq!(fx.fts_hits("alpha"), 1);
+    assert_eq!(fx.query::<i64>("SELECT count(*) FROM fts"), total as i64);
+    assert_eq!(
+        fx.query::<i64>("SELECT count(*) FROM chunks WHERE title = 'stale'"),
+        0,
+        "the chunk rows were rebuilt"
+    );
+
+    let third = fx.run_as(&reopened, "chunker-b", Options::default());
+    assert!(!third.report.rechunked);
+    assert_eq!(third.report.files_changed(), 0);
+    assert_eq!(third.report.chunks_added, 0);
+}
+
+#[test]
+fn the_same_chunker_reopens_without_rechunking() {
+    let fx = Fixture::new();
+    fx.write("a.rs", "fn alpha() { 1; }\n");
+    fx.run_as(&fx.index, "chunker-a", Options::default());
+    let reopened = block_on(Index::open(fx.tree.path())).unwrap();
+    let again = fx.run_as(&reopened, "chunker-a", Options::default());
+    assert!(!again.report.rechunked);
+    assert_eq!(again.report.chunks_added, 0);
+    assert_eq!(again.report.files_changed(), 0);
 }

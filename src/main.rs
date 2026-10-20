@@ -109,6 +109,7 @@ mod tests {
         assert_eq!(Cli::command().get_version(), Some(VERSION_INFO));
         let text = VERSION_INFO;
         assert!(text.contains(env!("CARGO_PKG_VERSION")));
+        assert!(text.contains(repo_search_core::CHUNKER_FINGERPRINT));
         assert!(text.contains(MODEL_NAME));
         assert!(text.contains(MODEL_LICENSE));
     }
