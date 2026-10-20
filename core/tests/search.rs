@@ -9,6 +9,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 
+mod counters;
+
+use counters::CapOff;
 use futures_executor::block_on;
 use repo_search_core::reconcile::{Options, PendingChunk, reconcile};
 use repo_search_core::search::{
@@ -217,6 +220,7 @@ impl Fixture {
             MODEL,
             tree.path(),
             Options::default(),
+            Arc::new(CapOff),
         ))
         .unwrap();
         let mut pending = reconciled.pending.clone();
@@ -258,6 +262,7 @@ impl Fixture {
                         members: vec![MemberRecord {
                             bytes: start as u64..end as u64,
                             kind: "doc".to_owned(),
+                            cut: 0,
                             symbol: String::new(),
                         }],
                         content_hash: hash,
@@ -889,6 +894,7 @@ fn a_content_hash_shared_by_code_and_docs_is_searched_on_both_sides() {
             members: vec![MemberRecord {
                 bytes: 0..shared.text.len() as u64,
                 kind: "doc".to_owned(),
+                cut: 0,
                 symbol: String::new(),
             }],
             content_hash: shared.content_hash,

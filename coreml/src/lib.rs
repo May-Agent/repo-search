@@ -21,7 +21,7 @@ use objc2_core_ml::{
     MLModelConfiguration, MLMultiArray, MLMultiArrayDataType,
 };
 use objc2_foundation::{NSArray, NSDictionary, NSError, NSInteger, NSNumber, NSString, NSURL};
-use repo_search_core::{Embedder, QueryTask, UnitVector};
+use repo_search_core::{Embedder, QueryTask, TokenCounter, UnitVector};
 use tokenizers::{Tokenizer, TruncationParams};
 
 use manifest::Manifest;
@@ -136,9 +136,11 @@ struct Bucket {
 /// `Embedder` backed by a compiled multifunction Core ML model.
 pub struct CoreMlEmbedder {
     model_id: String,
-    tokenizer: Tokenizer,
-    /// `tokenizer` with truncation at `max_len`, so a truncated query keeps
-    /// its post-processed special tokens (`<eos>`).
+    /// The model's tokenizer and document prompt; embeds documents and
+    /// answers the chunker's token cap.
+    counter: DocumentCounter,
+    /// `counter`'s tokenizer with truncation at `max_len`, so a truncated
+    /// query keeps its post-processed special tokens (`<eos>`).
     query_tokenizer: Tokenizer,
     pad: i32,
     /// Ascending by `len`.
@@ -146,10 +148,108 @@ pub struct CoreMlEmbedder {
     /// `buckets.last().len`: the token cap.
     max_len: usize,
     dim: usize,
-    /// `prompts.document` split around `{title}` and `{text}`.
-    document: (String, String, String),
     /// The single declared output's feature name.
     embedding: String,
+}
+
+/// Counts the model's tokens for the chunker's cap. The tokenizer and the
+/// document prompt the count applies to are the model's own, loaded from
+/// `tokenizer.json` and `manifest.json`, so `repo-search-core` never
+/// formats a prompt.
+pub struct DocumentCounter {
+    tokenizer: Tokenizer,
+    /// `prompts.document` split around `{title}` and `{text}`.
+    document: (String, String, String),
+    /// Tokens the post-processor adds to every encoding (`<s>`, `</s>`).
+    specials: usize,
+}
+
+impl DocumentCounter {
+    /// Loads `tokenizer.json` and `manifest.json` from the model directory;
+    /// the compiled model is not needed for counting.
+    ///
+    /// # Errors
+    ///
+    /// The manifest, tokenizer or model load failures of
+    /// [`CoreMlEmbedder::open`], minus the model's own.
+    pub fn open(dir: impl AsRef<Path>) -> Result<Self, Error> {
+        let dir = dir.as_ref();
+        let manifest = Manifest::load(dir)?;
+        let tokenizer = Tokenizer::from_file(dir.join("tokenizer.json"))?;
+        let specials = specials(&tokenizer)?;
+        Ok(Self {
+            tokenizer,
+            document: document_parts(&manifest),
+            specials,
+        })
+    }
+
+    /// The document `prompts.document` formats for `title` and `text`.
+    fn document(&self, title: &str, text: &str) -> String {
+        let (before, between, after) = &self.document;
+        format!("{before}{title}{between}{text}{after}")
+    }
+
+    /// The document `title` and `text` encode to, when the byte bound does
+    /// not decide it first: `None` when it fits `max` tokens, else the
+    /// formatted prompt.
+    fn document_over(&self, title: &str, text: &[&str], max: usize) -> Option<String> {
+        let (before, between, after) = &self.document;
+        let bytes = before.len()
+            + title.len()
+            + between.len()
+            + text.iter().map(|part| part.len()).sum::<usize>()
+            + after.len();
+        // Every token covers at least one byte, so a document whose bytes
+        // plus the special tokens stay under `max` fits without an encode.
+        if bytes + self.specials <= max {
+            return None;
+        }
+        let mut doc = String::with_capacity(bytes);
+        doc.push_str(before);
+        doc.push_str(title);
+        doc.push_str(between);
+        for part in text {
+            doc.push_str(part);
+        }
+        doc.push_str(after);
+        Some(doc)
+    }
+}
+
+impl TokenCounter for DocumentCounter {
+    fn count(&self, text: &str) -> usize {
+        self.tokenizer
+            .encode_fast(text, true)
+            .expect("a loaded tokenizer encodes every input")
+            .len()
+    }
+
+    fn fits(&self, title: &str, text: &[&str], max: usize) -> bool {
+        match self.document_over(title, text, max) {
+            None => true,
+            Some(doc) => self.count(&doc) <= max,
+        }
+    }
+
+    fn fit_end(&self, title: &str, text: &[&str], max: usize) -> Option<usize> {
+        let doc = self.document_over(title, text, max)?;
+        let encoding = self
+            .tokenizer
+            .encode(&*doc, true)
+            .expect("a loaded tokenizer encodes every input");
+        if encoding.len() <= max {
+            return None;
+        }
+        let head = self.document.0.len() + title.len() + self.document.1.len();
+        // The end of the `max`-th token in the document, mapped back into
+        // `text`. The estimate is exact only up to merges spanning the cut.
+        Some(
+            encoding.get_offsets()[max.saturating_sub(1)]
+                .1
+                .saturating_sub(head),
+        )
+    }
 }
 
 // SAFETY: `MLModel` and `MLMultiArray` may be used from any thread provided
@@ -226,14 +326,11 @@ impl CoreMlEmbedder {
             ..Default::default()
         }))?;
 
-        let (before, rest) = manifest
-            .prompts
-            .document
-            .split_once("{title}")
-            .expect("manifest validation checked the markers");
-        let (between, after) = rest
-            .split_once("{text}")
-            .expect("manifest validation checked the markers");
+        let counter = DocumentCounter {
+            document: document_parts(&manifest),
+            specials: specials(&tokenizer)?,
+            tokenizer,
+        };
         let embedding = manifest
             .outputs
             .into_keys()
@@ -241,13 +338,12 @@ impl CoreMlEmbedder {
             .expect("manifest validation checked the output count");
         Ok(Self {
             model_id: model_id.into(),
-            tokenizer,
+            counter,
             query_tokenizer,
             pad,
             buckets: buckets.into_boxed_slice(),
             max_len,
             dim: manifest.embedding_dim,
-            document: (before.to_owned(), between.to_owned(), after.to_owned()),
             embedding,
         })
     }
@@ -412,11 +508,7 @@ impl Embedder for CoreMlEmbedder {
     }
 
     fn embed_document(&mut self, title: &str, text: &str) -> Result<UnitVector, Self::Error> {
-        let (before, between, after) = &self.document;
-        let ids = encode(
-            &self.tokenizer,
-            &format!("{before}{title}{between}{text}{after}"),
-        )?;
+        let ids = encode(&self.counter.tokenizer, &self.counter.document(title, text))?;
         self.embed_tokens(&ids)
     }
 
@@ -429,6 +521,25 @@ impl Embedder for CoreMlEmbedder {
 /// Tokenizes `text` with `tokenizer` (special tokens on).
 fn encode(tokenizer: &Tokenizer, text: &str) -> Result<Vec<u32>, Error> {
     Ok(tokenizer.encode(text, true)?.get_ids().to_vec())
+}
+
+/// The tokens `tokenizer`'s post-processor adds to every encoding: the
+/// length of an empty encode.
+fn specials(tokenizer: &Tokenizer) -> Result<usize, Error> {
+    Ok(tokenizer.encode("", true)?.len())
+}
+
+/// `prompts.document` split around `{title}` and `{text}`.
+fn document_parts(manifest: &Manifest) -> (String, String, String) {
+    let (before, rest) = manifest
+        .prompts
+        .document
+        .split_once("{title}")
+        .expect("manifest validation checked the markers");
+    let (between, after) = rest
+        .split_once("{text}")
+        .expect("manifest validation checked the markers");
+    (before.to_owned(), between.to_owned(), after.to_owned())
 }
 
 /// The one `*.mlmodelc` bundle in `dir`, canonicalized.

@@ -4,13 +4,13 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
-use std::ops::Range;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
 use ignore::WalkBuilder;
 
 use super::{Error, PendingChunk, SkipReason, Skipped};
+use crate::TokenCounter;
 #[cfg(feature = "lang-c")]
 use crate::chunk::C;
 #[cfg(any(
@@ -36,11 +36,12 @@ use crate::chunk::Python;
 use crate::chunk::Rust;
 #[cfg(feature = "lang-swift")]
 use crate::chunk::Swift;
-use crate::chunk::{self, ConfigChunker, DocChunker, FileChunker, Language};
+use crate::chunk::{self, ConfigChunker, DocChunker, FileChunker, Language, MemberEmit};
 #[cfg(feature = "lang-typescript")]
 use crate::chunk::{Tsx, TypeScript};
 use crate::store::{
-    ChunkRecord, ContentHash, FileChange, FileState, MemberRecord, StoredChunk, fts_body,
+    ChunkRecord, ContentHash, FileChange, FileState, MemberRecord, StoredChunk, StoredMember,
+    StoredMemberKind, fts_body,
 };
 
 /// Directories that are never part of the indexed tree, even when ignore rules
@@ -100,28 +101,31 @@ impl Chunkers {
         language: Language,
         path: &str,
         src: &str,
+        tokens: &dyn TokenCounter,
     ) -> Result<Vec<(ChunkRecord, String)>, chunk::Error> {
         match language {
             #[cfg(feature = "lang-c")]
-            Language::C => chunk_with(&mut self.c, path, src),
+            Language::C => chunk_with(&mut self.c, path, src, tokens),
             #[cfg(feature = "lang-cpp")]
-            Language::Cpp => chunk_with(&mut self.cpp, path, src),
+            Language::Cpp => chunk_with(&mut self.cpp, path, src, tokens),
             #[cfg(feature = "lang-go")]
-            Language::Go => chunk_with(&mut self.go, path, src),
+            Language::Go => chunk_with(&mut self.go, path, src, tokens),
             #[cfg(feature = "lang-javascript")]
-            Language::JavaScript => chunk_with(&mut self.javascript, path, src),
+            Language::JavaScript => chunk_with(&mut self.javascript, path, src, tokens),
             #[cfg(feature = "lang-python")]
-            Language::Python => chunk_with(&mut self.python, path, src),
+            Language::Python => chunk_with(&mut self.python, path, src, tokens),
             #[cfg(feature = "lang-rust")]
-            Language::Rust => chunk_with(&mut self.rust, path, src),
+            Language::Rust => chunk_with(&mut self.rust, path, src, tokens),
             #[cfg(feature = "lang-swift")]
-            Language::Swift => chunk_with(&mut self.swift, path, src),
+            Language::Swift => chunk_with(&mut self.swift, path, src, tokens),
             #[cfg(feature = "lang-typescript")]
-            Language::TypeScript => chunk_with(&mut self.typescript, path, src),
+            Language::TypeScript => chunk_with(&mut self.typescript, path, src, tokens),
             #[cfg(feature = "lang-typescript")]
-            Language::Tsx => chunk_with(&mut self.tsx, path, src),
-            Language::Doc(format) => chunk_with(&mut DocChunker::new(format), path, src),
-            Language::Config(format) => chunk_with(&mut ConfigChunker::new(format), path, src),
+            Language::Tsx => chunk_with(&mut self.tsx, path, src, tokens),
+            Language::Doc(format) => chunk_with(&mut DocChunker::new(format), path, src, tokens),
+            Language::Config(format) => {
+                chunk_with(&mut ConfigChunker::new(format), path, src, tokens)
+            }
         }
     }
 }
@@ -130,8 +134,9 @@ fn chunk_with<C: FileChunker>(
     chunker: &mut C,
     path: &str,
     src: &str,
+    tokens: &dyn TokenCounter,
 ) -> Result<Vec<(ChunkRecord, String)>, chunk::Error> {
-    let chunks = chunker.chunk_file(path, src)?;
+    let chunks = chunker.chunk_file(path, src, tokens)?;
     Ok(chunks
         .iter()
         .map(|chunk| {
@@ -147,6 +152,10 @@ fn chunk_with<C: FileChunker>(
                     .map(|m| MemberRecord {
                         bytes: m.bytes.start as u64..m.bytes.end as u64,
                         kind: chunker.member_kind_name(m.kind).into_owned(),
+                        cut: match m.kind {
+                            crate::chunk::MemberKind::Signature { cut } => cut as u64,
+                            _ => 0,
+                        },
                         symbol: m.symbol.clone(),
                     })
                     .collect(),
@@ -188,17 +197,32 @@ impl Candidate {
     }
 }
 
+/// One file's chunking outcome: its records and texts, or the failure.
+type Chunked = Result<Vec<(ChunkRecord, String)>, chunk::Error>;
+
+/// What the fingerprint pass decided for one candidate.
+enum Work {
+    /// Unchanged (or vanished mid-pass): stays stored as it is.
+    Live,
+    /// Same bytes, moved fingerprint: stored chunks stay.
+    Restamp(FileState),
+    /// Re-chunk: its new state and source, and the file's index in `jobs`.
+    Chunk(FileState, String, usize),
+    /// Not indexable: the reason it is skipped.
+    Skip(SkipReason),
+}
+
 /// Walks `root` and diffs it against `stored`.
 pub(super) fn plan(
     root: &Path,
     include_ignored: bool,
     stored: HashMap<String, FileState>,
+    tokens: &dyn TokenCounter,
 ) -> Result<Plan, Error> {
     let Walked {
         candidates,
         skipped,
     } = walk(root, include_ignored)?;
-    let mut chunkers = Chunkers::new();
     let mut plan = Plan {
         changes: Vec::new(),
         texts: HashMap::new(),
@@ -210,17 +234,25 @@ pub(super) fn plan(
         skipped,
     };
     let mut live: HashSet<String> = HashSet::with_capacity(candidates.len());
+    // First the fingerprint diff decides every file's fate and reads the
+    // ones that need chunking.
+    let mut work = Vec::with_capacity(candidates.len());
+    let mut jobs = Vec::new();
     for cand in candidates {
         let previous = stored.get(&cand.rel);
         if previous.is_some_and(|state| cand.matches(state)) {
-            live.insert(cand.rel);
+            live.insert(cand.rel.clone());
+            work.push((cand, Work::Live));
             continue;
         }
         let bytes = match fs::read(root.join(&cand.rel)) {
             Ok(bytes) => bytes,
             // Deleted between the stat and the read: a deletion like any
             // other, so it is left out of `live` and removed below.
-            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                work.push((cand, Work::Live));
+                continue;
+            }
             Err(source) => {
                 return Err(Error::Io {
                     path: cand.rel,
@@ -237,50 +269,98 @@ pub(super) fn plan(
             content_hash,
         };
         if previous.is_some_and(|old| old.content_hash == content_hash) {
-            live.insert(cand.rel);
+            live.insert(cand.rel.clone());
             plan.files_restamped += 1;
-            plan.changes.push(FileChange::Restamp(state));
+            work.push((cand, Work::Restamp(state)));
             continue;
         }
         let Ok(src) = String::from_utf8(bytes) else {
             tracing::warn!(path = %cand.rel, "skipping a file that is not valid UTF-8");
-            plan.skipped.push(Skipped {
-                path: cand.rel,
-                reason: SkipReason::NotUtf8,
-            });
+            work.push((cand, Work::Skip(SkipReason::NotUtf8)));
             continue;
         };
-        let chunked = match chunkers.chunk(cand.language, &cand.rel, &src) {
-            Ok(chunked) => chunked,
-            Err(error) => {
-                tracing::warn!(path = %cand.rel, %error, "skipping a file that is not valid");
+        jobs.push(work.len());
+        work.push((cand, Work::Chunk(state, src, jobs.len() - 1)));
+    }
+    // The files to chunk go to a worker per core, each with its own
+    // chunkers; chunk order is preserved by job index.
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let workers = std::thread::available_parallelism()
+        .map_or(1, std::num::NonZero::get)
+        .min(jobs.len());
+    let per_worker: Vec<Vec<(usize, Chunked)>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..workers)
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut chunkers = Chunkers::new();
+                    let mut out = Vec::new();
+                    loop {
+                        let job = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if job >= jobs.len() {
+                            break;
+                        }
+                        let (cand, work) = &work[jobs[job]];
+                        let Work::Chunk(_, src, _) = work else {
+                            unreachable!("jobs holds only Chunk entries")
+                        };
+                        out.push((job, chunkers.chunk(cand.language, &cand.rel, src, tokens)));
+                    }
+                    out
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    let mut results: Vec<Option<Chunked>> = (0..jobs.len()).map(|_| None).collect();
+    for done in per_worker {
+        for (job, result) in done {
+            results[job] = Some(result);
+        }
+    }
+    for (cand, item) in work {
+        match item {
+            Work::Live => {}
+            Work::Restamp(state) => plan.changes.push(FileChange::Restamp(state)),
+            Work::Skip(reason) => {
                 plan.skipped.push(Skipped {
                     path: cand.rel,
-                    reason: SkipReason::Malformed,
+                    reason,
                 });
-                continue;
             }
-        };
-        let mut records = Vec::with_capacity(chunked.len());
-        for (record, text) in chunked {
-            plan.texts
-                .entry(record.content_hash)
-                .or_insert_with(|| PendingChunk {
-                    path: cand.rel.clone(),
-                    title: record.title.clone(),
-                    lines: record.lines.clone(),
-                    content_hash: record.content_hash,
-                    text,
-                });
-            records.push(record);
+            Work::Chunk(state, _src, job) => {
+                let chunked = match results[job].take().expect("every job ran") {
+                    Ok(chunked) => chunked,
+                    Err(error) => {
+                        tracing::warn!(path = %cand.rel, %error, "skipping a file that is not valid");
+                        plan.skipped.push(Skipped {
+                            path: cand.rel,
+                            reason: SkipReason::Malformed,
+                        });
+                        continue;
+                    }
+                };
+                let mut records = Vec::with_capacity(chunked.len());
+                for (record, text) in chunked {
+                    plan.texts
+                        .entry(record.content_hash)
+                        .or_insert_with(|| PendingChunk {
+                            path: cand.rel.clone(),
+                            title: record.title.clone(),
+                            lines: record.lines.clone(),
+                            content_hash: record.content_hash,
+                            text,
+                        });
+                    records.push(record);
+                }
+                if stored.contains_key(&cand.rel) {
+                    plan.files_modified += 1;
+                } else {
+                    plan.files_added += 1;
+                }
+                live.insert(cand.rel);
+                plan.changes.push(FileChange::Replace(state, records));
+            }
         }
-        if previous.is_some() {
-            plan.files_modified += 1;
-        } else {
-            plan.files_added += 1;
-        }
-        live.insert(cand.rel);
-        plan.changes.push(FileChange::Replace(state, records));
     }
     // Whatever was stored but not seen alive is gone: deleted (including
     // vanished mid-pass), newly ignored, no longer valid UTF-8, or malformed.
@@ -326,7 +406,7 @@ pub(super) fn read_chunks(
         let Some((_, bytes)) = file.as_ref().filter(|(path, _)| *path == chunk.path) else {
             continue;
         };
-        let Some(text) = chunk_text(bytes, &chunk.ranges) else {
+        let Some(text) = chunk_text(bytes, &chunk.members) else {
             continue;
         };
         if ContentHash::of_chunk(&chunk.title, &text) != chunk.content_hash {
@@ -343,18 +423,24 @@ pub(super) fn read_chunks(
     Ok(out)
 }
 
-/// The member slices joined by `\n`, as `Chunk::write_text` builds them;
-/// `None` when a range no longer fits the file or splits a character.
-fn chunk_text(bytes: &[u8], ranges: &[Range<u64>]) -> Option<String> {
-    let mut text = Vec::new();
-    for (i, range) in ranges.iter().enumerate() {
-        if i > 0 {
-            text.push(b'\n');
-        }
-        let range = usize::try_from(range.start).ok()?..usize::try_from(range.end).ok()?;
-        text.extend_from_slice(bytes.get(range)?);
+/// The member slices joined by `\n`, as `Chunk::write_text` builds them — a
+/// signature member emits its slice whitespace-collapsed plus ` …\n`;
+/// `None` when the file is not UTF-8 or a range no longer fits it.
+fn chunk_text(bytes: &[u8], members: &[StoredMember]) -> Option<String> {
+    let src = std::str::from_utf8(bytes).ok()?;
+    let mut emit = Vec::with_capacity(members.len());
+    for member in members {
+        emit.push((
+            usize::try_from(member.bytes.start).ok()?..usize::try_from(member.bytes.end).ok()?,
+            match member.kind {
+                StoredMemberKind::Signature { cut } => MemberEmit::Signature { cut },
+                StoredMemberKind::Text => MemberEmit::Text,
+            },
+        ));
     }
-    String::from_utf8(text).ok()
+    let mut text = String::new();
+    chunk::write_members(src, emit, &mut text)?;
+    Some(text)
 }
 
 /// What the walk found.
@@ -459,6 +545,7 @@ fn rel_string(rel: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use std::ffi::OsStr;
+    use std::ops::Range;
     use std::os::unix::ffi::OsStrExt;
 
     use super::*;
@@ -472,7 +559,13 @@ mod tests {
             path: path.into(),
             title: title.into(),
             lines: 1..=1,
-            ranges,
+            members: ranges
+                .into_iter()
+                .map(|bytes| StoredMember {
+                    bytes,
+                    kind: StoredMemberKind::Text,
+                })
+                .collect(),
             content_hash: ContentHash::of_chunk(title, text),
         }
     }

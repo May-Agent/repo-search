@@ -2,7 +2,11 @@
 #![cfg(feature = "lang-rust")]
 
 use std::fs;
+use std::sync::Arc;
 
+mod counters;
+
+use counters::CapOff;
 use futures_executor::block_on;
 use repo_search_core::UnitVector;
 use repo_search_core::reconcile::{Options, PendingChunk, Reconciled, SkipReason, reconcile};
@@ -45,6 +49,7 @@ impl Fixture {
             MODEL,
             self.tree.path(),
             options,
+            Arc::new(CapOff),
         ))
         .unwrap()
     }
@@ -277,6 +282,7 @@ fn a_failing_transaction_lands_nothing() {
         MODEL,
         fx.tree.path(),
         Options::default(),
+        Arc::new(CapOff),
     ))
     .unwrap_err();
     assert!(err.to_string().contains("boom"), "{err}");
@@ -393,6 +399,7 @@ fn a_missing_worktree_is_an_error_and_leaves_the_index_untouched() {
         MODEL,
         &missing,
         Options::default(),
+        Arc::new(CapOff),
     ))
     .unwrap_err();
     assert!(
@@ -414,7 +421,7 @@ fn rebuilt_pending_text_equals_the_chunkers_for_packed_crlf_non_ascii() {
 
     let mut expected = Vec::new();
     let mut packed = false;
-    for chunk in Chunker::new(Rust).chunk_file("p.rs", src).unwrap() {
+    for chunk in Chunker::new(Rust).chunk_file("p.rs", src, &CapOff).unwrap() {
         packed |= chunk.kind == ChunkKind::Packed && chunk.members.len() > 1;
         let mut text = String::new();
         chunk.write_text(src, &mut text);

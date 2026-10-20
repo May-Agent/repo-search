@@ -15,8 +15,9 @@ use std::ops::Range;
 
 use smallvec::SmallVec;
 
-use super::units::{LineIndex, MAX_BYTES, line_split_bytes, trim_range, without_bom};
+use super::units::{Cap, LineIndex, MAX_BYTES, token_split, trim_range, without_bom};
 use super::{Chunk, ChunkKind, DocFormat, Error, FileChunker, Member, MemberKind};
+use crate::TokenCounter;
 
 /// Separates the path and the headings in a title and a symbol.
 const SEPARATOR: &str = " › ";
@@ -54,7 +55,12 @@ impl DocChunker {
 }
 
 impl FileChunker for DocChunker {
-    fn chunk_file(&mut self, path: &str, src: &str) -> Result<Vec<Chunk>, Error> {
+    fn chunk_file(
+        &mut self,
+        path: &str,
+        src: &str,
+        tokens: &dyn TokenCounter,
+    ) -> Result<Vec<Chunk>, Error> {
         without_bom(src, |src| {
             let outline = match self.format {
                 DocFormat::Markdown => markdown::outline(src),
@@ -66,22 +72,26 @@ impl FileChunker for DocChunker {
                     protected: Vec::new(),
                 },
             };
-            Ok(Sectioner::new(path, src, outline).chunks())
+            Ok(Sectioner::new(path, src, outline, tokens).chunks())
         })
     }
 
     fn chunk_kind_name(&self, kind: ChunkKind) -> Cow<'_, str> {
-        Cow::Borrowed(
-            kind.static_name()
-                .expect("a documentation chunker produces only `doc` chunks"),
-        )
+        match kind {
+            ChunkKind::Doc => {
+                Cow::Borrowed(kind.static_name().expect("a doc chunk has a static name"))
+            }
+            _ => panic!("a documentation chunker produces only `doc` chunks"),
+        }
     }
 
     fn member_kind_name(&self, kind: MemberKind) -> Cow<'_, str> {
-        Cow::Borrowed(
-            kind.static_name()
-                .expect("a documentation chunker produces only `doc` members"),
-        )
+        match kind {
+            MemberKind::Doc => {
+                Cow::Borrowed(kind.static_name().expect("a doc member has a static name"))
+            }
+            _ => panic!("a documentation chunker produces only `doc` members"),
+        }
     }
 }
 
@@ -90,16 +100,18 @@ struct Sectioner<'a> {
     src: &'a str,
     lines: LineIndex,
     outline: Outline,
+    tokens: &'a dyn TokenCounter,
     chunks: Vec<Chunk>,
 }
 
 impl<'a> Sectioner<'a> {
-    fn new(path: &'a str, src: &'a str, outline: Outline) -> Self {
+    fn new(path: &'a str, src: &'a str, outline: Outline, tokens: &'a dyn TokenCounter) -> Self {
         Self {
             path,
             src,
             lines: LineIndex::new(src),
             outline,
+            tokens,
             chunks: Vec::new(),
         }
     }
@@ -158,36 +170,60 @@ impl<'a> Sectioner<'a> {
     ) {
         let body = trim_range(self.src, body);
         let heading = heading.map(|heading| trim_range(self.src, heading.bytes.clone()));
+        let title = if heading_path.is_empty() {
+            self.path.to_owned()
+        } else {
+            format!("{}{SEPARATOR}{heading_path}", self.path)
+        };
+        let cap = Cap::new(self.tokens, &title);
         if body.is_empty() {
             if let (true, Some(heading)) = (keep_bare, heading) {
-                self.push(heading_path, [heading]);
+                for part in token_split(&cap, "", "", &self.src[heading.clone()], MAX_BYTES) {
+                    let part = heading.start + part.start..heading.start + part.end;
+                    self.push(heading_path, &title, [part]);
+                }
             }
             return;
         }
         let whole = heading.as_ref().map_or(body.start, |h| h.start)..body.end;
-        if whole.len() <= MAX_BYTES {
-            self.push(heading_path, [whole]);
+        if whole.len() <= MAX_BYTES && cap.fits("", &self.src[whole.clone()]) {
+            self.push(heading_path, &title, [whole]);
             return;
         }
         // Every part is emitted with the heading and a newline before it.
+        let prefix = heading
+            .as_ref()
+            .map_or(String::new(), |h| format!("{}\n", &self.src[h.clone()]));
         let budget = MAX_BYTES
             .saturating_sub(heading.as_ref().map_or(0, |h| h.len() + 1))
             .max(1);
-        for part in self.parts(body, budget) {
+        for part in self.parts(&cap, &prefix, body, budget) {
             match &heading {
-                Some(heading) => self.push(heading_path, [heading.clone(), part]),
-                None => self.push(heading_path, [part]),
+                Some(heading) => self.push(heading_path, &title, [heading.clone(), part]),
+                None => self.push(heading_path, &title, [part]),
             }
         }
     }
 
     /// Splits `body` into parts of at most `budget` bytes on paragraph
-    /// boundaries; a paragraph over the limit is split on line boundaries.
-    fn parts(&self, body: Range<usize>, budget: usize) -> Vec<Range<usize>> {
+    /// boundaries; a paragraph over the limit is split on line boundaries,
+    /// and no part's document under `prefix` may exceed the token cap.
+    fn parts(
+        &self,
+        cap: &Cap,
+        prefix: &str,
+        body: Range<usize>,
+        budget: usize,
+    ) -> Vec<Range<usize>> {
         let mut parts: Vec<Range<usize>> = Vec::new();
-        for piece in self.pieces(body, budget) {
+        for piece in self.pieces(body, budget, cap, prefix) {
             match parts.last_mut() {
-                Some(part) if piece.end - part.start <= budget => part.end = piece.end,
+                Some(part)
+                    if piece.end - part.start <= budget
+                        && cap.fits(prefix, &self.src[part.start..piece.end]) =>
+                {
+                    part.end = piece.end;
+                }
                 _ => parts.push(piece),
             }
         }
@@ -196,7 +232,13 @@ impl<'a> Sectioner<'a> {
 
     /// The paragraphs of `body` (blank-line separated, never inside a
     /// protected range), each split on line boundaries when over the limit.
-    fn pieces(&self, body: Range<usize>, budget: usize) -> Vec<Range<usize>> {
+    fn pieces(
+        &self,
+        body: Range<usize>,
+        budget: usize,
+        cap: &Cap,
+        prefix: &str,
+    ) -> Vec<Range<usize>> {
         let mut pieces = Vec::new();
         let mut block: Option<Range<usize>> = None;
         let mut offset = body.start;
@@ -212,17 +254,21 @@ impl<'a> Sectioner<'a> {
         pieces.extend(block);
         pieces
             .into_iter()
-            .flat_map(|block| self.cap(block, budget))
+            .flat_map(|block| self.fit_block(cap, prefix, block, budget))
             .collect()
     }
 
-    /// `block` itself, or its line-split parts when it exceeds `budget`.
-    fn cap(&self, block: Range<usize>, budget: usize) -> Vec<Range<usize>> {
+    /// `block` itself, or its line-split parts when its document exceeds the
+    /// byte budget or the token cap.
+    fn fit_block(
+        &self,
+        cap: &Cap,
+        prefix: &str,
+        block: Range<usize>,
+        budget: usize,
+    ) -> Vec<Range<usize>> {
         let block = trim_range(self.src, block);
-        if block.len() <= budget {
-            return vec![block];
-        }
-        line_split_bytes(&self.src[block.clone()], budget)
+        token_split(cap, prefix, prefix, &self.src[block.clone()], budget)
             .into_iter()
             .map(|part| trim_range(self.src, block.start + part.start..block.start + part.end))
             .filter(|part| !part.is_empty())
@@ -240,18 +286,18 @@ impl<'a> Sectioner<'a> {
             .is_some_and(|range| range.start <= offset)
     }
 
-    /// Appends a chunk made of `members`, in order.
-    fn push<const N: usize>(&mut self, heading_path: &str, members: [Range<usize>; N]) {
-        let title = if heading_path.is_empty() {
-            self.path.to_owned()
-        } else {
-            format!("{}{SEPARATOR}{heading_path}", self.path)
-        };
+    /// Appends a chunk of `title` made of `members`, in order.
+    fn push<const N: usize>(
+        &mut self,
+        heading_path: &str,
+        title: &str,
+        members: [Range<usize>; N],
+    ) {
         // The lines of the text itself: a split part does not claim the
         // heading's lines.
         let text = &members[N - 1];
         let lines = self.lines.row(text.start) as u32 + 1..=self.lines.row(text.end - 1) as u32 + 1;
-        let members: SmallVec<[Member; 1]> = members
+        let members: SmallVec<[Member; 2]> = members
             .into_iter()
             .map(|bytes| Member {
                 bytes,
@@ -260,7 +306,7 @@ impl<'a> Sectioner<'a> {
             })
             .collect();
         self.chunks.push(Chunk {
-            title,
+            title: title.to_owned(),
             kind: ChunkKind::Doc,
             lines,
             members,

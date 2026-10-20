@@ -27,6 +27,7 @@ CREATE TABLE chunk_members (
     start_byte INTEGER NOT NULL,
     end_byte   INTEGER NOT NULL,
     kind       TEXT NOT NULL,
+    cut        INTEGER NOT NULL,
     symbol     TEXT NOT NULL,
     PRIMARY KEY (chunk_id, ord)
 ) WITHOUT ROWID;

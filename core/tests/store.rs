@@ -29,6 +29,7 @@ fn chunk(lines: RangeInclusive<u32>, title: &str, kind: &str, text: &str) -> Chu
         members: vec![MemberRecord {
             bytes: 0..text.len() as u64,
             kind: kind.into(),
+            cut: 0,
             symbol: title.into(),
         }],
         content_hash: ContentHash::of_chunk(title, text),
@@ -688,7 +689,13 @@ fn chunks_by_hash_returns_the_first_row_with_member_ranges() {
     assert_eq!(found[0].path, "src/a.rs");
     assert_eq!(found[0].title, "fn a");
     assert_eq!(found[0].lines, 3..=3);
-    assert_eq!(found[0].ranges, vec![0..text.len() as u64]);
+    assert_eq!(
+        found[0].members,
+        vec![repo_search_core::store::StoredMember {
+            bytes: 0..text.len() as u64,
+            kind: repo_search_core::store::StoredMemberKind::Text,
+        }]
+    );
 }
 
 #[test]

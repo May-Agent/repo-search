@@ -53,6 +53,28 @@ impl Grammar for Python {
         is_docstring(text)
     }
 
+    fn inner_doc_text<'a>(&self, text: &'a str) -> &'a str {
+        // `"""docstring"""` -> `docstring`: the literal's prefix letters and
+        // quotes are not part of the sentence.
+        let bytes = text.as_bytes();
+        let mut i = 0;
+        while i < 3
+            && matches!(
+                bytes.get(i).map(u8::to_ascii_lowercase),
+                Some(b'r' | b'b' | b'f' | b'u' | b't')
+            )
+        {
+            i += 1;
+        }
+        let text = &text[i..];
+        for quote in ["\"\"\"", "'''", "\"", "'"] {
+            if let Some(rest) = text.strip_prefix(quote) {
+                return rest.strip_suffix(quote).unwrap_or(rest);
+            }
+        }
+        text
+    }
+
     fn subject<'a>(&self, node: Node<'a>) -> Node<'a> {
         match node.kind() {
             "decorated_definition" => node.child_by_field_name("definition").unwrap_or(node),
