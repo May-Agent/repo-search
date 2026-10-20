@@ -1070,3 +1070,92 @@ fn alternating_searches_show_ignored_files_only_when_asked() {
         "nothing re-embedded"
     );
 }
+
+/// A function whose body is over the line-split byte limit, followed by a
+/// small sibling. With the cap off, `lazy_rows` line-splits in two and its
+/// second part carries a `signature` member (the collapsed multi-line
+/// signature plus ` …\n`). With `rows` small enough the second part is
+/// under the packing limit and packs with `row_height`.
+fn split_fn_source(rows: usize) -> String {
+    let mut src = String::from(
+        "pub fn lazy_rows(\n    items: &[Item],\n    window: usize,\n) -> Vec<Row> {\n    let mut rows = Vec::new();\n",
+    );
+    for i in 1..=rows {
+        src.push_str(&format!(
+            "    rows.push(render_row(items, window, {i:02}));\n"
+        ));
+    }
+    src.push_str("    rows\n}\n\npub fn row_height() -> usize {\n    1\n}\n");
+    src
+}
+
+/// The indexed text of the chunk whose title contains `title`.
+fn indexed_text<'a>(fixture: &'a Fixture, title: &str) -> &'a PendingChunk {
+    fixture
+        .pending
+        .iter()
+        .find(|p| p.title.contains(title))
+        .unwrap_or_else(|| panic!("no chunk titled {title}"))
+}
+
+/// Searches a fully indexed worktree of `src` and checks that the chunk
+/// titled `title` reads back as exactly the text that was hashed at index
+/// time.
+fn assert_reads_back_after_a_full_index(src: String, title: &str) {
+    let mut fixture = Fixture::build(&[("lazy.rs".to_owned(), src)], &Vectors::All, false);
+    let expected = indexed_text(&fixture, title).clone();
+    assert!(
+        expected
+            .text
+            .starts_with("pub fn lazy_rows( items: &[Item], window: usize, ) -> Vec<Row> …\n"),
+        "{:?}",
+        expected.text
+    );
+    let results = fixture
+        .try_search(&Request::new("render a list of rows lazily"))
+        .expect("an unchanged chunk reads back after a full index");
+    let chunk = results
+        .code
+        .iter()
+        .flatten()
+        .flat_map(|f| &f.chunks)
+        .find(|c| c.lines == [*expected.lines.start(), *expected.lines.end()])
+        .unwrap_or_else(|| panic!("{title} is not in the answer"));
+    assert_eq!(chunk.text, expected.text);
+}
+
+#[test]
+fn a_split_part_reads_back_after_a_full_index() {
+    // `lazy_rows (part 2/2)` alone: members `[signature, text]`.
+    assert_reads_back_after_a_full_index(split_fn_source(60), "fn lazy_rows (part 2/2)");
+}
+
+#[test]
+fn a_packed_split_tail_reads_back_after_a_full_index() {
+    // `lazy_rows (part 2/2), fn row_height`: members `[signature, text, text]`.
+    assert_reads_back_after_a_full_index(
+        split_fn_source(52),
+        "fn lazy_rows (part 2/2), fn row_height",
+    );
+}
+
+#[test]
+fn a_split_part_without_a_vector_is_embedded_on_the_spot() {
+    let mut fixture = Fixture::build(
+        &[("lazy.rs".to_owned(), split_fn_source(60))],
+        &Vectors::None,
+        false,
+    );
+    // Both parts of `lazy_rows` match; neither has a vector yet.
+    let candidates = fixture
+        .pending
+        .iter()
+        .filter(|p| p.text.contains("rows.push"))
+        .count();
+    assert_eq!(candidates, 2);
+    fixture.search(&Request {
+        files_only: true,
+        ..Request::new("rows push render")
+    });
+    assert_eq!(fixture.retriever_embedder_documents(), candidates);
+}

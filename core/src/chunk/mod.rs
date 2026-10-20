@@ -56,7 +56,7 @@ use smallvec::SmallVec;
 use tree_sitter::{Language as TsLanguage, Node, Parser};
 
 use units::{CtxFrame, Emitter, Item, MAX_BYTES, Span, ctx_symbol, first_sentence, join_symbol};
-pub(crate) use units::{MemberEmit, write_members};
+pub(crate) use units::{MemberEmit, rebuild_text};
 
 use crate::TokenCounter;
 

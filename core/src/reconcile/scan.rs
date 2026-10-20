@@ -36,12 +36,12 @@ use crate::chunk::Python;
 use crate::chunk::Rust;
 #[cfg(feature = "lang-swift")]
 use crate::chunk::Swift;
-use crate::chunk::{self, ConfigChunker, DocChunker, FileChunker, Language, MemberEmit};
+use crate::chunk::{self, ConfigChunker, DocChunker, FileChunker, Language};
 #[cfg(feature = "lang-typescript")]
 use crate::chunk::{Tsx, TypeScript};
 use crate::store::{
-    ChunkRecord, ContentHash, FileChange, FileState, MemberRecord, StoredChunk, StoredMember,
-    StoredMemberKind, Unchunkable, UnchunkableReason, fts_body,
+    ChunkRecord, ContentHash, FileChange, FileState, MemberRecord, StoredChunk, Unchunkable,
+    UnchunkableReason, fts_body,
 };
 
 /// Directories that are never part of the indexed tree, even when ignore rules
@@ -489,7 +489,10 @@ pub(super) fn read_chunks(
         let Some((_, bytes)) = file.as_ref().filter(|(path, _)| *path == chunk.path) else {
             continue;
         };
-        let Some(text) = chunk_text(bytes, &chunk.members) else {
+        let Some(text) = chunk::rebuild_text(
+            bytes,
+            chunk.members.iter().map(|m| (m.bytes.clone(), m.kind)),
+        ) else {
             continue;
         };
         if ContentHash::of_chunk(&chunk.title, &text) != chunk.content_hash {
@@ -504,26 +507,6 @@ pub(super) fn read_chunks(
         });
     }
     Ok(out)
-}
-
-/// The member slices joined by `\n`, as `Chunk::write_text` builds them — a
-/// signature member emits its slice whitespace-collapsed plus ` …\n`;
-/// `None` when the file is not UTF-8 or a range no longer fits it.
-fn chunk_text(bytes: &[u8], members: &[StoredMember]) -> Option<String> {
-    let src = std::str::from_utf8(bytes).ok()?;
-    let mut emit = Vec::with_capacity(members.len());
-    for member in members {
-        emit.push((
-            usize::try_from(member.bytes.start).ok()?..usize::try_from(member.bytes.end).ok()?,
-            match member.kind {
-                StoredMemberKind::Signature { cut } => MemberEmit::Signature { cut },
-                StoredMemberKind::Text => MemberEmit::Text,
-            },
-        ));
-    }
-    let mut text = String::new();
-    chunk::write_members(src, emit, &mut text)?;
-    Some(text)
 }
 
 /// What the walk found.
@@ -660,22 +643,25 @@ mod tests {
     use std::os::unix::ffi::OsStrExt;
 
     use super::*;
+    use crate::store::{StoredMember, StoredMemberKind};
 
     fn stored(path: &str, title: &str, text: &str, range: Range<u64>) -> StoredChunk {
-        with_ranges(path, title, text, vec![range])
+        with_ranges(path, title, text, vec![(range, StoredMemberKind::Text)])
     }
 
-    fn with_ranges(path: &str, title: &str, text: &str, ranges: Vec<Range<u64>>) -> StoredChunk {
+    fn with_ranges(
+        path: &str,
+        title: &str,
+        text: &str,
+        members: Vec<(Range<u64>, StoredMemberKind)>,
+    ) -> StoredChunk {
         StoredChunk {
             path: path.into(),
             title: title.into(),
             lines: 1..=1,
-            members: ranges
+            members: members
                 .into_iter()
-                .map(|bytes| StoredMember {
-                    bytes,
-                    kind: StoredMemberKind::Text,
-                })
+                .map(|(bytes, kind)| StoredMember { bytes, kind })
                 .collect(),
             content_hash: ContentHash::of_chunk(title, text),
         }
@@ -685,10 +671,58 @@ mod tests {
     fn read_chunks_joins_member_ranges() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("a.rs"), "fn a() {}\n\nfn b() {}\n").unwrap();
-        let chunk = with_ranges("a.rs", "t", "fn a() {}\nfn b() {}", vec![0..9, 11..20]);
+        let chunk = with_ranges(
+            "a.rs",
+            "t",
+            "fn a() {}\nfn b() {}",
+            vec![
+                (0..9, StoredMemberKind::Text),
+                (11..20, StoredMemberKind::Text),
+            ],
+        );
         let out = read_chunks(dir.path(), vec![chunk]).unwrap();
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].text, "fn a() {}\nfn b() {}");
+    }
+
+    #[test]
+    fn a_signature_member_rebuilds_as_write_text_wrote_it() {
+        // A line-split part after the first: the signature member — the
+        // collapsed, cut signature plus ` …\n` — ahead of the part's text.
+        let src = "fn f(\n    a: u8,\n    b: u8,\n) -> u8 {\n    a + b\n}\n";
+        let chunk = chunk::Chunk {
+            title: "t".into(),
+            kind: chunk::ChunkKind::Packed,
+            lines: 1..=7,
+            members: smallvec::smallvec![
+                chunk::Member {
+                    bytes: 0..35,
+                    kind: chunk::MemberKind::Signature { cut: 20 },
+                    symbol: String::new(),
+                },
+                chunk::Member {
+                    bytes: 35..50,
+                    kind: chunk::MemberKind::Doc,
+                    symbol: String::new(),
+                },
+            ],
+        };
+        let mut text = String::new();
+        chunk.write_text(src, &mut text);
+        let members = [
+            (0..35, StoredMemberKind::Signature { cut: 20 }),
+            (35..50, StoredMemberKind::Text),
+        ];
+        assert_eq!(
+            chunk::rebuild_text(src.as_bytes(), members.iter().cloned()),
+            Some(text.clone())
+        );
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.rs"), src).unwrap();
+        let stored = with_ranges("a.rs", "t", &text, members.to_vec());
+        let out = read_chunks(dir.path(), vec![stored]).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].text, text);
     }
 
     #[test]
