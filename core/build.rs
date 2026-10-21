@@ -1,6 +1,7 @@
 //! Computes the chunker fingerprint: a hash of the chunker sources and of the
-//! resolved tree-sitter grammar versions, so an index can tell it was chunked
-//! by a different chunker.
+//! tree-sitter grammar versions, so an index can tell it was chunked by a
+//! different chunker. The grammars are pinned exactly in this crate's manifest,
+//! which is the one file that travels with the crate wherever it is built.
 
 use std::env;
 use std::fmt::Write as _;
@@ -15,9 +16,9 @@ const FINGERPRINT_BYTES: usize = 16;
 
 fn main() {
     let manifest = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("cargo sets it"));
-    let lock = manifest.join("../Cargo.lock");
+    let cargo_toml = manifest.join("Cargo.toml");
     println!("cargo:rerun-if-changed=src/chunk");
-    println!("cargo:rerun-if-changed={}", lock.display());
+    println!("cargo:rerun-if-changed=Cargo.toml");
 
     let mut hasher = Sha256::new();
     let mut sources = Vec::new();
@@ -34,24 +35,25 @@ fn main() {
         hasher.update(&bytes);
     }
 
-    let text = fs::read_to_string(&lock).unwrap_or_else(|e| {
-        panic!(
-            "the chunker fingerprint needs the workspace lockfile at {}: {e}",
-            lock.display()
-        )
-    });
+    let text = fs::read_to_string(&cargo_toml)
+        .unwrap_or_else(|e| panic!("reading {}: {e}", cargo_toml.display()));
     let doc: DocumentMut = text
         .parse()
-        .unwrap_or_else(|e| panic!("{} is not valid TOML: {e}", lock.display()));
-    let packages = doc["package"]
-        .as_array_of_tables()
-        .expect("Cargo.lock has [[package]] entries");
-    let mut grammars: Vec<(&str, &str)> = packages
+        .unwrap_or_else(|e| panic!("{} is not valid TOML: {e}", cargo_toml.display()));
+    let dependencies = doc["dependencies"]
+        .as_table()
+        .expect("the manifest has a [dependencies] table");
+    let mut grammars: Vec<(&str, &str)> = dependencies
         .iter()
-        .filter_map(|package| {
-            let name = package["name"].as_str().expect("package name");
-            let version = package["version"].as_str().expect("package version");
-            (name == "tree-sitter" || name.starts_with("tree-sitter-")).then_some((name, version))
+        .filter(|(name, _)| *name == "tree-sitter" || name.starts_with("tree-sitter-"))
+        .map(|(name, item)| {
+            let requirement = item["version"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{name} has no version requirement"));
+            let version = requirement.strip_prefix('=').unwrap_or_else(|| {
+                panic!("{name} must be pinned exactly (`={requirement}`) for the fingerprint")
+            });
+            (name, version)
         })
         .collect();
     grammars.sort_unstable();
