@@ -1,6 +1,7 @@
-//! The GPU thread: batch stage-1 indexing on `CPU_AND_GPU`.
+//! The GPU thread: batch indexing on `CPU_AND_GPU`.
 //!
-//! The scheduler spawns this thread when stage-1 work and headroom allow.
+//! The scheduler spawns this thread when work in its queue — stage 1 on a
+//! wide-class chip, background on a base one — and headroom allow.
 //! Opening the instance — a multi-second cold start — happens on this thread,
 //! off every other path. `Stop` drops the embedder, releasing the Core ML GPU
 //! instance, and the thread exits. There is no query path here by

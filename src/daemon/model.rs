@@ -24,6 +24,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use crate::model_store::{Fetch, ModelStore};
 
 use super::ane;
+use super::chip::ChipClass;
 use super::scheduler::{self, STAGE1_MAX_TOKENS, SchedulerHandle};
 use super::{Backend, BusySource, Error, Headroom, LoadStage};
 
@@ -136,18 +137,40 @@ impl LoadFail {
     }
 }
 
-/// Spawns the loader task; it starts the load sequence at once. `bound`
-/// caps the wait on the ANE thread's reports: a load past it fails fatally
-/// with the stage it stopped in.
-pub fn spawn<B: Backend>(
-    backend: Arc<B>,
-    store: Arc<ModelStore>,
-    bound: Duration,
-    headroom: watch::Receiver<Headroom>,
-    busy: watch::Sender<bool>,
-    busy_reg: mpsc::Sender<BusySource>,
-    fatal: mpsc::Sender<Error>,
-) -> Loader<B> {
+/// What the loader is built from.
+pub struct LoaderConfig<B: Backend> {
+    /// The embedding backend.
+    pub backend: Arc<B>,
+    /// The model cache; `ensure` starts at once.
+    pub store: Arc<ModelStore>,
+    /// The cap on the wait for the ANE thread's `counted` and `loaded`
+    /// reports: a load past it fails fatally with the stage it stopped in.
+    pub bound: Duration,
+    /// The host's chip class, handed to the scheduler: a base chip keeps
+    /// the GPU off stage-1 work.
+    pub chip: ChipClass,
+    /// Host headroom for the GPU instance.
+    pub headroom: watch::Receiver<Headroom>,
+    /// The loader's busy state for the idle-exit tracker.
+    pub busy: watch::Sender<bool>,
+    /// Where busy sources register with the idle-exit tracker.
+    pub busy_reg: mpsc::Sender<BusySource>,
+    /// Fatal errors go to `run` here.
+    pub fatal: mpsc::Sender<Error>,
+}
+
+/// Spawns the loader task; it starts the load sequence at once.
+pub fn spawn<B: Backend>(config: LoaderConfig<B>) -> Loader<B> {
+    let LoaderConfig {
+        backend,
+        store,
+        bound,
+        chip,
+        headroom,
+        busy,
+        busy_reg,
+        fatal,
+    } = config;
     let (state_tx, state) = watch::channel(ModelState::Absent);
     let (tx, mut rx) = mpsc::channel::<LoaderMsg>(64);
     tokio::spawn(async move {
@@ -169,6 +192,7 @@ pub fn spawn<B: Backend>(
                         backend: backend.clone(),
                         store: store.clone(),
                         bound,
+                        chip,
                         fetch: fetch_tx.clone(),
                         headroom: headroom.clone(),
                         busy_reg: busy_reg.clone(),
@@ -307,6 +331,8 @@ struct LoadParts<B: Backend> {
     /// The cap on the wait for the ANE thread's `counted` and `loaded`
     /// reports.
     bound: Duration,
+    /// The host's chip class, handed to the scheduler.
+    chip: ChipClass,
     fetch: watch::Sender<Fetch>,
     headroom: watch::Receiver<Headroom>,
     busy_reg: mpsc::Sender<BusySource>,
@@ -319,6 +345,7 @@ async fn load<B: Backend>(parts: LoadParts<B>, mut cancel: oneshot::Receiver<()>
         backend,
         store,
         bound,
+        chip,
         fetch,
         headroom,
         busy_reg,
@@ -384,6 +411,7 @@ async fn load<B: Backend>(parts: LoadParts<B>, mut cancel: oneshot::Receiver<()>
         model_id: model_id.clone(),
         buckets: buckets.clone(),
         headroom,
+        chip,
         fatal,
         busy: sched_busy_tx,
         ane_exited: ane_exited.clone(),
