@@ -279,7 +279,7 @@ pub struct StubBackend {
     /// Keeps the watch alive so `send_replace` stores; never read.
     _headroom_rx: tokio::sync::watch::Receiver<Headroom>,
     on_change: OnceLock<OnChange>,
-    gates: BTreeMap<Instance, Arc<Barrier>>,
+    gates: BTreeMap<Instance, BTreeMap<usize, Arc<Barrier>>>,
     index_gates: BTreeMap<Instance, Arc<IndexGate>>,
     dim: usize,
 }
@@ -329,9 +329,19 @@ impl StubBackend {
     }
 
     /// Gates `instance`'s first embed call on a barrier the test opens.
+    #[allow(dead_code)] // only the socket-level tests use it
     pub fn gate_first(&mut self, instance: Instance) -> Arc<Barrier> {
+        self.gate_call(instance, 1)
+    }
+
+    /// Gates `instance`'s `call`-th embed call — `call` is 1-based over the
+    /// embedder's `embed_*` calls — on a barrier the test opens.
+    pub fn gate_call(&mut self, instance: Instance, call: usize) -> Arc<Barrier> {
         let gate = Arc::new(Barrier::new(2));
-        self.gates.insert(instance, gate.clone());
+        self.gates
+            .entry(instance)
+            .or_default()
+            .insert(call, gate.clone());
         gate
     }
 
@@ -429,8 +439,8 @@ impl StubBackend {
             counter: StubCounter::default(),
             records: self.records.clone(),
             delays: self.delays.clone(),
-            gate: self.gates.get(&instance).cloned(),
-            gated: false,
+            gates: self.gates.get(&instance).cloned().unwrap_or_default(),
+            calls: 0,
             index_gate: self.index_gates.get(&instance).cloned(),
             dim: self.dim,
         }
@@ -494,16 +504,17 @@ impl Backend for StubBackend {
 }
 
 /// The stub embedder, for either instance. Every call reports a
-/// [`Kind::Started`] record, waits out its gate on the first call, sleeps its
-/// bucket's configured duration, then reports a [`Record`] per document.
+/// [`Kind::Started`] record, waits out the gate installed for its 1-based
+/// ordinal if any, sleeps its bucket's configured duration, then reports a
+/// [`Record`] per document.
 pub struct StubEmbedder {
     instance: Instance,
     counter: StubCounter,
     records: mpsc::Sender<Record>,
     delays: BTreeMap<(Instance, usize), Duration>,
-    gate: Option<Arc<Barrier>>,
-    /// The first call's gate was already waited on.
-    gated: bool,
+    gates: BTreeMap<usize, Arc<Barrier>>,
+    /// The embed calls this embedder served, for picking a call's gate.
+    calls: usize,
     index_gate: Option<Arc<IndexGate>>,
     dim: usize,
 }
@@ -518,13 +529,11 @@ impl StubEmbedder {
         std::thread::sleep(delay);
     }
 
-    /// Blocks the first embed call until the test opens the gate.
+    /// Blocks this call while the barrier installed for its 1-based
+    /// ordinal is closed; calls with no gate pass.
     fn wait_gate(&mut self) {
-        if self.gated {
-            return;
-        }
-        self.gated = true;
-        if let Some(gate) = &self.gate {
+        self.calls += 1;
+        if let Some(gate) = self.gates.get(&self.calls) {
             gate.wait();
         }
     }

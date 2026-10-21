@@ -1,18 +1,19 @@
 //! The per-worktree feeder: turns each freshness barrier's outcome into the
 //! worktree's next scheduler `Enqueue`, in barrier order, off the owner.
-//! Token counting and a full resync run here, so a query never waits on
-//! them.
+//! Token counting and a resync's text rebuild run here, so a query never
+//! waits on them. A resync's set is listed from the owner's books: by the
+//! barrier, or by asking the owner when a failed feed promotes a `Change`.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use repo_search_core::TokenCounter;
 use repo_search_core::qos::performance_cores;
-use repo_search_core::reconcile::{self, PendingChunk};
-use repo_search_core::store::{Index, VectorCache};
+use repo_search_core::reconcile::{self, Missing, PendingChunk};
 use tokio::sync::{mpsc, oneshot};
 
 use super::Backend;
+use super::coverage::Asker;
 use super::scheduler::{
     Enqueue, IndexClass, Interest, PendingItem, RepoId, SchedulerHandle, Stage1Done, WorktreeId,
 };
@@ -24,18 +25,32 @@ const INBOX: usize = 8;
 
 /// What a barrier hands the feeder.
 pub enum Feed {
-    /// Flush the repository's writer, then rebuild the worktree's whole
-    /// pending set in `options`' scope with `reconcile::missing` and
-    /// replace the scheduler's interest with it.
+    /// Flush the repository's writer, then settle the worktree's whole
+    /// pending set in `options`' scope, rebuild its texts and replace the
+    /// scheduler's interest with it.
     Resync {
-        /// The index the set is read from: the owner's current handle.
-        index: Index,
         /// The scope.
         options: reconcile::Options,
-        /// Texts the pass already holds, so `missing` need not re-read them.
+        /// The set, listed from the owner's books inside the barrier.
+        missing: Missing,
+        /// Texts the pass already holds, so they need not be rebuilt.
         known: Vec<PendingChunk>,
     },
     /// One pass's changes, in the scope of the last `Resync`.
+    Change(reconcile::Changes),
+}
+
+/// What the feeder does with one feed.
+enum Work {
+    /// Replace the scheduler's interest with the scope's whole set.
+    Resync {
+        options: reconcile::Options,
+        /// The set as the barrier listed it; `None` for a `Change` a failed
+        /// feed promoted, whose set the owner's books list on asking.
+        listed: Option<Missing>,
+        known: Vec<PendingChunk>,
+    },
+    /// Apply one pass's changes.
     Change(reconcile::Changes),
 }
 
@@ -56,12 +71,10 @@ pub struct FeederConfig<B: Backend> {
     pub worktree: WorktreeId,
     /// The repository the worktree lives in.
     pub repo: RepoId,
-    /// The worktree root `missing` reads under.
+    /// The worktree root, for diagnostics.
     pub root: PathBuf,
-    /// The model-id vectors are stored under.
-    pub model_id: String,
-    /// The repository's shared vector cache.
-    pub cache: VectorCache,
+    /// Asks the owner's books for the set of a promoted resync.
+    pub books: Asker,
     /// The repository's vector writer, handed to every `Enqueue`.
     pub writer: WriterHandle,
     /// The model's token counter.
@@ -79,8 +92,7 @@ pub fn spawn<B: Backend>(config: FeederConfig<B>) -> mpsc::Sender<FeedMsg> {
         worktree,
         repo,
         root,
-        model_id,
-        cache,
+        books,
         writer,
         counter,
         sched,
@@ -88,43 +100,62 @@ pub fn spawn<B: Backend>(config: FeederConfig<B>) -> mpsc::Sender<FeedMsg> {
     } = config;
     let (tx, mut rx) = mpsc::channel(INBOX);
     tokio::spawn(async move {
-        // The last `Resync`'s index handle and scope; a `Change` applies in
-        // that scope.
-        let mut scope: Option<(Index, reconcile::Options)> = None;
+        // The last `Resync`'s scope; a `Change` applies in that scope.
+        let mut scope: Option<reconcile::Options> = None;
         // A feed failed, so the scheduler's interest no longer matches what
         // the barriers reported: the next `Change` is promoted to a resync.
         let mut stale = false;
         while let Some(FeedMsg { feed, class, ack }) = rx.recv().await {
-            let feed = match feed {
-                Feed::Change(changes) if stale => {
-                    let (index, options) = scope.clone().expect("a Change follows a Resync");
-                    Feed::Resync {
-                        index,
-                        options,
-                        known: changes.added,
-                    }
-                }
-                feed => feed,
-            };
-            let interest: Result<Interest, String> = match feed {
+            let work = match feed {
+                Feed::Change(changes) if stale => Work::Resync {
+                    options: scope.expect("a Change follows a Resync"),
+                    listed: None,
+                    known: changes.added,
+                },
                 Feed::Resync {
-                    index,
                     options,
+                    missing,
+                    known,
+                } => Work::Resync {
+                    options,
+                    listed: Some(missing),
+                    known,
+                },
+                Feed::Change(changes) => Work::Change(changes),
+            };
+            let interest: Result<Interest, String> = match work {
+                Work::Resync {
+                    options,
+                    listed,
                     known,
                 } => {
-                    scope = Some((index.clone(), options));
+                    scope = Some(options);
                     // Vectors the writer still buffers would read as
                     // missing: the scheduler would drop them from the
                     // `Replace`, but only after their text was rebuilt and
-                    // counted for nothing.
+                    // counted for nothing. Settling the set reads the
+                    // cache's slot log after the flush, inside this feed's
+                    // barrier; a promoted `Change` has no listed set, so the
+                    // owner's books list it now.
                     let pending = async {
                         writer
                             .flush()
                             .await
                             .map_err(|e| format!("vector writer flush: {e}"))?;
-                        reconcile::missing(&index, &cache, &model_id, &root, options, known)
-                            .await
-                            .map_err(|e| e.to_string())
+                        let missing = match listed {
+                            Some(missing) => missing,
+                            None => books.missing(options).await.map_err(|e| e.to_string())?,
+                        };
+                        let listed = missing.reads;
+                        let pending = missing.pending(known).await.map_err(|e| e.to_string())?;
+                        tracing::debug!(root = %root.display(),
+                            listed_chunk_rows = listed.chunk_rows,
+                            listed_cache_probes = listed.cache_probes,
+                            listed_cache_slots = listed.cache_slots,
+                            settled_cache_slots = pending.reads.cache_slots,
+                            rebuilt_chunk_rows = pending.reads.chunk_rows,
+                            pending = pending.chunks.len(), "resync settled");
+                        Ok::<_, String>(pending.chunks)
                     }
                     .await;
                     match pending {
@@ -134,7 +165,7 @@ pub fn spawn<B: Backend>(config: FeederConfig<B>) -> mpsc::Sender<FeedMsg> {
                         Err(message) => Err(message),
                     }
                 }
-                Feed::Change(reconcile::Changes { added, dropped }) => {
+                Work::Change(reconcile::Changes { added, dropped }) => {
                     count_pending::<B>(added, counter.clone())
                         .await
                         .map(|added| Interest::Change { added, dropped })
