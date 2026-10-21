@@ -2,6 +2,9 @@
 git_only = false
 publish = false
 git_release_enable = false
+# Before 1.0 the public API changes freely, and the crates.io baseline is an
+# empty placeholder, so there is no API to check against.
+semver_check = false
 
 [[package]]
 name = "repo-search"
