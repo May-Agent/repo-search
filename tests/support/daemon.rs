@@ -77,6 +77,7 @@ pub fn spawn_on(
     model_store: ModelStore,
     backend: Arc<StubBackend>,
     idle_exit: Duration,
+    load_bound: Duration,
     build: BuildId,
 ) -> JoinHandle<Result<(), Error>> {
     runtime.spawn(async move {
@@ -87,6 +88,7 @@ pub fn spawn_on(
         daemon::run(Config {
             listener,
             idle_exit,
+            load_bound,
             model_store,
             backend,
             build,
@@ -102,6 +104,7 @@ pub async fn daemon(
     mut backend: StubBackend,
     model: Model,
     idle_exit: Duration,
+    load_bound: Duration,
 ) -> Daemon {
     let root = tmp.path().join("models");
     let store = model_store(root, &model);
@@ -117,6 +120,7 @@ pub async fn daemon(
         store,
         backend.clone(),
         idle_exit,
+        load_bound,
         client::build(),
     );
     Daemon {

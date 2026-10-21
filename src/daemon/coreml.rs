@@ -4,7 +4,7 @@ use std::path::Path;
 
 use repo_search_coreml::{ComputeUnits, CoreMlEmbedder, DocumentCounter, Error, HeadroomMonitor};
 
-use super::{Backend, GpuOpen, Headroom};
+use super::{Backend, GpuOpen, Headroom, LoadStage};
 
 /// The daemon's Core ML backend.
 pub struct CoreMlBackend;
@@ -22,8 +22,14 @@ impl Backend for CoreMlBackend {
         Ok((counter, buckets))
     }
 
-    fn open_ane(&self, dir: &Path, model_id: &str) -> Result<Self::Ane, Self::LoadError> {
+    fn open_ane(
+        &self,
+        dir: &Path,
+        model_id: &str,
+        stage: &tokio::sync::watch::Sender<LoadStage>,
+    ) -> Result<Self::Ane, Self::LoadError> {
         let mut embedder = CoreMlEmbedder::open(dir, model_id, ComputeUnits::CpuAndNeuralEngine)?;
+        stage.send_replace(LoadStage::WarmUp);
         // Warm every bucket once so the first query does not pay the ANE
         // compile.
         let buckets: Vec<usize> = embedder.counter().buckets().to_vec();

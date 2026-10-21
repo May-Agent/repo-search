@@ -17,6 +17,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::sync::{mpsc, oneshot, watch};
 
@@ -24,7 +25,7 @@ use crate::model_store::{Fetch, ModelStore};
 
 use super::ane;
 use super::scheduler::{self, STAGE1_MAX_TOKENS, SchedulerHandle};
-use super::{Backend, BusySource, Error, Headroom};
+use super::{Backend, BusySource, Error, Headroom, LoadStage};
 
 /// Where the model is on its way to readiness.
 pub enum ModelState<B: Backend> {
@@ -115,7 +116,8 @@ enum LoadFail {
         /// The threads the attempt already spawned, to be stopped.
         pipeline: Option<Pipeline>,
     },
-    /// `open_ane` on a verified archive: fatal per the fatal-errors rule.
+    /// `open_ane` on a verified archive, or the load outliving the bound:
+    /// fatal per the fatal-errors rule.
     Fatal {
         /// The error text.
         message: String,
@@ -134,10 +136,13 @@ impl LoadFail {
     }
 }
 
-/// Spawns the loader task; it starts the load sequence at once.
+/// Spawns the loader task; it starts the load sequence at once. `bound`
+/// caps the wait on the ANE thread's reports: a load past it fails fatally
+/// with the stage it stopped in.
 pub fn spawn<B: Backend>(
     backend: Arc<B>,
     store: Arc<ModelStore>,
+    bound: Duration,
     headroom: watch::Receiver<Headroom>,
     busy: watch::Sender<bool>,
     busy_reg: mpsc::Sender<BusySource>,
@@ -163,6 +168,7 @@ pub fn spawn<B: Backend>(
                     LoadParts {
                         backend: backend.clone(),
                         store: store.clone(),
+                        bound,
                         fetch: fetch_tx.clone(),
                         headroom: headroom.clone(),
                         busy_reg: busy_reg.clone(),
@@ -298,6 +304,9 @@ fn retryable(message: String, pipeline: Option<Pipeline>) -> LoadFail {
 struct LoadParts<B: Backend> {
     backend: Arc<B>,
     store: Arc<ModelStore>,
+    /// The cap on the wait for the ANE thread's `counted` and `loaded`
+    /// reports.
+    bound: Duration,
     fetch: watch::Sender<Fetch>,
     headroom: watch::Receiver<Headroom>,
     busy_reg: mpsc::Sender<BusySource>,
@@ -309,6 +318,7 @@ async fn load<B: Backend>(parts: LoadParts<B>, mut cancel: oneshot::Receiver<()>
     let LoadParts {
         backend,
         store,
+        bound,
         fetch,
         headroom,
         busy_reg,
@@ -327,15 +337,20 @@ async fn load<B: Backend>(parts: LoadParts<B>, mut cancel: oneshot::Receiver<()>
     let ane::AneThread {
         counted,
         sched: ane_sched,
+        stage,
         loaded,
         exited: ane_exited,
     } = ane::spawn(backend.clone(), dir.clone(), model_id.clone());
-    let (counter, buckets) = match counted.await {
-        Ok(Ok(out)) => out,
-        Ok(Err(message)) => {
+    // One deadline covers every wait on the thread's reports: a load past
+    // `bound` fails with the stage `stage` last reported.
+    let deadline = tokio::time::Instant::now() + bound;
+    let (counter, buckets) = match tokio::time::timeout_at(deadline, counted).await {
+        Err(_) => return Err(timed_out(bound, *stage.borrow())),
+        Ok(Ok(Ok(out))) => out,
+        Ok(Ok(Err(message))) => {
             return Err(retryable(message, Some(Pipeline::just_ane(ane_exited))));
         }
-        Err(_) => {
+        Ok(Err(_)) => {
             return Err(retryable(
                 "the ANE thread went away".to_owned(),
                 Some(Pipeline::just_ane(ane_exited)),
@@ -373,7 +388,6 @@ async fn load<B: Backend>(parts: LoadParts<B>, mut cancel: oneshot::Receiver<()>
         busy: sched_busy_tx,
         ane_exited: ane_exited.clone(),
     });
-    let _ = ane_sched.send(sched.tx());
     let make = |handle: SchedulerHandle,
                 exited: oneshot::Receiver<Vec<oneshot::Receiver<()>>>,
                 ane_exited: watch::Receiver<bool>| {
@@ -382,25 +396,49 @@ async fn load<B: Backend>(parts: LoadParts<B>, mut cancel: oneshot::Receiver<()>
             ane_exited,
         }
     };
-    match loaded.await {
-        Err(_) => Err(retryable(
+    match tokio::time::timeout_at(deadline, loaded).await {
+        // The thread is still inside the call that timed out, so the
+        // attempt reports `pipeline: None` rather than a pipeline it
+        // cannot stop: `sched` and the unsent `ane_sched` drop here, which
+        // ends the scheduler and makes a late return exit the thread; a
+        // permanently wedged call dies with the daemon's fatal exit.
+        Err(_) => Err(timed_out(bound, *stage.borrow())),
+        Ok(Err(_)) => Err(retryable(
             "the ANE thread went away".to_owned(),
             Some(make(sched, sched_exited, ane_exited)),
         )),
-        Ok(Err(message)) => Err(LoadFail::Fatal {
+        Ok(Ok(Err(message))) => Err(LoadFail::Fatal {
             message,
             pipeline: Some(make(sched, sched_exited, ane_exited)),
         }),
-        Ok(Ok(_thread)) => Ok((
-            Arc::new(Model {
-                id: model_id,
-                dir,
-                counter: Arc::new(counter),
-                buckets,
-                scheduler: sched.clone(),
-            }),
-            make(sched, sched_exited, ane_exited),
-        )),
+        Ok(Ok(Ok(_thread))) => {
+            // The thread waits on its scheduler handoff after reporting
+            // `loaded`; it is handed over only once the load is confirmed.
+            let _ = ane_sched.send(sched.tx());
+            Ok((
+                Arc::new(Model {
+                    id: model_id,
+                    dir,
+                    counter: Arc::new(counter),
+                    buckets,
+                    scheduler: sched.clone(),
+                }),
+                make(sched, sched_exited, ane_exited),
+            ))
+        }
+    }
+}
+
+/// The load outlived `bound` while in `stage`: fatal — the client gets the
+/// error and no `Retry` restarts the attempt.
+fn timed_out(bound: Duration, stage: LoadStage) -> LoadFail {
+    tracing::error!(%stage, bound_s = bound.as_secs(), "the model load timed out");
+    LoadFail::Fatal {
+        message: format!(
+            "the model load exceeded the {}s bound during {stage}",
+            bound.as_secs()
+        ),
+        pipeline: None,
     }
 }
 

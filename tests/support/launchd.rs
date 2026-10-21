@@ -175,6 +175,7 @@ impl Owner {
                 store,
                 self.backend.clone(),
                 Duration::from_secs(600),
+                repo_search::daemon::LOAD_BOUND,
                 self.build,
             ))
         };

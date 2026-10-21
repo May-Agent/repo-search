@@ -14,7 +14,7 @@ use repo_search_core::qos::{self, QosClass};
 use tokio::sync::{mpsc, oneshot, watch};
 
 use super::scheduler::{AneJob, EmbedError, QueryJob, SchedulerMsg};
-use super::{Backend, CounterLoad};
+use super::{Backend, CounterLoad, LoadStage};
 
 /// The running ANE thread.
 pub struct AneThread<C> {
@@ -24,6 +24,10 @@ pub struct AneThread<C> {
     /// The scheduler's inbox goes here once it is spawned; dropping it
     /// exits the thread once `loaded` was sent.
     pub sched: oneshot::Sender<mpsc::Sender<SchedulerMsg>>,
+    /// Where the load is: `Counter` first, `Open` once `open_ane` starts,
+    /// and `WarmUp` once the model is open and the buckets warm — the
+    /// stage a timed-out load names.
+    pub stage: watch::Receiver<LoadStage>,
     /// Resolves once `open_ane` returned: the thread's [`qos::ThreadId`], or
     /// the load error's message.
     pub loaded: oneshot::Receiver<Result<qos::ThreadId, String>>,
@@ -41,6 +45,7 @@ pub struct AneThread<C> {
 pub fn spawn<B: Backend>(backend: Arc<B>, dir: PathBuf, model_id: String) -> AneThread<B::Counter> {
     let (counted_tx, counted) = oneshot::channel();
     let (sched_tx, sched_rx) = oneshot::channel();
+    let (stage_tx, stage) = watch::channel(LoadStage::Counter);
     let (loaded_tx, loaded) = oneshot::channel();
     let (exited_tx, exited) = watch::channel(false);
     std::thread::Builder::new()
@@ -52,6 +57,7 @@ pub fn spawn<B: Backend>(backend: Arc<B>, dir: PathBuf, model_id: String) -> Ane
                 &model_id,
                 counted_tx,
                 sched_rx,
+                stage_tx,
                 loaded_tx,
             );
             let _ = exited_tx.send(true);
@@ -60,6 +66,7 @@ pub fn spawn<B: Backend>(backend: Arc<B>, dir: PathBuf, model_id: String) -> Ane
     AneThread {
         counted,
         sched: sched_tx,
+        stage,
         loaded,
         exited,
     }
@@ -71,6 +78,7 @@ fn run<B: Backend>(
     model_id: &str,
     counted: oneshot::Sender<CounterLoad<B::Counter, String>>,
     sched_rx: oneshot::Receiver<mpsc::Sender<SchedulerMsg>>,
+    stage: watch::Sender<LoadStage>,
     loaded: oneshot::Sender<Result<qos::ThreadId, String>>,
 ) {
     let loaded_out = match backend.load_counter(dir) {
@@ -83,13 +91,21 @@ fn run<B: Backend>(
     if counted.send(Ok(loaded_out)).is_err() {
         return;
     }
-    let mut embedder = match backend.open_ane(dir, model_id) {
+    stage.send_replace(LoadStage::Open);
+    tracing::info!(model = %model_id, "loading the ANE model instance");
+    let started = Instant::now();
+    let mut embedder = match backend.open_ane(dir, model_id, &stage) {
         Ok(embedder) => embedder,
         Err(error) => {
             let _ = loaded.send(Err(error.to_string()));
             return;
         }
     };
+    tracing::info!(
+        model = %model_id,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "the ANE model instance loaded"
+    );
     let me = qos::ThreadId::current();
     let _ = loaded.send(Ok(me));
     // The job's QoS applies only around its embed call; the pull and the

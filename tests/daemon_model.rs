@@ -55,6 +55,7 @@ async fn stage_1_query_on_the_ane() {
     let daemon = tokio::spawn(daemon::run(Config {
         listener,
         idle_exit: Duration::from_secs(600),
+        load_bound: daemon::LOAD_BOUND,
         model_store: store,
         backend: Arc::new(CoreMlBackend),
         build: client::build(),
@@ -174,6 +175,7 @@ async fn daemon_host_coreml() {
     daemon::run(Config {
         listener,
         idle_exit: Duration::from_secs(3600),
+        load_bound: daemon::LOAD_BOUND,
         model_store: store,
         backend: Arc::new(CoreMlBackend),
         build: client::build(),

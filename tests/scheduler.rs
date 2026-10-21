@@ -81,6 +81,7 @@ async fn rig(ane_delay: Duration, gpu_delay: Duration, gated: &[Instance]) -> Ri
     let ane::AneThread {
         counted,
         sched: ane_sched,
+        stage: _,
         loaded,
         exited,
     } = ane::spawn(
