@@ -4,7 +4,8 @@
 //! `Retriever`'s `&mut` search requires. It owns the index, the retriever
 //! built on [`AneHandle`], the last barrier's report, the FSEvents watcher,
 //! the HEAD commit and the index phase, and runs the freshness barrier,
-//! whose changes its feeder orders into the scheduler.
+//! whose changes its feeder orders into the scheduler. Its spawned
+//! `index --wait` tasks read coverage off its books by asking it.
 
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
@@ -12,9 +13,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use repo_search_core::qos::performance_cores;
-use repo_search_core::reconcile::{self, PendingChunk, Reconciler, Report};
+use repo_search_core::reconcile::{self, Counts, PendingChunk, Reconciler, Report};
 use repo_search_core::search::{self, EmbedService, Reconciliation, Retriever};
-use repo_search_core::store::{ContentHash, Index, Phase, VectorCache};
+use repo_search_core::store::{Index, Phase, VectorCache};
 use repo_search_core::{CHUNKER_FINGERPRINT, QueryTask, TokenCounter, UnitVector};
 use tokio::sync::{mpsc, oneshot, watch};
 
@@ -24,6 +25,7 @@ use crate::protocol::{
 };
 
 use super::Backend;
+use super::coverage::{self, Ask, AskError, Asker};
 use super::feed::{self, Feed, FeedMsg, FeederConfig};
 use super::model::{Model, ModelState};
 use super::registry::RegistryHandle;
@@ -133,7 +135,8 @@ struct Owner<B: Backend> {
     sync: Option<reconcile::Options>,
     /// Reconciles `index`, keeping its books between barriers; built at
     /// the first barrier or `Status` and dropped with the index handle it
-    /// holds. Its books answer `Status`'s coverage, and every barrier's
+    /// holds. Its books answer the coverage of `Status` and of
+    /// `index --wait`'s frames, and every barrier's
     /// presence is passed on to the retriever, which never reads the
     /// index's hashes itself.
     reconciler: Option<Reconciler>,
@@ -146,12 +149,17 @@ struct Owner<B: Backend> {
     phase_tx: watch::Sender<Phase>,
     /// The spawned `index --wait` tasks the owner has not yet seen finish.
     waits: tokio::task::JoinSet<()>,
+    /// Handed to each `index --wait` task; kept so `asks` never closes.
+    asker: Asker,
+    /// The waits' coverage asks, answered from the reconciler's books.
+    asks: mpsc::Receiver<Ask>,
 }
 
 impl<B: Backend> Owner<B> {
     fn new(config: OwnerConfig<B>, rx: mpsc::Receiver<OwnerMsg>) -> Self {
         let (stage1_tx, stage1_rx) = mpsc::channel(8);
         let (phase_tx, _) = watch::channel(Phase::FirstIndex);
+        let (asker, asks) = coverage::channel();
         Self {
             id: config.id,
             root: config.root,
@@ -180,6 +188,8 @@ impl<B: Backend> Owner<B> {
             stage1_rx,
             phase_tx,
             waits: tokio::task::JoinSet::new(),
+            asker,
+            asks,
         }
     }
 
@@ -194,6 +204,9 @@ impl<B: Backend> Owner<B> {
                     }
                     self.apply_stage1_done().await;
                 }
+                // Before the inbox: a frame's ask is cheap, and a stream of
+                // requests must not hold a wait's frames back.
+                Some(ask) = self.asks.recv() => self.answer(ask).await,
                 msg = self.rx.recv() => {
                     let Some(msg) = msg else { break 'run };
                     let events = msg.events();
@@ -247,7 +260,8 @@ impl<B: Backend> Owner<B> {
         }
         // The owner does not leave while a spawned `index --wait` is still
         // answering. A wait parked on the phase watch completes only once
-        // its `Stage1Done` is applied, so the drain keeps consuming it.
+        // its `Stage1Done` is applied, and a wait's frames and `Indexed`
+        // are counted off the books, so the drain keeps serving both.
         let mut stage1_open = true;
         while !self.waits.is_empty() {
             tokio::select! {
@@ -257,6 +271,7 @@ impl<B: Backend> Owner<B> {
                         None => stage1_open = false,
                     }
                 }
+                Some(ask) = self.asks.recv() => self.answer(ask).await,
                 joined = self.waits.join_next() => {
                     if joined.is_none() {
                         break;
@@ -604,13 +619,12 @@ impl<B: Backend> Owner<B> {
                 return;
             }
         };
-        let total = report.chunks_total;
         if !wait {
             let _ = send(
                 events,
                 Event::Final(Final::Indexed {
                     with_vector: report.chunks_with_vector,
-                    total,
+                    total: report.chunks_total,
                 }),
             )
             .await;
@@ -624,13 +638,10 @@ impl<B: Backend> Owner<B> {
             sched: model.scheduler.clone(),
             worktree: self.id,
             ack: ack_rx,
-            index: self.index.as_ref().expect("opened").clone(),
-            cache: self.cache.clone().expect("opened above"),
+            coverage: self.asker.clone(),
             writer: self.writer.as_ref().expect("opened").clone(),
-            model_id: self.model_id.clone(),
             phase: self.phase_tx.subscribe(),
             stopping: self.stopping.clone(),
-            total,
         }));
     }
 
@@ -861,6 +872,14 @@ impl<B: Backend> Owner<B> {
         self.feeder.as_ref().expect("spawned above").clone()
     }
 
+    /// A spawned `index --wait`'s ask, answered from the books; an owner
+    /// whose index failed to reopen has none to answer from. The cache is
+    /// open: only an `Index` request, after `shared`, spawns a wait.
+    async fn answer(&mut self, ask: Ask) {
+        let reconciler = self.index.is_some().then(|| self.reconciler());
+        ask.answer(reconciler).await;
+    }
+
     /// The reconciler of the open index, built on first use; the index and
     /// cache are open by then.
     fn reconciler(&mut self) -> &mut Reconciler {
@@ -977,25 +996,20 @@ struct IndexWait {
     /// Resolves once the barrier's `Enqueue` is in the scheduler's inbox,
     /// or with why there is none.
     ack: oneshot::Receiver<Result<(), String>>,
-    /// The worktree's index handle.
-    index: Index,
-    /// The repository's vector cache, measured for coverage.
-    cache: VectorCache,
+    /// The owner's books, asked for each frame's and `Indexed`'s coverage;
+    /// the wait reads neither the index nor the cache itself.
+    coverage: Asker,
     /// The repository's writer, flushed before `Indexed` claims coverage.
     writer: WriterHandle,
-    /// The model-id vectors are stored under.
-    model_id: String,
     /// The owner's phase watch; `Maintained` releases a first-index wait.
     phase: watch::Receiver<Phase>,
     /// The daemon's shutdown flag.
     stopping: watch::Receiver<bool>,
-    /// The barrier report's `chunks_total`.
-    total: u64,
 }
 
 /// The tail of an `index --wait`, run off the owner: coverage frames while
 /// the scheduler drains the enqueue, the stage-1 completion off the phase
-/// watch, then the measured `Indexed`. Cancels on a client hang-up and
+/// watch, then the counted `Indexed`. Cancels on a client hang-up and
 /// answers `ShuttingDown` once the daemon begins stopping.
 async fn index_wait(wait: IndexWait) {
     let IndexWait {
@@ -1003,13 +1017,10 @@ async fn index_wait(wait: IndexWait) {
         sched,
         worktree,
         ack,
-        index,
-        cache,
+        coverage,
         writer,
-        model_id,
         mut phase,
         mut stopping,
-        total,
     } = wait;
     // The barrier's `Enqueue` must be in the scheduler's inbox before the
     // `WatchCounts` the ack orders it behind; then the watch's seed
@@ -1040,14 +1051,7 @@ async fn index_wait(wait: IndexWait) {
             return;
         }
     };
-    let hashes = match index.chunk_hashes(false).await {
-        Ok(hashes) => hashes,
-        Err(e) => {
-            send(&events, error(ErrorKind::Internal, e.to_string())).await;
-            return;
-        }
-    };
-    let mut sent: Option<u64> = None;
+    let mut sent: Option<(u64, u64)> = None;
     let mut last_send_at: Option<Instant> = None;
     let mut dirty = true;
     loop {
@@ -1060,27 +1064,24 @@ async fn index_wait(wait: IndexWait) {
         }
         let throttled = last_send_at.is_some_and(|at| at.elapsed() < COVERAGE_INTERVAL);
         if dirty && !throttled {
-            match measure(&cache, &model_id, &hashes).await {
-                Ok(with_vector) => {
-                    if sent != Some(with_vector) {
-                        if !send(
-                            &events,
-                            Event::Progress(Progress::Coverage { with_vector, total }),
-                        )
-                        .await
-                        {
-                            return;
-                        }
-                        sent = Some(with_vector);
-                        last_send_at = Some(Instant::now());
-                    }
-                    dirty = false;
-                }
-                Err(message) => {
-                    send(&events, error(ErrorKind::Internal, message)).await;
+            let Some(counts) = ask(&coverage, &events).await else {
+                return;
+            };
+            let frame = (counts.chunks_with_vector, counts.chunks_total);
+            if sent != Some(frame) {
+                let (with_vector, total) = frame;
+                if !send(
+                    &events,
+                    Event::Progress(Progress::Coverage { with_vector, total }),
+                )
+                .await
+                {
                     return;
                 }
+                sent = Some(frame);
+                last_send_at = Some(Instant::now());
             }
+            dirty = false;
             continue;
         }
         // Wait for a counts change or, while a report is pending, the
@@ -1133,29 +1134,40 @@ async fn index_wait(wait: IndexWait) {
             }
         }
     }
-    // `Indexed` is measured, not asserted: what the cache holds now.
-    match measure(&cache, &model_id, &hashes).await {
-        Ok(with_vector) => {
-            let _ = send(&events, Event::Final(Final::Indexed { with_vector, total })).await;
-        }
-        Err(message) => {
-            send(&events, error(ErrorKind::Internal, message)).await;
-        }
-    }
+    // `Indexed` is counted, not asserted: the books after the flush above,
+    // which see every vector it committed.
+    let Some(counts) = ask(&coverage, &events).await else {
+        return;
+    };
+    let _ = send(
+        &events,
+        Event::Final(Final::Indexed {
+            with_vector: counts.chunks_with_vector,
+            total: counts.chunks_total,
+        }),
+    )
+    .await;
 }
 
-/// Rows of `hashes` with a cached vector — the coverage count as
-/// reconcile computes it.
-async fn measure(
-    cache: &VectorCache,
-    model_id: &str,
-    hashes: &[ContentHash],
-) -> Result<u64, String> {
-    let cached = cache
-        .cached(model_id, hashes)
-        .await
-        .map_err(|e| e.to_string())?;
-    Ok(hashes.iter().filter(|hash| cached.contains(hash)).count() as u64)
+/// The owner's coverage count now; `None` once the reply's final event is
+/// sent or the client hung up. The owner answers between its requests, and
+/// in its shutdown drain until every wait is done, so only a hang-up cuts
+/// an ask short.
+async fn ask(coverage: &Asker, events: &mpsc::Sender<Event>) -> Option<Counts> {
+    tokio::select! {
+        counts = coverage.now() => match counts {
+            Ok(counts) => Some(counts),
+            Err(AskError::OwnerGone) => {
+                send(events, shutting_down()).await;
+                None
+            }
+            Err(AskError::Count(message)) => {
+                send(events, error(ErrorKind::Internal, message)).await;
+                None
+            }
+        },
+        _ = events.closed() => None,
+    }
 }
 
 /// Completes once `stopping` shows `true` or its sender is gone.
