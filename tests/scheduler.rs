@@ -40,7 +40,7 @@ struct Rig {
     /// The repository's vector cache, read back after a flush.
     cache: VectorCache,
     fatal: tokio::sync::mpsc::Receiver<Error>,
-    gates: BTreeMap<Instance, Arc<Barrier>>,
+    gates: BTreeMap<(Instance, usize), Arc<Barrier>>,
     /// The ANE thread, for reading its effective priority.
     ane_thread: qos::ThreadId,
     _monitor: StubMonitor,
@@ -49,20 +49,39 @@ struct Rig {
 }
 
 impl Rig {
-    /// The barrier `gate_first` installed for `instance`.
+    /// The barrier installed for `instance`'s first call.
     fn gate(&self, instance: Instance) -> &Barrier {
-        &self.gates[&instance]
+        self.gate_call(instance, 1)
+    }
+
+    /// The barrier `gate_call` installed for `instance`'s `call`-th call.
+    fn gate_call(&self, instance: Instance, call: usize) -> &Barrier {
+        &self.gates[&(instance, call)]
     }
 }
 
 async fn rig(ane_delay: Duration, gpu_delay: Duration, gated: &[Instance]) -> Rig {
+    rig_gated(
+        ane_delay,
+        gpu_delay,
+        &gated
+            .iter()
+            .map(|&instance| (instance, 1))
+            .collect::<Vec<_>>(),
+    )
+    .await
+}
+
+/// `rig` with a barrier on chosen calls: each `(instance, call)` gates
+/// `instance`'s `call`-th embed call (1-based over its `embed_*` calls).
+async fn rig_gated(ane_delay: Duration, gpu_delay: Duration, gated: &[(Instance, usize)]) -> Rig {
     let (record_tx, records) = mpsc::channel();
     let mut backend = StubBackend::new(record_tx);
     backend.set_instance_delay(Instance::Ane, ane_delay);
     backend.set_instance_delay(Instance::Gpu, gpu_delay);
-    let gates: BTreeMap<Instance, Arc<Barrier>> = gated
+    let gates: BTreeMap<(Instance, usize), Arc<Barrier>> = gated
         .iter()
-        .map(|&instance| (instance, backend.gate_first(instance)))
+        .map(|&(instance, call)| ((instance, call), backend.gate_call(instance, call)))
         .collect();
     let backend = Arc::new(backend);
 
@@ -799,8 +818,20 @@ async fn query_after_a_fatal_error_is_answered_and_the_scheduler_exits() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn counts_track_an_ane_pull_and_done() {
     // The ANE's first call — a query — is gated, so the enqueue's counts are
-    // exact before any index item is dispatched.
-    let rig = rig(Duration::from_millis(10), Duration::ZERO, &[Instance::Ane]).await;
+    // exact before any index item is dispatched. Every index call is gated
+    // too: the item its `Started` announces is provably in flight while the
+    // counts are read.
+    let rig = rig_gated(
+        Duration::from_millis(10),
+        Duration::ZERO,
+        &[
+            (Instance::Ane, 1),
+            (Instance::Ane, 2),
+            (Instance::Ane, 3),
+            (Instance::Ane, 4),
+        ],
+    )
+    .await;
     rig.backend
         .push_headroom(Err(GpuBlocked::NotMains("Battery Power".to_owned())));
     let query = send_query(&rig, "hold the pull").await;
@@ -821,10 +852,13 @@ async fn counts_track_an_ane_pull_and_done() {
     query.await.expect("query answered").expect("embeds fine");
     wait_started(&mut log, &rig.records, 2);
     assert_eq!(counts_of(&rig, WORKTREE).await, counts(2, 0, 1, false));
+    open(rig.gate_call(Instance::Ane, 2));
     wait_started(&mut log, &rig.records, 3);
     assert_eq!(counts_of(&rig, WORKTREE).await, counts(1, 0, 1, false));
+    open(rig.gate_call(Instance::Ane, 3));
     wait_started(&mut log, &rig.records, 4);
     assert_eq!(counts_of(&rig, WORKTREE).await, counts(0, 0, 1, false));
+    open(rig.gate_call(Instance::Ane, 4));
 
     tokio::time::timeout(TIMEOUT, done.recv())
         .await
@@ -886,8 +920,14 @@ async fn counts_track_a_gpu_batch_pull_and_done() {
 async fn counts_drop_a_re_enqueued_in_flight_item() {
     // The ANE's first call is gated, so a chunk is provably in flight when
     // the re-`Enqueue` drops it: the tally falls at once and the late
-    // `AneDone` changes nothing for this worktree.
-    let rig = rig(Duration::from_millis(10), Duration::ZERO, &[Instance::Ane]).await;
+    // `AneDone` changes nothing for this worktree. The second call is gated
+    // as well, holding its item in flight while its counts are read.
+    let rig = rig_gated(
+        Duration::from_millis(10),
+        Duration::ZERO,
+        &[(Instance::Ane, 1), (Instance::Ane, 2)],
+    )
+    .await;
     rig.backend
         .push_headroom(Err(GpuBlocked::NotMains("Battery Power".to_owned())));
     let _old_done = enqueue(
@@ -911,6 +951,7 @@ async fn counts_drop_a_re_enqueued_in_flight_item() {
     open(rig.gate(Instance::Ane));
     wait_started(&mut log, &rig.records, 2);
     assert_eq!(counts_of(&rig, WORKTREE).await, counts(0, 0, 1, false));
+    open(rig.gate_call(Instance::Ane, 2));
 
     tokio::time::timeout(TIMEOUT, done.recv())
         .await
@@ -923,8 +964,14 @@ async fn counts_drop_a_re_enqueued_in_flight_item() {
 async fn counts_are_per_worktree_on_a_shared_item() {
     const OTHER: WorktreeId = WorktreeId(2);
     // A gated query holds the ANE's first call, so both enqueues are counted
-    // before any dispatch.
-    let rig = rig(Duration::from_millis(10), Duration::ZERO, &[Instance::Ane]).await;
+    // before any dispatch; the second call's gate keeps the shared item in
+    // flight while the worktrees' counts are read.
+    let rig = rig_gated(
+        Duration::from_millis(10),
+        Duration::ZERO,
+        &[(Instance::Ane, 1), (Instance::Ane, 2)],
+    )
+    .await;
     rig.backend
         .push_headroom(Err(GpuBlocked::NotMains("Battery Power".to_owned())));
     let query = send_query(&rig, "hold the pull").await;
@@ -960,6 +1007,7 @@ async fn counts_are_per_worktree_on_a_shared_item() {
     wait_started(&mut log, &rig.records, 2);
     assert_eq!(counts_of(&rig, WORKTREE).await, counts(1, 0, 1, false));
     assert_eq!(counts_of(&rig, OTHER).await, counts(1, 0, 0, false));
+    open(rig.gate_call(Instance::Ane, 2));
 
     for done_rx in [&mut done, &mut other_done] {
         tokio::time::timeout(TIMEOUT, done_rx.recv())
@@ -974,8 +1022,14 @@ async fn counts_are_per_worktree_on_a_shared_item() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn counts_move_to_background_at_stage1_completion() {
     // `AneDone` is handled before the pull that follows it on the wire, so
-    // the next `Started` already shows the post-completion queues.
-    let rig = rig(Duration::from_millis(10), Duration::ZERO, &[]).await;
+    // the next `Started` already shows the post-completion queues. Both
+    // calls are gated: each counts read sees a provably in-flight item.
+    let rig = rig_gated(
+        Duration::from_millis(10),
+        Duration::ZERO,
+        &[(Instance::Ane, 1), (Instance::Ane, 2)],
+    )
+    .await;
     // The completed items embed at background QoS, which a loaded host can
     // starve: lift the thread's effective priority for the run — its
     // requested class stays Background.
@@ -1000,13 +1054,16 @@ async fn counts_move_to_background_at_stage1_completion() {
     assert_eq!(counts_of(&rig, WORKTREE).await, counts(2, 0, 1, false));
 
     // Completion moves the large items to background, and the next pull
-    // already draws from there.
+    // already draws from there: the gate holds it in flight while the
+    // counts are read.
+    open(rig.gate(Instance::Ane));
     tokio::time::timeout(TIMEOUT, done.recv())
         .await
         .expect("stage 1 completes")
         .expect("stage-1 channel open");
     wait_started(&mut log, &rig.records, 2);
     assert_eq!(counts_of(&rig, WORKTREE).await, counts(0, 1, 1, true));
+    open(rig.gate_call(Instance::Ane, 2));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1058,9 +1115,14 @@ async fn a_documents_job_takes_its_queued_twin_out_of_the_queue() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn watch_counts_seeds_and_pushes_counts() {
-    // The ANE's first call is gated, so every pushed count is one the
-    // scheduler provably holds.
-    let rig = rig(Duration::from_millis(10), Duration::ZERO, &[Instance::Ane]).await;
+    // Both ANE calls are gated, so every pushed count is one the scheduler
+    // provably holds.
+    let rig = rig_gated(
+        Duration::from_millis(10),
+        Duration::ZERO,
+        &[(Instance::Ane, 1), (Instance::Ane, 2)],
+    )
+    .await;
     rig.backend
         .push_headroom(Err(GpuBlocked::NotMains("Battery Power".to_owned())));
     let _old_done = enqueue(&rig, vec![pending(0, 100)], IndexClass::Stage1).await;
@@ -1094,6 +1156,7 @@ async fn watch_counts_seeds_and_pushes_counts() {
         .expect("watch open");
     assert_eq!(*watch.borrow_and_update(), counts(0, 0, 1, false));
     assert_eq!(counts_of(&rig, WORKTREE).await, *watch.borrow());
+    open(rig.gate_call(Instance::Ane, 2));
 
     tokio::time::timeout(TIMEOUT, done.recv())
         .await
