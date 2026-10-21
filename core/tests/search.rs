@@ -1,6 +1,7 @@
 //! End to end: a small synthetic worktree, the real index and cache, and a
 //! fake bag-of-words embedder.
 
+use std::cell::RefCell;
 use std::fs;
 use std::future::Future;
 use std::num::NonZeroUsize;
@@ -14,7 +15,7 @@ mod support;
 
 use counters::CapOff;
 use futures_executor::block_on;
-use repo_search_core::reconcile::{Options, PendingChunk, missing, reconcile};
+use repo_search_core::reconcile::{Options, PendingChunk, Reconciler, missing};
 use repo_search_core::search::{
     Channel, Error, FilterError, Filters, Mode, ON_THE_SPOT, Reconciliation, Request, Results,
     Retriever, TokenCounter,
@@ -217,15 +218,13 @@ impl Fixture {
 
         let index = block_on(Index::open(tree.path())).unwrap();
         let cache = block_on(VectorCache::open(common.path())).unwrap();
-        let reconciled = block_on(reconcile(
-            &index,
-            &cache,
-            MODEL,
-            CHUNKER_FINGERPRINT,
-            tree.path(),
-            Options::default(),
-            Arc::new(CapOff),
-        ))
+        let reconciled = block_on(
+            Reconciler::new(index.clone(), cache.clone(), MODEL, tree.path()).reconcile(
+                CHUNKER_FINGERPRINT,
+                Options::default(),
+                Arc::new(CapOff),
+            ),
+        )
         .unwrap();
         let code_pending = block_on(missing(
             &index,
@@ -1008,13 +1007,15 @@ fn alternating_searches_show_ignored_files_only_when_asked() {
     .unwrap();
     let index = block_on(Index::open(tree.path())).unwrap();
     let cache = block_on(VectorCache::open(common.path())).unwrap();
+    let reconciler = RefCell::new(Reconciler::new(
+        index.clone(),
+        cache.clone(),
+        MODEL,
+        tree.path(),
+    ));
     let pass = |include_ignored| {
-        block_on(reconcile(
-            &index,
-            &cache,
-            MODEL,
+        block_on(reconciler.borrow_mut().reconcile(
             CHUNKER_FINGERPRINT,
-            tree.path(),
             Options { include_ignored },
             Arc::new(CapOff),
         ))
