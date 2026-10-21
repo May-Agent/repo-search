@@ -11,7 +11,7 @@ use std::sync::mpsc;
 use std::sync::{Arc, Barrier, OnceLock};
 use std::time::{Duration, Instant};
 
-use repo_search::daemon::{Backend, GpuOpen, Headroom};
+use repo_search::daemon::{Backend, GpuOpen, Headroom, LoadStage};
 use repo_search_core::qos::{self, QosClass};
 use repo_search_core::store::ContentHash;
 use repo_search_core::{BatchEmbedder, Embedder, QueryTask, TokenCounter, UnitVector};
@@ -464,7 +464,12 @@ impl Backend for StubBackend {
         ))
     }
 
-    fn open_ane(&self, _: &Path, _: &str) -> Result<Self::Ane, Self::LoadError> {
+    fn open_ane(
+        &self,
+        _: &Path,
+        _: &str,
+        _: &tokio::sync::watch::Sender<LoadStage>,
+    ) -> Result<Self::Ane, Self::LoadError> {
         let _ = self.ane_thread.set(qos::ThreadId::current());
         self.ane_opens.fetch_add(1, Ordering::Relaxed);
         if let Some(hold) = &self.open_ane_hold {

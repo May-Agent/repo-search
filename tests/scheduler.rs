@@ -100,6 +100,7 @@ async fn rig_gated(ane_delay: Duration, gpu_delay: Duration, gated: &[(Instance,
     let ane::AneThread {
         counted,
         sched: ane_sched,
+        stage: _,
         loaded,
         exited,
     } = ane::spawn(

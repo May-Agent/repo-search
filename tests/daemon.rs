@@ -112,7 +112,14 @@ async fn start(
     } else {
         Arc::new(Barrier::new(1))
     };
-    let d = daemon(tmp, backend, Model::Cached, Duration::from_secs(600)).await;
+    let d = daemon(
+        tmp,
+        backend,
+        Model::Cached,
+        Duration::from_secs(600),
+        daemon::LOAD_BOUND,
+    )
+    .await;
     (d, ane_gate, gpu_gate)
 }
 
@@ -129,7 +136,14 @@ async fn start_index_gated(ane: Duration) -> (Daemon, Arc<IndexGate>) {
     let mut backend = StubBackend::new(mpsc::channel().0);
     backend.set_instance_delay(Instance::Ane, ane);
     let gate = backend.gate_first_index(Instance::Ane);
-    let d = daemon(tmp, backend, Model::Cached, Duration::from_secs(600)).await;
+    let d = daemon(
+        tmp,
+        backend,
+        Model::Cached,
+        Duration::from_secs(600),
+        daemon::LOAD_BOUND,
+    )
+    .await;
     (d, gate)
 }
 
@@ -193,7 +207,14 @@ async fn query_preempts_indexing() {
     // Once armed, holds the feeder's next token count: a feed found by the
     // search's barrier never reaches the scheduler while the search runs.
     let feed = backend.hold_document_tokens();
-    let d = daemon(tmp, backend, Model::Cached, Duration::from_secs(600)).await;
+    let d = daemon(
+        tmp,
+        backend,
+        Model::Cached,
+        Duration::from_secs(600),
+        daemon::LOAD_BOUND,
+    )
+    .await;
 
     // Stage 1 completes first: every later chunk is stage-2 work, which the
     // ANE runs at background QoS, the class a queued query lifts.
@@ -653,7 +674,14 @@ async fn search_answers_during_index_wait() {
     let mut backend = StubBackend::new(mpsc::channel().0);
     backend.set_instance_delay(Instance::Ane, Duration::from_millis(10));
     let gate = backend.gate_first_index(Instance::Gpu);
-    let d = daemon(tmp, backend, Model::Cached, Duration::from_secs(600)).await;
+    let d = daemon(
+        tmp,
+        backend,
+        Model::Cached,
+        Duration::from_secs(600),
+        daemon::LOAD_BOUND,
+    )
+    .await;
 
     // Armed before the GPU is unblocked: its first Index call holds, and
     // stage 1 can never finish, so the wait cannot complete.
@@ -945,7 +973,14 @@ async fn idle_exit() {
     let repo = fn_repo(30, SMALL_BYTES, 10);
     let tmp = tempfile::tempdir().expect("tempdir");
     let backend = StubBackend::new(mpsc::channel().0);
-    let d = daemon(tmp, backend, Model::Cached, Duration::from_secs(2)).await;
+    let d = daemon(
+        tmp,
+        backend,
+        Model::Cached,
+        Duration::from_secs(2),
+        daemon::LOAD_BOUND,
+    )
+    .await;
     answer_search(&d, &repo.root, MARKER).await;
     // Nothing is queued, buffered or in flight once the index is complete,
     // so only the idle deadline remains.
@@ -972,7 +1007,14 @@ async fn idle_exit() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let mut backend = StubBackend::new(mpsc::channel().0);
     backend.set_instance_delay(Instance::Ane, Duration::from_millis(100));
-    let d = daemon(tmp, backend, Model::Cached, Duration::from_secs(2)).await;
+    let d = daemon(
+        tmp,
+        backend,
+        Model::Cached,
+        Duration::from_secs(2),
+        daemon::LOAD_BOUND,
+    )
+    .await;
     let events = request(
         &d.socket,
         &hello(),
@@ -1028,6 +1070,7 @@ async fn protocol_mismatch_shuts_down() {
         StubBackend::new(mpsc::channel().0),
         Model::Cached,
         Duration::from_secs(600),
+        daemon::LOAD_BOUND,
     )
     .await;
 
@@ -1055,6 +1098,7 @@ async fn build_mismatch_shuts_down() {
         StubBackend::new(mpsc::channel().0),
         Model::Cached,
         Duration::from_secs(600),
+        daemon::LOAD_BOUND,
     )
     .await;
 
@@ -1087,7 +1131,14 @@ async fn shutdown_during_open_ane_joins_the_thread() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let mut backend = StubBackend::new(mpsc::channel().0);
     let hold = backend.hold_open_ane();
-    let d = daemon(tmp, backend, Model::Cached, Duration::from_secs(600)).await;
+    let d = daemon(
+        tmp,
+        backend,
+        Model::Cached,
+        Duration::from_secs(600),
+        daemon::LOAD_BOUND,
+    )
+    .await;
 
     // The ANE thread is inside `open_ane` when the shutdown begins.
     tokio::task::block_in_place(|| {
@@ -1128,6 +1179,7 @@ async fn shutdown_during_download_leaves_no_model_dir() {
             sha: digest_of(&body),
         },
         Duration::from_secs(600),
+        daemon::LOAD_BOUND,
     )
     .await;
 
@@ -1180,7 +1232,14 @@ async fn dropped_client_still_completes_the_barrier() {
     let mut backend = StubBackend::new(mpsc::channel().0);
     // The counter is called inside `reconcile`, which the barrier awaits.
     let hold = backend.hold_counter();
-    let d = daemon(tmp, backend, Model::Cached, Duration::from_secs(1)).await;
+    let d = daemon(
+        tmp,
+        backend,
+        Model::Cached,
+        Duration::from_secs(1),
+        daemon::LOAD_BOUND,
+    )
+    .await;
 
     let stream = stream_request(&d.socket, &hello(), search(&repo.root, MARKER)).await;
     // The search is inside its barrier when the counter is entered.
@@ -1216,6 +1275,7 @@ async fn silent_client_dropped_at_hello_deadline() {
         StubBackend::new(mpsc::channel().0),
         Model::Cached,
         Duration::from_secs(1),
+        daemon::LOAD_BOUND,
     )
     .await;
 
@@ -1248,7 +1308,14 @@ async fn fatal_open_ane_fails_the_request() {
     // than racing the daemon's close.
     let hold = backend.hold_open_ane();
     backend.fail_ane_open();
-    let d = daemon(tmp, backend, Model::Cached, Duration::from_secs(600)).await;
+    let d = daemon(
+        tmp,
+        backend,
+        Model::Cached,
+        Duration::from_secs(600),
+        daemon::LOAD_BOUND,
+    )
+    .await;
     let backend = d.backend.clone();
 
     tokio::task::block_in_place(|| {
@@ -1287,6 +1354,72 @@ async fn fatal_open_ane_fails_the_request() {
     assert_eq!(backend.ane_opens(), 1, "a fatal open_ane is never retried");
 }
 
+/// An `open_ane` that outlives the load bound is answered `Model` with the
+/// stage it stopped in — a final error frame, not a silent timeout — and
+/// shuts the daemon down without a retry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn load_past_the_bound_fails_with_the_stage() {
+    let repo = fn_repo(5, SMALL_BYTES, 10);
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let mut backend = StubBackend::new(mpsc::channel().0);
+    // `hold_open_ane` parks the ANE thread inside `open_ane`; the hold is
+    // released only after the error lands, so the bound is what ends the
+    // wait.
+    let hold = backend.hold_open_ane();
+    let d = daemon(
+        tmp,
+        backend,
+        Model::Cached,
+        Duration::from_secs(600),
+        Duration::from_secs(2),
+    )
+    .await;
+    let backend = d.backend.clone();
+
+    let mut stream = stream_request(&d.socket, &hello(), search(&repo.root, MARKER)).await;
+    loop {
+        match next_event(&mut stream).await {
+            Event::Progress(protocol::Progress::ModelLoading) => break,
+            Event::Final(f) => panic!("the request ended while the model loaded: {f:?}"),
+            _ => {}
+        }
+    }
+    // `entered` proves the thread is inside `open_ane`, so the stage is
+    // the model open, not the warm-up.
+    tokio::task::block_in_place(|| {
+        hold.entered
+            .recv_timeout(TIMEOUT)
+            .expect("open_ane is entered")
+    });
+    match final_event(&mut stream).await {
+        Final::Error(report) => {
+            assert_eq!(report.kind, ErrorKind::Model);
+            assert!(
+                report.message.contains("model open"),
+                "the timeout names the stage it stopped in: {}",
+                report.message
+            );
+        }
+        other => panic!("expected a Model error, got {other:?}"),
+    }
+    // The fatal failure takes the daemon down; releasing the parked call
+    // lets the ANE thread exit instead of leaking into the test runtime.
+    tokio::task::block_in_place(|| hold.open());
+    let outcome = tokio::time::timeout(TIMEOUT, d.join)
+        .await
+        .expect("run returns after the load timed out")
+        .expect("run task does not panic");
+    assert!(
+        matches!(outcome, Err(Error::Embedder(_))),
+        "the timed-out load is run's fatal error: {outcome:?}"
+    );
+    assert_eq!(
+        backend.ane_opens(),
+        1,
+        "a load past the bound is never retried"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn model_download_streams_progress() {
     let body = support::http::archive(&[("manifest.json", b"{}")]);
@@ -1303,6 +1436,7 @@ async fn model_download_streams_progress() {
             sha: digest_of(&body),
         },
         Duration::from_secs(600),
+        daemon::LOAD_BOUND,
     )
     .await;
 
@@ -1350,6 +1484,7 @@ async fn corrupt_model_download_is_rejected() {
             sha: digest_of(&good),
         },
         Duration::from_secs(600),
+        daemon::LOAD_BOUND,
     )
     .await;
 
@@ -1418,6 +1553,7 @@ async fn status_does_not_create_an_index() {
         StubBackend::new(mpsc::channel().0),
         Model::Cached,
         Duration::from_secs(600),
+        daemon::LOAD_BOUND,
     )
     .await;
 
@@ -1502,6 +1638,7 @@ async fn daemon_host() {
     daemon::run(Config {
         listener,
         idle_exit: Duration::from_secs(3600),
+        load_bound: daemon::LOAD_BOUND,
         model_store: store,
         backend: Arc::new(backend),
         build: support::client::build(),
@@ -2173,7 +2310,14 @@ async fn start_feed_held(ane: Duration) -> (Daemon, Arc<IndexGate>, HoldHandle) 
     backend.set_instance_delay(Instance::Ane, ane);
     let gate = backend.gate_first_index(Instance::Ane);
     let hold = backend.hold_document_tokens();
-    let d = daemon(tmp, backend, Model::Cached, Duration::from_secs(600)).await;
+    let d = daemon(
+        tmp,
+        backend,
+        Model::Cached,
+        Duration::from_secs(600),
+        daemon::LOAD_BOUND,
+    )
+    .await;
     (d, gate, hold)
 }
 

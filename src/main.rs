@@ -138,6 +138,7 @@ fn daemon_main(idle_exit: Duration, model_cache: Option<PathBuf>) -> ExitCode {
     match runtime.block_on(daemon::run(Config {
         listener,
         idle_exit,
+        load_bound: daemon::LOAD_BOUND,
         model_store,
         backend: Arc::new(CoreMlBackend),
         build,

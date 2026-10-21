@@ -70,12 +70,20 @@ pub trait Backend: Send + Sync + 'static {
 
     /// Opens the ANE instance; called on the ANE thread, which owns the
     /// returned embedder. Implementations warm every bucket before returning
-    /// so the first query does not pay a compile.
+    /// so the first query does not pay a compile. `stage` is already `Open`
+    /// on entry; an implementation sends [`LoadStage::WarmUp`] once the
+    /// model is open and the warm-up embeds begin, so a load that outlives
+    /// the bound names the stage it stopped in.
     ///
     /// # Errors
     ///
     /// When the model cannot be loaded.
-    fn open_ane(&self, dir: &Path, model_id: &str) -> Result<Self::Ane, Self::LoadError>;
+    fn open_ane(
+        &self,
+        dir: &Path,
+        model_id: &str,
+        stage: &tokio::sync::watch::Sender<LoadStage>,
+    ) -> Result<Self::Ane, Self::LoadError>;
 
     /// Opens the GPU instance; called on the GPU thread, which owns the
     /// returned embedder.
@@ -123,6 +131,37 @@ const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 /// The daemon exits after this long with no connections and no work.
 pub const IDLE_EXIT: Duration = Duration::from_secs(600);
 
+/// The model load — counter, open and warm-up — must report within this
+/// long. A cache-hit open takes seconds; a miss pays the system's ANE
+/// compile, which is unbounded under contention and was observed past
+/// 180 s. The bound is generous enough for a cold compile on a slow host
+/// while still failing a wedged load instead of waiting on it forever.
+pub const LOAD_BOUND: Duration = Duration::from_secs(300);
+
+/// Where the ANE thread's load is, reported over `AneThread`'s `stage`
+/// watch so a load that outlives [`LOAD_BOUND`] names the stage it stopped
+/// in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoadStage {
+    /// `load_counter` is reading the tokenizer and the manifest.
+    Counter,
+    /// `open_ane` is inside the compiled-model open — the ANE compile when
+    /// the system's compiled-model cache misses.
+    Open,
+    /// The model is open; the per-bucket warm-up embeds are running.
+    WarmUp,
+}
+
+impl std::fmt::Display for LoadStage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Counter => "the counter load",
+            Self::Open => "the model open",
+            Self::WarmUp => "the bucket warm-up",
+        })
+    }
+}
+
 /// A busy-source registration for the idle-exit tracker. Each source owns
 /// its `watch::Sender<bool>` — state, not transitions, so nothing is lost —
 /// and the aggregator receives the receiver once over this channel.
@@ -138,6 +177,9 @@ pub struct Config<B: Backend> {
     pub listener: UnixListener,
     /// Exit after this long with no connections and no work.
     pub idle_exit: Duration,
+    /// Fail the model load past this bound, naming the stage it stopped
+    /// in; [`LOAD_BOUND`] in production.
+    pub load_bound: Duration,
     /// The model cache; the loader starts `ensure` at once.
     pub model_store: ModelStore,
     /// The embedding backend.
@@ -194,6 +236,7 @@ pub async fn run<B: Backend>(config: Config<B>) -> Result<(), Error> {
     let loader = model::spawn(
         backend,
         Arc::new(config.model_store),
+        config.load_bound,
         headroom_rx,
         loader_busy_tx,
         busy_tx.clone(),

@@ -8,6 +8,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 
 use repo_search_core::BatchEmbedder;
 use repo_search_core::qos::{self, QosClass};
@@ -38,6 +39,8 @@ pub fn spawn<B: Backend>(
 
 fn run<B: Backend>(backend: &B, dir: &Path, model_id: &str, sched: &mpsc::Sender<SchedulerMsg>) {
     qos::set_current_thread(QosClass::UserInitiated);
+    tracing::info!(model = %model_id, "loading the GPU model instance");
+    let started = Instant::now();
     let mut embedder = match backend.open_gpu(dir, model_id) {
         Ok(embedder) => embedder,
         // Headroom changed between the scheduler's check and the open; not
@@ -54,6 +57,11 @@ fn run<B: Backend>(backend: &B, dir: &Path, model_id: &str, sched: &mpsc::Sender
             return;
         }
     };
+    tracing::info!(
+        model = %model_id,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "the GPU model instance loaded"
+    );
     if sched.blocking_send(SchedulerMsg::GpuStarted).is_err() {
         return;
     }
