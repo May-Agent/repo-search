@@ -5,7 +5,10 @@
 //! same-bucket batches) and the background queue. Indexing items are
 //! de-duplicated by `(repo, hash)` so worktrees of one repository share
 //! vectors. The ANE and GPU threads pull their next job over [`SchedulerMsg`];
-//! finished vectors go to the per-repository [`writer`].
+//! finished vectors go to the per-repository [`writer`]. A worktree's
+//! interest is replaced whole on a fresh or rescoped pass and edited by each
+//! later pass's changes, so a pass that changed nothing costs the scheduler
+//! nothing.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
@@ -66,7 +69,8 @@ pub struct PendingItem {
 #[derive(Debug)]
 pub struct Stage1Done;
 
-/// A worktree's indexing work, replacing what the scheduler holds for it.
+/// A worktree's indexing work. A worktree's `Enqueue`s are applied in the
+/// order sent, and its first one is an `Interest::Replace`.
 #[derive(Debug)]
 pub struct Enqueue {
     /// The worktree these items belong to.
@@ -75,17 +79,39 @@ pub struct Enqueue {
     pub repo: RepoId,
     /// `Stage1` while the worktree's index is in its first pass.
     pub class: IndexClass,
-    /// Per-worktree barrier counter; an `Enqueue` not newer than the last one
-    /// applied for this worktree is dropped.
-    pub generation: u64,
-    /// The pending chunks, each with its token count.
-    pub items: Vec<PendingItem>,
+    /// What the worktree now wants embedded.
+    pub interest: Interest,
     /// This repo's vector writer; the embedding threads hand it every
     /// finished vector directly, and stage-1 completion is reported only
     /// after it has flushed.
     pub writer: WriterHandle,
     /// Where stage-1 completion for `worktree` is announced.
     pub stage1_done: mpsc::Sender<Stage1Done>,
+}
+
+/// How an `Enqueue` changes the worktree's interest.
+///
+/// Each `Change` is computed from the index right after its own pass:
+/// `added` lists the hashes present in scope and uncached at that moment,
+/// `dropped` the hashes absent from scope at that moment. Feeds are applied
+/// in pass order, so for any hash the last feed that names it reflects the
+/// latest pass that changed its presence, and a `Replace` computed later
+/// than some queued `Change`s is corrected by them. A hash `missing` left
+/// out because its file changed after the pass is offered again by the next
+/// pass.
+#[derive(Debug)]
+pub enum Interest {
+    /// Every chunk of the worktree's scope that lacks a vector: replaces
+    /// what the scheduler holds for it.
+    Replace(Vec<PendingItem>),
+    /// One reconcile pass's changes, on top of the interest the previous
+    /// `Enqueue` left.
+    Change {
+        /// Chunks to want; already-wanted ones are a no-op.
+        added: Vec<PendingItem>,
+        /// Hashes to stop wanting; unknown or finished ones are a no-op.
+        dropped: Vec<ContentHash>,
+    },
 }
 
 /// A query's embedding request; query work preempts indexing on the ANE.
@@ -110,9 +136,6 @@ pub enum QueryJob {
     Documents {
         /// The worktree asking.
         worktree: WorktreeId,
-        /// The repository the chunks live in; queued index items with the
-        /// same `(repo, hash)` are dropped when the job completes.
-        repo: RepoId,
         /// The chunks to embed.
         chunks: Vec<PendingChunk>,
         /// When the job was handed to the scheduler.
@@ -249,7 +272,8 @@ pub enum GpuState {
 /// scheduler through this one channel.
 #[derive(Debug)]
 pub enum SchedulerMsg {
-    /// A worktree's indexing work, replacing its previous list.
+    /// A worktree's indexing work: a `Replace` or a `Change` of its
+    /// interest.
     Enqueue(Box<Enqueue>),
     /// A query job.
     Query(Box<QueryJob>),
@@ -293,6 +317,15 @@ pub enum SchedulerMsg {
     GpuDone {
         /// The completed items.
         items: Vec<ItemId>,
+    },
+    /// A `Documents` job's vectors are committed to `repo`'s cache: queued
+    /// items with these hashes are redundant and leave the queues; in-flight
+    /// ones finish normally.
+    DocumentsStored {
+        /// The repository whose cache holds the vectors.
+        repo: RepoId,
+        /// The committed hashes.
+        hashes: Vec<ContentHash>,
     },
     /// An embedder call or an `open_gpu` failed: fatal.
     EmbedderFailed {
@@ -402,6 +435,22 @@ impl SchedulerHandle {
             .await
             .map_err(|_| Closed)?;
         rx.await.map_err(|_| Closed)
+    }
+
+    /// Reports a `Documents` job's vectors committed to `repo`'s cache.
+    ///
+    /// # Errors
+    ///
+    /// When the scheduler is gone.
+    pub async fn documents_stored(
+        &self,
+        repo: RepoId,
+        hashes: Vec<ContentHash>,
+    ) -> Result<(), Closed> {
+        self.tx
+            .send(SchedulerMsg::DocumentsStored { repo, hashes })
+            .await
+            .map_err(|_| Closed)
     }
 
     /// Reports a worktree's freshness barrier running or ended; a running
@@ -514,14 +563,13 @@ impl Tally {
 struct Worktree {
     /// The last applied `Enqueue` class.
     class: IndexClass,
-    /// The last applied generation; `None` until the first `Enqueue`.
-    generation: Option<u64>,
     /// Stage-1 completion already ran.
     stage1_done: bool,
     /// Interested stage-1 items with `tokens <= STAGE1_MAX_TOKENS` still
     /// queued or in flight.
     stage1_left: usize,
-    /// The items the last applied `Enqueue` listed.
+    /// The items this worktree wants that the scheduler still holds: set by
+    /// a `Replace`, edited by each `Change`, shrunk as items finish.
     interest: HashSet<ItemId>,
     /// `interest` counted by queue.
     tally: Tally,
@@ -581,9 +629,6 @@ struct Scheduler<B: Backend> {
     /// Fires when the ANE thread exits: a thread that died before its first
     /// pull can never be answered `Stop`, and a panic unwinds past the send.
     ane_exited: watch::Receiver<bool>,
-    /// `(repo, hash)` pairs to drop from both queues when the in-flight
-    /// `Documents` query job completes.
-    in_flight_docs: Vec<(RepoId, ContentHash)>,
     gpu: Gpu,
     /// Exit receivers of every GPU thread ever spawned; handed to the
     /// caller at exit so it can join them without blocking the executor.
@@ -675,7 +720,6 @@ pub fn spawn<B: Backend>(
         ane_override: None,
         ane_stopped: false,
         ane_exited,
-        in_flight_docs: Vec::new(),
         gpu: Gpu::Absent,
         gpu_exited: Vec::new(),
         exit_tx: Some(exit_tx),
@@ -775,6 +819,11 @@ impl<B: Backend> Scheduler<B> {
                     self.item_done(item);
                 }
             }
+            SchedulerMsg::DocumentsStored { repo, hashes } => {
+                for hash in hashes {
+                    self.remove_queued(repo, hash);
+                }
+            }
             SchedulerMsg::EmbedderFailed { error } => self.on_fatal(error).await,
             SchedulerMsg::TakeStats { worktree, reply } => {
                 let _ = reply.send(self.stats.remove(&worktree).unwrap_or_default());
@@ -864,21 +913,42 @@ impl<B: Backend> Scheduler<B> {
             && self.headroom.borrow().is_ok()
     }
 
-    /// Pops a worktree's stage-1 items with `tokens <= max` still pending.
+    /// Applies a worktree's `Enqueue`: a `Replace` or a `Change` of its
+    /// interest.
     fn on_enqueue(&mut self, enqueue: Enqueue) {
         let Enqueue {
             worktree,
             repo,
             class,
-            generation,
-            items: pending,
+            interest,
             writer,
             stage1_done,
         } = enqueue;
         self.writers.entry(repo).or_insert(writer);
-        let state = self.worktrees.entry(worktree).or_insert_with(|| Worktree {
+        match interest {
+            Interest::Replace(items) => {
+                self.replace_interest(worktree, repo, class, items, stage1_done)
+            }
+            Interest::Change { added, dropped } => {
+                self.change_interest(worktree, repo, class, added, dropped)
+            }
+        }
+        self.maybe_complete_stage1(worktree);
+    }
+
+    /// A `Replace` re-lists the worktree's whole interest: drop what it no
+    /// longer names, then add what it does.
+    fn replace_interest(
+        &mut self,
+        worktree: WorktreeId,
+        repo: RepoId,
+        class: IndexClass,
+        items: Vec<PendingItem>,
+        stage1_done: mpsc::Sender<Stage1Done>,
+    ) {
+        let keep: HashSet<ContentHash> = items.iter().map(|item| item.chunk.content_hash).collect();
+        self.worktrees.entry(worktree).or_insert_with(|| Worktree {
             class,
-            generation: None,
             stage1_done: false,
             stage1_left: 0,
             interest: HashSet::new(),
@@ -886,13 +956,24 @@ impl<B: Backend> Scheduler<B> {
             repo,
             stage1_done_tx: stage1_done.clone(),
         });
-        if state.generation.is_some_and(|prev| generation <= prev) {
-            return;
+        let old: Vec<ItemId> = self.worktrees[&worktree].interest.iter().copied().collect();
+        for item in old {
+            if !keep.contains(&self.items[&item].hash) {
+                self.worktrees
+                    .get_mut(&worktree)
+                    .expect("the worktree exists")
+                    .interest
+                    .remove(&item);
+                self.lose_interest(worktree, item);
+            }
         }
-        let adds_small = pending
+        let adds_small = items
             .iter()
             .any(|item| item.tokens as usize <= STAGE1_MAX_TOKENS);
-        state.generation = Some(generation);
+        let state = self
+            .worktrees
+            .get_mut(&worktree)
+            .expect("the worktree exists");
         state.class = class;
         // A `Stage1` enqueue that adds no small item keeps a past completion:
         // `Stage1Done` is sent once per stage-1 pass, not once per enqueue.
@@ -901,67 +982,150 @@ impl<B: Backend> Scheduler<B> {
         }
         state.repo = repo;
         state.stage1_done_tx = stage1_done;
-
-        let old = std::mem::take(&mut state.interest);
-        let mut interest = HashSet::with_capacity(pending.len());
-        for PendingItem { chunk, tokens } in pending {
-            let key = (repo, chunk.content_hash);
-            let item = match self.by_hash.get(&key) {
-                Some(&item) => item,
-                None => {
-                    let item = self.next_item;
-                    self.next_item += 1;
-                    let queue = match class {
-                        IndexClass::Stage1 => Queue::Stage1,
-                        IndexClass::Background => Queue::Background,
-                    };
-                    self.queue_mut(queue).insert((tokens, item), ());
-                    self.items.insert(
-                        item,
-                        Item {
-                            repo,
-                            hash: chunk.content_hash,
-                            chunk,
-                            tokens,
-                            class,
-                            queue,
-                            worktrees: Vec::new(),
-                        },
-                    );
-                    self.by_hash.insert(key, item);
-                    item
-                }
-            };
-            let entry = self.items.get_mut(&item).expect("queued item exists");
-            if !entry.worktrees.contains(&worktree) {
-                entry.worktrees.push(worktree);
-                self.worktrees
-                    .get_mut(&worktree)
-                    .expect("the worktree exists")
-                    .tally
-                    .add(entry.queue);
-            }
-            interest.insert(item);
+        for item in items {
+            self.add_interest(worktree, repo, class, item);
+        }
+        let interest: Vec<ItemId> = self.worktrees[&worktree].interest.iter().copied().collect();
+        for item in interest {
             self.refresh_class(item);
         }
-        for item in old {
-            if !interest.contains(&item) {
-                self.lose_interest(worktree, item);
-            }
-        }
-        self.recompute_stage1_left(worktree, &interest);
-        self.worktrees
-            .get_mut(&worktree)
-            .expect("inserted above")
-            .interest = interest;
-        self.maybe_complete_stage1(worktree);
+        self.recompute_stage1_left(worktree);
     }
 
-    /// Recomputes `stage1_left` for `worktree` from its new interest list; an
+    /// A `Change` edits the interest the previous `Enqueue` left: drop under
+    /// the old counting, then add under the new class.
+    fn change_interest(
+        &mut self,
+        worktree: WorktreeId,
+        repo: RepoId,
+        class: IndexClass,
+        added: Vec<PendingItem>,
+        dropped: Vec<ContentHash>,
+    ) {
+        let was_active = self
+            .worktrees
+            .get_mut(&worktree)
+            .expect("a worktree's first Enqueue is a Replace")
+            .stage1_active();
+        for hash in dropped {
+            let Some(&item) = self.by_hash.get(&(repo, hash)) else {
+                continue;
+            };
+            if !self
+                .worktrees
+                .get_mut(&worktree)
+                .expect("the worktree exists")
+                .interest
+                .remove(&item)
+            {
+                continue;
+            }
+            self.lose_interest(worktree, item);
+        }
+        {
+            let state = self
+                .worktrees
+                .get_mut(&worktree)
+                .expect("the worktree exists");
+            state.class = class;
+            if class == IndexClass::Stage1
+                && added
+                    .iter()
+                    .any(|item| item.tokens as usize <= STAGE1_MAX_TOKENS)
+            {
+                state.stage1_done = false;
+            }
+        }
+        let flipped = self.worktrees[&worktree].stage1_active() != was_active;
+        for item in added {
+            self.add_interest(worktree, repo, class, item);
+        }
+        // A class refresh is needed only when the worktree's stage-1
+        // activity flipped: a late `Stage1` `Change` after completion, or
+        // the `Background` `Change` after `Stage1Done`.
+        if flipped {
+            let interest: Vec<ItemId> =
+                self.worktrees[&worktree].interest.iter().copied().collect();
+            for item in interest {
+                self.refresh_class(item);
+            }
+            self.recompute_stage1_left(worktree);
+        }
+    }
+
+    /// `worktree` wants `pending`: creates the `(repo, hash)` item when new,
+    /// and when the worktree was not yet interested adds it to the item, the
+    /// tally and `stage1_left`, then re-derives the item's class.
+    fn add_interest(
+        &mut self,
+        worktree: WorktreeId,
+        repo: RepoId,
+        class: IndexClass,
+        pending: PendingItem,
+    ) {
+        let PendingItem { chunk, tokens } = pending;
+        let key = (repo, chunk.content_hash);
+        let item = match self.by_hash.get(&key) {
+            Some(&item) => item,
+            None => {
+                let item = self.next_item;
+                self.next_item += 1;
+                let queue = match class {
+                    IndexClass::Stage1 => Queue::Stage1,
+                    IndexClass::Background => Queue::Background,
+                };
+                self.queue_mut(queue).insert((tokens, item), ());
+                self.items.insert(
+                    item,
+                    Item {
+                        repo,
+                        hash: chunk.content_hash,
+                        chunk,
+                        tokens,
+                        class,
+                        queue,
+                        worktrees: Vec::new(),
+                    },
+                );
+                self.by_hash.insert(key, item);
+                item
+            }
+        };
+        self.worktrees
+            .get_mut(&worktree)
+            .expect("the worktree exists")
+            .interest
+            .insert(item);
+        let entry = self.items.get_mut(&item).expect("queued item exists");
+        if entry.worktrees.contains(&worktree) {
+            return;
+        }
+        entry.worktrees.push(worktree);
+        let (queue, item_class, item_tokens) = (entry.queue, entry.class, entry.tokens);
+        // This item was not yet counted: add it under its queue as it sits
+        // now, before the refresh below may flip it.
+        let state = self
+            .worktrees
+            .get_mut(&worktree)
+            .expect("the worktree exists");
+        state.tally.add(queue);
+        if item_class == IndexClass::Stage1
+            && item_tokens as usize <= STAGE1_MAX_TOKENS
+            && state.stage1_active()
+        {
+            state.stage1_left += 1;
+        }
+        // A Background→Stage1 flip increments every interested active
+        // worktree, this one included; it was not counted above.
+        self.refresh_class(item);
+    }
+
+    /// Recomputes `stage1_left` for `worktree` from its interest list; an
     /// inactive worktree counts nothing.
-    fn recompute_stage1_left(&mut self, worktree: WorktreeId, interest: &HashSet<ItemId>) {
+    fn recompute_stage1_left(&mut self, worktree: WorktreeId) {
         let left = if self.worktrees[&worktree].stage1_active() {
-            interest
+            self.worktrees[&worktree]
+                .interest
                 .iter()
                 .filter(|item| {
                     let item = &self.items[item];
@@ -1162,9 +1326,6 @@ impl<B: Backend> Scheduler<B> {
             };
             let overtaken = u32::try_from(self.dispatched_indexing - stamp)
                 .expect("overtaken cannot exceed dispatched_indexing");
-            if let QueryJob::Documents { repo, chunks, .. } = &job {
-                self.in_flight_docs = chunks.iter().map(|c| (*repo, c.content_hash)).collect();
-            }
             self.queries_in_flight += 1;
             let _ = reply.send(AneJob::Query { job, overtaken });
             return;
@@ -1271,23 +1432,19 @@ impl<B: Backend> Scheduler<B> {
         }
     }
 
-    /// A query job completed: drop the queue entries its `Documents` vectors
-    /// make redundant, and accumulate the worktree's stats.
+    /// A query job completed: accumulate the worktree's stats.
     fn on_query_done(&mut self, worktree: WorktreeId, wait: Duration, overtaken: u32) {
         self.queries_in_flight = self
             .queries_in_flight
             .checked_sub(1)
             .expect("a QueryDone without an in-flight query");
-        for (repo, hash) in std::mem::take(&mut self.in_flight_docs) {
-            self.remove_queued(repo, hash);
-        }
         let stats = self.stats.entry(worktree).or_default();
         stats.wait = stats.wait.max(wait);
         stats.overtaken = stats.overtaken.saturating_add(overtaken);
     }
 
-    /// Removes a queued item whose vector arrived another way; in-flight
-    /// items are untouched.
+    /// Removes a queued item whose vector was committed another way;
+    /// in-flight items are untouched.
     fn remove_queued(&mut self, repo: RepoId, hash: ContentHash) {
         let Some(&item) = self.by_hash.get(&(repo, hash)) else {
             return;

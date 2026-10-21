@@ -13,8 +13,8 @@ use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
 
 use repo_search::daemon::scheduler::{
-    Counts, EmbedError, Enqueue, IndexClass, PendingItem, QueryJob, SchedulerHandle, Stage1Done,
-    WorktreeId,
+    Counts, EmbedError, Enqueue, IndexClass, Interest, PendingItem, QueryJob, SchedulerHandle,
+    Stage1Done, WorktreeId,
 };
 use repo_search::daemon::{Backend, Error, ane, scheduler, writer};
 use repo_search_core::QueryTask;
@@ -142,11 +142,11 @@ fn pending(seq: u64, tokens: u32) -> scheduler::PendingItem {
     }
 }
 
-/// Sends `items` to the scheduler for `worktree` as `class` at `generation`.
+/// Sends `items` to the scheduler for `worktree` as `class`, replacing its
+/// interest.
 async fn enqueue_for(
     rig: &Rig,
     worktree: WorktreeId,
-    generation: u64,
     items: Vec<scheduler::PendingItem>,
     class: IndexClass,
 ) -> tokio::sync::mpsc::Receiver<Stage1Done> {
@@ -156,8 +156,7 @@ async fn enqueue_for(
             worktree,
             repo: REPO,
             class,
-            generation,
-            items,
+            interest: Interest::Replace(items),
             writer: rig.writer.clone(),
             stage1_done: done_tx,
         })
@@ -166,13 +165,36 @@ async fn enqueue_for(
     done_rx
 }
 
-/// Sends `items` to the scheduler as `class`, generation 1.
+/// Sends `items` to the scheduler as `class`, replacing its interest.
 async fn enqueue(
     rig: &Rig,
     items: Vec<scheduler::PendingItem>,
     class: IndexClass,
 ) -> tokio::sync::mpsc::Receiver<Stage1Done> {
-    enqueue_for(rig, WORKTREE, 1, items, class).await
+    enqueue_for(rig, WORKTREE, items, class).await
+}
+
+/// Sends one pass's changes for `worktree` as `class`.
+async fn change_for(
+    rig: &Rig,
+    worktree: WorktreeId,
+    added: Vec<scheduler::PendingItem>,
+    dropped: Vec<ContentHash>,
+    class: IndexClass,
+) -> tokio::sync::mpsc::Receiver<Stage1Done> {
+    let (done_tx, done_rx) = tokio::sync::mpsc::channel(8);
+    rig.sched
+        .enqueue(Enqueue {
+            worktree,
+            repo: REPO,
+            class,
+            interest: Interest::Change { added, dropped },
+            writer: rig.writer.clone(),
+            stage1_done: done_tx,
+        })
+        .await
+        .expect("scheduler is up");
+    done_rx
 }
 
 /// The expected `Counts` for the scheduler-level assertions.
@@ -273,9 +295,17 @@ async fn query(rig: &Rig, text: &str) {
         .expect("embeds fine");
 }
 
-/// Sends a `Documents` job of `n` chunks for `WORKTREE`, awaits the vectors
-/// and returns the chunks' content hashes.
-async fn query_documents(rig: &Rig, first_seq: u64, n: usize) -> HashSet<ContentHash> {
+/// Sends a `Documents` job of `n` chunks for `WORKTREE`; the receiver
+/// resolves with its vectors or its error, and the chunks' content hashes
+/// come along.
+async fn send_documents(
+    rig: &Rig,
+    first_seq: u64,
+    n: usize,
+) -> (
+    oneshot::Receiver<Result<Vec<UnitVector>, EmbedError>>,
+    HashSet<ContentHash>,
+) {
     let (reply, rx) = oneshot::channel();
     let chunks: Vec<PendingChunk> = (first_seq..first_seq + n as u64)
         .map(|seq| pending(seq, 100).chunk)
@@ -284,7 +314,6 @@ async fn query_documents(rig: &Rig, first_seq: u64, n: usize) -> HashSet<Content
     rig.sched
         .query(QueryJob::Documents {
             worktree: WORKTREE,
-            repo: REPO,
             chunks,
             enqueued: Instant::now(),
             stamp: 0,
@@ -292,6 +321,13 @@ async fn query_documents(rig: &Rig, first_seq: u64, n: usize) -> HashSet<Content
         })
         .await
         .expect("scheduler is up");
+    (rx, hashes)
+}
+
+/// Sends a `Documents` job of `n` chunks for `WORKTREE`, awaits the vectors
+/// and returns the chunks' content hashes.
+async fn query_documents(rig: &Rig, first_seq: u64, n: usize) -> HashSet<ContentHash> {
+    let (rx, hashes) = send_documents(rig, first_seq, n).await;
     let vectors = rx.await.expect("documents answered").expect("embeds fine");
     assert_eq!(vectors.len(), n);
     hashes
@@ -802,7 +838,7 @@ async fn counts_drop_a_re_enqueued_in_flight_item() {
 
     // The replacement lists only item 2: item 0's in-flight count and item
     // 1's queued count drop.
-    let mut done = enqueue_for(&rig, WORKTREE, 2, vec![pending(2, 100)], IndexClass::Stage1).await;
+    let mut done = enqueue_for(&rig, WORKTREE, vec![pending(2, 100)], IndexClass::Stage1).await;
     assert_eq!(counts_of(&rig, WORKTREE).await, counts(1, 0, 0, false));
 
     // The gated item's `AneDone` arrives after the drop; the next `Started`
@@ -836,7 +872,6 @@ async fn counts_are_per_worktree_on_a_shared_item() {
     let _other_done = enqueue_for(
         &rig,
         OTHER,
-        1,
         (0..2).map(|seq| pending(seq, 100)).collect(),
         IndexClass::Stage1,
     )
@@ -850,8 +885,7 @@ async fn counts_are_per_worktree_on_a_shared_item() {
 
     // The other worktree's re-`Enqueue` drops the shared items; only its
     // tally moves.
-    let mut other_done =
-        enqueue_for(&rig, OTHER, 2, vec![pending(2, 100)], IndexClass::Stage1).await;
+    let mut other_done = enqueue_for(&rig, OTHER, vec![pending(2, 100)], IndexClass::Stage1).await;
     assert_eq!(counts_of(&rig, OTHER).await, counts(1, 0, 0, false));
     assert_eq!(counts_of(&rig, WORKTREE).await, counts(2, 0, 0, false));
 
@@ -877,6 +911,10 @@ async fn counts_move_to_background_at_stage1_completion() {
     // `AneDone` is handled before the pull that follows it on the wire, so
     // the next `Started` already shows the post-completion queues.
     let rig = rig(Duration::from_millis(10), Duration::ZERO, &[]).await;
+    // The completed items embed at background QoS, which a loaded host can
+    // starve: lift the thread's effective priority for the run — its
+    // requested class stays Background.
+    let _lift = stub::lift_ane(&rig.backend, QosClass::UserInitiated);
     rig.backend
         .push_headroom(Err(GpuBlocked::NotMains("Battery Power".to_owned())));
     let mut done = enqueue(
@@ -907,12 +945,13 @@ async fn counts_move_to_background_at_stage1_completion() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn counts_drop_a_documents_queued_duplicate() {
-    // The ANE's first call is gated so the duplicate is provably still
-    // queued when the `Documents` job lands.
+async fn documents_stored_drops_a_queued_twin() {
+    // The ANE's first call is gated, so the twin is provably still queued
+    // when `DocumentsStored` lands.
     let rig = rig(Duration::from_millis(10), Duration::ZERO, &[Instance::Ane]).await;
     rig.backend
         .push_headroom(Err(GpuBlocked::NotMains("Battery Power".to_owned())));
+    let query = send_query(&rig, "hold the pull").await;
     let mut done = enqueue(
         &rig,
         (0..3).map(|seq| pending(seq, 100)).collect(),
@@ -922,19 +961,24 @@ async fn counts_drop_a_documents_queued_duplicate() {
 
     let mut log = Vec::new();
     wait_started(&mut log, &rig.records, 1);
-    assert_eq!(counts_of(&rig, WORKTREE).await, counts(2, 0, 1, false));
+    assert_eq!(counts_of(&rig, WORKTREE).await, counts(3, 0, 0, false));
 
-    // The `Documents` job embeds chunk 1 on the spot and `QueryDone` drops
-    // its queued twin; chunk 2's `Started` proves the removal was handled.
+    // The `Documents` job's vectors committed: its queued twin leaves.
+    let twin = pending(1, 100).chunk.content_hash;
+    rig.sched
+        .documents_stored(REPO, vec![twin])
+        .await
+        .expect("scheduler is up");
+    assert_eq!(counts_of(&rig, WORKTREE).await, counts(2, 0, 0, false));
+
     open(rig.gate(Instance::Ane));
-    query_documents(&rig, 1, 1).await;
-    wait_started(&mut log, &rig.records, 3);
-    assert_eq!(counts_of(&rig, WORKTREE).await, counts(0, 0, 1, false));
-
+    query.await.expect("query answered").expect("embeds fine");
     tokio::time::timeout(TIMEOUT, done.recv())
         .await
         .expect("stage 1 completes")
         .expect("stage-1 channel open");
+    let embedded = index_records(&rig);
+    assert!(!embedded.contains(&twin), "no Index record for the twin");
     assert_eq!(counts_of(&rig, WORKTREE).await, counts(0, 0, 0, true));
 }
 
@@ -958,7 +1002,7 @@ async fn watch_counts_seeds_and_pushes_counts() {
     assert_eq!(counts_of(&rig, WORKTREE).await, *watch.borrow());
 
     // A re-`Enqueue` pushes the drop of the in-flight item.
-    let mut done = enqueue_for(&rig, WORKTREE, 2, vec![pending(1, 100)], IndexClass::Stage1).await;
+    let mut done = enqueue_for(&rig, WORKTREE, vec![pending(1, 100)], IndexClass::Stage1).await;
     tokio::time::timeout(TIMEOUT, watch.changed())
         .await
         .expect("counts pushed")
@@ -987,4 +1031,305 @@ async fn watch_counts_seeds_and_pushes_counts() {
         .expect("watch open");
     assert_eq!(*watch.borrow_and_update(), counts(0, 0, 0, true));
     assert_eq!(counts_of(&rig, WORKTREE).await, *watch.borrow());
+}
+
+/// Collects every `Kind::Index` record hash the run produced; all records
+/// precede `Stage1Done`, which follows the writer flush, so `try_iter`
+/// sees them all once stage 1 is done.
+fn index_records(rig: &Rig) -> Vec<ContentHash> {
+    rig.records
+        .try_iter()
+        .filter(|r| r.kind == Kind::Index)
+        .map(|r| r.hash.expect("an Index record carries a hash"))
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_change_adds_and_drops_on_top_of_a_replace() {
+    let rig = rig(Duration::from_millis(10), Duration::ZERO, &[Instance::Ane]).await;
+    rig.backend
+        .push_headroom(Err(GpuBlocked::NotMains("Battery Power".to_owned())));
+    let query = send_query(&rig, "hold the pull").await;
+    let mut done = enqueue(
+        &rig,
+        (0..3).map(|seq| pending(seq, 100)).collect(),
+        IndexClass::Stage1,
+    )
+    .await;
+    let mut log = Vec::new();
+    wait_started(&mut log, &rig.records, 1);
+    assert_eq!(counts_of(&rig, WORKTREE).await, counts(3, 0, 0, false));
+
+    let dropped = pending(1, 100).chunk.content_hash;
+    let _change = change_for(
+        &rig,
+        WORKTREE,
+        vec![pending(3, 100)],
+        vec![dropped],
+        IndexClass::Stage1,
+    )
+    .await;
+    assert_eq!(counts_of(&rig, WORKTREE).await, counts(3, 0, 0, false));
+
+    let _empty = change_for(&rig, WORKTREE, vec![], vec![], IndexClass::Stage1).await;
+    assert_eq!(counts_of(&rig, WORKTREE).await, counts(3, 0, 0, false));
+
+    open(rig.gate(Instance::Ane));
+    query.await.expect("query answered").expect("embeds fine");
+    tokio::time::timeout(TIMEOUT, done.recv())
+        .await
+        .expect("stage 1 completes")
+        .expect("stage-1 channel open");
+
+    let embedded = index_records(&rig);
+    let want: HashSet<ContentHash> = [0, 2, 3]
+        .into_iter()
+        .map(|seq| pending(seq, 100).chunk.content_hash)
+        .collect();
+    assert_eq!(embedded.len(), 3, "{embedded:?}");
+    assert!(embedded.iter().all(|h| want.contains(h)));
+    assert!(!embedded.contains(&dropped));
+    assert_eq!(counts_of(&rig, WORKTREE).await, counts(0, 0, 0, true));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_change_re_adding_a_wanted_item_is_a_no_op() {
+    let rig = rig(Duration::from_millis(10), Duration::ZERO, &[Instance::Ane]).await;
+    rig.backend
+        .push_headroom(Err(GpuBlocked::NotMains("Battery Power".to_owned())));
+    let query = send_query(&rig, "hold the pull").await;
+    let mut done = enqueue(
+        &rig,
+        (0..2).map(|seq| pending(seq, 100)).collect(),
+        IndexClass::Stage1,
+    )
+    .await;
+    let mut log = Vec::new();
+    wait_started(&mut log, &rig.records, 1);
+    assert_eq!(counts_of(&rig, WORKTREE).await, counts(2, 0, 0, false));
+
+    let _change = change_for(
+        &rig,
+        WORKTREE,
+        vec![pending(0, 100), pending(1, 100)],
+        vec![],
+        IndexClass::Stage1,
+    )
+    .await;
+    assert_eq!(counts_of(&rig, WORKTREE).await, counts(2, 0, 0, false));
+
+    open(rig.gate(Instance::Ane));
+    query.await.expect("query answered").expect("embeds fine");
+    tokio::time::timeout(TIMEOUT, done.recv())
+        .await
+        .expect("stage 1 completes")
+        .expect("stage-1 channel open");
+
+    let embedded = index_records(&rig);
+    let want: HashSet<ContentHash> = [0, 1]
+        .into_iter()
+        .map(|seq| pending(seq, 100).chunk.content_hash)
+        .collect();
+    assert_eq!(embedded.len(), 2, "each hash embeds exactly once");
+    assert!(embedded.iter().all(|h| want.contains(h)));
+    assert_eq!(counts_of(&rig, WORKTREE).await, counts(0, 0, 0, true));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_change_dropping_a_finished_or_unknown_hash_is_a_no_op() {
+    let rig = rig(Duration::from_millis(10), Duration::ZERO, &[Instance::Ane]).await;
+    rig.backend
+        .push_headroom(Err(GpuBlocked::NotMains("Battery Power".to_owned())));
+    let query = send_query(&rig, "hold the pull").await;
+    let mut done = enqueue(&rig, vec![pending(0, 100)], IndexClass::Stage1).await;
+    let mut log = Vec::new();
+    wait_started(&mut log, &rig.records, 1);
+    assert_eq!(counts_of(&rig, WORKTREE).await, counts(1, 0, 0, false));
+
+    let unknown = pending(9, 100).chunk.content_hash;
+    let _change = change_for(&rig, WORKTREE, vec![], vec![unknown], IndexClass::Stage1).await;
+    assert_eq!(counts_of(&rig, WORKTREE).await, counts(1, 0, 0, false));
+
+    open(rig.gate(Instance::Ane));
+    query.await.expect("query answered").expect("embeds fine");
+    tokio::time::timeout(TIMEOUT, done.recv())
+        .await
+        .expect("stage 1 completes")
+        .expect("stage-1 channel open");
+    assert_eq!(counts_of(&rig, WORKTREE).await, counts(0, 0, 0, true));
+
+    // Hash 0 is finished; dropping it now changes nothing and does not
+    // panic.
+    let finished = pending(0, 100).chunk.content_hash;
+    let _late = change_for(&rig, WORKTREE, vec![], vec![finished], IndexClass::Stage1).await;
+    assert_eq!(counts_of(&rig, WORKTREE).await, counts(0, 0, 0, true));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_change_on_one_worktree_keeps_a_shared_item_for_the_other() {
+    const OTHER: WorktreeId = WorktreeId(2);
+    let rig = rig(Duration::from_millis(10), Duration::ZERO, &[Instance::Ane]).await;
+    rig.backend
+        .push_headroom(Err(GpuBlocked::NotMains("Battery Power".to_owned())));
+    let query = send_query(&rig, "hold the pull").await;
+    let mut done = enqueue(
+        &rig,
+        (0..2).map(|seq| pending(seq, 100)).collect(),
+        IndexClass::Stage1,
+    )
+    .await;
+    let _other_done = enqueue_for(
+        &rig,
+        OTHER,
+        (0..2).map(|seq| pending(seq, 100)).collect(),
+        IndexClass::Stage1,
+    )
+    .await;
+    let mut log = Vec::new();
+    wait_started(&mut log, &rig.records, 1);
+    assert_eq!(counts_of(&rig, WORKTREE).await, counts(2, 0, 0, false));
+    assert_eq!(counts_of(&rig, OTHER).await, counts(2, 0, 0, false));
+
+    let drops: Vec<ContentHash> = [0, 1]
+        .into_iter()
+        .map(|seq| pending(seq, 100).chunk.content_hash)
+        .collect();
+    let _change = change_for(&rig, OTHER, vec![], drops, IndexClass::Stage1).await;
+    let other = counts_of(&rig, OTHER).await;
+    assert_eq!(
+        (
+            other.queued_stage1,
+            other.queued_background,
+            other.in_flight
+        ),
+        (0, 0, 0)
+    );
+    assert_eq!(counts_of(&rig, WORKTREE).await, counts(2, 0, 0, false));
+
+    open(rig.gate(Instance::Ane));
+    query.await.expect("query answered").expect("embeds fine");
+    tokio::time::timeout(TIMEOUT, done.recv())
+        .await
+        .expect("stage 1 completes")
+        .expect("stage-1 channel open");
+
+    let embedded = index_records(&rig);
+    let want: HashSet<ContentHash> = [0, 1]
+        .into_iter()
+        .map(|seq| pending(seq, 100).chunk.content_hash)
+        .collect();
+    assert_eq!(embedded.len(), 2, "each shared hash embeds exactly once");
+    assert!(embedded.iter().all(|h| want.contains(h)));
+    assert_eq!(counts_of(&rig, WORKTREE).await, counts(0, 0, 0, true));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_background_change_after_stage1_done_moves_nothing_back() {
+    let rig = rig(Duration::from_millis(10), Duration::ZERO, &[Instance::Ane]).await;
+    rig.backend
+        .push_headroom(Err(GpuBlocked::NotMains("Battery Power".to_owned())));
+    let query = send_query(&rig, "hold the pull").await;
+    let mut done = enqueue(
+        &rig,
+        vec![pending(0, 100), pending(1, 500)],
+        IndexClass::Stage1,
+    )
+    .await;
+    let mut log = Vec::new();
+    wait_started(&mut log, &rig.records, 1);
+
+    open(rig.gate(Instance::Ane));
+    query.await.expect("query answered").expect("embeds fine");
+    tokio::time::timeout(TIMEOUT, done.recv())
+        .await
+        .expect("stage 1 completes")
+        .expect("stage-1 channel open");
+
+    // A background pass's additions stay background: nothing moves back to
+    // stage 1 once it completed.
+    let _change = change_for(
+        &rig,
+        WORKTREE,
+        vec![pending(2, 100)],
+        vec![],
+        IndexClass::Background,
+    )
+    .await;
+    let now = counts_of(&rig, WORKTREE).await;
+    // A reopen flips `stage1_done` inside the same `on_enqueue`, before
+    // `counts_of` is served: this is exact, not timing.
+    assert!(now.stage1_done, "{now:?}");
+    assert_eq!(now.queued_stage1, 0, "{now:?}");
+    assert!(matches!(
+        done.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stage1_change_after_completion_reopens_stage1_once() {
+    let rig = rig(Duration::from_millis(10), Duration::ZERO, &[Instance::Ane]).await;
+    rig.backend
+        .push_headroom(Err(GpuBlocked::NotMains("Battery Power".to_owned())));
+    let query = send_query(&rig, "hold the pull").await;
+    let mut done = enqueue(&rig, vec![pending(0, 100)], IndexClass::Stage1).await;
+    let mut log = Vec::new();
+    wait_started(&mut log, &rig.records, 1);
+
+    open(rig.gate(Instance::Ane));
+    query.await.expect("query answered").expect("embeds fine");
+    tokio::time::timeout(TIMEOUT, done.recv())
+        .await
+        .expect("stage 1 completes")
+        .expect("stage-1 channel open");
+
+    // A late stage-1 change reopens completion; the second `Stage1Done` is
+    // the documented idempotent double delivery.
+    let _change = change_for(
+        &rig,
+        WORKTREE,
+        vec![pending(1, 100)],
+        vec![],
+        IndexClass::Stage1,
+    )
+    .await;
+    let now = counts_of(&rig, WORKTREE).await;
+    assert!(!now.stage1_done, "{now:?}");
+    assert_eq!(now.queued_stage1 + now.in_flight, 1, "{now:?}");
+    wait_for(&mut log, &rig.records, |r| {
+        r.kind == Kind::Index && r.hash == Some(pending(1, 100).chunk.content_hash)
+    });
+    tokio::time::timeout(TIMEOUT, done.recv())
+        .await
+        .expect("stage 1 completes again")
+        .expect("stage-1 channel open");
+    assert_eq!(counts_of(&rig, WORKTREE).await, counts(0, 0, 0, true));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_documents_job_keeps_its_queued_twin_until_stored() {
+    let rig = rig(Duration::from_millis(10), Duration::ZERO, &[Instance::Ane]).await;
+    rig.backend
+        .push_headroom(Err(GpuBlocked::NotMains("Battery Power".to_owned())));
+    let query = send_query(&rig, "hold the pull").await;
+    let mut done = enqueue(&rig, vec![pending(1, 100)], IndexClass::Stage1).await;
+    let mut log = Vec::new();
+    wait_started(&mut log, &rig.records, 1);
+    assert_eq!(counts_of(&rig, WORKTREE).await, counts(1, 0, 0, false));
+
+    let (docs, _hashes) = send_documents(&rig, 1, 1).await;
+    open(rig.gate(Instance::Ane));
+    query.await.expect("query answered").expect("embeds fine");
+    docs.await
+        .expect("documents answered")
+        .expect("embeds fine");
+
+    // The twin was never reported stored: it stays queued and embeds.
+    wait_for(&mut log, &rig.records, |r| {
+        r.kind == Kind::Index && r.hash == Some(pending(1, 100).chunk.content_hash)
+    });
+    tokio::time::timeout(TIMEOUT, done.recv())
+        .await
+        .expect("stage 1 completes")
+        .expect("stage-1 channel open");
 }

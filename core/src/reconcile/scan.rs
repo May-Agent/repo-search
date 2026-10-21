@@ -173,6 +173,9 @@ pub(super) struct Plan {
     pub changes: Vec<FileChange>,
     /// Text of every chunk of every re-chunked file, by content hash.
     pub texts: HashMap<ContentHash, PendingChunk>,
+    /// Paths of the files written as `FileChange::Restamp` this pass: same
+    /// bytes, moved stat or ignored flag. Their stored chunks stay.
+    pub restamped: Vec<String>,
     pub files_scanned: u64,
     pub files_added: u64,
     pub files_modified: u64,
@@ -250,6 +253,7 @@ pub(super) fn plan(
     let mut plan = Plan {
         changes: Vec::new(),
         texts: HashMap::new(),
+        restamped: Vec::new(),
         files_scanned: candidates.len() as u64,
         files_added: 0,
         files_modified: 0,
@@ -383,7 +387,10 @@ pub(super) fn plan(
     for (cand, item) in work {
         match item {
             Work::Live => {}
-            Work::Restamp(state) => plan.changes.push(FileChange::Restamp(state)),
+            Work::Restamp(state) => {
+                plan.restamped.push(state.path.clone());
+                plan.changes.push(FileChange::Restamp(state));
+            }
             Work::KeepUnchunkable(reason) => plan.skipped.push(Skipped {
                 path: cand.rel,
                 reason: reason.into(),
@@ -462,18 +469,21 @@ pub(super) fn plan(
 /// ranges, without parsing. The pass reconciled the index moments ago, so the
 /// stored rows are the truth; the hash check only guards against a file
 /// rewritten in the meantime, whose chunks are then left out and handled by
-/// the next pass (as are files deleted in the meantime).
+/// the next pass (as are files deleted in the meantime). Each file is read
+/// and validated once, however many of its chunks are rebuilt.
 pub(super) fn read_chunks(
     root: &Path,
     mut stored: Vec<StoredChunk>,
 ) -> Result<Vec<PendingChunk>, Error> {
     stored.sort_by(|a, b| a.path.cmp(&b.path));
     let mut out = Vec::with_capacity(stored.len());
-    let mut file: Option<(String, Vec<u8>)> = None;
+    let mut file: Option<(String, Option<String>)> = None;
     for chunk in stored {
         if file.as_ref().is_none_or(|(path, _)| *path != chunk.path) {
             match fs::read(root.join(&chunk.path)) {
-                Ok(bytes) => file = Some((chunk.path.clone(), bytes)),
+                Ok(bytes) => {
+                    file = Some((chunk.path.clone(), String::from_utf8(bytes).ok()));
+                }
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {
                     file = None;
                     continue;
@@ -486,13 +496,12 @@ pub(super) fn read_chunks(
                 }
             }
         }
-        let Some((_, bytes)) = file.as_ref().filter(|(path, _)| *path == chunk.path) else {
+        let Some((_, Some(src))) = file.as_ref().filter(|(path, _)| *path == chunk.path) else {
             continue;
         };
-        let Some(text) = chunk::rebuild_text(
-            bytes,
-            chunk.members.iter().map(|m| (m.bytes.clone(), m.kind)),
-        ) else {
+        let Some(text) =
+            chunk::rebuild_text(src, chunk.members.iter().map(|m| (m.bytes.clone(), m.kind)))
+        else {
             continue;
         };
         if ContentHash::of_chunk(&chunk.title, &text) != chunk.content_hash {
@@ -714,7 +723,7 @@ mod tests {
             (35..50, StoredMemberKind::Text),
         ];
         assert_eq!(
-            chunk::rebuild_text(src.as_bytes(), members.iter().cloned()),
+            chunk::rebuild_text(src, members.iter().cloned()),
             Some(text.clone())
         );
         let dir = tempfile::tempdir().unwrap();
@@ -723,6 +732,37 @@ mod tests {
         let out = read_chunks(dir.path(), vec![stored]).unwrap();
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].text, text);
+    }
+
+    #[test]
+    fn read_chunks_rebuilds_every_chunk_of_one_file() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.rs"), "fn a() {}\nfn b() {}\nfn c() {}\n").unwrap();
+        let chunks = vec![
+            stored("a.rs", "t", "fn a() {}", 0..9),
+            stored("a.rs", "t", "fn b() {}", 10..19),
+            stored("a.rs", "t", "fn c() {}", 20..29),
+        ];
+        let out = read_chunks(dir.path(), chunks).unwrap();
+        assert_eq!(out.len(), 3);
+        let texts: Vec<&str> = out.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(texts, ["fn a() {}", "fn b() {}", "fn c() {}"]);
+    }
+
+    #[test]
+    fn read_chunks_skips_every_chunk_of_a_file_that_is_not_utf8() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("bad.rs"), b"fn a() {}\xff\nfn b() {}\n").unwrap();
+        fs::write(dir.path().join("good.rs"), "fn g() {}\n").unwrap();
+        let chunks = vec![
+            stored("bad.rs", "t", "fn a() {}", 0..9),
+            stored("bad.rs", "t", "fn b() {}", 11..20),
+            stored("good.rs", "t", "fn g() {}", 0..9),
+        ];
+        let out = read_chunks(dir.path(), chunks).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].path, "good.rs");
+        assert_eq!(out[0].text, "fn g() {}");
     }
 
     #[test]

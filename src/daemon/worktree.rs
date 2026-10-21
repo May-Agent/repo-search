@@ -3,8 +3,8 @@
 //! One task per worktree handles its inbox one message at a time, which the
 //! `Retriever`'s `&mut` search requires. It owns the index, the retriever
 //! built on [`AneHandle`], the last barrier's report, the FSEvents watcher,
-//! the HEAD commit and the index phase, and runs the freshness barrier that
-//! hands pending chunks to the scheduler.
+//! the HEAD commit and the index phase, and runs the freshness barrier,
+//! whose changes its feeder orders into the scheduler.
 
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
@@ -24,11 +24,12 @@ use crate::protocol::{
 };
 
 use super::Backend;
+use super::feed::{self, Feed, FeedMsg, FeederConfig};
 use super::model::{Model, ModelState};
 use super::registry::RegistryHandle;
 use super::scheduler::{
-    EmbedError, Enqueue, GpuState, IndexClass, PendingItem, QueryJob, RepoId, SchedulerHandle,
-    SchedulerMsg, Stage1Done, WorktreeId,
+    EmbedError, GpuState, IndexClass, QueryJob, RepoId, SchedulerHandle, SchedulerMsg, Stage1Done,
+    WorktreeId,
 };
 use super::watch::{WatchMsg, Watcher};
 use super::writer::WriterHandle;
@@ -125,7 +126,13 @@ struct Owner<B: Backend> {
     report: Option<Report>,
     commit: String,
     watcher: Option<Watcher>,
-    generation: u64,
+    /// The scope whose whole pending set the feeder was last told to hold
+    /// (a `Resync`), every later pass's changes following it; `None` until
+    /// the first barrier and after anything that may have broken that —
+    /// a failed barrier or a reopened index.
+    sync: Option<reconcile::Options>,
+    /// The feeder, spawned at the first barrier.
+    feeder: Option<mpsc::Sender<feed::FeedMsg>>,
     stage1_tx: mpsc::Sender<Stage1Done>,
     stage1_rx: mpsc::Receiver<Stage1Done>,
     /// The applied phase, published to `index --wait` tasks spawned off
@@ -160,7 +167,8 @@ impl<B: Backend> Owner<B> {
             report: None,
             commit: String::new(),
             watcher: None,
-            generation: 0,
+            sync: None,
+            feeder: None,
             stage1_tx,
             stage1_rx,
             phase_tx,
@@ -310,6 +318,7 @@ impl<B: Backend> Owner<B> {
         self.index = None;
         self.retriever = None;
         self.index_id = None;
+        self.sync = None;
         self.set_phase(Phase::FirstIndex);
         self.ensure_index().await
     }
@@ -476,6 +485,8 @@ impl<B: Backend> Owner<B> {
                 return;
             }
         };
+        let total_us = total_start.elapsed().as_micros() as u64;
+        tracing::info!(root = %self.root.display(), barrier_us, total_us, "search answered");
         let answer = Answer {
             output: match request.format {
                 Format::Text => results.to_text(),
@@ -487,7 +498,7 @@ impl<B: Backend> Owner<B> {
                 indexing_wait_us: stats.wait.as_micros() as u64,
                 indexing_overtaken: stats.overtaken,
                 embedded_on_the_spot: results.embedded_on_the_spot,
-                total_us: total_start.elapsed().as_micros() as u64,
+                total_us,
             },
         };
         let _ = send(events, Event::Final(Final::Answer(answer))).await;
@@ -541,7 +552,7 @@ impl<B: Backend> Owner<B> {
         if !send(events, Event::Progress(Progress::Reconciling)).await {
             return;
         }
-        let (ack_tx, ack_rx) = oneshot::channel::<()>();
+        let (ack_tx, ack_rx) = oneshot::channel::<Result<(), String>>();
         let (report, _) = match self.barrier(&model, false, Some(ack_tx)).await {
             Ok(done) => done,
             Err(message) => {
@@ -722,63 +733,61 @@ impl<B: Backend> Owner<B> {
     }
 
     /// The freshness barrier: flush the writer, then `reconcile` and
-    /// `git rev-parse HEAD` concurrently, then hand the pending chunks to
-    /// the counting pool and the scheduler — spawned, so a query never
-    /// waits on the enqueue. It never cancels: its busy marker is cleared
-    /// only by its own completion message.
+    /// `git rev-parse HEAD` concurrently, then hand the pass's outcome to
+    /// the feeder, which orders it into the scheduler. It never cancels:
+    /// its busy marker is cleared by the feeder, or here on failure.
     async fn barrier(
         &mut self,
         model: &Arc<Model<B>>,
         include_ignored: bool,
-        ack: Option<oneshot::Sender<()>>,
+        ack: Option<oneshot::Sender<Result<(), String>>>,
     ) -> Result<(Report, String), String> {
         self.verify_index().await?;
         let sched = model.scheduler.clone();
         sched.barrier(self.id, true).await;
         match self.barrier_steps(model, include_ignored).await {
-            Ok((report, commit, pending)) => {
+            Ok((report, commit, changes)) => {
                 self.report = Some(report.clone());
                 self.commit = commit.clone();
-                let counter = model.counter.clone();
-                let writer = self.writer.clone().expect("opened");
-                let stage1_done = self.stage1_tx.clone();
-                let worktree = self.id;
-                let repo = self.repo;
+                let options = reconcile::Options { include_ignored };
+                let index = self.index.clone().expect("opened");
+                // A `Change` is enough when the feeder provably holds this
+                // scope's set: anything else is a resync — the first
+                // barrier, a scope flip, a rechunk or a reopened index.
+                let (feed, resync) = match changes {
+                    Some(changes) if self.sync == Some(options) => (Feed::Change(changes), false),
+                    Some(changes) => (
+                        Feed::Resync {
+                            index,
+                            options,
+                            known: changes.added,
+                        },
+                        true,
+                    ),
+                    None => (
+                        Feed::Resync {
+                            index,
+                            options,
+                            known: Vec::new(),
+                        },
+                        true,
+                    ),
+                };
+                self.sync = Some(options);
                 let class = match self.phase {
                     Phase::FirstIndex => IndexClass::Stage1,
                     Phase::Maintained => IndexClass::Background,
                 };
-                self.generation += 1;
-                let generation = self.generation;
-                let sched2 = sched.clone();
-                tokio::spawn(async move {
-                    let items = match count_pending::<B>(pending, counter).await {
-                        Ok(items) => items,
-                        Err(error) => {
-                            tracing::error!(%error, "counting pending chunks failed");
-                            sched2.barrier(worktree, false).await;
-                            return;
-                        }
-                    };
-                    let _ = sched2
-                        .enqueue(Enqueue {
-                            worktree,
-                            repo,
-                            class,
-                            generation,
-                            items,
-                            writer,
-                            stage1_done,
-                        })
-                        .await;
-                    if let Some(ack) = ack {
-                        let _ = ack.send(());
-                    }
-                    sched2.barrier(worktree, false).await;
-                });
+                self.feeder(model)
+                    .send(FeedMsg { feed, class, ack })
+                    .await
+                    .expect("the feeder runs while the owner holds its sender");
+                tracing::info!(root = %self.root.display(), files_changed = report.files_changed(),
+                               resync, "barrier done");
                 Ok((report, commit))
             }
             Err(message) => {
+                self.sync = None;
                 drop(ack);
                 sched.barrier(self.id, false).await;
                 Err(message)
@@ -786,11 +795,30 @@ impl<B: Backend> Owner<B> {
         }
     }
 
+    /// The feeder, spawned on first use; the cache and writer are open by
+    /// then (every barrier caller ran `shared` first).
+    fn feeder(&mut self, model: &Arc<Model<B>>) -> mpsc::Sender<feed::FeedMsg> {
+        if self.feeder.is_none() {
+            self.feeder = Some(feed::spawn(FeederConfig::<B> {
+                worktree: self.id,
+                repo: self.repo,
+                root: self.root.clone(),
+                model_id: model.id.clone(),
+                cache: self.cache.clone().expect("opened"),
+                writer: self.writer.clone().expect("opened"),
+                counter: model.counter.clone(),
+                sched: model.scheduler.clone(),
+                stage1_done: self.stage1_tx.clone(),
+            }));
+        }
+        self.feeder.as_ref().expect("spawned above").clone()
+    }
+
     async fn barrier_steps(
         &mut self,
         model: &Arc<Model<B>>,
         include_ignored: bool,
-    ) -> Result<(Report, String, Vec<PendingChunk>), String> {
+    ) -> Result<(Report, String, Option<reconcile::Changes>), String> {
         self.writer
             .as_ref()
             .expect("opened")
@@ -827,7 +855,7 @@ impl<B: Backend> Owner<B> {
             ));
         }
         let commit = String::from_utf8_lossy(&head.stdout).trim().to_owned();
-        Ok((reconciled.report, commit, reconciled.pending))
+        Ok((reconciled.report, commit, reconciled.changes))
     }
 
     /// A watcher burst: the same barrier as a query, answered nowhere and
@@ -850,8 +878,8 @@ impl<B: Backend> Owner<B> {
     }
 
     /// `Stage1Done`: the scheduler flushed every stage-1 vector. The
-    /// transition is idempotent — a `Stage1` `Enqueue` landing after
-    /// completion can deliver it twice.
+    /// transition is idempotent — a `Stage1` change adding a small chunk
+    /// after completion can deliver it twice.
     async fn apply_stage1_done(&mut self) {
         if self.phase == Phase::Maintained {
             return;
@@ -884,8 +912,9 @@ struct IndexWait {
     sched: SchedulerHandle,
     /// The worktree the wait covers.
     worktree: WorktreeId,
-    /// Resolves once the barrier's `Enqueue` is in the scheduler's inbox.
-    ack: oneshot::Receiver<()>,
+    /// Resolves once the barrier's `Enqueue` is in the scheduler's inbox,
+    /// or with why there is none.
+    ack: oneshot::Receiver<Result<(), String>>,
     /// The worktree's index handle.
     index: Index,
     /// The repository's vector cache, measured for coverage.
@@ -923,13 +952,20 @@ async fn index_wait(wait: IndexWait) {
     // The barrier's `Enqueue` must be in the scheduler's inbox before the
     // `WatchCounts` the ack orders it behind; then the watch's seed
     // already counts the enqueued items.
-    if ack.await.is_err() {
-        send(
-            &events,
-            error(ErrorKind::ShuttingDown, "scheduler gone".into()),
-        )
-        .await;
-        return;
+    match ack.await {
+        Ok(Ok(())) => {}
+        Ok(Err(message)) => {
+            send(&events, error(ErrorKind::Internal, message)).await;
+            return;
+        }
+        Err(_) => {
+            send(
+                &events,
+                error(ErrorKind::ShuttingDown, "scheduler gone".into()),
+            )
+            .await;
+            return;
+        }
     }
     let mut counts = match sched.watch_counts(worktree).await {
         Ok(counts) => counts,
@@ -1135,7 +1171,6 @@ impl EmbedService for AneHandle {
         self.sched
             .send(SchedulerMsg::Query(Box::new(QueryJob::Documents {
                 worktree: self.worktree,
-                repo: self.repo,
                 chunks,
                 enqueued: Instant::now(),
                 stamp: 0,
@@ -1145,48 +1180,14 @@ impl EmbedService for AneHandle {
             .map_err(|_| EmbedError::SchedulerGone)?;
         rx.await.map_err(|_| EmbedError::SchedulerGone)?
     }
-}
 
-/// Counts each pending chunk's document tokens on a scoped worker pool of
-/// `performance_cores()` threads, off the executor.
-async fn count_pending<B: Backend>(
-    pending: Vec<PendingChunk>,
-    counter: Arc<B::Counter>,
-) -> Result<Vec<PendingItem>, String> {
-    if pending.is_empty() {
-        return Ok(Vec::new());
+    async fn stored(&self, hashes: Vec<ContentHash>) -> Result<(), Self::Error> {
+        self.sched
+            .send(SchedulerMsg::DocumentsStored {
+                repo: self.repo,
+                hashes,
+            })
+            .await
+            .map_err(|_| EmbedError::SchedulerGone)
     }
-    let threads = performance_cores()
-        .map_err(|e| e.to_string())?
-        .min(pending.len());
-    let (tx, rx) = oneshot::channel();
-    std::thread::spawn(move || {
-        let size = pending.len().div_ceil(threads);
-        std::thread::scope(|s| {
-            let handles: Vec<_> = pending
-                .chunks(size)
-                .map(|slice| {
-                    let counter = &counter;
-                    s.spawn(move || {
-                        slice
-                            .iter()
-                            .map(|chunk| PendingItem {
-                                tokens: u32::try_from(
-                                    counter.document_tokens(&chunk.title, &chunk.text),
-                                )
-                                .expect("a chunk is capped at 512 tokens"),
-                                chunk: chunk.clone(),
-                            })
-                            .collect::<Vec<PendingItem>>()
-                    })
-                })
-                .collect();
-            let items: Vec<PendingItem> = handles
-                .into_iter()
-                .flat_map(|handle| handle.join().expect("counting thread"))
-                .collect();
-            let _ = tx.send(items);
-        });
-    });
-    Ok(rx.await.expect("the counting pool answers"))
 }
