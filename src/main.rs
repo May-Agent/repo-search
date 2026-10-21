@@ -133,6 +133,14 @@ fn daemon_main(cli: &Cli) -> ExitCode {
         .with_max_level(tracing::Level::INFO)
         .init();
 
+    let build = match repo_search::protocol::BuildId::of_current_exe() {
+        Ok(build) => build,
+        Err(error) => {
+            tracing::error!(%error, "could not identify the running binary");
+            return ExitCode::FAILURE;
+        }
+    };
+
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -201,6 +209,7 @@ fn daemon_main(cli: &Cli) -> ExitCode {
             .map_or(daemon::IDLE_EXIT, Duration::from_secs),
         model_store,
         backend: Arc::new(CoreMlBackend),
+        build,
     })) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {

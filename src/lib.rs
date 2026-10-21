@@ -5,6 +5,9 @@ pub mod client;
 /// The `search` daemon.
 #[cfg(target_os = "macos")]
 pub mod daemon;
+/// Event-driven waits on kqueue for the install flow.
+#[cfg(target_os = "macos")]
+pub mod kqueue;
 /// launchd socket activation and the LaunchAgent document.
 #[cfg(target_os = "macos")]
 pub mod launchd;

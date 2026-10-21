@@ -13,20 +13,17 @@ use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
-use repo_search::client::Client;
 use repo_search::daemon::{self, Config, Error};
-use repo_search::model_store::{ModelSpec, ModelStore, Sha256Digest};
-use repo_search::protocol::{
-    self, ErrorKind, Event, Final, Format, Request, SearchRequest, WireMode, WirePhase,
-};
+use repo_search::model_store::{ModelSpec, ModelStore};
+use repo_search::protocol::{self, ErrorKind, Event, Final, Request, WirePhase};
 use repo_search_core::qos::QosClass;
 use repo_search_core::store::{ContentHash, Index, VectorCache};
 use repo_search_coreml::GpuBlocked;
-use sha2::Digest;
+use support::client::{final_of, next_event, request, search, stream_request};
+use support::daemon::{Daemon, Model, daemon, digest_of, sha_7};
 use support::repo::{self, TestRepo};
 use support::stub::{IndexGate, Instance, Kind, Record, StubBackend};
 use tokio::net::UnixListener;
-use tokio::task::JoinHandle;
 
 const TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -61,80 +58,6 @@ fn fn_repo(n: usize, bytes: usize, per_file: usize) -> TestRepo {
     repo::repo(&files)
 }
 
-/// The test daemon: a socket in a temp dir, the stub backend's record log
-/// and the run task's handle.
-struct Daemon {
-    socket: PathBuf,
-    /// The store's archive dir: `<models>/<sha>` appears only on a
-    /// completed download.
-    model_dir: PathBuf,
-    records: mpsc::Receiver<Record>,
-    backend: Arc<StubBackend>,
-    join: JoinHandle<Result<(), Error>>,
-    _tmp: tempfile::TempDir,
-}
-
-/// How the model cache is laid out for the store.
-enum Model {
-    /// `models/<sha>/` exists, so `ensure` returns at once.
-    Cached,
-    /// The dir is absent and the spec points at `url` serving `body`.
-    Served { url: String, sha: Sha256Digest },
-}
-
-fn digest_of(bytes: &[u8]) -> Sha256Digest {
-    Sha256Digest::from_hex(&hex::encode(sha2::Sha256::digest(bytes))).expect("hex digest")
-}
-
-/// A fixed model id for the cached-model tests.
-fn sha_7() -> Sha256Digest {
-    Sha256Digest::from_hex(&"07".repeat(32)).expect("hex digest")
-}
-
-/// Starts a daemon with `backend`; the record log drains into `records`.
-async fn daemon(
-    tmp: tempfile::TempDir,
-    mut backend: StubBackend,
-    model: Model,
-    idle_exit: Duration,
-) -> Daemon {
-    let root = tmp.path().join("models");
-    let spec = match &model {
-        Model::Cached => ModelSpec {
-            url: "http://127.0.0.1:1/unused".into(),
-            sha256: sha_7(),
-        },
-        Model::Served { url, sha } => ModelSpec {
-            url: url.clone(),
-            sha256: *sha,
-        },
-    };
-    let store = ModelStore::new(root, spec).expect("model store");
-    if matches!(model, Model::Cached) {
-        std::fs::create_dir_all(store.dir()).expect("cached model dir");
-    }
-    let model_dir = store.dir();
-    let socket = tmp.path().join("daemon.sock");
-    let listener = UnixListener::bind(&socket).expect("socket binds");
-    let (records_tx, records) = mpsc::channel();
-    backend.records_to(records_tx);
-    let backend = Arc::new(backend);
-    let join = tokio::spawn(daemon::run(Config {
-        listener,
-        idle_exit,
-        model_store: store,
-        backend: backend.clone(),
-    }));
-    Daemon {
-        socket,
-        model_dir,
-        records,
-        backend,
-        join,
-        _tmp: tmp,
-    }
-}
-
 /// Receives the next record within `TIMEOUT`, off the async executor.
 fn recv(log: &mut Vec<Record>, records: &mpsc::Receiver<Record>) {
     tokio::task::block_in_place(|| {
@@ -166,45 +89,6 @@ fn wait_for(
 
 fn open(gate: &Barrier) {
     tokio::task::block_in_place(|| gate.wait());
-}
-
-/// A `search` request for `query` on `worktree`.
-fn search(worktree: &Path, query: &str) -> Request {
-    Request::Search(SearchRequest {
-        worktree: worktree.to_path_buf(),
-        query: query.to_owned(),
-        mode: WireMode::Hybrid,
-        paths: vec![],
-        langs: vec![],
-        kinds: vec![],
-        symbol: None,
-        budget: 4000,
-        files_only: false,
-        include_ignored: false,
-        format: Format::Json,
-    })
-}
-
-/// Sends `request` and collects events to the `Final` frame.
-async fn request(socket: &Path, request: Request) -> Vec<Event> {
-    let client = Client::connect(socket)
-        .await
-        .expect("connect to the daemon");
-    let responses = client.request(request).await.expect("request sends");
-    tokio::time::timeout(TIMEOUT, responses.collect::<Vec<_>>())
-        .await
-        .expect("the reply stream does not stall")
-        .into_iter()
-        .collect::<Result<_, _>>()
-        .expect("every frame decodes")
-}
-
-/// The events' `Final`.
-fn final_of(events: &[Event]) -> &Final {
-    match events.last() {
-        Some(Event::Final(f)) => f,
-        other => panic!("the last event is the Final frame, got {other:?}"),
-    }
 }
 
 /// The daemon's stub-backed start: cached model, ANE and GPU delays.
@@ -1037,18 +921,23 @@ async fn idle_exit() {
         .expect("idle exit is not an error");
 }
 
+/// A `Hello` one protocol version ahead of the daemon's.
+fn next_protocol() -> protocol::Hello {
+    protocol::Hello {
+        protocol: protocol::PROTOCOL + 1,
+        version: "0.0.0".into(),
+        build: support::client::build(),
+    }
+}
+
 /// A raw client whose `Hello` mismatches: the daemon answers
 /// `ProtocolMismatch` and begins shutdown. Returns the parsed frame.
-fn mismatched_hello(socket: &Path) -> Event {
+fn mismatched_hello(socket: &Path, hello: &protocol::Hello) -> Event {
     let line = tokio::task::block_in_place(|| {
         use std::io::{BufRead, BufReader};
         let socket = socket.to_path_buf();
         let mut stream = std::os::unix::net::UnixStream::connect(&socket).expect("connect");
-        let hello = serde_json::to_string(&protocol::Hello {
-            protocol: protocol::PROTOCOL + 1,
-            version: "0.0.0".into(),
-        })
-        .unwrap();
+        let hello = serde_json::to_string(hello).unwrap();
         writeln!(stream, "{hello}").unwrap();
         let mut line = String::new();
         BufReader::new(&stream).read_line(&mut line).unwrap();
@@ -1068,7 +957,7 @@ async fn protocol_mismatch_shuts_down() {
     )
     .await;
 
-    match mismatched_hello(&d.socket) {
+    match mismatched_hello(&d.socket, &next_protocol()) {
         Event::Final(Final::Error(report)) => {
             assert_eq!(report.kind, ErrorKind::ProtocolMismatch)
         }
@@ -1079,6 +968,41 @@ async fn protocol_mismatch_shuts_down() {
         .expect("run returns after the mismatch")
         .expect("run task does not panic")
         .expect("a protocol mismatch is a clean shutdown");
+}
+
+/// The daemon's protocol and version but another `BuildId` — a daemon
+/// running a binary that has been rebuilt or reinstalled in place — is the
+/// same `ProtocolMismatch`: `run` returns so launchd starts the new file.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn build_mismatch_shuts_down() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let d = daemon(
+        tmp,
+        StubBackend::new(mpsc::channel().0),
+        Model::Cached,
+        Duration::from_secs(600),
+    )
+    .await;
+
+    // No real file can carry this identity, so it differs from the
+    // daemon's `Config::build` by construction.
+    let hello = protocol::Hello::new(protocol::BuildId {
+        dev: 0,
+        ino: 0,
+        size: 0,
+        mtime_ns: 0,
+    });
+    match mismatched_hello(&d.socket, &hello) {
+        Event::Final(Final::Error(report)) => {
+            assert_eq!(report.kind, ErrorKind::ProtocolMismatch)
+        }
+        other => panic!("expected a ProtocolMismatch, got {other:?}"),
+    }
+    tokio::time::timeout(TIMEOUT, d.join)
+        .await
+        .expect("run returns after the mismatch")
+        .expect("run task does not panic")
+        .expect("a build mismatch is a clean shutdown");
 }
 
 /// A shutdown during a gated `open_ane` must not abandon the ANE thread:
@@ -1097,7 +1021,7 @@ async fn shutdown_during_open_ane_joins_the_thread() {
             .recv_timeout(TIMEOUT)
             .expect("open_ane is entered")
     });
-    mismatched_hello(&d.socket);
+    mismatched_hello(&d.socket, &next_protocol());
     tokio::task::block_in_place(|| hold.open());
 
     // `open_ane` returns a live embedder; the pipeline stop pulls `Stop`
@@ -1147,7 +1071,7 @@ async fn shutdown_during_download_leaves_no_model_dir() {
         }
     }
 
-    mismatched_hello(&d.socket);
+    mismatched_hello(&d.socket, &next_protocol());
     // The waiting request is answered `ShuttingDown`, not left hanging.
     loop {
         match next_event(&mut stream).await {
@@ -1309,11 +1233,7 @@ async fn model_download_streams_progress() {
     .await;
 
     let repo = fn_repo(20, SMALL_BYTES, 10);
-    let client = Client::connect(&d.socket).await.expect("connect");
-    let mut responses = client
-        .request(search(&repo.root, MARKER))
-        .await
-        .expect("request sends");
+    let mut responses = stream_request(&d.socket, search(&repo.root, MARKER)).await;
     loop {
         match next_event(&mut responses).await {
             Event::Progress(protocol::Progress::ModelDownload { .. }) => break,
@@ -1509,6 +1429,7 @@ async fn daemon_host() {
         idle_exit: Duration::from_secs(3600),
         model_store: store,
         backend: Arc::new(backend),
+        build: support::client::build(),
     })
     .await
     .expect("the host runs");
@@ -1687,21 +1608,6 @@ async fn host_parent() {
     // The harness left its `test ... ` prefix unterminated on this line.
     println!("\nPID {}", host.child.id());
     std::future::pending::<()>().await;
-}
-
-/// Sends `request` and returns the live event stream, uncollected.
-async fn stream_request(socket: &Path, request: Request) -> repo_search::client::Responses {
-    let client = Client::connect(socket).await.expect("connect");
-    client.request(request).await.expect("request sends")
-}
-
-/// The next frame on a live stream within `TIMEOUT`.
-async fn next_event(stream: &mut repo_search::client::Responses) -> Event {
-    tokio::time::timeout(TIMEOUT, stream.next())
-        .await
-        .expect("a frame arrives")
-        .expect("the stream stays open")
-        .expect("the frame decodes")
 }
 
 /// SIGTERM during an `index --wait`: the in-flight request is answered
@@ -1954,7 +1860,9 @@ fn host_exits_when_its_parent_is_killed() {
     parent.child.kill().expect("SIGKILL");
     parent.child.wait().expect("wait");
     assert!(
-        support::host::wait_for_exit(pid, Duration::from_secs(30)),
+        repo_search::kqueue::ExitWatch::register(pid)
+            .expect("the host's exit registers")
+            .wait(Duration::from_secs(30)),
         "the host outlived a SIGKILLed parent"
     );
 }

@@ -87,6 +87,7 @@ libc = { version = "0.2.191", default-features = false, features = ["std"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 repo-search-coreml.workspace = true
+kqueue = { version = "1.2.1", default-features = false }
 libc = { version = "0.2.191", default-features = false, features = ["std"] }
 notify = { version = "8.2.0", default-features = false, features = [
     "macos_fsevent",
