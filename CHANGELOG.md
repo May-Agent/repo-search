@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.2](https://github.com/May-Agent/repo-search/compare/v0.0.1...v0.0.2) - 2026-10-21
+
+### Other
+
+- *(release)* compute versions from tags again
+
 ## [0.0.1](https://github.com/May-Agent/repo-search/compare/v0.0.0...v0.0.1) - 2026-10-21
 
 ### Added
