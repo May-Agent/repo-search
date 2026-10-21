@@ -23,9 +23,17 @@ pub fn build() -> BuildId {
     BuildId::of_current_exe().expect("the test binary stats")
 }
 
-/// The handshake matching [`build`].
+/// The handshake matching [`build`]: right for the in-process and
+/// re-executed test daemons, which run this same binary.
 pub fn hello() -> Hello {
     Hello::new(build())
+}
+
+/// The handshake matching a daemon running the `search` binary at
+/// `program` — the real launchd tests, where the daemon is not this test
+/// binary.
+pub fn hello_for(program: &Path) -> Hello {
+    Hello::new(BuildId::of_file(program).expect("the daemon binary stats"))
 }
 
 /// A `search` request for `query` on `worktree`.
@@ -46,8 +54,8 @@ pub fn search(worktree: &Path, query: &str) -> Request {
 }
 
 /// Sends `request` and collects events to the `Final` frame.
-pub async fn request(socket: &Path, request: Request) -> Vec<Event> {
-    let client = Client::connect(socket, &hello())
+pub async fn request(socket: &Path, hello: &Hello, request: Request) -> Vec<Event> {
+    let client = Client::connect(socket, hello)
         .await
         .expect("connect to the daemon");
     let responses = client.request(request).await.expect("request sends");
@@ -68,8 +76,8 @@ pub fn final_of(events: &[Event]) -> &Final {
 }
 
 /// Sends `request` and returns the live event stream, uncollected.
-pub async fn stream_request(socket: &Path, request: Request) -> Responses {
-    let client = Client::connect(socket, &hello()).await.expect("connect");
+pub async fn stream_request(socket: &Path, hello: &Hello, request: Request) -> Responses {
+    let client = Client::connect(socket, hello).await.expect("connect");
     client.request(request).await.expect("request sends")
 }
 

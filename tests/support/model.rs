@@ -12,7 +12,7 @@ use std::process::Command;
 
 use repo_search::client::Responses;
 use repo_search::model_store::{ModelSpec, ModelStore};
-use repo_search::protocol::{Event, Final, Progress, Request, WirePhase};
+use repo_search::protocol::{Event, Final, Hello, Progress, Request, WirePhase};
 use repo_search_core::store::{Index, VectorCache};
 
 use super::client;
@@ -74,9 +74,10 @@ pub fn model_store(root: PathBuf) -> ModelStore {
 }
 
 /// Opens an `index --wait` stream for `worktree` on `socket`.
-pub async fn index_wait(socket: &Path, worktree: &Path) -> Responses {
+pub async fn index_wait(socket: &Path, hello: &Hello, worktree: &Path) -> Responses {
     client::stream_request(
         socket,
+        hello,
         Request::Index {
             worktree: worktree.to_path_buf(),
             wait: true,
@@ -118,9 +119,10 @@ pub async fn committed(worktree: &Path, common_dir: &Path, model_id: &str) -> u6
 /// phase the kill left behind is `first_index`, its index stream resumes at
 /// `at_least` committed vectors, and coverage grows by another 200. The
 /// stream is dropped without waiting for the full index.
-pub async fn assert_resume(socket: &Path, worktree: &Path, at_least: u64) {
+pub async fn assert_resume(socket: &Path, hello: &Hello, worktree: &Path, at_least: u64) {
     let events = client::request(
         socket,
+        hello,
         Request::Status {
             worktree: worktree.to_path_buf(),
         },
@@ -136,7 +138,7 @@ pub async fn assert_resume(socket: &Path, worktree: &Path, at_least: u64) {
         "the kill left the phase at first-index"
     );
 
-    let mut stream = index_wait(socket, worktree).await;
+    let mut stream = index_wait(socket, hello, worktree).await;
     let mut first: Option<u64> = None;
     loop {
         match client::next_event(&mut stream).await {

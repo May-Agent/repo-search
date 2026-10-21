@@ -4,6 +4,8 @@
 <dict>
 	<key>Label</key>
 	<string>{{ label }}</string>
+	<key>LimitLoadToSessionType</key>
+	<string>Background</string>
 	<key>ProgramArguments</key>
 	<array>
 		<string>{{ program.display() }}</string>

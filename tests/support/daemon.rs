@@ -69,7 +69,8 @@ pub fn model_store(root: PathBuf, model: &Model) -> ModelStore {
 
 /// Starts the stub daemon on an already-bound `listener` — the caller owns
 /// the socket path. `runtime` spawns the run task, so a non-tokio thread
-/// (the fake launchd) can start it too.
+/// (the fake launchd) can start it too; `from_std` registers the fd with
+/// the reactor, so it runs inside the spawned task.
 pub fn spawn_on(
     runtime: &tokio::runtime::Handle,
     listener: std::os::unix::net::UnixListener,
@@ -78,17 +79,20 @@ pub fn spawn_on(
     idle_exit: Duration,
     build: BuildId,
 ) -> JoinHandle<Result<(), Error>> {
-    listener
-        .set_nonblocking(true)
-        .expect("the listener goes nonblocking");
-    let listener = UnixListener::from_std(listener).expect("the listener adopts");
-    runtime.spawn(daemon::run(Config {
-        listener,
-        idle_exit,
-        model_store,
-        backend,
-        build,
-    }))
+    runtime.spawn(async move {
+        listener
+            .set_nonblocking(true)
+            .expect("the listener goes nonblocking");
+        let listener = UnixListener::from_std(listener).expect("the listener adopts");
+        daemon::run(Config {
+            listener,
+            idle_exit,
+            model_store,
+            backend,
+            build,
+        })
+        .await
+    })
 }
 
 /// Starts a daemon with `backend`; the record log drains into `records`.

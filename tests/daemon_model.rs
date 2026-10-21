@@ -61,7 +61,8 @@ async fn stage_1_query_on_the_ane() {
     }));
 
     for query in QUERIES {
-        let events = client::request(&socket, client::search(&worktree, query)).await;
+        let events =
+            client::request(&socket, &client::hello(), client::search(&worktree, query)).await;
         let answer = match client::final_of(&events) {
             Final::Answer(answer) => answer,
             Final::Error(error) => panic!("{query:?} failed: {error:?}"),
@@ -108,7 +109,7 @@ async fn kill_and_resume_on_the_model() {
 
     let mut host = Host::spawn(&host_config("daemon1.sock"));
     let socket = tmp.path().join("daemon1.sock");
-    let mut stream = model::index_wait(&socket, &worktree).await;
+    let mut stream = model::index_wait(&socket, &client::hello(), &worktree).await;
     model::await_coverage(&mut stream, 500).await;
     drop(stream);
 
@@ -117,6 +118,7 @@ async fn kill_and_resume_on_the_model() {
     // chunk is committed, not still buffered.
     let events = client::request(
         &socket,
+        &client::hello(),
         Request::Index {
             worktree: worktree.clone(),
             wait: false,
@@ -136,7 +138,13 @@ async fn kill_and_resume_on_the_model() {
     assert!(committed >= 500, "{committed} committed vectors");
 
     let _host = Host::spawn(&host_config("daemon2.sock"));
-    model::assert_resume(&tmp.path().join("daemon2.sock"), &worktree, committed).await;
+    model::assert_resume(
+        &tmp.path().join("daemon2.sock"),
+        &client::hello(),
+        &worktree,
+        committed,
+    )
+    .await;
 }
 
 /// Configuration handed to a re-executed `daemon_host_coreml` through

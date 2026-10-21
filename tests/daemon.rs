@@ -19,7 +19,7 @@ use repo_search::protocol::{self, ErrorKind, Event, Final, Request, WirePhase};
 use repo_search_core::qos::QosClass;
 use repo_search_core::store::{ContentHash, Index, VectorCache};
 use repo_search_coreml::GpuBlocked;
-use support::client::{final_of, next_event, request, search, stream_request};
+use support::client::{final_of, hello, next_event, request, search, stream_request};
 use support::daemon::{Daemon, Model, daemon, digest_of, sha_7};
 use support::repo::{self, TestRepo};
 use support::stub::{IndexGate, Instance, Kind, Record, StubBackend};
@@ -119,7 +119,7 @@ async fn start(
 /// A daemon whose request/answer drive indexing, with records collected in
 /// `log`.
 async fn answer_search(daemon: &Daemon, worktree: &Path, query: &str) -> Vec<Event> {
-    request(&daemon.socket, search(worktree, query)).await
+    request(&daemon.socket, &hello(), search(worktree, query)).await
 }
 
 /// A daemon whose ANE holds index calls at an [`IndexGate`] once the test
@@ -158,6 +158,7 @@ async fn first_search_answers_and_starts_stage_1() {
     wait_held(&mut log, &d.records);
     let events = request(
         &d.socket,
+        &hello(),
         Request::Status {
             worktree: repo.root.clone(),
         },
@@ -195,6 +196,7 @@ async fn query_preempts_indexing() {
     // ANE runs at background QoS, the class a queued query lifts.
     let events = request(
         &d.socket,
+        &hello(),
         Request::Index {
             worktree: repo.root.clone(),
             wait: true,
@@ -221,6 +223,7 @@ async fn query_preempts_indexing() {
     );
     let events = request(
         &d.socket,
+        &hello(),
         Request::Index {
             worktree: repo.root.clone(),
             wait: false,
@@ -234,7 +237,7 @@ async fn query_preempts_indexing() {
     // The query's lexical candidates are the edited, unembedded functions:
     // the search embeds them on the spot.
     let sent = Instant::now();
-    let responses = stream_request(&d.socket, search(&repo.root, "edited_item_3")).await;
+    let responses = stream_request(&d.socket, &hello(), search(&repo.root, "edited_item_3")).await;
     // The request is on the wire: releasing the held call is the test's
     // doing, not the query's lift — the scheduler-level test proves the
     // override. What stays asserted here is the ordering.
@@ -323,7 +326,8 @@ async fn gpu_takes_the_long_end_in_same_bucket_batches() {
     .await;
     let socket = d.socket.clone();
     let root = repo.root.clone();
-    let query = tokio::spawn(async move { request(&socket, search(&root, "long_0")).await });
+    let query =
+        tokio::spawn(async move { request(&socket, &hello(), search(&root, "long_0")).await });
     // A Started record proves the daemon is up — its headroom callback is
     // registered — so the push below lands.
     let mut log: Vec<Record> = Vec::new();
@@ -451,7 +455,8 @@ async fn gpu_released_on_power_loss() {
     // headroom callback is registered before we push.
     let socket = d.socket.clone();
     let root = repo.root.clone();
-    let query = tokio::spawn(async move { request(&socket, search(&root, "long_0")).await });
+    let query =
+        tokio::spawn(async move { request(&socket, &hello(), search(&root, "long_0")).await });
     let mut log = Vec::new();
     wait_for(&mut log, &d.records, |r| {
         r.instance == Instance::Ane && r.kind == Kind::Started
@@ -520,7 +525,8 @@ async fn stage_2_runs_at_background_qos() {
     let socket = d.socket.clone();
     let root = repo.root.clone();
     // The query matches nothing, so no chunk is embedded on the spot.
-    let query = tokio::spawn(async move { request(&socket, search(&root, "nomatchterm")).await });
+    let query =
+        tokio::spawn(async move { request(&socket, &hello(), search(&root, "nomatchterm")).await });
     let mut log: Vec<Record> = Vec::new();
     // The daemon is up once the ANE's first record lands; the headroom push
     // after it reaches a registered callback.
@@ -553,6 +559,7 @@ async fn stage_2_runs_at_background_qos() {
     // smalls: `Indexed` comes after the last of them and after the phase flip.
     let events = request(
         &d.socket,
+        &hello(),
         Request::Index {
             worktree: repo.root.clone(),
             wait: true,
@@ -562,6 +569,7 @@ async fn stage_2_runs_at_background_qos() {
     assert!(matches!(final_of(&events), Final::Indexed { .. }));
     let events = request(
         &d.socket,
+        &hello(),
         Request::Status {
             worktree: repo.root.clone(),
         },
@@ -586,6 +594,7 @@ async fn stage_2_runs_at_background_qos() {
     );
     let events = request(
         &d.socket,
+        &hello(),
         Request::Index {
             worktree: repo.root.clone(),
             wait: true,
@@ -627,6 +636,7 @@ async fn search_answers_during_index_wait() {
     let index_wait = tokio::spawn(async move {
         request(
             &socket,
+            &hello(),
             Request::Index {
                 worktree: root,
                 wait: true,
@@ -648,6 +658,7 @@ async fn search_answers_during_index_wait() {
     assert!(matches!(final_of(&events), Final::Answer(_)));
     let events = request(
         &d.socket,
+        &hello(),
         Request::Status {
             worktree: repo.root.clone(),
         },
@@ -689,6 +700,7 @@ async fn stage1_done_reaches_a_waiting_index() {
     let first = tokio::spawn(async move {
         request(
             &socket,
+            &hello(),
             Request::Index {
                 worktree: root,
                 wait: true,
@@ -701,6 +713,7 @@ async fn stage1_done_reaches_a_waiting_index() {
     let second = tokio::spawn(async move {
         request(
             &socket,
+            &hello(),
             Request::Index {
                 worktree: root,
                 wait: true,
@@ -714,6 +727,7 @@ async fn stage1_done_reaches_a_waiting_index() {
     // waits are parked.
     let events = request(
         &d.socket,
+        &hello(),
         Request::Status {
             worktree: repo.root.clone(),
         },
@@ -742,6 +756,7 @@ async fn stage1_done_reaches_a_waiting_index() {
     // taken after the waits reports `Maintained`.
     let events = request(
         &d.socket,
+        &hello(),
         Request::Status {
             worktree: repo.root.clone(),
         },
@@ -816,6 +831,7 @@ async fn fsevents_change_is_embedded_in_background() {
     // and the phase flips to maintained before it answers.
     let events = request(
         &d.socket,
+        &hello(),
         Request::Index {
             worktree: repo.root.clone(),
             wait: true,
@@ -825,6 +841,7 @@ async fn fsevents_change_is_embedded_in_background() {
     assert!(matches!(final_of(&events), Final::Indexed { .. }));
     let events = request(
         &d.socket,
+        &hello(),
         Request::Status {
             worktree: repo.root.clone(),
         },
@@ -879,6 +896,7 @@ async fn idle_exit() {
     // so only the idle deadline remains.
     let events = request(
         &d.socket,
+        &hello(),
         Request::Index {
             worktree: repo.root.clone(),
             wait: true,
@@ -902,6 +920,7 @@ async fn idle_exit() {
     let d = daemon(tmp, backend, Model::Cached, Duration::from_secs(2)).await;
     let events = request(
         &d.socket,
+        &hello(),
         Request::Index {
             worktree: repo.root.clone(),
             wait: false,
@@ -1060,7 +1079,7 @@ async fn shutdown_during_download_leaves_no_model_dir() {
     // A request waits out the download; `ModelDownload` progress proves
     // `ensure` is mid-body, held by the server.
     let repo = fn_repo(5, SMALL_BYTES, 10);
-    let mut stream = stream_request(&d.socket, search(&repo.root, MARKER)).await;
+    let mut stream = stream_request(&d.socket, &hello(), search(&repo.root, MARKER)).await;
     loop {
         match next_event(&mut stream).await {
             Event::Progress(protocol::Progress::ModelDownload { received, .. }) if received > 0 => {
@@ -1108,7 +1127,7 @@ async fn dropped_client_still_completes_the_barrier() {
     let hold = backend.hold_counter();
     let d = daemon(tmp, backend, Model::Cached, Duration::from_secs(1)).await;
 
-    let stream = stream_request(&d.socket, search(&repo.root, MARKER)).await;
+    let stream = stream_request(&d.socket, &hello(), search(&repo.root, MARKER)).await;
     // The search is inside its barrier when the counter is entered.
     tokio::task::block_in_place(|| {
         hold.entered
@@ -1182,7 +1201,7 @@ async fn fatal_open_ane_fails_the_request() {
             .recv_timeout(TIMEOUT)
             .expect("open_ane is entered")
     });
-    let mut stream = stream_request(&d.socket, search(&repo.root, MARKER)).await;
+    let mut stream = stream_request(&d.socket, &hello(), search(&repo.root, MARKER)).await;
     loop {
         match next_event(&mut stream).await {
             Event::Progress(protocol::Progress::ModelLoading) => break,
@@ -1233,7 +1252,7 @@ async fn model_download_streams_progress() {
     .await;
 
     let repo = fn_repo(20, SMALL_BYTES, 10);
-    let mut responses = stream_request(&d.socket, search(&repo.root, MARKER)).await;
+    let mut responses = stream_request(&d.socket, &hello(), search(&repo.root, MARKER)).await;
     loop {
         match next_event(&mut responses).await {
             Event::Progress(protocol::Progress::ModelDownload { .. }) => break,
@@ -1327,7 +1346,7 @@ async fn a_recreated_worktree_gets_a_fresh_index() {
         worktree.join(".repo-search/index.db").exists(),
         "the search indexes the new tree"
     );
-    let events = request(&d.socket, Request::Status { worktree }).await;
+    let events = request(&d.socket, &hello(), Request::Status { worktree }).await;
     let status = match final_of(&events) {
         Final::Status(status) => status,
         other => panic!("expected a Status, got {other:?}"),
@@ -1349,6 +1368,7 @@ async fn status_does_not_create_an_index() {
 
     let events = request(
         &d.socket,
+        &hello(),
         Request::Status {
             worktree: repo.root.clone(),
         },
@@ -1635,6 +1655,7 @@ async fn sigterm_answers_in_flight_and_flushes() {
     let socket = tmp.path().join("daemon.sock");
     let mut stream = stream_request(
         &socket,
+        &hello(),
         Request::Index {
             worktree: repo.root.clone(),
             wait: true,
@@ -1713,6 +1734,7 @@ async fn kill_mid_index_resumes() {
     let socket = tmp.path().join("daemon1.sock");
     let mut stream = stream_request(
         &socket,
+        &hello(),
         Request::Index {
             worktree: repo.root.clone(),
             wait: true,
@@ -1752,6 +1774,7 @@ async fn kill_mid_index_resumes() {
     let socket = tmp.path().join("daemon2.sock");
     let events = request(
         &socket,
+        &hello(),
         Request::Status {
             worktree: repo.root.clone(),
         },
@@ -1770,6 +1793,7 @@ async fn kill_mid_index_resumes() {
     // The resumed pass starts at the committed count and runs to the end.
     let mut stream = stream_request(
         &socket,
+        &hello(),
         Request::Index {
             worktree: repo.root.clone(),
             wait: true,
@@ -1797,6 +1821,7 @@ async fn kill_mid_index_resumes() {
     assert_eq!(indexed.0, indexed.1, "the resumed pass completes coverage");
     let events = request(
         &socket,
+        &hello(),
         Request::Status {
             worktree: repo.root.clone(),
         },

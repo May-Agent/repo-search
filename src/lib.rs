@@ -5,6 +5,9 @@ pub mod client;
 /// The `search` daemon.
 #[cfg(target_os = "macos")]
 pub mod daemon;
+/// Installing and replacing the per-user LaunchAgent.
+#[cfg(target_os = "macos")]
+pub mod install;
 /// Event-driven waits on kqueue for the install flow.
 #[cfg(target_os = "macos")]
 pub mod kqueue;

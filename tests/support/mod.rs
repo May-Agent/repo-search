@@ -8,6 +8,8 @@ pub mod daemon;
 pub mod host;
 pub mod http;
 #[cfg(target_os = "macos")]
+pub mod launchd;
+#[cfg(target_os = "macos")]
 pub mod model;
 pub mod repo;
 #[cfg(target_os = "macos")]
