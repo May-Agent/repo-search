@@ -320,6 +320,10 @@ impl<S: EmbedService> Retriever<S> {
             )
             .await?;
         let hashes: Vec<ContentHash> = pending.iter().map(|p| p.content_hash).collect();
+        self.service
+            .stored(hashes.clone())
+            .await
+            .map_err(Error::Embed)?;
         let stored = self.cache.get_many(model, &hashes).await?;
         self.vectors
             .adopt::<S::Error>(
@@ -533,7 +537,7 @@ async fn read_texts<E: std::error::Error + 'static>(
 ) -> Result<Vec<Result<String, ReadError>>, Error<E>> {
     let root = root.to_path_buf();
     run_blocking(move || {
-        let mut files: HashMap<&str, Vec<u8>> = HashMap::new();
+        let mut files: HashMap<&str, Option<String>> = HashMap::new();
         rows.iter()
             .map(|row| read_text(&root, row, &mut files))
             .collect()
@@ -544,7 +548,7 @@ async fn read_texts<E: std::error::Error + 'static>(
 fn read_text<'a>(
     root: &Path,
     row: &'a ChunkRow,
-    files: &mut HashMap<&'a str, Vec<u8>>,
+    files: &mut HashMap<&'a str, Option<String>>,
 ) -> Result<String, ReadError> {
     let stale = || ReadError::Stale {
         path: row.path.clone(),
@@ -563,11 +567,13 @@ fn read_text<'a>(
                 });
             }
         };
-        files.insert(&row.path, bytes);
+        files.insert(&row.path, String::from_utf8(bytes).ok());
     }
-    let bytes = &files[row.path.as_str()];
+    let Some(src) = files[row.path.as_str()].as_deref() else {
+        return Err(stale());
+    };
     let Some(text) =
-        crate::chunk::rebuild_text(bytes, row.members.iter().map(|m| (m.bytes.clone(), m.emit)))
+        crate::chunk::rebuild_text(src, row.members.iter().map(|m| (m.bytes.clone(), m.emit)))
     else {
         return Err(stale());
     };

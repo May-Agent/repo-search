@@ -3,6 +3,7 @@
 
 pub mod ane;
 pub mod coreml;
+pub mod feed;
 pub mod gpu;
 pub mod model;
 pub mod registry;

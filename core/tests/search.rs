@@ -14,7 +14,7 @@ mod support;
 
 use counters::CapOff;
 use futures_executor::block_on;
-use repo_search_core::reconcile::{Options, PendingChunk, reconcile};
+use repo_search_core::reconcile::{Options, PendingChunk, missing, reconcile};
 use repo_search_core::search::{
     Channel, Error, FilterError, Filters, Mode, ON_THE_SPOT, Reconciliation, Request, Results,
     Retriever, TokenCounter,
@@ -227,8 +227,16 @@ impl Fixture {
             Arc::new(CapOff),
         ))
         .unwrap();
-        let mut pending = reconciled.pending.clone();
-        let code_pending = reconciled.pending.clone();
+        let code_pending = block_on(missing(
+            &index,
+            &cache,
+            MODEL,
+            tree.path(),
+            Options::default(),
+            Vec::new(),
+        ))
+        .unwrap();
+        let mut pending = code_pending.clone();
         let mut total = reconciled.report.chunks_total;
         let changed = reconciled.report.files_changed();
 
@@ -1031,7 +1039,19 @@ fn alternating_searches_show_ignored_files_only_when_asked() {
     .unwrap();
     let mut search = |include_ignored: bool, mode: Mode, files_only: bool| {
         let reconciled = pass(include_ignored);
-        assert!(reconciled.pending.is_empty(), "everything is embedded");
+        assert!(
+            block_on(missing(
+                &index,
+                &cache,
+                MODEL,
+                tree.path(),
+                Options { include_ignored },
+                Vec::new()
+            ))
+            .unwrap()
+            .is_empty(),
+            "everything is embedded"
+        );
         let report = &reconciled.report;
         assert_eq!(report.chunks_total, if include_ignored { 2 } else { 1 });
         assert_eq!(report.chunks_with_vector, report.chunks_total);
@@ -1050,9 +1070,20 @@ fn alternating_searches_show_ignored_files_only_when_asked() {
         .unwrap()
     };
 
-    let first = pass(true);
-    assert!(first.pending.iter().any(|p| p.path == "secret.rs"));
-    embed(&first.pending);
+    let _first = pass(true);
+    let first_pending = block_on(missing(
+        &index,
+        &cache,
+        MODEL,
+        tree.path(),
+        Options {
+            include_ignored: true,
+        },
+        Vec::new(),
+    ))
+    .unwrap();
+    assert!(first_pending.iter().any(|p| p.path == "secret.rs"));
+    embed(&first_pending);
 
     for mode in [Mode::Lexical, Mode::Semantic, Mode::Hybrid] {
         for files_only in [false, true] {

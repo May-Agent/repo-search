@@ -8,6 +8,7 @@ use tokio::sync::{mpsc, oneshot};
 use repo_search_core::qos::{QosClass, set_current_thread};
 use repo_search_core::reconcile::PendingChunk;
 use repo_search_core::search::EmbedService;
+use repo_search_core::store::ContentHash;
 use repo_search_core::{Embedder, QueryTask, UnitVector};
 
 /// A test embedder thread that exits early is a test bug.
@@ -83,5 +84,9 @@ impl<E: Embedder + Send + 'static> EmbedService for EmbedThread<E> {
         let request = Request::Documents { chunks, reply };
         self.tx.send(request).await.expect(GONE);
         rx.await.expect(GONE)
+    }
+
+    async fn stored(&self, _hashes: Vec<ContentHash>) -> Result<(), Self::Error> {
+        Ok(())
     }
 }

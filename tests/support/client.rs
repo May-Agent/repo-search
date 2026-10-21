@@ -81,6 +81,15 @@ pub async fn stream_request(socket: &Path, hello: &Hello, request: Request) -> R
     client.request(request).await.expect("request sends")
 }
 
+/// Reads `stream` to its `Final` frame, dropping any progress frames.
+pub async fn final_event(stream: &mut Responses) -> Final {
+    loop {
+        if let Event::Final(f) = next_event(stream).await {
+            break f;
+        }
+    }
+}
+
 /// The next frame on a live stream within `TIMEOUT`.
 pub async fn next_event(stream: &mut Responses) -> Event {
     tokio::time::timeout(TIMEOUT, stream.next())

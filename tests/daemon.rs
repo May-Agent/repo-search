@@ -19,7 +19,7 @@ use repo_search::protocol::{self, ErrorKind, Event, Final, Request, WirePhase};
 use repo_search_core::qos::QosClass;
 use repo_search_core::store::{ContentHash, Index, VectorCache};
 use repo_search_coreml::GpuBlocked;
-use support::client::{final_of, hello, next_event, request, search, stream_request};
+use support::client::{final_event, final_of, hello, next_event, request, search, stream_request};
 use support::daemon::{Daemon, Model, daemon, digest_of, sha_7};
 use support::repo::{self, TestRepo};
 use support::stub::{IndexGate, Instance, Kind, Record, StubBackend};
@@ -1889,5 +1889,223 @@ fn host_exits_when_its_parent_is_killed() {
             .expect("the host's exit registers")
             .wait(Duration::from_secs(30)),
         "the host outlived a SIGKILLed parent"
+    );
+}
+
+/// A lexical `search` request: no on-the-spot embedding, so the only reads
+/// are the barrier's and the answer's.
+fn lexical(worktree: &Path, query: &str) -> Request {
+    let mut request = search(worktree, query);
+    let Request::Search(inner) = &mut request else {
+        unreachable!("search builds a Search request")
+    };
+    inner.mode = protocol::WireMode::Lexical;
+    request
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_no_change_search_reads_no_pending_file() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let repo = fn_repo(40, SMALL_BYTES, 10);
+    let (d, gate) = start_index_gated(Duration::from_millis(10)).await;
+    gate.arm();
+
+    let events = request(&d.socket, &hello(), lexical(&repo.root, MARKER)).await;
+    let answer = match final_of(&events) {
+        Final::Answer(answer) => answer,
+        other => panic!("expected an Answer, got {other:?}"),
+    };
+    assert!(answer.has_results);
+    let mut log: Vec<Record> = Vec::new();
+    wait_held(&mut log, &d.records);
+
+    // A permission bit is a ctime-only change: the next barrier touches no
+    // file's stat fields, so it must not read f3 at all.
+    let f3 = repo.root.join("src/f3.rs");
+    std::fs::set_permissions(&f3, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let events = request(&d.socket, &hello(), lexical(&repo.root, MARKER)).await;
+    std::fs::set_permissions(&f3, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let answer = match final_of(&events) {
+        Final::Answer(answer) => answer,
+        other => panic!("expected an Answer, got {other:?}"),
+    };
+    assert!(answer.has_results);
+
+    gate.open();
+    let events = request(
+        &d.socket,
+        &hello(),
+        Request::Index {
+            worktree: repo.root.clone(),
+            wait: true,
+        },
+    )
+    .await;
+    match final_of(&events) {
+        Final::Indexed { with_vector, total } => {
+            assert_eq!(with_vector, total, "every chunk has a vector")
+        }
+        other => panic!("expected Indexed, got {other:?}"),
+    }
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn background_work_follows_edits_and_deletions() {
+    let repo = fn_repo(40, SMALL_BYTES, 10);
+    let (d, gate) = start_index_gated(Duration::from_millis(10)).await;
+    gate.arm();
+
+    let events = request(&d.socket, &hello(), lexical(&repo.root, MARKER)).await;
+    assert!(
+        matches!(final_of(&events), Final::Answer(a) if a.has_results),
+        "{events:?}"
+    );
+    // The held item is the first in index order, a chunk of f0.
+    let mut log: Vec<Record> = Vec::new();
+    wait_held(&mut log, &d.records);
+    // The edit's chunks embed at background QoS once the phase flips, which
+    // a loaded host can starve: lift the thread's effective priority for
+    // the run — its requested class stays Background. The Held record
+    // proves `open_ane` has published the thread.
+    let _lift = support::stub::lift_ane(&d.backend, QosClass::UserInitiated);
+
+    repo::append(
+        &repo.root,
+        "src/f1.rs",
+        &repo::rust_fn("added_while_held", SMALL_BYTES),
+    );
+    std::fs::remove_file(repo.root.join("src/f3.rs")).unwrap();
+
+    let events = request(&d.socket, &hello(), lexical(&repo.root, "added_while_held")).await;
+    assert!(
+        matches!(final_of(&events), Final::Answer(a) if a.has_results),
+        "{events:?}"
+    );
+
+    // The wait's first `Coverage` is sent only once its own `Enqueue` is
+    // in the scheduler's inbox — and the feeder applies feeds in order, so
+    // the search's `Change` is in by then. The held item keeps `remaining`
+    // above 0, so the first loop iteration reports right away.
+    let mut wait = support::model::index_wait(&d.socket, &hello(), &repo.root).await;
+    support::model::await_coverage(&mut wait, 0).await;
+    gate.open();
+    match final_event(&mut wait).await {
+        Final::Indexed { with_vector, total } => {
+            assert_eq!(with_vector, total, "every chunk has a vector");
+            assert_eq!(total, 32, "41 chunks - f3's 10 + the appended fn");
+        }
+        other => panic!("expected Indexed, got {other:?}"),
+    }
+
+    // Every surviving chunk was embedded exactly once; f3's chunks never
+    // were. Watcher passes may interleave the searches' barriers — every
+    // interleaving must give this result.
+    let final_hashes: HashSet<ContentHash> = Index::open(&repo.root)
+        .await
+        .expect("index opens")
+        .chunk_hashes(false)
+        .await
+        .expect("chunk hashes")
+        .into_iter()
+        .collect();
+    let embedded: Vec<ContentHash> = d
+        .records
+        .try_iter()
+        .filter(|r| r.kind == Kind::Index)
+        .map(|r| r.hash.expect("an Index record carries a hash"))
+        .collect();
+    let embedded_set: HashSet<ContentHash> = embedded.iter().copied().collect();
+    assert_eq!(embedded.len(), embedded_set.len(), "no hash embedded twice");
+    assert_eq!(embedded_set, final_hashes);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_include_ignored_search_and_a_plain_one_resync_the_scope() {
+    // The vendored functions' longer names give their chunks more
+    // `StubCounter` tokens than the `fn_NNNN` chunks, so shortest-first
+    // dispatch holds a `src` chunk at the gate.
+    let mut files = Vec::new();
+    for f in 0..2 {
+        let mut body = String::new();
+        for j in 0..10 {
+            body.push_str(&repo::rust_fn(
+                &format!("fn_{:04}", f * 10 + j),
+                SMALL_BYTES,
+            ));
+        }
+        if f == 0 {
+            body.push_str(&repo::rust_fn(&format!("{MARKER}_fn"), SMALL_BYTES));
+        }
+        files.push((format!("src/f{f}.rs"), body));
+    }
+    files.push((".gitignore".to_owned(), "vendor/\n".to_owned()));
+    let mut vendored = String::new();
+    for i in 0..10 {
+        vendored.push_str(&repo::rust_fn(&format!("vendored_fn_{i:04}"), SMALL_BYTES));
+    }
+    files.push(("vendor/v.rs".to_owned(), vendored));
+    let repo = repo::repo(&files);
+
+    let (d, gate) = start_index_gated(Duration::from_millis(10)).await;
+    gate.arm();
+
+    let mut ignored = lexical(&repo.root, MARKER);
+    let Request::Search(inner) = &mut ignored else {
+        unreachable!()
+    };
+    inner.include_ignored = true;
+    let events = request(&d.socket, &hello(), ignored).await;
+    assert!(
+        matches!(final_of(&events), Final::Answer(a) if a.has_results),
+        "{events:?}"
+    );
+    let mut log: Vec<Record> = Vec::new();
+    wait_held(&mut log, &d.records);
+
+    // The scope flip resyncs: the vendored chunks leave the interest before
+    // any dispatch, the held item being a src chunk.
+    let events = request(&d.socket, &hello(), lexical(&repo.root, MARKER)).await;
+    assert!(
+        matches!(final_of(&events), Final::Answer(a) if a.has_results),
+        "{events:?}"
+    );
+
+    // Same ordering: the first `Coverage` puts the wait's feed — and so,
+    // FIFO, the scope-false `Resync` — into the scheduler before the gate
+    // frees the ANE.
+    let mut wait = support::model::index_wait(&d.socket, &hello(), &repo.root).await;
+    support::model::await_coverage(&mut wait, 0).await;
+    gate.open();
+    match final_event(&mut wait).await {
+        Final::Indexed { with_vector, total } => {
+            assert_eq!(with_vector, total, "every chunk has a vector")
+        }
+        other => panic!("expected Indexed, got {other:?}"),
+    }
+
+    let index = Index::open(&repo.root).await.expect("index opens");
+    let all: HashSet<ContentHash> = index
+        .chunk_hashes(true)
+        .await
+        .expect("chunk hashes")
+        .into_iter()
+        .collect();
+    let visible: HashSet<ContentHash> = index
+        .chunk_hashes(false)
+        .await
+        .expect("chunk hashes")
+        .into_iter()
+        .collect();
+    let vendor_hashes: HashSet<ContentHash> = all.difference(&visible).copied().collect();
+    assert!(!vendor_hashes.is_empty());
+    let embedded: HashSet<ContentHash> = d
+        .records
+        .try_iter()
+        .filter(|r| r.kind == Kind::Index)
+        .filter_map(|r| r.hash)
+        .collect();
+    assert!(
+        vendor_hashes.iter().all(|h| !embedded.contains(h)),
+        "the scope-false resync dropped the vendored chunks before dispatch"
     );
 }

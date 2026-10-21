@@ -8,12 +8,22 @@ mod counters;
 
 use counters::CapOff;
 use futures_executor::block_on;
-use repo_search_core::reconcile::{Options, PendingChunk, Reconciled, SkipReason, reconcile};
+use repo_search_core::reconcile::{
+    Changes, Options, PendingChunk, Reconciled, Report, SkipReason, missing, reconcile,
+};
 use repo_search_core::store::{ContentHash, Index, VectorCache};
 use repo_search_core::{CHUNKER_FINGERPRINT, UnitVector};
 use tempfile::TempDir;
 
 const MODEL: &str = "test-model";
+
+/// One pass as the old API returned it, plus its changes: `pending` is
+/// `missing` taken right after the pass.
+struct Pass {
+    report: Report,
+    changes: Option<Changes>,
+    pending: Vec<PendingChunk>,
+}
 
 struct Fixture {
     tree: TempDir,
@@ -42,11 +52,29 @@ impl Fixture {
         fs::write(path, text).unwrap();
     }
 
-    fn run(&self, options: Options) -> Reconciled {
+    fn run(&self, options: Options) -> Pass {
         self.run_as(&self.index, CHUNKER_FINGERPRINT, options)
     }
 
-    fn run_as(&self, index: &Index, chunker: &str, options: Options) -> Reconciled {
+    fn run_as(&self, index: &Index, chunker: &str, options: Options) -> Pass {
+        let reconciled = self.reconcile_as(index, chunker, options);
+        let pending = block_on(missing(
+            index,
+            &self.cache,
+            MODEL,
+            self.tree.path(),
+            options,
+            Vec::new(),
+        ))
+        .unwrap();
+        Pass {
+            report: reconciled.report,
+            changes: reconciled.changes,
+            pending,
+        }
+    }
+
+    fn reconcile_as(&self, index: &Index, chunker: &str, options: Options) -> Reconciled {
         block_on(reconcile(
             index,
             &self.cache,
@@ -59,7 +87,13 @@ impl Fixture {
         .unwrap()
     }
 
-    fn pass(&self) -> Reconciled {
+    /// Runs only `reconcile`, which therefore reads no file outside the
+    /// pass itself.
+    fn reconcile_only(&self, options: Options) -> Reconciled {
+        self.reconcile_as(&self.index, CHUNKER_FINGERPRINT, options)
+    }
+
+    fn pass(&self) -> Pass {
         self.run(Options::default())
     }
 
@@ -619,7 +653,7 @@ fn malformed_configuration_is_reported_and_dropped() {
     assert_eq!(r.report.chunks_total, 0);
 }
 
-fn malformed_error(r: &Reconciled) -> &str {
+fn malformed_error(r: &Pass) -> &str {
     match &r.report.skipped[0].reason {
         SkipReason::Malformed(error) => error,
         other => panic!("expected a malformed file, got {other:?}"),
@@ -736,6 +770,7 @@ fn another_chunker_rechunks_and_reuses_cached_vectors() {
 
     let reopened = block_on(Index::open(fx.tree.path())).unwrap();
     let second = fx.run_as(&reopened, "chunker-b", Options::default());
+    assert!(second.changes.is_none(), "a rechunk reports no changes");
     let r = &second.report;
     assert!(r.rechunked);
     assert_eq!((r.files_added, r.files_modified), (2, 0));
@@ -784,4 +819,201 @@ fn another_chunker_retries_recorded_unchunkable_files() {
     assert_eq!(r.report.files_chunked, 2);
     assert_eq!(r.report.skipped.len(), 1);
     assert_eq!(fx.query::<i64>("SELECT count(*) FROM unchunkable"), 1);
+}
+
+// DEV-PROBE (migrated to the final form with the implementation): a no-change
+// pass must not read a pending file. On dev `reconcile` rebuilds every missing
+// chunk's text and fails here with `Error::Io` (PermissionDenied on b.rs).
+#[test]
+fn a_no_change_pass_reads_no_file_while_vectors_are_missing() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fx = Fixture::new();
+    fx.write("a.rs", "fn alpha() { 1; }\n");
+    fx.write("b.rs", "fn beta() { 2; }\n");
+    let first = fx.pass();
+    assert!(!first.pending.is_empty());
+    let b = fx.tree.path().join("b.rs");
+    // ctime only: size, mtime and inode hold, so nothing changed.
+    fs::set_permissions(&b, fs::Permissions::from_mode(0o000)).unwrap();
+    let r = fx.reconcile_only(Options::default());
+    fs::set_permissions(&b, fs::Permissions::from_mode(0o644)).unwrap();
+    assert_eq!(r.report.files_changed(), 0);
+    assert_eq!(r.report.files_chunked, 0);
+    assert_eq!(r.changes, Some(Changes::default()));
+    assert_eq!(r.report.chunks_with_vector, 0);
+    assert_eq!(r.report.chunks_total, first.report.chunks_total);
+}
+
+/// The content hashes of `pending`'s chunks on `path`.
+fn hashes_on(pending: &[PendingChunk], path: &str) -> std::collections::HashSet<ContentHash> {
+    pending
+        .iter()
+        .filter(|c| c.path == path)
+        .map(|c| c.content_hash)
+        .collect()
+}
+
+#[test]
+fn an_edit_offers_that_files_chunks_and_drops_its_old_ones() {
+    let fx = Fixture::new();
+    fx.write("a.rs", "fn alpha() { 1; }\n");
+    fx.write("b.rs", "fn gamma() { 3; }\n");
+    let first = fx.pass();
+    let a0 = hashes_on(&first.pending, "a.rs");
+    let b0 = hashes_on(&first.pending, "b.rs");
+    assert!(!a0.is_empty() && !b0.is_empty());
+
+    fx.write("a.rs", "fn alpha() { 10; }\n");
+    let r = fx.reconcile_only(Options::default());
+    let c = r.changes.expect("a plain pass reports its changes");
+    assert!(!c.added.is_empty());
+    assert!(c.added.iter().all(|chunk| chunk.path == "a.rs"));
+    assert!(c.added.iter().any(|chunk| chunk.text.contains("10")));
+    let dropped: std::collections::HashSet<_> = c.dropped.iter().copied().collect();
+    assert_eq!(dropped, a0);
+    let added: std::collections::HashSet<_> =
+        c.added.iter().map(|chunk| chunk.content_hash).collect();
+    assert!(
+        b0.iter()
+            .all(|h| !added.contains(h) && !dropped.contains(h))
+    );
+
+    // Convergence: `missing` after the pass is the old set minus the drops
+    // plus the additions.
+    let next: std::collections::HashSet<_> =
+        fx.pass().pending.iter().map(|c| c.content_hash).collect();
+    let mut expect: std::collections::HashSet<_> =
+        first.pending.iter().map(|c| c.content_hash).collect();
+    for hash in &a0 {
+        expect.remove(hash);
+    }
+    expect.extend(added);
+    assert_eq!(next, expect);
+}
+
+#[test]
+fn an_unchanged_chunk_of_an_edited_file_stays_wanted() {
+    let big = |name: &str| {
+        format!(
+            "pub fn {name}() -> usize {{ \"{}\".len() }}\n\n",
+            "x".repeat(500)
+        )
+    };
+    let fx = Fixture::new();
+    fx.write("a.rs", &(big("alpha") + &big("beta")));
+    let first = fx.pass();
+    let hash_of = |needle: &str| {
+        first
+            .pending
+            .iter()
+            .find(|c| c.text.contains(needle))
+            .unwrap_or_else(|| panic!("a pending chunk holds {needle}"))
+            .content_hash
+    };
+    let alpha = hash_of("fn alpha");
+    let beta = hash_of("fn beta");
+    assert_ne!(alpha, beta, "each function is its own chunk");
+
+    fx.write("a.rs", &(big("alpha") + &big("beta_two")));
+    let c = fx
+        .reconcile_only(Options::default())
+        .changes
+        .expect("a plain pass reports its changes");
+    assert!(c.dropped.contains(&beta));
+    assert!(!c.dropped.contains(&alpha));
+    let added: std::collections::HashSet<_> =
+        c.added.iter().map(|chunk| chunk.content_hash).collect();
+    assert!(added.contains(&alpha), "the unchanged chunk is re-offered");
+    assert!(c.added.iter().any(|chunk| chunk.text.contains("beta_two")));
+}
+
+#[test]
+fn a_deleted_file_drops_its_hashes() {
+    let fx = Fixture::new();
+    fx.write("a.rs", "fn alpha() { 1; }\n");
+    fx.write("b.rs", "fn beta() { 2; }\n");
+    let first = fx.pass();
+    let b0 = hashes_on(&first.pending, "b.rs");
+    assert!(!b0.is_empty());
+
+    fs::remove_file(fx.tree.path().join("b.rs")).unwrap();
+    let c = fx
+        .reconcile_only(Options::default())
+        .changes
+        .expect("a plain pass reports its changes");
+    assert!(c.added.is_empty());
+    let dropped: std::collections::HashSet<_> = c.dropped.iter().copied().collect();
+    assert_eq!(dropped, b0);
+}
+
+#[test]
+fn a_restamped_file_offers_its_uncached_chunks_again() {
+    let fx = Fixture::new();
+    fx.write("a.rs", "fn alpha() { 1; }\n");
+    fx.write("b.rs", "fn beta() { 2; }\n");
+    let first = fx.pass();
+    let a0 = hashes_on(&first.pending, "a.rs");
+    assert!(!a0.is_empty());
+
+    // Same bytes, new inode and mtime, as an editor's atomic save leaves.
+    let path = fx.tree.path().join("a.rs");
+    let bytes = fs::read(&path).unwrap();
+    fs::remove_file(&path).unwrap();
+    fs::write(&path, bytes).unwrap();
+
+    let r = fx.reconcile_only(Options::default());
+    assert_eq!(r.report.files_restamped, 1);
+    assert_eq!(r.report.files_chunked, 0);
+    let c = r.changes.expect("a plain pass reports its changes");
+    let added: std::collections::HashSet<_> =
+        c.added.iter().map(|chunk| chunk.content_hash).collect();
+    assert_eq!(added, a0);
+    for chunk in &c.added {
+        let first_chunk = first
+            .pending
+            .iter()
+            .find(|p| p.content_hash == chunk.content_hash)
+            .expect("the restamped file's chunks are its stored ones");
+        assert_eq!(chunk.text, first_chunk.text);
+    }
+    assert!(c.dropped.is_empty());
+}
+
+#[test]
+fn an_unignored_file_offers_its_uncached_chunks() {
+    let fx = Fixture::new();
+    fx.write(".gitignore", "secret.rs\n");
+    fx.write("kept.rs", "fn kept() {}\n");
+    fx.write("secret.rs", "fn hidden() {}\n");
+    let first = fx.run(WITH_IGNORED);
+    let secret = hashes_on(&first.pending, "secret.rs");
+    assert!(!secret.is_empty());
+
+    fx.write(".gitignore", "");
+    let r = fx.reconcile_only(Options::default());
+    assert_eq!(r.report.files_restamped, 1);
+    let c = r.changes.expect("a plain pass reports its changes");
+    let added: std::collections::HashSet<_> =
+        c.added.iter().map(|chunk| chunk.content_hash).collect();
+    assert_eq!(added, secret);
+}
+
+#[test]
+fn a_scope_true_pass_drops_a_deleted_ignored_file() {
+    let fx = Fixture::new();
+    fx.write(".gitignore", "secret.rs\n");
+    fx.write("kept.rs", "fn kept() {}\n");
+    fx.write("secret.rs", "fn hidden() {}\n");
+    let first = fx.run(WITH_IGNORED);
+    let secret = hashes_on(&first.pending, "secret.rs");
+    assert!(!secret.is_empty());
+
+    fs::remove_file(fx.tree.path().join("secret.rs")).unwrap();
+    let c = fx
+        .reconcile_only(WITH_IGNORED)
+        .changes
+        .expect("a plain pass reports its changes");
+    let dropped: std::collections::HashSet<_> = c.dropped.iter().copied().collect();
+    assert_eq!(dropped, secret);
 }

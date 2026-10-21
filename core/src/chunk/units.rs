@@ -526,15 +526,15 @@ pub(crate) fn write_members(
     Some(())
 }
 
-/// The text a chunk's stored members emit from `bytes`, rebuilt exactly as
+/// The text a chunk's stored members emit from `src`, rebuilt exactly as
 /// [`write_members`] — and so `Chunk::write_text` — produced it at index
-/// time; `None` when `bytes` is not UTF-8 or a member's range no longer
-/// fits it.
+/// time; `None` when a member's range no longer fits `src` or splits a
+/// character. The caller validates the file once, however many of its
+/// chunks it rebuilds.
 pub(crate) fn rebuild_text(
-    bytes: &[u8],
+    src: &str,
     members: impl IntoIterator<Item = (Range<u64>, StoredMemberKind)>,
 ) -> Option<String> {
-    let src = std::str::from_utf8(bytes).ok()?;
     let mut emit = Vec::new();
     for (range, kind) in members {
         emit.push((
