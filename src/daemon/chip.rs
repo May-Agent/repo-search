@@ -22,8 +22,11 @@ pub enum ChipClass {
 
 impl ChipClass {
     /// The class a `machdep.cpu.brand_string` value belongs to, or `None`
-    /// for a string that is not a recognised Apple M-series one.
+    /// for a string that is not a recognised Apple M-series one. A virtual
+    /// machine reports its host chip with a ` (Virtual)` suffix and is
+    /// classed by that chip.
     pub fn of_brand(brand: &str) -> Option<Self> {
+        let brand = brand.strip_suffix(" (Virtual)").unwrap_or(brand);
         let rest = brand.strip_prefix("Apple M")?;
         let mut parts = rest.splitn(2, ' ');
         let generation = parts.next().expect("splitn yields a first part");
@@ -135,6 +138,8 @@ mod tests {
             ("Apple M2 Max", ChipClass::Wide),
             ("Apple M3 Ultra", ChipClass::Wide),
             ("Apple M4", ChipClass::Base),
+            ("Apple M1 (Virtual)", ChipClass::Base),
+            ("Apple M2 Pro (Virtual)", ChipClass::Wide),
         ] {
             assert_eq!(ChipClass::of_brand(brand), Some(class), "{brand}");
         }
@@ -149,6 +154,8 @@ mod tests {
             "Apple M1x",
             "Apple M1 ",
             "Apple M1 Pro Max",
+            "Apple M1 (Virtual) (Virtual)",
+            "Apple M1(Virtual)",
             "Apple A14",
             "Intel(R) Core(TM) i7-10700K CPU @ 3.80GHz",
         ] {
