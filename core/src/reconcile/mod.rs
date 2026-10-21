@@ -1,6 +1,6 @@
 //! The reconcile pass: brings the index in line with the worktree and reports
-//! how the set of chunks needing a vector changed; [`missing`] lists that set
-//! whole.
+//! how the set of chunks needing a vector changed; [`Reconciler::missing`]
+//! lists that set whole.
 //!
 //! One pass walks the worktree, stats every supported file and diffs it
 //! against the stored file table. Only files whose size, mtime or inode moved
@@ -15,9 +15,10 @@
 //! and side, and which hashes have a vector. A pass updates them from its
 //! own changes and from the vectors the cache stored since the last pass, so
 //! a pass that changed nothing reads no chunk row and looks up no hash. The
-//! same books answer [`Reconciler::counts`] between passes, and each pass
-//! reports how the set of `(hash, side)` pairs changed ([`Presence`]), which
-//! is what a retriever's vector indexes follow.
+//! same books answer [`Reconciler::counts`] and [`Reconciler::missing`]
+//! between passes, so neither reads every row or looks every hash up. Each
+//! pass reports how the set of `(hash, side)` pairs changed ([`Presence`]),
+//! which is what a retriever's vector indexes follow.
 
 mod books;
 mod scan;
@@ -26,7 +27,7 @@ pub use books::Books;
 
 use std::collections::{HashMap, HashSet};
 use std::ops::RangeInclusive;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread;
 
@@ -210,16 +211,17 @@ impl Report {
 
 /// What a pass changed in the set of chunks its scope needs vectors for.
 ///
-/// Applied in pass order on top of [`missing`] taken after some earlier
-/// pass of the same scope, successive passes' changes keep that set
-/// current: `added` holds the chunks the pass put in scope or touched that
+/// Applied in pass order on top of [`Reconciler::missing`] taken after
+/// some earlier pass of the same scope, successive passes' changes keep that
+/// set current: `added` holds the chunks the pass put in scope or touched that
 /// have no cached vector, `dropped` the hashes it took out of scope.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Changes {
     /// Chunks of files the pass re-chunked or restamped that have no cached
     /// vector, one per distinct hash, ordered by path then first line. A
-    /// restamped file's chunks are offered again so a chunk [`missing`]
-    /// could not rebuild while the file was mid-change is never lost.
+    /// restamped file's chunks are offered again so a chunk
+    /// [`Missing::pending`] could not rebuild while the file was mid-change
+    /// is never lost.
     pub added: Vec<PendingChunk>,
     /// Hashes some row of which the pass deleted and of which no row
     /// visible in the scope remains; distinct, in deletion order.
@@ -256,7 +258,7 @@ pub struct Reconciled {
     pub report: Report,
     /// The pass's changes; `None` when it re-chunked an emptied index
     /// (`report.rechunked`), whose deleted hashes nothing recorded: a caller
-    /// keeping a pending set rebuilds it with [`missing`].
+    /// keeping a pending set rebuilds it with [`Reconciler::missing`].
     pub changes: Option<Changes>,
     /// How the pass changed the pairs the index holds.
     pub presence: Presence,
@@ -318,8 +320,8 @@ impl Reconciler {
     }
 
     /// Brings the index in line with the worktree, then reports how the
-    /// pass changed the chunks its scope needs vectors for; [`missing`]
-    /// lists that set whole.
+    /// pass changed the chunks its scope needs vectors for;
+    /// [`Reconciler::missing`] lists that set whole.
     ///
     /// `chunker` identifies the chunker, normally
     /// [`crate::CHUNKER_FINGERPRINT`]. An index stored under another
@@ -408,7 +410,8 @@ impl Reconciler {
 
         let changes = if rechunked {
             // The emptied index's deleted hashes were never recorded; a
-            // caller keeping a pending set rebuilds it with `missing`.
+            // caller keeping a pending set rebuilds it with
+            // `Reconciler::missing`.
             None
         } else {
             let mut added: Vec<PendingChunk> = plan
@@ -501,6 +504,43 @@ impl Reconciler {
     /// When the index or the cache rejects a read. The books are dropped
     /// then; the next pass loads them again.
     pub async fn counts(&mut self, include_ignored: bool) -> Result<Counts, Error> {
+        let (books, reads) = self.current().await?;
+        Ok(Counts {
+            chunks_total: books.chunks_total(include_ignored),
+            chunks_with_vector: books.chunks_with_vector(include_ignored),
+            reads,
+        })
+    }
+
+    /// Every distinct hash visible in `include_ignored`'s scope that has no
+    /// vector now, from the books, as [`Self::counts`] reads them: only the
+    /// vectors the cache stored since the books last looked, however many
+    /// chunks already have one. Without books they are read whole first and
+    /// kept for the next pass. [`Missing::pending`] later drops what was
+    /// stored after this listing.
+    ///
+    /// # Errors
+    ///
+    /// When the index or the cache rejects a read. The books are dropped
+    /// then; the next pass loads them again.
+    pub async fn missing(&mut self, include_ignored: bool) -> Result<Missing, Error> {
+        let (books, reads) = self.current().await?;
+        let hashes = books.uncached(include_ignored);
+        let high_water = books.high_water();
+        Ok(Missing {
+            hashes,
+            high_water,
+            index: self.index.clone(),
+            cache: self.cache.clone(),
+            model_id: self.model_id.clone(),
+            worktree: self.worktree.clone(),
+            reads,
+        })
+    }
+
+    /// The books brought up to the cache's slot log, loaded whole first
+    /// when the reconciler holds none, with what that read.
+    async fn current(&mut self) -> Result<(&Books, Reads), Error> {
         let (mut books, mut reads) = match self.books.take() {
             Some(books) => (books, Reads::default()),
             None => {
@@ -512,94 +552,105 @@ impl Reconciler {
         let slots = self.cache.since(&self.model_id, books.high_water()).await?;
         reads.cache_slots += slots.len() as u64;
         books.advance(&slots);
-        let counts = Counts {
-            chunks_total: books.chunks_total(include_ignored),
-            chunks_with_vector: books.chunks_with_vector(include_ignored),
-            reads,
-        };
-        self.books = Some(books);
-        Ok(counts)
+        Ok((self.books.insert(books), reads))
     }
 }
 
-/// Every distinct chunk hash visible in `options`' scope that has no vector
-/// cached for `model_id`, in index order, with its text: taken from `known`
-/// when it holds the hash, otherwise rebuilt from the file's stored byte
-/// ranges (each file read and validated once). A hash whose file changed or
-/// vanished since the last pass is left out; the next pass offers it again.
-///
-/// # Errors
-///
-/// When the index or the cache rejects a read, or a file read fails for a
-/// reason other than the file having vanished.
-pub async fn missing(
-    index: &Index,
-    cache: &VectorCache,
-    model_id: &str,
-    worktree: &Path,
-    options: Options,
-    known: Vec<PendingChunk>,
-) -> Result<Vec<PendingChunk>, Error> {
-    let coverage = coverage(index, cache, model_id, options.include_ignored).await?;
+/// A scope's chunks with no vector, listed from a reconciler's books by
+/// [`Reconciler::missing`]: their hashes, the first slot of the cache's log
+/// the listing did not see, and the stores and worktree their texts are
+/// rebuilt from.
+pub struct Missing {
+    hashes: Vec<ContentHash>,
+    high_water: u64,
+    index: Index,
+    cache: VectorCache,
+    model_id: String,
+    worktree: PathBuf,
+    /// What listing them read.
+    pub reads: Reads,
+}
 
-    // Missing hashes, distinct, in index order.
-    let missing: Vec<ContentHash> = coverage
-        .distinct
-        .iter()
-        .copied()
-        .filter(|hash| !coverage.cached.contains(hash))
-        .collect();
-    let mut texts: HashMap<ContentHash, PendingChunk> =
-        known.into_iter().map(|c| (c.content_hash, c)).collect();
-    // Chunks `known` does not hold: rebuilt from the stored byte ranges, no
-    // parsing.
-    let to_load: Vec<ContentHash> = missing
-        .iter()
-        .filter(|hash| !texts.contains_key(hash))
-        .copied()
-        .collect();
-    if !to_load.is_empty() {
-        let stored = index.chunks_by_hash(to_load).await?;
-        let root = worktree.to_path_buf();
-        let loaded = run_blocking(move || scan::read_chunks(&root, stored)).await??;
-        texts.extend(loaded.into_iter().map(|c| (c.content_hash, c)));
+impl std::fmt::Debug for Missing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Missing")
+            .field("worktree", &self.worktree)
+            .field("hashes", &self.hashes.len())
+            .field("reads", &self.reads)
+            .finish_non_exhaustive()
     }
-    let mut pending = Vec::with_capacity(missing.len());
-    for hash in missing {
+}
+
+/// The missing chunks with their texts, from [`Missing::pending`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pending {
+    /// One chunk per missing hash whose text could be had, ordered by path
+    /// then first line.
+    pub chunks: Vec<PendingChunk>,
+    /// What settling the list and rebuilding the texts read: the vectors
+    /// stored since the listing, and the stored rows of the hashes still
+    /// missing that `known` did not hold.
+    pub reads: Reads,
+}
+
+impl Missing {
+    /// The missing hashes, distinct, in no particular order.
+    #[must_use]
+    pub fn hashes(&self) -> &[ContentHash] {
+        &self.hashes
+    }
+
+    /// Each hash still missing with its text. A hash whose vector the
+    /// cache stored after the listing is dropped: read from the slot log,
+    /// so a caller that flushes its writer first rebuilds no text the flush
+    /// made moot. The text is taken from `known` when it holds the hash,
+    /// otherwise rebuilt from one stored row's byte ranges (each file read
+    /// and validated once). A hash whose file changed or vanished since the
+    /// last pass is left out; the next pass offers it again.
+    ///
+    /// # Errors
+    ///
+    /// When the index or the cache rejects a read, or a file read fails for
+    /// a reason other than the file having vanished.
+    pub async fn pending(mut self, known: Vec<PendingChunk>) -> Result<Pending, Error> {
+        let mut reads = Reads::default();
+        let slots = self.cache.since(&self.model_id, self.high_water).await?;
+        reads.cache_slots = slots.len() as u64;
+        if !slots.is_empty() {
+            let stored: HashSet<ContentHash> = slots.iter().map(|s| s.content_hash).collect();
+            self.hashes.retain(|hash| !stored.contains(hash));
+        }
+        let mut texts: HashMap<ContentHash, PendingChunk> =
+            known.into_iter().map(|c| (c.content_hash, c)).collect();
+        // Chunks `known` does not hold: rebuilt from the stored byte ranges,
+        // no parsing.
+        let to_load: Vec<ContentHash> = self
+            .hashes
+            .iter()
+            .filter(|hash| !texts.contains_key(hash))
+            .copied()
+            .collect();
+        if !to_load.is_empty() {
+            let stored = self.index.chunks_by_hash(to_load).await?;
+            reads.chunk_rows = stored.len() as u64;
+            let root = self.worktree;
+            let loaded = run_blocking(move || scan::read_chunks(&root, stored)).await??;
+            texts.extend(loaded.into_iter().map(|c| (c.content_hash, c)));
+        }
         // A hash with no text belongs to a file that changed or vanished
         // after the pass; the next pass handles it.
-        if let Some(chunk) = texts.remove(&hash) {
-            pending.push(chunk);
-        }
+        let mut chunks: Vec<PendingChunk> = self
+            .hashes
+            .iter()
+            .filter_map(|hash| texts.remove(hash))
+            .collect();
+        chunks.sort_by(|a, b| {
+            a.path
+                .cmp(&b.path)
+                .then(a.lines.start().cmp(b.lines.start()))
+        });
+        Ok(Pending { chunks, reads })
     }
-    Ok(pending)
-}
-
-/// A scope's chunk coverage: the distinct hashes of its stored rows, and
-/// which of them have a cached vector.
-struct Coverage {
-    /// The distinct hashes of the stored rows, in first-seen index order.
-    distinct: Vec<ContentHash>,
-    /// The hashes of `distinct` with a vector cached under the model.
-    cached: HashSet<ContentHash>,
-}
-
-/// Reads `index`'s coverage in `include_ignored`'s scope against `cache`.
-async fn coverage(
-    index: &Index,
-    cache: &VectorCache,
-    model_id: &str,
-    include_ignored: bool,
-) -> Result<Coverage, Error> {
-    let rows = index.chunk_hashes(include_ignored).await?;
-    let mut seen = HashSet::with_capacity(rows.len());
-    let distinct: Vec<ContentHash> = rows
-        .iter()
-        .copied()
-        .filter(|hash| seen.insert(*hash))
-        .collect();
-    let cached = cache.cached(model_id, &distinct).await?;
-    Ok(Coverage { distinct, cached })
 }
 
 /// Runs blocking `work` on its own thread and awaits the result.

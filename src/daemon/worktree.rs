@@ -5,7 +5,7 @@
 //! built on [`AneHandle`], the last barrier's report, the FSEvents watcher,
 //! the HEAD commit and the index phase, and runs the freshness barrier,
 //! whose changes its feeder orders into the scheduler. Its spawned
-//! `index --wait` tasks read coverage off its books by asking it.
+//! `index --wait` tasks and its feeder read off its books by asking it.
 
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
@@ -136,7 +136,7 @@ struct Owner<B: Backend> {
     /// Reconciles `index`, keeping its books between barriers; built at
     /// the first barrier or `Status` and dropped with the index handle it
     /// holds. Its books answer the coverage of `Status` and of
-    /// `index --wait`'s frames, and every barrier's
+    /// `index --wait`'s frames and every resync's set, and every barrier's
     /// presence is passed on to the retriever, which never reads the
     /// index's hashes itself.
     reconciler: Option<Reconciler>,
@@ -151,7 +151,8 @@ struct Owner<B: Backend> {
     waits: tokio::task::JoinSet<()>,
     /// Handed to each `index --wait` task; kept so `asks` never closes.
     asker: Asker,
-    /// The waits' coverage asks, answered from the reconciler's books.
+    /// The waits' and the feeder's asks, answered from the reconciler's
+    /// books.
     asks: mpsc::Receiver<Ask>,
 }
 
@@ -260,8 +261,9 @@ impl<B: Backend> Owner<B> {
         }
         // The owner does not leave while a spawned `index --wait` is still
         // answering. A wait parked on the phase watch completes only once
-        // its `Stage1Done` is applied, and a wait's frames and `Indexed`
-        // are counted off the books, so the drain keeps serving both.
+        // its `Stage1Done` is applied, a wait's frames and `Indexed` are
+        // counted off the books, and its ack may wait on a feeder whose
+        // promoted resync asks the books, so the drain keeps serving both.
         let mut stage1_open = true;
         while !self.waits.is_empty() {
             tokio::select! {
@@ -801,42 +803,16 @@ impl<B: Backend> Owner<B> {
         let sched = model.scheduler.clone();
         sched.barrier(self.repo, true).await;
         match self.barrier_steps(model, include_ignored).await {
-            Ok((report, commit, changes)) => {
+            Ok((report, commit, feed)) => {
                 self.report = Some(report.clone());
                 self.commit = commit.clone();
-                let options = reconcile::Options { include_ignored };
-                let index = self.index.clone().expect("opened");
-                // A `Change` is enough when the feeder provably holds this
-                // scope's set: anything else is a resync — the first
-                // barrier, a scope flip, a rechunk or a reopened index.
-                let (feed, resync) = match changes {
-                    Some(changes) if self.sync == Some(options) => (Feed::Change(changes), false),
-                    Some(changes) => (
-                        Feed::Resync {
-                            index,
-                            options,
-                            known: changes.added,
-                        },
-                        true,
-                    ),
-                    None => (
-                        Feed::Resync {
-                            index,
-                            options,
-                            known: Vec::new(),
-                        },
-                        true,
-                    ),
-                };
-                self.sync = Some(options);
+                self.sync = Some(reconcile::Options { include_ignored });
+                let resync = matches!(feed, Feed::Resync { .. });
                 let class = match self.phase {
                     Phase::FirstIndex => IndexClass::Stage1,
                     Phase::Maintained => IndexClass::Background,
                 };
-                self.feeder(model)
-                    .send(FeedMsg { feed, class, ack })
-                    .await
-                    .expect("the feeder runs while the owner holds its sender");
+                self.feed(model, FeedMsg { feed, class, ack }).await;
                 tracing::info!(root = %self.root.display(), files_changed = report.files_changed(),
                                   resync, chunk_rows = report.reads.chunk_rows,
                                   cache_probes = report.reads.cache_probes,
@@ -853,16 +829,33 @@ impl<B: Backend> Owner<B> {
         }
     }
 
-    /// The feeder, spawned on first use; the cache and writer are open by
-    /// then (every barrier caller ran `shared` first).
+    /// Hands `msg` to the feeder. A resync the feeder promotes after a
+    /// failed feed asks the books before it takes the next feed, so asks
+    /// are answered while the feeder's inbox is full: the owner never waits
+    /// on a feeder that waits on it.
+    async fn feed(&mut self, model: &Arc<Model<B>>, msg: FeedMsg) {
+        let feeder = self.feeder(model);
+        let permit = loop {
+            tokio::select! {
+                biased;
+                permit = feeder.reserve() => {
+                    break permit.expect("the feeder runs while the owner holds its sender");
+                }
+                Some(ask) = self.asks.recv() => self.answer(ask).await,
+            }
+        };
+        permit.send(msg);
+    }
+
+    /// The feeder, spawned on first use; the writer is open by then (every
+    /// barrier caller ran `shared` first).
     fn feeder(&mut self, model: &Arc<Model<B>>) -> mpsc::Sender<feed::FeedMsg> {
         if self.feeder.is_none() {
             self.feeder = Some(feed::spawn(FeederConfig::<B> {
                 worktree: self.id,
                 repo: self.repo,
                 root: self.root.clone(),
-                model_id: model.id.clone(),
-                cache: self.cache.clone().expect("opened"),
+                books: self.asker.clone(),
                 writer: self.writer.clone().expect("opened"),
                 counter: model.counter.clone(),
                 sched: model.scheduler.clone(),
@@ -872,9 +865,10 @@ impl<B: Backend> Owner<B> {
         self.feeder.as_ref().expect("spawned above").clone()
     }
 
-    /// A spawned `index --wait`'s ask, answered from the books; an owner
-    /// whose index failed to reopen has none to answer from. The cache is
-    /// open: only an `Index` request, after `shared`, spawns a wait.
+    /// A spawned `index --wait`'s or the feeder's ask, answered from the
+    /// books; an owner whose index failed to reopen has none to answer
+    /// from. The cache is open: only a barrier or an `Index` request, both
+    /// after `shared`, spawn the feeder or a wait.
     async fn answer(&mut self, ask: Ask) {
         let reconciler = self.index.is_some().then(|| self.reconciler());
         ask.answer(reconciler).await;
@@ -893,11 +887,13 @@ impl<B: Backend> Owner<B> {
         })
     }
 
+    /// The barrier's writer flush, pass and `git rev-parse`, and the feed
+    /// the pass leaves for the feeder.
     async fn barrier_steps(
         &mut self,
         model: &Arc<Model<B>>,
         include_ignored: bool,
-    ) -> Result<(Report, String, Option<reconcile::Changes>), String> {
+    ) -> Result<(Report, String, Feed), String> {
         self.writer
             .as_ref()
             .expect("opened")
@@ -936,7 +932,26 @@ impl<B: Backend> Owner<B> {
             ));
         }
         let commit = String::from_utf8_lossy(&head.stdout).trim().to_owned();
-        Ok((reconciled.report, commit, reconciled.changes))
+        let options = reconcile::Options { include_ignored };
+        // A `Change` is enough when the feeder provably holds this scope's
+        // set: anything else is a resync — the first barrier, a scope flip,
+        // a rechunk or a reopened index. Its set is listed from the books
+        // the pass just brought up to date, here inside the barrier, so it
+        // reads no chunk row and looks up no hash; the feeder rebuilds the
+        // texts.
+        let feed = match reconciled.changes {
+            Some(changes) if self.sync == Some(options) => Feed::Change(changes),
+            changes => Feed::Resync {
+                options,
+                missing: self
+                    .reconciler()
+                    .missing(include_ignored)
+                    .await
+                    .map_err(|e| e.to_string())?,
+                known: changes.map(|changes| changes.added).unwrap_or_default(),
+            },
+        };
+        Ok((reconciled.report, commit, feed))
     }
 
     /// A watcher burst: the same barrier as a query, answered nowhere and
@@ -1161,7 +1176,7 @@ async fn ask(coverage: &Asker, events: &mpsc::Sender<Event>) -> Option<Counts> {
                 send(events, shutting_down()).await;
                 None
             }
-            Err(AskError::Count(message)) => {
+            Err(AskError::Books(message)) => {
                 send(events, error(ErrorKind::Internal, message)).await;
                 None
             }

@@ -1,55 +1,90 @@
-//! `index --wait`'s coverage, read from the worktree owner's books.
+//! Reads off the worktree owner's books by the tasks it spawns: the
+//! coverage of `index --wait`'s frames, and the set of a resync the feeder
+//! promotes after a failed feed.
 //!
-//! The wait runs in a task the owner spawns, so it cannot borrow the
-//! owner's [`Reconciler`]. It asks instead: the owner answers each [`Ask`]
-//! between requests, from the books its barriers keep. An answer reads only
-//! the vectors the cache stored since the books last looked — no chunk row
-//! and no hash lookup — so a progress frame costs the same at any index
-//! size. The books stay single-owned; the wait holds no index or cache
-//! handle at all.
+//! Neither the wait nor the feeder can borrow the owner's [`Reconciler`].
+//! They ask instead: the owner answers each [`Ask`] between requests, and
+//! while it waits for room in the feeder's inbox, from the books its
+//! barriers keep. An answer reads only the vectors the cache stored since
+//! the books last looked — no chunk row and no hash lookup — so a progress
+//! frame or a resync's listing costs the same however many chunks already
+//! have a vector. The books stay single-owned.
 
-use repo_search_core::reconcile::{Counts, Reconciler};
+use repo_search_core::reconcile::{Counts, Missing, Options, Reconciler};
 use tokio::sync::{mpsc, oneshot};
 
-/// Asks queued at once; each wait keeps at most one outstanding.
+/// Asks queued at once; each wait and the feeder keep at most one
+/// outstanding.
 const ASKS: usize = 8;
 
-/// A wait's ask for the coverage of its scope now.
+/// An ask for a read off the owner's books.
 #[derive(Debug)]
 pub struct Ask {
-    reply: oneshot::Sender<Result<Counts, String>>,
+    question: Question,
+}
+
+#[derive(Debug)]
+enum Question {
+    /// `index --wait`'s coverage now.
+    Counts(oneshot::Sender<Result<Counts, String>>),
+    /// The scope's chunks with no vector now, for a promoted resync.
+    Missing {
+        options: Options,
+        reply: oneshot::Sender<Result<Missing, String>>,
+    },
 }
 
 impl Ask {
-    /// Answers from `reconciler`'s books in `index --wait`'s scope — never
-    /// ignored files, as its barrier. `None` is an owner whose index is not
-    /// open: a reopen after a recreated `.repo-search/` failed.
+    /// Answers from `reconciler`'s books. `None` is an owner whose index is
+    /// not open: a reopen after a recreated `.repo-search/` failed.
     pub async fn answer(self, reconciler: Option<&mut Reconciler>) {
-        let counts = match reconciler {
-            Some(reconciler) => reconciler.counts(false).await.map_err(|e| e.to_string()),
-            None => Err("the worktree's index is not open".to_owned()),
+        let Some(reconciler) = reconciler else {
+            let message = "the worktree's index is not open".to_owned();
+            match self.question {
+                Question::Counts(reply) => {
+                    let _ = reply.send(Err(message));
+                }
+                Question::Missing { reply, .. } => {
+                    let _ = reply.send(Err(message));
+                }
+            }
+            return;
         };
-        if let Ok(counts) = &counts {
-            tracing::debug!(
-                chunk_rows = counts.reads.chunk_rows,
-                cache_probes = counts.reads.cache_probes,
-                cache_slots = counts.reads.cache_slots,
-                "index wait counted"
-            );
+        // An asker that hung up no longer needs the answer.
+        match self.question {
+            // `index --wait`'s scope never holds ignored files, as its
+            // barrier.
+            Question::Counts(reply) => {
+                let counts = reconciler.counts(false).await.map_err(|e| e.to_string());
+                if let Ok(counts) = &counts {
+                    tracing::debug!(
+                        chunk_rows = counts.reads.chunk_rows,
+                        cache_probes = counts.reads.cache_probes,
+                        cache_slots = counts.reads.cache_slots,
+                        "index wait counted"
+                    );
+                }
+                let _ = reply.send(counts);
+            }
+            Question::Missing { options, reply } => {
+                let missing = reconciler
+                    .missing(options.include_ignored)
+                    .await
+                    .map_err(|e| e.to_string());
+                let _ = reply.send(missing);
+            }
         }
-        // A wait that hung up no longer needs the answer.
-        let _ = self.reply.send(counts);
     }
 }
 
-/// A wait's handle on the owner's books; the owner keeps one so its inbox
-/// of asks never closes while it runs.
+/// A spawned task's handle on the owner's books; the owner keeps one so
+/// its inbox of asks never closes while it runs.
 #[derive(Debug, Clone)]
 pub struct Asker {
     tx: mpsc::Sender<Ask>,
 }
 
-/// Why an ask has no counts.
+/// Why an ask has no answer.
 #[derive(Debug, thiserror::Error)]
 pub enum AskError {
     /// The owner is gone, so its books are.
@@ -57,24 +92,44 @@ pub enum AskError {
     OwnerGone,
     /// The owner's books could not be read.
     #[error("{0}")]
-    Count(String),
+    Books(String),
 }
 
 impl Asker {
-    /// The coverage now, as the owner's books count it.
+    /// The coverage of `index --wait`'s scope now, as the owner's books
+    /// count it.
     ///
     /// # Errors
     ///
     /// When the owner is gone or its books could not be read.
     pub async fn now(&self) -> Result<Counts, AskError> {
+        self.ask(Question::Counts).await
+    }
+
+    /// The chunks of `options`' scope with no vector now, as the owner's
+    /// books list them.
+    ///
+    /// # Errors
+    ///
+    /// When the owner is gone or its books could not be read.
+    pub async fn missing(&self, options: Options) -> Result<Missing, AskError> {
+        self.ask(|reply| Question::Missing { options, reply }).await
+    }
+
+    async fn ask<T>(
+        &self,
+        question: impl FnOnce(oneshot::Sender<Result<T, String>>) -> Question,
+    ) -> Result<T, AskError> {
         let (reply, rx) = oneshot::channel();
         self.tx
-            .send(Ask { reply })
+            .send(Ask {
+                question: question(reply),
+            })
             .await
             .map_err(|_| AskError::OwnerGone)?;
         rx.await
             .map_err(|_| AskError::OwnerGone)?
-            .map_err(AskError::Count)
+            .map_err(AskError::Books)
     }
 }
 
@@ -243,6 +298,62 @@ mod tests {
         }
     }
 
+    /// What a resync's listing read through the owner's ask, once every
+    /// chunk but `m0.rs`'s has a vector and a barrier booked them, over
+    /// `files` modules; with the number of hashes listed and stored.
+    async fn resync_reads(files: usize) -> (Reads, usize, usize) {
+        let tree = tempfile::tempdir().expect("tempdir");
+        let common = tempfile::tempdir().expect("tempdir");
+        write_modules(tree.path(), files);
+        let index = Index::open(tree.path()).await.expect("index");
+        let cache = VectorCache::open(common.path()).await.expect("cache");
+        let mut reconciler = Reconciler::new(index.clone(), cache.clone(), MODEL, tree.path());
+        let pass = async |reconciler: &mut Reconciler| {
+            reconciler
+                .reconcile(CHUNKER_FINGERPRINT, Options::default(), Arc::new(CapOff))
+                .await
+                .expect("the barrier's pass")
+        };
+        let first = pass(&mut reconciler).await;
+        let added = first
+            .changes
+            .expect("a first pass reports its changes")
+            .added;
+        let (left, rest): (Vec<_>, Vec<_>) = added.into_iter().partition(|c| c.path == "m0.rs");
+        let stored: Vec<ContentHash> = rest.iter().map(|c| c.content_hash).collect();
+        store(&cache, &stored).await;
+        pass(&mut reconciler).await;
+
+        let (asker, mut asks) = channel();
+        let owner = tokio::spawn(async move {
+            while let Some(ask) = asks.recv().await {
+                ask.answer(Some(&mut reconciler)).await;
+            }
+        });
+        let missing = asker.missing(Options::default()).await.expect("listed");
+        let listed: HashSet<ContentHash> = missing.hashes().iter().copied().collect();
+        assert_eq!(
+            listed,
+            left.iter().map(|c| c.content_hash).collect::<HashSet<_>>()
+        );
+        let reads = missing.reads;
+        let pending = missing.pending(Vec::new()).await.expect("texts");
+        assert_eq!(pending.chunks, left);
+        drop(asker);
+        owner.await.expect("the owner ends with its last asker");
+        (reads, listed.len(), stored.len())
+    }
+
+    #[tokio::test]
+    async fn a_resync_listing_reads_nothing_for_chunks_with_a_vector() {
+        let (small, left, few) = resync_reads(5).await;
+        let (large, same_left, many) = resync_reads(50).await;
+        assert!(many >= 10 * few, "{many} vs {few}");
+        assert_eq!(left, same_left);
+        assert_eq!(small, Reads::default());
+        assert_eq!(large, Reads::default());
+    }
+
     #[tokio::test]
     async fn an_owner_without_an_index_answers_an_error() {
         let (asker, mut asks) = channel();
@@ -250,7 +361,17 @@ mod tests {
             let ask = asks.recv().await.expect("one ask");
             ask.answer(None).await;
         });
-        assert!(matches!(asker.now().await, Err(AskError::Count(_))));
+        assert!(matches!(asker.now().await, Err(AskError::Books(_))));
+        owner.await.expect("the owner answered");
+        let (asker, mut asks) = channel();
+        let owner = tokio::spawn(async move {
+            let ask = asks.recv().await.expect("one ask");
+            ask.answer(None).await;
+        });
+        assert!(matches!(
+            asker.missing(Options::default()).await,
+            Err(AskError::Books(_))
+        ));
         owner.await.expect("the owner answered");
         assert!(matches!(asker.now().await, Err(AskError::OwnerGone)));
     }
