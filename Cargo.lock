@@ -1479,7 +1479,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "repo-search"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "askama",
  "clap",
@@ -1507,7 +1507,7 @@ dependencies = [
 
 [[package]]
 name = "repo-search-core"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "askama",
  "blake3",
@@ -1544,7 +1544,7 @@ dependencies = [
 
 [[package]]
 name = "repo-search-coreml"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "block2",
  "numkong",
