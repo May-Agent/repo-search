@@ -1,0 +1,130 @@
+//! Per-dimension int8 quantization.
+
+use numkong::f16;
+
+use crate::UnitVector;
+use crate::store::{StoredCalibration, VectorCache};
+
+use super::Error;
+
+/// Per-dimension affine map from fp32 components to unsigned 8-bit codes:
+/// `code = round((x - lo) / scale)`, `scale = (hi - lo) / 255`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Calibration {
+    /// Per-dimension minimum.
+    pub lo: Box<[f32]>,
+    /// Per-dimension step, `(hi - lo) / 255`; zero for a constant dimension.
+    pub scale: Box<[f32]>,
+}
+
+impl Calibration {
+    /// Calibrates over `rows`, which must not be empty and share one dimension.
+    ///
+    /// # Panics
+    ///
+    /// When `rows` is empty or the rows differ in dimension.
+    #[must_use]
+    pub fn from_rows<'a>(rows: impl IntoIterator<Item = &'a [f16]>) -> Self {
+        let mut rows = rows.into_iter();
+        let first = rows.next().expect("cannot calibrate without rows");
+        let mut bounds = StoredCalibration::empty(first.len());
+        bounds.add(first);
+        rows.for_each(|row| bounds.add(row));
+        Self::from_bounds(&bounds.lo, &bounds.hi)
+    }
+
+    /// The calibration of stored per-dimension bounds.
+    ///
+    /// # Panics
+    ///
+    /// When `lo` and `hi` differ in length.
+    #[must_use]
+    pub fn from_bounds(lo: &[f32], hi: &[f32]) -> Self {
+        assert_eq!(lo.len(), hi.len(), "bounds dimension");
+        Self {
+            lo: lo.into(),
+            scale: lo.iter().zip(hi).map(|(l, h)| (h - l) / 255.0).collect(),
+        }
+    }
+
+    /// Components per vector.
+    #[must_use]
+    pub fn dim(&self) -> usize {
+        self.lo.len()
+    }
+
+    /// Encodes `row` into signed codes: `round((x - lo) / scale)` clamped to
+    /// `0..=255`, minus 128. A constant dimension encodes to -128.
+    ///
+    /// # Panics
+    ///
+    /// When `row` or `out` is not [`dim`](Self::dim) long.
+    pub fn encode(&self, row: &[f16], out: &mut [i8]) {
+        assert_eq!(row.len(), self.dim(), "row dimension");
+        assert_eq!(out.len(), self.dim(), "output dimension");
+        for (((x, out), lo), scale) in row.iter().zip(out).zip(&self.lo).zip(&self.scale) {
+            *out = if *scale == 0.0 {
+                -128
+            } else {
+                (((x.to_f32() - lo) / scale).round().clamp(0.0, 255.0) - 128.0) as i8
+            };
+        }
+    }
+
+    /// Quantizes a query for the int8 dot with [`encode`](Self::encode)d rows:
+    /// weights `q * scale` divided by their one scale `max|w| / 127`, rounded
+    /// and clamped to `-127..=127`. A flat calibration — one stored vector,
+    /// or identical ones — leaves `out` all zero: the first pass then ties
+    /// and the fp16 re-rank orders the rows it sees.
+    ///
+    /// # Panics
+    ///
+    /// When `q` or `out` is not [`dim`](Self::dim) long.
+    pub fn query_weights(&self, q: &UnitVector, out: &mut [i8]) {
+        let q = q.as_slice();
+        assert_eq!(q.len(), self.dim(), "query dimension");
+        assert_eq!(out.len(), self.dim(), "output dimension");
+        let weights: Vec<f32> = q.iter().zip(&self.scale).map(|(q, s)| q * s).collect();
+        let step = weights.iter().fold(0f32, |m, w| m.max(w.abs())) / 127.0;
+        if step == 0.0 {
+            out.fill(0);
+            return;
+        }
+        for (out, w) in out.iter_mut().zip(&weights) {
+            *out = (w / step).round().clamp(-127.0, 127.0) as i8;
+        }
+    }
+}
+
+/// The calibration to build an index of `model_id` with: the stored one while
+/// the cache holds fewer than twice the vectors it was taken over, otherwise
+/// bounds recomputed from every cached vector, stored, and used. A calibration
+/// taken while the cache held only short chunks must not stick. Codes live in
+/// memory only, so recalibrating invalidates nothing on disk.
+///
+/// The recomputation runs on the vector-cache actor thread as one request,
+/// so no file or database work happens on the calling executor.
+///
+/// # Errors
+///
+/// When the model has no cached vectors, the cache or the fp16 file cannot be
+/// read, or the new calibration cannot be stored.
+pub async fn calibration_for(cache: &VectorCache, model_id: &str) -> Result<Calibration, Error> {
+    let info = cache
+        .model(model_id)
+        .await?
+        .ok_or_else(|| Error::NoVectors(model_id.to_owned()))?;
+    if let Some(stored) = cache.calibration(model_id).await?
+        && info.vectors < stored.count.saturating_mul(2)
+    {
+        return Ok(Calibration::from_bounds(&stored.lo, &stored.hi));
+    }
+
+    let bounds = cache.bounds(model_id).await?;
+    if bounds.count == 0 {
+        return Err(Error::NoVectors(model_id.to_owned()));
+    }
+    let calibration = Calibration::from_bounds(&bounds.lo, &bounds.hi);
+    cache.set_calibration(model_id, bounds).await?;
+    Ok(calibration)
+}

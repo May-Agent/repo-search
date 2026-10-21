@@ -1,0 +1,116 @@
+[workspace]
+resolver = "3"
+members = ["core", "coreml"]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.90"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/May-Agent/repo-search"
+
+[workspace.dependencies]
+repo-search-core = { path = "core", version = "0.0.1" }
+repo-search-coreml = { path = "coreml", version = "0.0.1" }
+clap = { version = "4.6.7", default-features = false, features = [
+    "std",
+    "derive",
+    "help",
+    "usage",
+    "error-context",
+] }
+
+[package]
+name = "repo-search"
+version = "0.0.1"
+description = "Search a repository for code you can describe but cannot name"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "search"
+path = "src/main.rs"
+
+[dependencies]
+repo-search-core.workspace = true
+askama = { version = "0.16.1", default-features = false, features = [
+    "derive",
+    "std",
+] }
+clap.workspace = true
+const_format = { version = "0.2.36", default-features = false }
+futures-util = { version = "0.3.34", default-features = false, features = [
+    "sink",
+    "std",
+] }
+hex = { version = "0.4.3", default-features = false, features = ["alloc"] }
+reqwest = { version = "0.13.5", default-features = false, features = [
+    "native-tls",
+] }
+serde = { version = "1.0.229", default-features = false, features = [
+    "derive",
+    "std",
+] }
+serde_json = { version = "1.0.154", default-features = false, features = ["std"] }
+sha2 = { version = "0.11.1", default-features = false }
+tar = { version = "0.4.46", default-features = false }
+tempfile = { version = "3.27.0", default-features = false }
+thiserror = { version = "2.0.21", default-features = false }
+tokio = { version = "1.54.0", default-features = false, features = [
+    "fs",
+    "io-std",
+    "io-util",
+    "macros",
+    "net",
+    "process",
+    "rt",
+    "rt-multi-thread",
+    "signal",
+    "sync",
+    "time",
+] }
+tokio-util = { version = "0.7.20", default-features = false, features = [
+    "codec",
+] }
+tracing = { version = "0.1.44", default-features = false }
+tracing-subscriber = { version = "0.3.23", default-features = false, features = [
+    "fmt",
+    "std",
+] }
+zstd = { version = "0.14.3", default-features = false }
+
+[dev-dependencies]
+tokio = { version = "1.54.0", default-features = false, features = ["test-util"] }
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+libc = { version = "0.2.191", default-features = false, features = ["std"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+repo-search-coreml.workspace = true
+kqueue = { version = "1.2.1", default-features = false }
+libc = { version = "0.2.191", default-features = false, features = ["std"] }
+notify = { version = "8.2.0", default-features = false, features = [
+    "macos_fsevent",
+] }
+
+[workspace.metadata.dist]
+cargo-dist-version = "0.33.0"
+ci = ["github"]
+installers = ["shell"]
+targets = ["aarch64-apple-darwin"]
+checksum = "sha256"
+dispatch-releases = true
+pr-run-mode = "plan"
+
+[workspace.metadata.dist.github-custom-runners]
+aarch64-apple-darwin = "macos-15"
+
+[workspace.metadata.dist.github-action-commits]
+"actions/checkout" = "3d3c42e5aac5ba805825da76410c181273ba90b1" # v7.0.1
+"actions/upload-artifact" = "cf430e030ddbb5b0abf93d22962f4752f3646cd9" # v7.0.2
+"actions/download-artifact" = "9000827ccba6bdab643e8b6fd33ac0654aef8333" # v8.0.2
+
+[profile.dist]
+inherits = "release"
+lto = "thin"
