@@ -221,8 +221,9 @@ impl<S: EmbedService> Retriever<S> {
     }
 
     /// Embeds the lexical candidates that have no vector among the first
-    /// [`ON_THE_SPOT`] of each list, stores them and adds them to the
-    /// in-memory indexes. Returns how many chunk rows gained a vector.
+    /// [`ON_THE_SPOT`] of each list through the service, which commits
+    /// them, and adds them to the in-memory indexes. Returns how many
+    /// chunk rows gained a vector.
     ///
     /// The window is taken first and filtered second: it is the best
     /// candidates, however many of them already have a vector. A candidate
@@ -299,32 +300,17 @@ impl<S: EmbedService> Retriever<S> {
         if pending.is_empty() {
             return Ok(0);
         }
-        let vectors = self
-            .service
-            .documents(pending.clone())
-            .await
-            .map_err(Error::Embed)?;
-        assert_eq!(
-            vectors.len(),
-            pending.len(),
-            "the embedder must return one vector per chunk"
-        );
-        self.cache
-            .put_many(
-                model,
-                pending
-                    .iter()
-                    .map(|p| p.content_hash)
-                    .zip(vectors)
-                    .collect(),
-            )
-            .await?;
         let hashes: Vec<ContentHash> = pending.iter().map(|p| p.content_hash).collect();
         self.service
-            .stored(hashes.clone())
+            .documents(pending)
             .await
             .map_err(Error::Embed)?;
         let stored = self.cache.get_many(model, &hashes).await?;
+        assert_eq!(
+            stored.len(),
+            hashes.len(),
+            "the embed service commits a vector for every chunk"
+        );
         self.vectors
             .adopt::<S::Error>(
                 &self.cache,

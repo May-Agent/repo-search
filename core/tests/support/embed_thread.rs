@@ -8,7 +8,7 @@ use tokio::sync::{mpsc, oneshot};
 use repo_search_core::qos::{QosClass, set_current_thread};
 use repo_search_core::reconcile::PendingChunk;
 use repo_search_core::search::EmbedService;
-use repo_search_core::store::ContentHash;
+use repo_search_core::store::{ContentHash, VectorCache};
 use repo_search_core::{Embedder, QueryTask, UnitVector};
 
 /// A test embedder thread that exits early is a test bug.
@@ -34,11 +34,14 @@ enum Request<Err> {
 pub struct EmbedThread<E: Embedder> {
     tx: mpsc::Sender<Request<E::Error>>,
     model: String,
+    /// Where `documents` commits its vectors.
+    cache: VectorCache,
 }
 
 impl<E: Embedder + Send + 'static> EmbedThread<E> {
-    /// Moves `embedder` onto a new thread, which exits when the handle drops.
-    pub fn spawn(mut embedder: E) -> io::Result<Self> {
+    /// Moves `embedder` onto a new thread, which exits when the handle
+    /// drops; `documents` commits into `cache`.
+    pub fn spawn(mut embedder: E, cache: VectorCache) -> io::Result<Self> {
         let model = embedder.model_id().to_owned();
         let (tx, mut rx) = mpsc::channel::<Request<E::Error>>(QUEUE);
         thread::Builder::new()
@@ -61,7 +64,7 @@ impl<E: Embedder + Send + 'static> EmbedThread<E> {
                     }
                 }
             })?;
-        Ok(Self { tx, model })
+        Ok(Self { tx, model, cache })
     }
 }
 
@@ -79,14 +82,16 @@ impl<E: Embedder + Send + 'static> EmbedService for EmbedThread<E> {
         rx.await.expect(GONE)
     }
 
-    async fn documents(&self, chunks: Vec<PendingChunk>) -> Result<Vec<UnitVector>, Self::Error> {
+    async fn documents(&self, chunks: Vec<PendingChunk>) -> Result<(), Self::Error> {
+        let hashes: Vec<ContentHash> = chunks.iter().map(|chunk| chunk.content_hash).collect();
         let (reply, rx) = oneshot::channel();
         let request = Request::Documents { chunks, reply };
         self.tx.send(request).await.expect(GONE);
-        rx.await.expect(GONE)
-    }
-
-    async fn stored(&self, _hashes: Vec<ContentHash>) -> Result<(), Self::Error> {
+        let vectors = rx.await.expect(GONE)?;
+        self.cache
+            .put_many(&self.model, hashes.into_iter().zip(vectors).collect())
+            .await
+            .expect("the test cache commits");
         Ok(())
     }
 }

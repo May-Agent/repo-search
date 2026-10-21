@@ -342,7 +342,7 @@ impl Fixture {
         let retriever = Retriever::new(
             index.clone(),
             cache.clone(),
-            EmbedThread::spawn(embedder).unwrap(),
+            EmbedThread::spawn(embedder, cache.clone()).unwrap(),
             PathBuf::from(tree.path()),
             NonZeroUsize::new(2).unwrap(),
         )
@@ -1032,7 +1032,7 @@ fn alternating_searches_show_ignored_files_only_when_asked() {
     let mut retriever = Retriever::new(
         index.clone(),
         cache.clone(),
-        EmbedThread::spawn(embedder).unwrap(),
+        EmbedThread::spawn(embedder, cache.clone()).unwrap(),
         PathBuf::from(tree.path()),
         NonZeroUsize::new(2).unwrap(),
     )

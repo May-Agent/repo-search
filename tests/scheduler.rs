@@ -1,4 +1,4 @@
-//! Scheduler-level tests: `Enqueue` and `QueryJob`s are fed to the scheduler
+//! `Enqueue`s, `QueryJob`s and `DocumentsJob`s are fed to the scheduler
 //! directly, with no daemon and no sockets. The stub's `Record` channel
 //! carries what the embedding threads did; waits use `recv_timeout` on it.
 
@@ -13,8 +13,8 @@ use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
 
 use repo_search::daemon::scheduler::{
-    Counts, EmbedError, Enqueue, IndexClass, Interest, PendingItem, QueryJob, SchedulerHandle,
-    Stage1Done, WorktreeId,
+    Counts, DocumentsJob, EmbedError, Enqueue, IndexClass, Interest, PendingItem, QueryJob,
+    SchedulerHandle, Stage1Done, WorktreeId,
 };
 use repo_search::daemon::{Backend, Error, ane, scheduler, writer};
 use repo_search_core::QueryTask;
@@ -37,6 +37,8 @@ struct Rig {
     backend: Arc<StubBackend>,
     records: mpsc::Receiver<Record>,
     writer: writer::WriterHandle,
+    /// The repository's vector cache, read back after a flush.
+    cache: VectorCache,
     fatal: tokio::sync::mpsc::Receiver<Error>,
     gates: BTreeMap<Instance, Arc<Barrier>>,
     /// The ANE thread, for reading its effective priority.
@@ -108,14 +110,19 @@ async fn rig(ane_delay: Duration, gpu_delay: Duration, gated: &[Instance]) -> Ri
 
     let cache = VectorCache::open(&git).await.expect("vector cache opens");
     let (writer_busy_tx, _writer_busy_rx) = tokio::sync::watch::channel(false);
-    let (writer, _writer_task) =
-        writer::spawn(cache, "stub-model".to_owned(), fatal_tx, writer_busy_tx);
+    let (writer, _writer_task) = writer::spawn(
+        cache.clone(),
+        "stub-model".to_owned(),
+        fatal_tx,
+        writer_busy_tx,
+    );
 
     Rig {
         sched,
         backend,
         records,
         writer,
+        cache,
         fatal,
         gates,
         ane_thread,
@@ -303,7 +310,7 @@ fn open(gate: &Barrier) {
 async fn send_query(rig: &Rig, text: &str) -> oneshot::Receiver<Result<UnitVector, EmbedError>> {
     let (reply, rx) = oneshot::channel();
     rig.sched
-        .query(QueryJob::Query {
+        .query(QueryJob {
             worktree: WORKTREE,
             task: QueryTask::CodeRetrieval,
             text: text.to_owned(),
@@ -325,42 +332,67 @@ async fn query(rig: &Rig, text: &str) {
         .expect("embeds fine");
 }
 
-/// Sends a `Documents` job of `n` chunks for `WORKTREE`; the receiver
-/// resolves with its vectors or its error, and the chunks' content hashes
-/// come along.
-async fn send_documents(
+/// Sends a `Documents` job of `chunks` for `WORKTREE`; the receiver
+/// resolves once every chunk's vector is with the rig's writer. The caller
+/// holds a search window of `REPO` open around it.
+async fn send_spot(
     rig: &Rig,
-    first_seq: u64,
-    n: usize,
-) -> (
-    oneshot::Receiver<Result<Vec<UnitVector>, EmbedError>>,
-    HashSet<ContentHash>,
-) {
+    chunks: Vec<PendingChunk>,
+) -> oneshot::Receiver<Result<(), EmbedError>> {
     let (reply, rx) = oneshot::channel();
-    let chunks: Vec<PendingChunk> = (first_seq..first_seq + n as u64)
-        .map(|seq| pending(seq, 100).chunk)
-        .collect();
-    let hashes: HashSet<ContentHash> = chunks.iter().map(|chunk| chunk.content_hash).collect();
     rig.sched
-        .query(QueryJob::Documents {
+        .documents(DocumentsJob {
             worktree: WORKTREE,
+            repo: REPO,
             chunks,
+            writer: rig.writer.clone(),
             enqueued: Instant::now(),
-            stamp: 0,
             reply,
         })
         .await
         .expect("scheduler is up");
-    (rx, hashes)
+    rx
 }
 
-/// Sends a `Documents` job of `n` chunks for `WORKTREE`, awaits the vectors
-/// and returns the chunks' content hashes.
+/// Flushes the rig's writer and asserts the cache holds a vector for each
+/// of `hashes`: what the retriever reads back after a `Documents` job.
+async fn assert_cached(rig: &Rig, hashes: &[ContentHash]) {
+    rig.writer.flush().await.expect("the writer commits");
+    let cached = rig
+        .cache
+        .get_many("stub-model", hashes)
+        .await
+        .expect("the cache reads");
+    assert_eq!(cached.len(), hashes.len(), "every chunk has a vector");
+}
+
+/// Drains the record channel into `log`; every embedding of `hash` in
+/// `log`, by instance and kind, in order.
+fn embeds_of(log: &mut Vec<Record>, rig: &Rig, hash: ContentHash) -> Vec<(Instance, Kind)> {
+    log.extend(rig.records.try_iter());
+    log.iter()
+        .filter(|r| matches!(r.kind, Kind::Index | Kind::QueryDocument) && r.hash == Some(hash))
+        .map(|r| (r.instance, r.kind))
+        .collect()
+}
+
+/// Sends a `Documents` job of `n` chunks for `WORKTREE` inside a search
+/// window of its own, awaits its answer, checks every vector is cached and
+/// returns the chunks' content hashes.
 async fn query_documents(rig: &Rig, first_seq: u64, n: usize) -> HashSet<ContentHash> {
-    let (rx, hashes) = send_documents(rig, first_seq, n).await;
-    let vectors = rx.await.expect("documents answered").expect("embeds fine");
-    assert_eq!(vectors.len(), n);
-    hashes
+    let chunks: Vec<PendingChunk> = (first_seq..first_seq + n as u64)
+        .map(|seq| pending(seq, 100).chunk)
+        .collect();
+    let hashes: Vec<ContentHash> = chunks.iter().map(|chunk| chunk.content_hash).collect();
+    rig.sched.barrier(REPO, true).await;
+    send_spot(rig, chunks)
+        .await
+        .await
+        .expect("documents answered")
+        .expect("embeds fine");
+    rig.sched.barrier(REPO, false).await;
+    assert_cached(rig, &hashes).await;
+    hashes.into_iter().collect()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -749,6 +781,9 @@ async fn query_after_a_fatal_error_is_answered_and_the_scheduler_exits() {
     let message = match rx.await.expect("the query is answered") {
         Err(EmbedError::Model(message)) => message,
         Err(EmbedError::SchedulerGone) => panic!("expected the fatal error, got SchedulerGone"),
+        Err(EmbedError::Writer(error)) => {
+            panic!("expected the fatal error, got a writer failure: {error}")
+        }
         Ok(_) => panic!("expected a model error, got a vector"),
     };
     assert_eq!(message, error);
@@ -975,9 +1010,9 @@ async fn counts_move_to_background_at_stage1_completion() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn documents_stored_drops_a_queued_twin() {
+async fn a_documents_job_takes_its_queued_twin_out_of_the_queue() {
     // The ANE's first call is gated, so the twin is provably still queued
-    // when `DocumentsStored` lands.
+    // when the `Documents` job lands.
     let rig = rig(Duration::from_millis(10), Duration::ZERO, &[Instance::Ane]).await;
     rig.backend
         .push_headroom(Err(GpuBlocked::NotMains("Battery Power".to_owned())));
@@ -993,22 +1028,31 @@ async fn documents_stored_drops_a_queued_twin() {
     wait_started(&mut log, &rig.records, 1);
     assert_eq!(counts_of(&rig, WORKTREE).await, counts(3, 0, 0, false));
 
-    // The `Documents` job's vectors committed: its queued twin leaves.
-    let twin = pending(1, 100).chunk.content_hash;
-    rig.sched
-        .documents_stored(REPO, vec![twin])
-        .await
-        .expect("scheduler is up");
-    assert_eq!(counts_of(&rig, WORKTREE).await, counts(2, 0, 0, false));
+    rig.sched.barrier(REPO, true).await;
+    let docs = send_spot(&rig, vec![pending(1, 100).chunk]).await;
+    // The twin is held and counted in flight, so the queue lost it.
+    assert_eq!(counts_of(&rig, WORKTREE).await, counts(2, 0, 1, false));
 
     open(rig.gate(Instance::Ane));
     query.await.expect("query answered").expect("embeds fine");
+    docs.await
+        .expect("documents answered")
+        .expect("embeds fine");
+    rig.sched.barrier(REPO, false).await;
     tokio::time::timeout(TIMEOUT, done.recv())
         .await
         .expect("stage 1 completes")
         .expect("stage-1 channel open");
-    let embedded = index_records(&rig);
+    let twin = pending(1, 100).chunk.content_hash;
+    let embedded = index_hashes(&mut log, &rig);
     assert!(!embedded.contains(&twin), "no Index record for the twin");
+    assert_eq!(
+        log.iter()
+            .filter(|r| r.kind == Kind::QueryDocument && r.hash == Some(twin))
+            .count(),
+        1,
+        "one QueryDocument record for the twin"
+    );
     assert_eq!(counts_of(&rig, WORKTREE).await, counts(0, 0, 0, true));
 }
 
@@ -1357,33 +1401,6 @@ async fn a_stage1_change_after_completion_reopens_stage1_once() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_documents_job_keeps_its_queued_twin_until_stored() {
-    let rig = rig(Duration::from_millis(10), Duration::ZERO, &[Instance::Ane]).await;
-    rig.backend
-        .push_headroom(Err(GpuBlocked::NotMains("Battery Power".to_owned())));
-    let query = send_query(&rig, "hold the pull").await;
-    let mut done = enqueue(&rig, vec![pending(1, 100)], IndexClass::Stage1).await;
-    let mut log = Vec::new();
-    wait_started(&mut log, &rig.records, 1);
-    assert_eq!(counts_of(&rig, WORKTREE).await, counts(1, 0, 0, false));
-
-    let (docs, _hashes) = send_documents(&rig, 1, 1).await;
-    open(rig.gate(Instance::Ane));
-    query.await.expect("query answered").expect("embeds fine");
-    docs.await
-        .expect("documents answered")
-        .expect("embeds fine");
-
-    // The twin was never reported stored: it stays queued and embeds.
-    wait_for(&mut log, &rig.records, |r| {
-        r.kind == Kind::Index && r.hash == Some(pending(1, 100).chunk.content_hash)
-    });
-    tokio::time::timeout(TIMEOUT, done.recv())
-        .await
-        .expect("stage 1 completes")
-        .expect("stage-1 channel open");
-}
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_resync_skips_chunks_finished_inside_its_barrier() {
     let rig = rig(Duration::from_millis(10), Duration::ZERO, &[Instance::Ane]).await;
     rig.backend
@@ -1503,7 +1520,7 @@ async fn a_change_skips_chunks_another_worktree_finished_inside_its_barrier() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_change_skips_chunks_a_search_stored_inside_its_barrier() {
+async fn a_change_skips_chunks_a_search_embedded_inside_its_barrier() {
     let rig = rig(Duration::from_millis(10), Duration::ZERO, &[]).await;
     rig.backend
         .push_headroom(Err(GpuBlocked::NotMains("Battery Power".to_owned())));
@@ -1511,14 +1528,9 @@ async fn a_change_skips_chunks_a_search_stored_inside_its_barrier() {
 
     // The edit's barrier, whose reconcile read saw 5, 6 and 7 uncached.
     rig.sched.barrier(REPO, true).await;
-    // A search embeds 5 and 6 on the spot; `documents_stored` stands for
-    // the retriever's `put_many` and `stored`. The scheduler holds neither
-    // hash.
-    let stored = query_documents(&rig, 5, 2).await;
-    rig.sched
-        .documents_stored(REPO, stored.iter().copied().collect())
-        .await
-        .expect("scheduler is up");
+    // A search embeds 5 and 6 on the spot; the scheduler holds neither
+    // hash, and `DocumentsDone` notes both committed.
+    query_documents(&rig, 5, 2).await;
     let mut log = Vec::new();
     // The `Documents` job's records prove `open_ane` ran.
     let _lift = stub::lift_ane(&rig.backend, QosClass::UserInitiated);
@@ -1696,4 +1708,473 @@ async fn committed_hashes_are_kept_only_while_a_barrier_runs() {
             "hash {seq} embedded exactly twice: {embedded:?}"
         );
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_search_embeds_its_gpu_chunk_again_without_waiting() {
+    // Both first calls are gated: the GPU provably holds `C` in its batch
+    // when the search's job lands, and the job answers without it.
+    let rig = rig(
+        Duration::from_millis(10),
+        Duration::from_millis(10),
+        &[Instance::Ane, Instance::Gpu],
+    )
+    .await;
+    let mut log = Vec::new();
+    let c = pending(0, 200);
+    let hash = c.chunk.content_hash;
+    let chunk = c.chunk.clone();
+    let query = send_query(&rig, "hold the pull").await;
+    let mut done = enqueue(&rig, vec![c], IndexClass::Stage1).await;
+    wait_started(&mut log, &rig.records, 1);
+
+    rig.backend.push_headroom(Ok(()));
+    wait_for(&mut log, &rig.records, |r| {
+        r.instance == Instance::Gpu && r.kind == Kind::Started && r.hash == Some(hash)
+    });
+    assert_eq!(counts_of(&rig, WORKTREE).await, counts(0, 0, 1, false));
+
+    rig.sched.barrier(REPO, true).await;
+    let mut docs = send_spot(&rig, vec![chunk]).await;
+    // The job twins `C`; the item stays in flight on the GPU, neither held
+    // nor counted again.
+    assert_eq!(counts_of(&rig, WORKTREE).await, counts(0, 0, 1, false));
+
+    open(rig.gate(Instance::Ane));
+    query.await.expect("query answered").expect("embeds fine");
+    // The GPU's gate is still closed, so the search was answered without
+    // waiting for the GPU batch.
+    tokio::time::timeout(TIMEOUT, &mut docs)
+        .await
+        .expect("the documents job is answered")
+        .expect("documents answered")
+        .expect("embeds fine");
+    assert_eq!(
+        embeds_of(&mut log, &rig, hash),
+        vec![(Instance::Ane, Kind::QueryDocument)],
+        "the job's part embedded C; the GPU batch has not finished"
+    );
+    assert_eq!(
+        counts_of(&rig, WORKTREE).await,
+        counts(0, 0, 1, false),
+        "DocumentsDone does not finish the GPU's item"
+    );
+    assert_cached(&rig, &[hash]).await;
+    rig.sched.barrier(REPO, false).await;
+
+    open(rig.gate(Instance::Gpu));
+    tokio::time::timeout(TIMEOUT, done.recv())
+        .await
+        .expect("stage 1 completes")
+        .expect("stage-1 channel open");
+    // `GpuDone` finished the item once.
+    assert_eq!(counts_of(&rig, WORKTREE).await, counts(0, 0, 0, true));
+
+    wait_for(&mut log, &rig.records, |r| {
+        r.instance == Instance::Gpu && r.kind == Kind::Dropped
+    });
+    assert_eq!(
+        embeds_of(&mut log, &rig, hash),
+        vec![
+            (Instance::Ane, Kind::QueryDocument),
+            (Instance::Gpu, Kind::Index)
+        ]
+    );
+    // The GPU's second vector for `C` committed without error, and the
+    // cache still answers one vector for it.
+    assert_cached(&rig, &[hash]).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_gpu_batch_skips_a_chunk_a_search_holds() {
+    let rig = rig(
+        Duration::from_millis(10),
+        Duration::from_millis(10),
+        &[Instance::Ane],
+    )
+    .await;
+    let mut log = Vec::new();
+    let c = pending(0, 200);
+    let hash = c.chunk.content_hash;
+    let chunk = c.chunk.clone();
+    let query = send_query(&rig, "hold the pull").await;
+    let mut items = vec![c];
+    items.extend((1..9).map(|seq| pending(seq, 100)));
+    let mut done = enqueue(&rig, items, IndexClass::Stage1).await;
+    wait_started(&mut log, &rig.records, 1);
+    assert_eq!(counts_of(&rig, WORKTREE).await, counts(9, 0, 0, false));
+
+    rig.sched.barrier(REPO, true).await;
+    let docs = send_spot(&rig, vec![chunk]).await;
+    // `C` is held and counted in flight.
+    assert_eq!(counts_of(&rig, WORKTREE).await, counts(8, 0, 1, false));
+
+    rig.backend.push_headroom(Ok(()));
+    // The GPU's first pull is FIFO-behind the job, so `C` is already held.
+    // The GPU embeds the eight fillers as one batch, and its next pull
+    // finds stage 1's queue empty.
+    wait_for(&mut log, &rig.records, |r| {
+        r.instance == Instance::Gpu && r.kind == Kind::Dropped
+    });
+    // `GpuDone` is handled before the pull that got `Stop`.
+    assert_eq!(counts_of(&rig, WORKTREE).await, counts(0, 0, 1, false));
+
+    open(rig.gate(Instance::Ane));
+    query.await.expect("query answered").expect("embeds fine");
+    tokio::time::timeout(TIMEOUT, docs)
+        .await
+        .expect("the documents job is answered")
+        .expect("documents answered")
+        .expect("embeds fine");
+    assert_cached(&rig, &[hash]).await;
+    rig.sched.barrier(REPO, false).await;
+    tokio::time::timeout(TIMEOUT, done.recv())
+        .await
+        .expect("stage 1 completes")
+        .expect("stage-1 channel open");
+    assert_eq!(counts_of(&rig, WORKTREE).await, counts(0, 0, 0, true));
+
+    assert_eq!(
+        embeds_of(&mut log, &rig, hash),
+        vec![(Instance::Ane, Kind::QueryDocument)]
+    );
+    let indexed = index_hashes(&mut log, &rig);
+    assert_each_once(&indexed);
+    let want: HashSet<ContentHash> = (1..9)
+        .map(|seq| pending(seq, 100).chunk.content_hash)
+        .collect();
+    assert_eq!(indexed.iter().copied().collect::<HashSet<_>>(), want);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_search_borrows_its_chunk_from_the_ane() {
+    // The ANE's first call is gated: `C` is provably in flight on the ANE
+    // when the job lands. `D` is never enqueued, so the job's own part
+    // embeds it behind the borrowed item.
+    let rig = rig(Duration::from_millis(10), Duration::ZERO, &[Instance::Ane]).await;
+    rig.backend
+        .push_headroom(Err(GpuBlocked::NotMains("Battery Power".to_owned())));
+    let mut log = Vec::new();
+    let c = pending(0, 100);
+    let hash = c.chunk.content_hash;
+    let chunk = c.chunk.clone();
+    let d = pending(1, 100);
+    let other_hash = d.chunk.content_hash;
+    let other = d.chunk.clone();
+    let mut done = enqueue(&rig, vec![c], IndexClass::Stage1).await;
+    wait_started(&mut log, &rig.records, 1);
+    assert_eq!(counts_of(&rig, WORKTREE).await, counts(0, 0, 1, false));
+
+    rig.sched.barrier(REPO, true).await;
+    let mut docs = send_spot(&rig, vec![chunk, other]).await;
+    // `C` is borrowed, and `D` has no item.
+    assert_eq!(counts_of(&rig, WORKTREE).await, counts(0, 0, 1, false));
+    // The `counts_of` reply proves the job was handled, and the gate holds
+    // `AneDone`: the job waits for the borrowed item.
+    assert!(matches!(
+        docs.try_recv(),
+        Err(oneshot::error::TryRecvError::Empty)
+    ));
+
+    open(rig.gate(Instance::Ane));
+    // The borrow did not stall the ANE thread. It finished `C`, then
+    // pulled and ran the job's part.
+    tokio::time::timeout(TIMEOUT, &mut docs)
+        .await
+        .expect("the documents job is answered")
+        .expect("documents answered")
+        .expect("embeds fine");
+    assert_cached(&rig, &[hash, other_hash]).await;
+    rig.sched.barrier(REPO, false).await;
+    tokio::time::timeout(TIMEOUT, done.recv())
+        .await
+        .expect("stage 1 completes")
+        .expect("stage-1 channel open");
+    assert_eq!(counts_of(&rig, WORKTREE).await, counts(0, 0, 0, true));
+
+    assert_eq!(
+        embeds_of(&mut log, &rig, hash),
+        vec![(Instance::Ane, Kind::Index)]
+    );
+    assert_eq!(
+        embeds_of(&mut log, &rig, other_hash),
+        vec![(Instance::Ane, Kind::QueryDocument)]
+    );
+    let index_pos = log
+        .iter()
+        .position(|r| r.kind == Kind::Index && r.hash == Some(hash))
+        .expect("C's Index record");
+    let part_pos = log
+        .iter()
+        .position(|r| r.kind == Kind::QueryDocument && r.hash == Some(other_hash))
+        .expect("D's QueryDocument record");
+    assert!(
+        part_pos > index_pos,
+        "the part ran after the borrowed item, on the same thread"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_search_skips_a_chunk_finished_inside_its_window() {
+    let rig = rig(Duration::from_millis(10), Duration::ZERO, &[Instance::Ane]).await;
+    rig.backend
+        .push_headroom(Err(GpuBlocked::NotMains("Battery Power".to_owned())));
+    let mut log = Vec::new();
+    let c = pending(0, 100);
+    let hash = c.chunk.content_hash;
+    let chunk = c.chunk.clone();
+    let query = send_query(&rig, "hold the pull").await;
+    let mut done = enqueue(&rig, vec![c], IndexClass::Stage1).await;
+    wait_started(&mut log, &rig.records, 1);
+
+    // The search's window; its vector sync, inside it, saw `C` uncached.
+    rig.sched.barrier(REPO, true).await;
+    open(rig.gate(Instance::Ane));
+    query.await.expect("query answered").expect("embeds fine");
+    // `C` was embedded and `item_done` ran inside the window.
+    tokio::time::timeout(TIMEOUT, done.recv())
+        .await
+        .expect("stage 1 completes")
+        .expect("stage-1 channel open");
+
+    let docs = send_spot(&rig, vec![chunk]).await;
+    // Answered at once, since `C` is in the committed set.
+    tokio::time::timeout(TIMEOUT, docs)
+        .await
+        .expect("the documents job is answered")
+        .expect("documents answered")
+        .expect("embeds fine");
+    assert_cached(&rig, &[hash]).await;
+    rig.sched.barrier(REPO, false).await;
+    assert_eq!(counts_of(&rig, WORKTREE).await, counts(0, 0, 0, true));
+    assert_eq!(
+        embeds_of(&mut log, &rig, hash),
+        vec![(Instance::Ane, Kind::Index)]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dropped_search_hands_its_held_chunk_back_to_indexing() {
+    let rig = rig(Duration::from_millis(10), Duration::ZERO, &[Instance::Ane]).await;
+    rig.backend
+        .push_headroom(Err(GpuBlocked::NotMains("Battery Power".to_owned())));
+    let mut log = Vec::new();
+    let c = pending(1, 100);
+    let hash = c.chunk.content_hash;
+    let chunk = c.chunk.clone();
+    let query = send_query(&rig, "hold the pull").await;
+    let mut done = enqueue(&rig, vec![c], IndexClass::Stage1).await;
+    wait_started(&mut log, &rig.records, 1);
+    assert_eq!(counts_of(&rig, WORKTREE).await, counts(1, 0, 0, false));
+
+    rig.sched.barrier(REPO, true).await;
+    let docs = send_spot(&rig, vec![chunk]).await;
+    assert_eq!(counts_of(&rig, WORKTREE).await, counts(0, 0, 1, false));
+    // The search hung up before its part ran.
+    drop(docs);
+
+    open(rig.gate(Instance::Ane));
+    query.await.expect("query answered").expect("embeds fine");
+    // The dispatch skipped the job and put `C` back in stage 1, and the
+    // ANE embedded it as indexing work.
+    tokio::time::timeout(TIMEOUT, done.recv())
+        .await
+        .expect("stage 1 completes")
+        .expect("stage-1 channel open");
+    rig.sched.barrier(REPO, false).await;
+    assert_eq!(counts_of(&rig, WORKTREE).await, counts(0, 0, 0, true));
+    assert_eq!(
+        embeds_of(&mut log, &rig, hash),
+        vec![(Instance::Ane, Kind::Index)]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_chunk_two_searches_hold_stays_held_when_one_is_dropped() {
+    let rig = rig(Duration::from_millis(10), Duration::ZERO, &[Instance::Ane]).await;
+    rig.backend
+        .push_headroom(Err(GpuBlocked::NotMains("Battery Power".to_owned())));
+    let mut log = Vec::new();
+    let c = pending(1, 100);
+    let hash = c.chunk.content_hash;
+    let chunk = c.chunk.clone();
+    let query = send_query(&rig, "hold the pull").await;
+    let mut done = enqueue(&rig, vec![c], IndexClass::Stage1).await;
+    wait_started(&mut log, &rig.records, 1);
+    assert_eq!(counts_of(&rig, WORKTREE).await, counts(1, 0, 0, false));
+
+    // Two searches' windows.
+    rig.sched.barrier(REPO, true).await;
+    rig.sched.barrier(REPO, true).await;
+    let first = send_spot(&rig, vec![chunk.clone()]).await;
+    let second = send_spot(&rig, vec![chunk]).await;
+    assert_eq!(counts_of(&rig, WORKTREE).await, counts(0, 0, 1, false));
+    drop(first);
+
+    open(rig.gate(Instance::Ane));
+    query.await.expect("query answered").expect("embeds fine");
+    tokio::time::timeout(TIMEOUT, second)
+        .await
+        .expect("the documents job is answered")
+        .expect("documents answered")
+        .expect("embeds fine");
+    assert_cached(&rig, &[hash]).await;
+    rig.sched.barrier(REPO, false).await;
+    rig.sched.barrier(REPO, false).await;
+    tokio::time::timeout(TIMEOUT, done.recv())
+        .await
+        .expect("stage 1 completes")
+        .expect("stage-1 channel open");
+    assert_eq!(counts_of(&rig, WORKTREE).await, counts(0, 0, 0, true));
+
+    // Without the count, releasing `first` would requeue `C` while
+    // `second` still embeds it, and `on_documents_done`'s `Held` assertion
+    // would panic the scheduler.
+    assert_eq!(
+        embeds_of(&mut log, &rig, hash),
+        vec![(Instance::Ane, Kind::QueryDocument)]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_search_whose_only_chunk_is_on_the_ane_is_answered_at_its_ane_done() {
+    // The ANE's first call is gated: `C` is provably in flight on the ANE
+    // when the job lands, and the job has no part of its own.
+    let rig = rig(Duration::from_millis(10), Duration::ZERO, &[Instance::Ane]).await;
+    rig.backend
+        .push_headroom(Err(GpuBlocked::NotMains("Battery Power".to_owned())));
+    let mut log = Vec::new();
+    let c = pending(0, 100);
+    let hash = c.chunk.content_hash;
+    let chunk = c.chunk.clone();
+    let mut done = enqueue(&rig, vec![c], IndexClass::Stage1).await;
+    wait_started(&mut log, &rig.records, 1);
+
+    rig.sched.barrier(REPO, true).await;
+    let mut docs = send_spot(&rig, vec![chunk]).await;
+    // `C` is borrowed: neither held nor counted again.
+    assert_eq!(counts_of(&rig, WORKTREE).await, counts(0, 0, 1, false));
+    // The `counts_of` reply proves the job was handled, and the gate holds
+    // `AneDone`: a job with only a borrow is not answered on arrival.
+    assert!(matches!(
+        docs.try_recv(),
+        Err(oneshot::error::TryRecvError::Empty)
+    ));
+
+    open(rig.gate(Instance::Ane));
+    // `AneDone` settles the borrow, which was the job's only part.
+    tokio::time::timeout(TIMEOUT, &mut docs)
+        .await
+        .expect("the documents job is answered")
+        .expect("documents answered")
+        .expect("embeds fine");
+    assert_cached(&rig, &[hash]).await;
+    rig.sched.barrier(REPO, false).await;
+    tokio::time::timeout(TIMEOUT, done.recv())
+        .await
+        .expect("stage 1 completes")
+        .expect("stage-1 channel open");
+    assert_eq!(counts_of(&rig, WORKTREE).await, counts(0, 0, 0, true));
+    assert_eq!(
+        embeds_of(&mut log, &rig, hash),
+        vec![(Instance::Ane, Kind::Index)]
+    );
+    assert!(
+        !log.iter().any(|r| r.kind == Kind::QueryDocument),
+        "the job ran no part: {log:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_gpu_twin_finished_before_the_search_part_is_counted_once() {
+    // As in `a_search_embeds_its_gpu_chunk_again_without_waiting`, but the
+    // GPU's gate opens first: `GpuDone` finishes the twin's item while the
+    // job's part still waits behind the gated query.
+    let rig = rig(
+        Duration::from_millis(10),
+        Duration::from_millis(10),
+        &[Instance::Ane, Instance::Gpu],
+    )
+    .await;
+    let mut log = Vec::new();
+    let c = pending(0, 200);
+    let hash = c.chunk.content_hash;
+    let chunk = c.chunk.clone();
+    let query = send_query(&rig, "hold the pull").await;
+    let mut done = enqueue(&rig, vec![c], IndexClass::Stage1).await;
+    wait_started(&mut log, &rig.records, 1);
+
+    rig.backend.push_headroom(Ok(()));
+    wait_for(&mut log, &rig.records, |r| {
+        r.instance == Instance::Gpu && r.kind == Kind::Started && r.hash == Some(hash)
+    });
+    rig.sched.barrier(REPO, true).await;
+    let mut docs = send_spot(&rig, vec![chunk]).await;
+    assert_eq!(counts_of(&rig, WORKTREE).await, counts(0, 0, 1, false));
+
+    open(rig.gate(Instance::Gpu));
+    tokio::time::timeout(TIMEOUT, done.recv())
+        .await
+        .expect("stage 1 completes")
+        .expect("stage-1 channel open");
+    // `GpuDone` finished the item; the ANE is still at its gate, so the
+    // job's part has not run.
+    assert_eq!(counts_of(&rig, WORKTREE).await, counts(0, 0, 0, true));
+    assert!(matches!(
+        docs.try_recv(),
+        Err(oneshot::error::TryRecvError::Empty)
+    ));
+
+    open(rig.gate(Instance::Ane));
+    query.await.expect("query answered").expect("embeds fine");
+    tokio::time::timeout(TIMEOUT, &mut docs)
+        .await
+        .expect("the documents job is answered")
+        .expect("documents answered")
+        .expect("embeds fine");
+    // `DocumentsDone` found the twin's item gone and only noted its hash.
+    assert_eq!(counts_of(&rig, WORKTREE).await, counts(0, 0, 0, true));
+    assert_eq!(
+        embeds_of(&mut log, &rig, hash),
+        vec![
+            (Instance::Gpu, Kind::Index),
+            (Instance::Ane, Kind::QueryDocument)
+        ]
+    );
+    assert_cached(&rig, &[hash]).await;
+    rig.sched.barrier(REPO, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stop_fails_a_queued_search_part_and_requeues_its_held_chunk() {
+    let rig = rig(Duration::from_millis(10), Duration::ZERO, &[Instance::Ane]).await;
+    rig.backend
+        .push_headroom(Err(GpuBlocked::NotMains("Battery Power".to_owned())));
+    let mut log = Vec::new();
+    let c = pending(1, 100);
+    let chunk = c.chunk.clone();
+    let query = send_query(&rig, "hold the pull").await;
+    let _done = enqueue(&rig, vec![c], IndexClass::Stage1).await;
+    wait_started(&mut log, &rig.records, 1);
+
+    rig.sched.barrier(REPO, true).await;
+    let docs = send_spot(&rig, vec![chunk]).await;
+    assert_eq!(counts_of(&rig, WORKTREE).await, counts(0, 0, 1, false));
+
+    // The part is queued behind the gated query when `Stop` lands: the job
+    // fails, and `C` goes back to stage 1's queue.
+    rig.sched.stop().await;
+    let answer = tokio::time::timeout(TIMEOUT, docs)
+        .await
+        .expect("the documents job is answered")
+        .expect("documents answered");
+    assert!(
+        matches!(answer, Err(EmbedError::SchedulerGone)),
+        "{answer:?}"
+    );
+    assert_eq!(counts_of(&rig, WORKTREE).await, counts(1, 0, 0, false));
+
+    // The running query still finishes before the ANE pulls `Stop`.
+    open(rig.gate(Instance::Ane));
+    query.await.expect("query answered").expect("embeds fine");
 }

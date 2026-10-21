@@ -28,8 +28,8 @@ use super::feed::{self, Feed, FeedMsg, FeederConfig};
 use super::model::{Model, ModelState};
 use super::registry::RegistryHandle;
 use super::scheduler::{
-    EmbedError, GpuState, IndexClass, QueryJob, RepoId, SchedulerHandle, SchedulerMsg, Stage1Done,
-    WorktreeId,
+    DocumentsJob, EmbedError, GpuState, IndexClass, QueryJob, RepoId, SchedulerHandle,
+    SchedulerMsg, Stage1Done, WorktreeId,
 };
 use super::watch::{WatchMsg, Watcher};
 use super::writer::WriterHandle;
@@ -374,52 +374,6 @@ impl<B: Backend> Owner<B> {
         if !send(events, Event::Progress(Progress::Reconciling)).await {
             return;
         }
-        let barrier_start = Instant::now();
-        let (report, commit) = match self.barrier(&model, request.include_ignored, None).await {
-            Ok(done) => done,
-            Err(message) => {
-                send(events, error(ErrorKind::Search, message)).await;
-                return;
-            }
-        };
-        let barrier_us = barrier_start.elapsed().as_micros() as u64;
-
-        if self.retriever.is_none() {
-            let knn_threads = match performance_cores() {
-                Ok(cores) => NonZeroUsize::new(cores),
-                Err(e) => {
-                    send(events, error(ErrorKind::Internal, e.to_string())).await;
-                    return;
-                }
-            };
-            let Some(knn_threads) = knn_threads else {
-                send(
-                    events,
-                    error(ErrorKind::Internal, "no performance cores".into()),
-                )
-                .await;
-                return;
-            };
-            let handle = AneHandle {
-                worktree: self.id,
-                repo: self.repo,
-                model_id: model.id.clone(),
-                sched: model.scheduler.tx(),
-            };
-            match Retriever::new(
-                self.index.as_ref().expect("opened").clone(),
-                self.cache.clone().expect("opened above"),
-                handle,
-                self.root.clone(),
-                knn_threads,
-            ) {
-                Ok(retriever) => self.retriever = Some(retriever),
-                Err(e) => {
-                    send(events, error(ErrorKind::Internal, e.to_string())).await;
-                    return;
-                }
-            }
-        }
         let core_request = search::Request {
             query: request.query,
             mode: request.mode.into(),
@@ -433,29 +387,18 @@ impl<B: Backend> Owner<B> {
             files_only: request.files_only,
             include_ignored: request.include_ignored,
         };
-        // Reset the accumulated query stats so a search reports only its own.
-        if let Err(()) = self.reset_stats(&model).await {
-            send(
-                events,
-                error(ErrorKind::ShuttingDown, "scheduler gone".into()),
-            )
+        let sched = model.scheduler.clone();
+        // The search's window: it opens before the freshness barrier's
+        // writer flush, so a vector the retrieval's cache reads miss is
+        // remembered until the retrieval's `Documents` job lands, and it
+        // closes after that job is answered (see `DocumentsJob`).
+        sched.barrier(self.repo, true).await;
+        let retrieved = self
+            .barrier_and_retrieve(&model, &core_request, events)
             .await;
+        sched.barrier(self.repo, false).await;
+        let Some(Retrieved { barrier_us, result }) = retrieved else {
             return;
-        }
-        let counter = BudgetCounter::<B>(model.counter.clone());
-        // Only the retrieval cancels on a hang-up: the barrier above always
-        // runs to completion.
-        let result = tokio::select! {
-            result = self
-                .retriever
-                .as_mut()
-                .expect("built above")
-                .search(
-                    &core_request,
-                    Reconciliation::new(commit, &report),
-                    &counter,
-                ) => Some(result),
-            _ = events.closed() => None,
         };
         // The stats are taken on every path so a failed search cannot leak
         // its wait or overtaken into the next one.
@@ -479,6 +422,7 @@ impl<B: Backend> Owner<B> {
                 let kind = match &e {
                     search::Error::Embed(EmbedError::Model(_)) => ErrorKind::Model,
                     search::Error::Embed(EmbedError::SchedulerGone) => ErrorKind::ShuttingDown,
+                    search::Error::Embed(EmbedError::Writer(_)) => ErrorKind::Internal,
                     _ => ErrorKind::Search,
                 };
                 send(events, error(kind, e.to_string())).await;
@@ -502,6 +446,89 @@ impl<B: Backend> Owner<B> {
             },
         };
         let _ = send(events, Event::Final(Final::Answer(answer))).await;
+    }
+
+    /// The freshness barrier, then the retrieval, inside the search's
+    /// window the caller holds open. `None` when an error event was
+    /// already sent.
+    async fn barrier_and_retrieve(
+        &mut self,
+        model: &Arc<Model<B>>,
+        request: &search::Request,
+        events: &mpsc::Sender<Event>,
+    ) -> Option<Retrieved> {
+        let barrier_start = Instant::now();
+        let (report, commit) = match self.barrier(model, request.include_ignored, None).await {
+            Ok(done) => done,
+            Err(message) => {
+                send(events, error(ErrorKind::Search, message)).await;
+                return None;
+            }
+        };
+        let barrier_us = barrier_start.elapsed().as_micros() as u64;
+
+        if self.retriever.is_none() {
+            let knn_threads = match performance_cores() {
+                Ok(cores) => NonZeroUsize::new(cores),
+                Err(e) => {
+                    send(events, error(ErrorKind::Internal, e.to_string())).await;
+                    return None;
+                }
+            };
+            let Some(knn_threads) = knn_threads else {
+                send(
+                    events,
+                    error(ErrorKind::Internal, "no performance cores".into()),
+                )
+                .await;
+                return None;
+            };
+            let handle = AneHandle {
+                worktree: self.id,
+                repo: self.repo,
+                model_id: model.id.clone(),
+                sched: model.scheduler.tx(),
+                writer: self.writer.clone().expect("opened by shared"),
+            };
+            match Retriever::new(
+                self.index.as_ref().expect("opened").clone(),
+                self.cache.clone().expect("opened above"),
+                handle,
+                self.root.clone(),
+                knn_threads,
+            ) {
+                Ok(retriever) => self.retriever = Some(retriever),
+                Err(e) => {
+                    send(events, error(ErrorKind::Internal, e.to_string())).await;
+                    return None;
+                }
+            }
+        }
+        // Reset the accumulated query stats so a search reports only its own.
+        if let Err(()) = self.reset_stats(model).await {
+            send(
+                events,
+                error(ErrorKind::ShuttingDown, "scheduler gone".into()),
+            )
+            .await;
+            return None;
+        }
+        let counter = BudgetCounter::<B>(model.counter.clone());
+        // Only the retrieval cancels on a hang-up: the barrier above always
+        // runs to completion.
+        let result = tokio::select! {
+            result = self
+                .retriever
+                .as_mut()
+                .expect("built above")
+                .search(
+                    request,
+                    Reconciliation::new(commit, &report),
+                    &counter,
+                ) => Some(result),
+            _ = events.closed() => None,
+        };
+        Some(Retrieved { barrier_us, result })
     }
 
     /// Drops this worktree's accumulated query stats; `Err` when the
@@ -1127,6 +1154,14 @@ fn shutting_down() -> Event {
     )
 }
 
+/// What a search's barrier and retrieval hand back.
+struct Retrieved {
+    /// The freshness barrier's duration, in µs.
+    barrier_us: u64,
+    /// The retrieval's outcome; `None` when the client hung up.
+    result: Option<Result<search::Results, search::Error<EmbedError>>>,
+}
+
 /// The output-budget counter over the model's tokenizer.
 struct BudgetCounter<B: Backend>(Arc<B::Counter>);
 
@@ -1136,15 +1171,19 @@ impl<B: Backend> search::TokenCounter for BudgetCounter<B> {
     }
 }
 
-/// The `Retriever`'s embedder: query work goes to the scheduler as
-/// [`QueryJob`]s, so the ANE thread shares queries and indexing and the GPU
-/// can never serve a query.
+/// The `Retriever`'s embedder: query work goes to the scheduler, so the
+/// ANE thread shares queries and indexing and the GPU never runs query
+/// work. A `Documents` job's vectors reach the cache through the
+/// repository's writer.
 #[derive(Clone)]
 struct AneHandle {
     worktree: WorktreeId,
     repo: RepoId,
     model_id: String,
     sched: mpsc::Sender<SchedulerMsg>,
+    /// The repository's writer: on-the-spot vectors go there, and
+    /// `documents` flushes it before it returns.
+    writer: WriterHandle,
 }
 
 impl EmbedService for AneHandle {
@@ -1157,7 +1196,7 @@ impl EmbedService for AneHandle {
     async fn query(&self, task: QueryTask, text: String) -> Result<UnitVector, Self::Error> {
         let (reply, rx) = oneshot::channel();
         self.sched
-            .send(SchedulerMsg::Query(Box::new(QueryJob::Query {
+            .send(SchedulerMsg::Query(Box::new(QueryJob {
                 worktree: self.worktree,
                 task,
                 text,
@@ -1170,28 +1209,25 @@ impl EmbedService for AneHandle {
         rx.await.map_err(|_| EmbedError::SchedulerGone)?
     }
 
-    async fn documents(&self, chunks: Vec<PendingChunk>) -> Result<Vec<UnitVector>, Self::Error> {
+    async fn documents(&self, chunks: Vec<PendingChunk>) -> Result<(), Self::Error> {
         let (reply, rx) = oneshot::channel();
         self.sched
-            .send(SchedulerMsg::Query(Box::new(QueryJob::Documents {
+            .send(SchedulerMsg::Documents(Box::new(DocumentsJob {
                 worktree: self.worktree,
+                repo: self.repo,
                 chunks,
+                writer: self.writer.clone(),
                 enqueued: Instant::now(),
-                stamp: 0,
                 reply,
             })))
             .await
             .map_err(|_| EmbedError::SchedulerGone)?;
-        rx.await.map_err(|_| EmbedError::SchedulerGone)?
-    }
-
-    async fn stored(&self, hashes: Vec<ContentHash>) -> Result<(), Self::Error> {
-        self.sched
-            .send(SchedulerMsg::DocumentsStored {
-                repo: self.repo,
-                hashes,
-            })
+        rx.await.map_err(|_| EmbedError::SchedulerGone)??;
+        // Every vector is with the writer: commit them for the
+        // retriever's read.
+        self.writer
+            .flush()
             .await
-            .map_err(|_| EmbedError::SchedulerGone)
+            .map_err(|error| EmbedError::Writer(error.to_string()))
     }
 }

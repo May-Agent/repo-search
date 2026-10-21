@@ -3,7 +3,6 @@
 use std::future::Future;
 
 use crate::reconcile::PendingChunk;
-use crate::store::ContentHash;
 use crate::{QueryTask, UnitVector};
 
 /// Embeds queries and chunks without blocking the caller's executor. The
@@ -23,18 +22,13 @@ pub trait EmbedService: Send + Sync {
         text: String,
     ) -> impl Future<Output = Result<UnitVector, Self::Error>> + Send;
 
-    /// Embeds `chunks` as documents; one vector per chunk, in order.
+    /// Embeds `chunks` as documents and commits a vector for each to the
+    /// vector cache; resolves once every one is committed. A service that
+    /// also runs indexing may commit a chunk's vector from the indexing
+    /// embedder already holding it instead of embedding it again. The
+    /// chunks' content hashes are distinct.
     fn documents(
         &self,
         chunks: Vec<PendingChunk>,
-    ) -> impl Future<Output = Result<Vec<UnitVector>, Self::Error>> + Send;
-
-    /// The vectors [`EmbedService::documents`] returned for `hashes` are now
-    /// committed to the vector cache. A service that also queues indexing
-    /// work drops the matching queued items here and never earlier: a search
-    /// that ends between `documents` and the commit leaves them queued.
-    fn stored(
-        &self,
-        hashes: Vec<ContentHash>,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 }
