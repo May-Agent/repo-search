@@ -707,10 +707,38 @@ async fn search_answers_during_index_wait() {
     let events = index_wait.await.expect("the index wait answers");
     match final_of(&events) {
         Final::Indexed { with_vector, total } => {
-            assert_eq!(with_vector, total, "every chunk has a vector")
+            assert_eq!(with_vector, total, "every chunk has a vector");
+            assert_frames_lead_to(&events, *total);
         }
         other => panic!("expected Indexed, got {other:?}"),
     }
+}
+
+/// The wait's coverage frames, counted off the owner's books: each counts
+/// the index the `Indexed` counts — no file changed meanwhile — and their
+/// coverage only rises.
+fn assert_frames_lead_to(events: &[Event], indexed_total: u64) {
+    let frames: Vec<(u64, u64)> = events
+        .iter()
+        .filter_map(|event| match event {
+            Event::Progress(protocol::Progress::Coverage { with_vector, total }) => {
+                Some((*with_vector, *total))
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !frames.is_empty(),
+        "a held batch leaves the wait frames to send"
+    );
+    for (with_vector, total) in &frames {
+        assert_eq!(*total, indexed_total, "a frame counts the whole index");
+        assert!(with_vector <= total, "a frame never exceeds its total");
+    }
+    assert!(
+        frames.windows(2).all(|pair| pair[0].0 <= pair[1].0),
+        "coverage only rises: {frames:?}"
+    );
 }
 
 /// Stage-1 completion reaches a parked `index --wait` through the owner's
