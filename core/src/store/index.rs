@@ -52,6 +52,18 @@ pub struct Applied {
     pub removed_hashes: Vec<ContentHash>,
 }
 
+/// One stored chunk row's content hash, with its file's path and ignored
+/// flag: what reconcile's books are loaded from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RowHash {
+    /// Worktree-relative path of the file.
+    pub path: String,
+    /// The row's content hash.
+    pub content_hash: ContentHash,
+    /// The file's `ignored` flag.
+    pub ignored: bool,
+}
+
 /// Where a stored chunk's text lives: enough to rebuild it from the file's
 /// bytes without parsing.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -144,6 +156,9 @@ enum Request {
     Apply {
         changes: Vec<FileChange>,
         reply: oneshot::Sender<Result<Applied, Error>>,
+    },
+    RowHashes {
+        reply: oneshot::Sender<Result<Vec<RowHash>, Error>>,
     },
     ChunkHashes {
         include_ignored: bool,
@@ -388,6 +403,16 @@ impl Index {
         .await
     }
 
+    /// Every stored chunk row as its path, content hash and its file's
+    /// ignored flag, in index order.
+    ///
+    /// # Errors
+    ///
+    /// When SQLite rejects the read or the actor is gone.
+    pub async fn row_hashes(&self) -> Result<Vec<RowHash>, Error> {
+        send_and_wait(&self.tx, |reply| Request::RowHashes { reply }).await
+    }
+
     /// Up to `limit` chunks matching the FTS5 expression `query` and `filter`,
     /// best BM25 first.
     ///
@@ -567,6 +592,9 @@ fn serve(mut conn: Connection, mut rx: mpsc::Receiver<Request>) {
                 reply,
             } => {
                 let _ = reply.send(chunk_hashes(&conn, include_ignored));
+            }
+            Request::RowHashes { reply } => {
+                let _ = reply.send(row_hashes(&conn));
             }
             Request::Bm25 {
                 query,
@@ -938,6 +966,23 @@ fn chunk_hashes(conn: &Connection, include_ignored: bool) -> Result<Vec<ContentH
     )?;
     let rows = stmt
         .query_map([include_ignored], |row| row.get(0))?
+        .collect::<Result<_, _>>()?;
+    Ok(rows)
+}
+
+fn row_hashes(conn: &Connection) -> Result<Vec<RowHash>, Error> {
+    let mut stmt = conn.prepare(
+        "SELECT c.path, c.content_hash, f.ignored FROM chunks c \
+         JOIN files f ON f.path = c.path ORDER BY c.id",
+    )?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok(RowHash {
+                path: row.get(0)?,
+                content_hash: row.get(1)?,
+                ignored: row.get(2)?,
+            })
+        })?
         .collect::<Result<_, _>>()?;
     Ok(rows)
 }

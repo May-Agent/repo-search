@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use repo_search_core::qos::performance_cores;
-use repo_search_core::reconcile::{self, PendingChunk, Report};
+use repo_search_core::reconcile::{self, PendingChunk, Reconciler, Report};
 use repo_search_core::search::{self, EmbedService, Reconciliation, Retriever};
 use repo_search_core::store::{ContentHash, Index, Phase, VectorCache};
 use repo_search_core::{CHUNKER_FINGERPRINT, QueryTask, TokenCounter, UnitVector};
@@ -131,6 +131,9 @@ struct Owner<B: Backend> {
     /// the first barrier and after anything that may have broken that —
     /// a failed barrier or a reopened index.
     sync: Option<reconcile::Options>,
+    /// Reconciles `index`, keeping its books between barriers; built at
+    /// the first barrier and dropped with the index handle it holds.
+    reconciler: Option<Reconciler>,
     /// The feeder, spawned at the first barrier.
     feeder: Option<mpsc::Sender<feed::FeedMsg>>,
     stage1_tx: mpsc::Sender<Stage1Done>,
@@ -168,6 +171,7 @@ impl<B: Backend> Owner<B> {
             commit: String::new(),
             watcher: None,
             sync: None,
+            reconciler: None,
             feeder: None,
             stage1_tx,
             stage1_rx,
@@ -319,6 +323,7 @@ impl<B: Backend> Owner<B> {
         self.retriever = None;
         self.index_id = None;
         self.sync = None;
+        self.reconciler = None;
         self.set_phase(Phase::FirstIndex);
         self.ensure_index().await
     }
@@ -814,7 +819,10 @@ impl<B: Backend> Owner<B> {
                     .await
                     .expect("the feeder runs while the owner holds its sender");
                 tracing::info!(root = %self.root.display(), files_changed = report.files_changed(),
-                               resync, "barrier done");
+                                  resync, chunk_rows = report.reads.chunk_rows,
+                                  cache_probes = report.reads.cache_probes,
+                                  cache_slots = report.reads.cache_slots, "barrier done");
+
                 Ok((report, commit))
             }
             Err(message) => {
@@ -856,18 +864,19 @@ impl<B: Backend> Owner<B> {
             .flush()
             .await
             .map_err(|e| format!("vector writer flush: {e}"))?;
-        let index = self.index.as_ref().expect("opened").clone();
-        let cache = self.cache.clone().expect("opened");
-        let model_id = model.id.clone();
-        let root = self.root.clone();
         let counter = model.counter.clone();
+        let reconciler = match &mut self.reconciler {
+            Some(reconciler) => reconciler,
+            none => none.insert(Reconciler::new(
+                self.index.clone().expect("opened"),
+                self.cache.clone().expect("opened"),
+                model.id.clone(),
+                self.root.clone(),
+            )),
+        };
         let (reconciled, head) = tokio::join!(
-            reconcile::reconcile(
-                &index,
-                &cache,
-                &model_id,
+            reconciler.reconcile(
                 CHUNKER_FINGERPRINT,
-                &root,
                 reconcile::Options { include_ignored },
                 counter,
             ),

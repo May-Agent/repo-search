@@ -18,7 +18,9 @@ use std::time::Duration;
 use rusqlite::{Connection, TransactionBehavior};
 use tokio::sync::{mpsc, oneshot};
 
-pub use index::{Applied, FileChange, Index, Phase, StoredChunk, StoredMember, StoredMemberKind};
+pub use index::{
+    Applied, FileChange, Index, Phase, RowHash, StoredChunk, StoredMember, StoredMemberKind,
+};
 pub use query::{ChunkFilter, ChunkId, ChunkRow, MemberRow, Side};
 pub use records::{
     ChunkRecord, ContentHash, FileState, MemberRecord, Unchunkable, UnchunkableReason, fts_body,

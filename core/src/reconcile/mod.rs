@@ -11,11 +11,14 @@
 //! tried again when its content changed. All changes land in one transaction.
 //! A first index is the same pass over an empty table.
 
+mod books;
 mod scan;
+
+pub use books::Books;
 
 use std::collections::{HashMap, HashSet};
 use std::ops::RangeInclusive;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread;
 
@@ -125,6 +128,22 @@ pub struct Skipped {
     pub reason: SkipReason,
 }
 
+/// What a pass read from the stores beyond the walk and the fingerprint
+/// table: the measure of its cost that does not depend on the machine. A
+/// pass whose reconciler holds books and that changed nothing reads no
+/// chunk row and looks up no hash.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Reads {
+    /// Chunk rows read from the index: loading the books, and the stored
+    /// chunks of restamped files.
+    pub chunk_rows: u64,
+    /// Hashes looked up one by one in the vector cache.
+    pub cache_probes: u64,
+    /// Entries read from the cache's slot log: the vectors stored since the
+    /// books last read it.
+    pub cache_slots: u64,
+}
+
 /// What a pass did, for the freshness line.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Report {
@@ -156,6 +175,8 @@ pub struct Report {
     /// Every walked file that is not indexed: the unchunkable files known to
     /// the index, recorded this pass or before, and paths that are not UTF-8.
     pub skipped: Vec<Skipped>,
+    /// What the pass read to settle coverage and its changes.
+    pub reads: Reads,
 }
 
 impl Report {
@@ -205,132 +226,204 @@ pub struct Reconciled {
     pub changes: Option<Changes>,
 }
 
-/// Brings `index` in line with the worktree at `worktree`, then reports how
-/// the pass changed the chunks its scope needs vectors for; [`missing`]
-/// lists that set whole.
+/// Reconciles one index against its worktree, keeping the [`Books`] that
+/// let a pass's reads follow what it changed.
 ///
-/// `chunker` identifies the chunker, normally [`crate::CHUNKER_FINGERPRINT`].
-/// An index stored under another `(chunker, model_id)` is emptied first and
-/// the pass re-chunks every file; cached vectors are reused by content hash.
-///
-/// `tokens` is the model's token counter; the chunker holds every chunk's
-/// embedded document to the cap it counts.
-///
-/// Every change to files, chunks and FTS commits in one transaction; a pass
-/// that finds nothing changed performs no write.
-///
-/// # Errors
-///
-/// When the walk or a read fails, or the index or cache rejects a request. A
-/// failed pass leaves the index as it was.
-pub async fn reconcile(
-    index: &Index,
-    cache: &VectorCache,
-    model_id: &str,
-    chunker: &str,
-    worktree: &Path,
-    options: Options,
-    tokens: Arc<dyn TokenCounter>,
-) -> Result<Reconciled, Error> {
-    let rechunked = index.align_chunker(chunker, model_id).await?;
-    let stored: HashMap<_, _> = index
-        .file_states()
-        .await?
-        .into_iter()
-        .map(|state| (state.path.clone(), state))
-        .collect();
-    let recorded: HashMap<_, _> = index
-        .unchunkables()
-        .await?
-        .into_iter()
-        .map(|record| (record.state.path.clone(), record))
-        .collect();
-    let root = worktree.to_path_buf();
-    let plan = run_blocking(move || {
-        scan::plan(&root, options.include_ignored, stored, recorded, &*tokens)
-    })
-    .await??;
+/// The books are loaded by the first pass, by the pass after a failed one,
+/// and by the pass that re-chunks an emptied index. Every change to the
+/// index's rows must go through this reconciler: rows changed any other way
+/// leave its books wrong, so whoever changes them builds a new one.
+pub struct Reconciler {
+    index: Index,
+    cache: VectorCache,
+    model_id: String,
+    worktree: PathBuf,
+    books: Option<Books>,
+}
 
-    let applied = if plan.changes.is_empty() {
-        Applied::default()
-    } else {
-        index.apply(plan.changes).await?
-    };
-    tracing::debug!(
-        scanned = plan.files_scanned,
-        added = plan.files_added,
-        modified = plan.files_modified,
-        removed = plan.files_removed,
-        restamped = plan.files_restamped,
-        chunked = plan.files_chunked,
-        "reconcile applied"
-    );
-
-    let coverage = coverage(index, cache, model_id, options.include_ignored).await?;
-    let visible: HashSet<ContentHash> = coverage.distinct.iter().copied().collect();
-    let chunks_with_vector = coverage
-        .rows
-        .iter()
-        .filter(|h| coverage.cached.contains(h))
-        .count() as u64;
-
-    let changes = if rechunked {
-        // The emptied index's deleted hashes were never recorded; a caller
-        // keeping a pending set rebuilds it with `missing`.
-        None
-    } else {
-        let mut added: Vec<PendingChunk> = plan
-            .texts
-            .into_values()
-            .filter(|chunk| !coverage.cached.contains(&chunk.content_hash))
-            .collect();
-        let mut taken: HashSet<ContentHash> =
-            added.iter().map(|chunk| chunk.content_hash).collect();
-        if !plan.restamped.is_empty() {
-            let stored: Vec<StoredChunk> = index
-                .chunks_in(plan.restamped)
-                .await?
-                .into_iter()
-                .filter(|row| {
-                    visible.contains(&row.content_hash)
-                        && !coverage.cached.contains(&row.content_hash)
-                        && taken.insert(row.content_hash)
-                })
-                .collect();
-            if !stored.is_empty() {
-                let root = worktree.to_path_buf();
-                let rebuilt = run_blocking(move || scan::read_chunks(&root, stored)).await??;
-                added.extend(rebuilt);
-            }
+impl Reconciler {
+    /// A reconciler of `index` against the worktree at `worktree`, under
+    /// `model_id` in `cache`; it holds no books until its first pass.
+    pub fn new(
+        index: Index,
+        cache: VectorCache,
+        model_id: impl Into<String>,
+        worktree: impl Into<PathBuf>,
+    ) -> Self {
+        Self {
+            index,
+            cache,
+            model_id: model_id.into(),
+            worktree: worktree.into(),
+            books: None,
         }
-        added.sort_by(|a, b| {
-            a.path
-                .cmp(&b.path)
-                .then(a.lines.start().cmp(b.lines.start()))
-        });
-        let dropped = applied
-            .removed_hashes
-            .into_iter()
-            .filter(|hash| !visible.contains(hash))
-            .collect();
-        Some(Changes { added, dropped })
-    };
+    }
 
-    let report = Report {
-        files_scanned: plan.files_scanned,
-        files_added: plan.files_added,
-        files_modified: plan.files_modified,
-        files_removed: plan.files_removed,
-        files_restamped: plan.files_restamped,
-        files_chunked: plan.files_chunked,
-        chunks_added: applied.chunks_added,
-        chunks_removed: applied.chunks_removed,
-        chunks_total: coverage.rows.len() as u64,
-        chunks_with_vector,
-        rechunked,
-        skipped: plan.skipped,
-    };
-    Ok(Reconciled { report, changes })
+    /// The books after the last pass that succeeded; `None` before the
+    /// first pass and after a failed one.
+    #[must_use]
+    pub fn books(&self) -> Option<&Books> {
+        self.books.as_ref()
+    }
+
+    /// Brings the index in line with the worktree, then reports how the
+    /// pass changed the chunks its scope needs vectors for; [`missing`]
+    /// lists that set whole.
+    ///
+    /// `chunker` identifies the chunker, normally
+    /// [`crate::CHUNKER_FINGERPRINT`]. An index stored under another
+    /// `(chunker, model_id)` is emptied first and the pass re-chunks every
+    /// file; cached vectors are reused by content hash.
+    ///
+    /// `tokens` is the model's token counter; the chunker holds every
+    /// chunk's embedded document to the cap it counts.
+    ///
+    /// Every change to files, chunks and FTS commits in one transaction; a
+    /// pass that finds nothing changed performs no write.
+    ///
+    /// # Errors
+    ///
+    /// When the walk or a read fails, or the index or cache rejects a
+    /// request. A failed pass leaves the index as it was and drops the
+    /// books; the next pass loads them again.
+    pub async fn reconcile(
+        &mut self,
+        chunker: &str,
+        options: Options,
+        tokens: Arc<dyn TokenCounter>,
+    ) -> Result<Reconciled, Error> {
+        let books = self.books.take();
+        let include_ignored = options.include_ignored;
+        let rechunked = self.index.align_chunker(chunker, &self.model_id).await?;
+        let (states, unchunkables) =
+            tokio::try_join!(self.index.file_states(), self.index.unchunkables())?;
+        let stored: HashMap<_, _> = states
+            .into_iter()
+            .map(|state| (state.path.clone(), state))
+            .collect();
+        let recorded: HashMap<_, _> = unchunkables
+            .into_iter()
+            .map(|record| (record.state.path.clone(), record))
+            .collect();
+        let root = self.worktree.clone();
+        // The books held before the pass describe the index unless the
+        // alignment just emptied it; then, and without books, they are read
+        // whole while the worktree is walked.
+        let books = async {
+            match books {
+                Some(books) if !rechunked => Ok((books, Reads::default())),
+                _ => Books::load(&self.index, &self.cache, &self.model_id).await,
+            }
+        };
+        let (plan, books) = tokio::join!(
+            run_blocking(move || {
+                scan::plan(&root, include_ignored, stored, recorded, &*tokens)
+            }),
+            books,
+        );
+        let plan = plan??;
+        let (mut books, mut reads) = books?;
+
+        let mut fresh = Vec::new();
+        for change in &plan.changes {
+            books.record(change, &mut fresh);
+        }
+        let applied = if plan.changes.is_empty() {
+            Applied::default()
+        } else {
+            self.index.apply(plan.changes).await?
+        };
+
+        // Vectors stored since the books last looked, and whether the
+        // hashes new to the books have one; neither read waits on the other.
+        let probe = async {
+            if fresh.is_empty() {
+                Ok(HashSet::new())
+            } else {
+                self.cache.cached(&self.model_id, &fresh).await
+            }
+        };
+        let (slots, found) =
+            tokio::try_join!(self.cache.since(&self.model_id, books.high_water()), probe)?;
+        reads.cache_slots += slots.len() as u64;
+        reads.cache_probes += fresh.len() as u64;
+        books.advance(&slots);
+        for hash in &found {
+            books.mark_cached(hash);
+        }
+
+        let changes = if rechunked {
+            // The emptied index's deleted hashes were never recorded; a
+            // caller keeping a pending set rebuilds it with `missing`.
+            None
+        } else {
+            let mut added: Vec<PendingChunk> = plan
+                .texts
+                .into_values()
+                .filter(|chunk| !books.is_cached(&chunk.content_hash))
+                .collect();
+            let mut taken: HashSet<ContentHash> =
+                added.iter().map(|chunk| chunk.content_hash).collect();
+            if !plan.restamped.is_empty() {
+                let rows = self.index.chunks_in(plan.restamped).await?;
+                reads.chunk_rows += rows.len() as u64;
+                let stored: Vec<StoredChunk> = rows
+                    .into_iter()
+                    .filter(|row| {
+                        books.is_visible(&row.content_hash, include_ignored)
+                            && !books.is_cached(&row.content_hash)
+                            && taken.insert(row.content_hash)
+                    })
+                    .collect();
+                if !stored.is_empty() {
+                    let root = self.worktree.clone();
+                    let rebuilt = run_blocking(move || scan::read_chunks(&root, stored)).await??;
+                    added.extend(rebuilt);
+                }
+            }
+            added.sort_by(|a, b| {
+                a.path
+                    .cmp(&b.path)
+                    .then(a.lines.start().cmp(b.lines.start()))
+            });
+            let dropped = applied
+                .removed_hashes
+                .into_iter()
+                .filter(|hash| !books.is_visible(hash, include_ignored))
+                .collect();
+            Some(Changes { added, dropped })
+        };
+
+        tracing::debug!(
+            scanned = plan.files_scanned,
+            added = plan.files_added,
+            modified = plan.files_modified,
+            removed = plan.files_removed,
+            restamped = plan.files_restamped,
+            chunked = plan.files_chunked,
+            chunk_rows = reads.chunk_rows,
+            cache_probes = reads.cache_probes,
+            cache_slots = reads.cache_slots,
+            "reconcile applied"
+        );
+        let report = Report {
+            files_scanned: plan.files_scanned,
+            files_added: plan.files_added,
+            files_modified: plan.files_modified,
+            files_removed: plan.files_removed,
+            files_restamped: plan.files_restamped,
+            files_chunked: plan.files_chunked,
+            chunks_added: applied.chunks_added,
+            chunks_removed: applied.chunks_removed,
+            chunks_total: books.chunks_total(include_ignored),
+            chunks_with_vector: books.chunks_with_vector(include_ignored),
+            rechunked,
+            skipped: plan.skipped,
+            reads,
+        };
+        self.books = Some(books);
+        Ok(Reconciled { report, changes })
+    }
 }
 
 /// Every distinct chunk hash visible in `options`' scope that has no vector
@@ -386,12 +479,10 @@ pub async fn missing(
     Ok(pending)
 }
 
-/// A scope's chunk coverage: every stored row's hash, the same hashes
-/// deduplicated, and which of them have a cached vector.
+/// A scope's chunk coverage: the distinct hashes of its stored rows, and
+/// which of them have a cached vector.
 struct Coverage {
-    /// Every stored chunk row's hash, in index order.
-    rows: Vec<ContentHash>,
-    /// The distinct hashes of `rows`, in first-seen index order.
+    /// The distinct hashes of the stored rows, in first-seen index order.
     distinct: Vec<ContentHash>,
     /// The hashes of `distinct` with a vector cached under the model.
     cached: HashSet<ContentHash>,
@@ -412,11 +503,7 @@ async fn coverage(
         .filter(|hash| seen.insert(*hash))
         .collect();
     let cached = cache.cached(model_id, &distinct).await?;
-    Ok(Coverage {
-        rows,
-        distinct,
-        cached,
-    })
+    Ok(Coverage { distinct, cached })
 }
 
 /// Runs blocking `work` on its own thread and awaits the result.
