@@ -396,6 +396,41 @@ async fn install_failure_exits_2() {
     );
 }
 
+/// A daemon that fails after socket activation answers the waiting client
+/// with its startup error; the client exits 2 naming the cause and the log.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn daemon_startup_failure_exits_2() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let config = config(&tmp);
+    let log = config.agent.stderr.clone();
+    let launchd = launchd(&config);
+    launchd.bootstrap_failing_daemon("Apple Z1");
+    let repo = marked_repo();
+    let env = cli_env(config, &launchd, &repo.root);
+    let mut term = vec_term();
+
+    let exit = tokio::time::timeout(
+        Duration::from_secs(30),
+        repo_search::cli::run(invocation(&["search", "xylophonemarker"]), env, &mut term),
+    )
+    .await
+    .expect("the client is answered instead of hanging");
+
+    assert_eq!(exit, Exit::Error);
+    let stderr = text(&term.stderr);
+    assert!(
+        stderr.contains(
+            "the daemon failed to start: could not determine the host's chip class: \
+             unrecognised chip brand \"Apple Z1\""
+        ),
+        "stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains(&log.display().to_string()),
+        "stderr: {stderr}"
+    );
+}
+
 /// A stderr that also forwards every write to a channel, so a test can
 /// act once a line lands — here, release the download gate on the
 /// announcement.

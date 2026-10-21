@@ -511,3 +511,74 @@ async fn replaced_binary_restarts_the_daemon() {
         "the replaced binary restarted the daemon under launchd"
     );
 }
+
+/// The production agent with a `Listener` array of several sockets, so
+/// launchd hands the daemon more than the one fd it accepts.
+#[derive(askama::Template)]
+#[template(path = "../tests/templates/two-listeners.plist", escape = "html")]
+struct ListenerAgent {
+    label: String,
+    program: PathBuf,
+    sockets: Vec<PathBuf>,
+    stderr: PathBuf,
+}
+
+/// A daemon that fails after socket activation answers the client waiting
+/// in the socket's queue with `Startup` instead of leaving it hanging. The
+/// failure is the real `ListenerCount` check: the plist declares two
+/// listeners. `cli::run` is not used because its install path would replace
+/// the plist with the production one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "real launchd and model; the release gate runs it"]
+async fn startup_failure_reaches_the_client() {
+    use repo_search::client::{Client, ClientError};
+    use repo_search::kqueue::DirWatch;
+    use repo_search::protocol::{ErrorKind, ErrorReport};
+
+    let tmp = tempfile::tempdir().expect("tmp");
+    let config = config(
+        "startup",
+        tmp.path(),
+        program(),
+        tmp.path().join("models"),
+        Duration::from_secs(600),
+    );
+    let socket = config.agent.socket.clone();
+    let agent_plist = askama::Template::render(&ListenerAgent {
+        label: config.agent.label.clone(),
+        program: program(),
+        sockets: vec![socket.clone(), tmp.path().join("second.sock")],
+        stderr: config.agent.stderr.clone(),
+    })
+    .expect("the template renders");
+    std::fs::write(&config.plist, agent_plist).expect("the plist writes");
+
+    let watch = DirWatch::register(tmp.path()).expect("the dir registers");
+    let agent = Agent {
+        label: config.agent.label.clone(),
+        socket: socket.clone(),
+        _tmp: tmp,
+    };
+    SystemLaunchctl
+        .bootstrap(&config.domain, &config.plist)
+        .expect("the agent bootstraps");
+    assert!(
+        watch.wait_for(&socket, install::SOCKET_TIMEOUT),
+        "launchd binds the socket"
+    );
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(30),
+        Client::connect(&agent.socket, &hello(&program())),
+    )
+    .await
+    .expect("the client is answered instead of hanging");
+    match result {
+        Err(ClientError::Refused(ErrorReport {
+            kind: ErrorKind::Startup,
+            message,
+        })) => assert!(message.contains('2'), "message: {message}"),
+        Err(other) => panic!("expected a Startup refusal, got {other:?}"),
+        Ok(_) => panic!("expected a Startup refusal, the handshake succeeded"),
+    }
+}

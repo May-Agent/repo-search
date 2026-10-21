@@ -126,6 +126,86 @@ pub enum Error {
     /// The listener or the signal handler failed.
     #[error("daemon I/O: {0}")]
     Io(#[from] io::Error),
+    /// `run` could not start; the queued connections were answered first.
+    #[error("{0}")]
+    Startup(#[from] StartupError),
+}
+
+/// A failure after socket activation that keeps the daemon from serving.
+/// `to_string` is both the log line and the message [`refuse`] sends.
+#[derive(Debug, thiserror::Error)]
+pub enum StartupError {
+    /// launchd handed over a number of `Listener` descriptors other than 1.
+    #[error("launchd returned {0} Listener fds, expected exactly 1")]
+    ListenerCount(usize),
+    /// The running binary could not be identified.
+    #[error("could not identify the running binary: {0}")]
+    Build(#[source] io::Error),
+    /// The model cache could not be opened.
+    #[error("could not open the model cache: {0}")]
+    ModelStore(#[source] crate::model_store::Error),
+    /// The host's chip class could not be decided.
+    #[error("could not determine the host's chip class: {0}")]
+    Chip(#[source] chip::Error),
+    /// The `Listener` fd could not be adopted into the runtime.
+    #[error("could not adopt the Listener fd: {0}")]
+    Adopt(#[source] io::Error),
+    /// The SIGTERM handler could not be installed.
+    #[error("could not install the SIGTERM handler: {0}")]
+    Signal(#[source] io::Error),
+}
+
+/// Answers every connection already queued on `listener` with a
+/// [`ErrorKind::Startup`] error, so no client is left waiting on a daemon
+/// that is about to exit. `listener` must be nonblocking.
+///
+/// Each connection's first frame is read (and ignored) before the answer,
+/// so the client's `Hello` write cannot hit a closed connection.
+pub async fn refuse(listener: std::os::unix::net::UnixListener, error: &StartupError) {
+    let mut streams = Vec::new();
+    loop {
+        match listener.accept() {
+            Ok((stream, _)) => streams.push(stream),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+            Err(e) => {
+                tracing::error!(error = %e, "could not accept a pending connection");
+                break;
+            }
+        }
+    }
+    let message = error.to_string();
+    // Keeps `read_frame`'s shutdown arm pending for the whole refusal.
+    let (_stop, stopping) = tokio::sync::watch::channel(false);
+    let mut answers = tokio::task::JoinSet::new();
+    for stream in streams {
+        let message = message.clone();
+        let stopping = stopping.clone();
+        answers.spawn(async move {
+            let stream = match stream
+                .set_nonblocking(true)
+                .and_then(|()| UnixStream::from_std(stream))
+            {
+                Ok(stream) => stream,
+                Err(e) => {
+                    tracing::error!(error = %e, "could not adopt a pending connection");
+                    return;
+                }
+            };
+            let mut framed = framed(stream);
+            let _ = read_hello(&mut framed, &stopping).await;
+            send_final(&mut framed, ErrorKind::Startup, message).await;
+        });
+    }
+    let mut answered = 0usize;
+    while let Some(done) = answers.join_next().await {
+        if done.is_ok() {
+            answered += 1;
+        }
+    }
+    tracing::info!(
+        answered,
+        "answered pending connections with the startup error"
+    );
 }
 
 /// A connection that sends no `Hello` within this long is closed.
@@ -215,7 +295,15 @@ enum ConnMsg {
 pub async fn run<B: Backend>(config: Config<B>) -> Result<(), Error> {
     // The signal stream exists before anything is spawned: a failure here
     // leaves nothing to shut down.
-    let mut signal = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let mut signal = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+    {
+        Ok(signal) => signal,
+        Err(error) => {
+            let error = StartupError::Signal(error);
+            refuse(config.listener.into_std()?, &error).await;
+            return Err(error.into());
+        }
+    };
     let started = Instant::now();
     let (fatal_tx, mut fatal_rx) = mpsc::channel::<Error>(64);
     let (busy_tx, mut busy_rx) = busy_channel();
@@ -443,10 +531,8 @@ async fn serve<B: Backend>(
     stopping: &tokio::sync::watch::Receiver<bool>,
     build: BuildId,
 ) -> ConnMsg {
-    // A client that never sends `Hello` must not hold the daemon alive.
-    let frame = match tokio::time::timeout(HELLO_TIMEOUT, read_frame(framed, stopping)).await {
-        Ok(Some(frame)) => frame,
-        _ => return ConnMsg::Closed,
+    let Some(frame) = read_hello(framed, stopping).await else {
+        return ConnMsg::Closed;
     };
     let hello = match serde_json::from_str::<Hello>(&frame) {
         Ok(hello) => hello,
@@ -776,6 +862,18 @@ async fn get_owner(
             None
         }
     }
+}
+
+/// Reads the first frame within [`HELLO_TIMEOUT`], or `None`: a client that
+/// never sends `Hello` must not hold the daemon alive.
+async fn read_hello(
+    framed: &mut protocol::Connection,
+    stopping: &tokio::sync::watch::Receiver<bool>,
+) -> Option<String> {
+    tokio::time::timeout(HELLO_TIMEOUT, read_frame(framed, stopping))
+        .await
+        .ok()
+        .flatten()
 }
 
 /// Reads one frame, or `None` on close, error or shutdown.

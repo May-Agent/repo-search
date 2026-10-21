@@ -17,7 +17,7 @@ use tokio::net::UnixStream;
 use tokio_util::codec::{Framed, LinesCodec};
 
 /// Wire format version, bumped whenever a wire type changes.
-pub const PROTOCOL: u32 = 2;
+pub const PROTOCOL: u32 = 3;
 
 /// The largest frame a peer may send, in bytes.
 pub const MAX_FRAME: usize = 64 << 20;
@@ -331,6 +331,8 @@ pub enum ErrorKind {
     TooLarge,
     /// Any other failure.
     Internal,
+    /// The daemon could not start; it exits after answering.
+    Startup,
 }
 
 /// A `status` reply for one worktree.
@@ -559,6 +561,7 @@ mod tests {
             ErrorKind::ShuttingDown,
             ErrorKind::TooLarge,
             ErrorKind::Internal,
+            ErrorKind::Startup,
         ] {
             round_trip(&ErrorReport {
                 kind,

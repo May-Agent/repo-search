@@ -2634,3 +2634,44 @@ async fn a_change_skips_chunks_a_search_embedded_while_it_was_held() {
         "the new chunk was never index-embedded: {embedded:?}"
     );
 }
+
+/// `refuse` takes every connection already queued on the listener, however
+/// many, and answers each with the startup error before returning.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn refuse_answers_every_queued_connection() {
+    use std::io::{BufRead, BufReader};
+    use std::os::unix::net::{UnixListener, UnixStream};
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let path = tmp.path().join("daemon.sock");
+    let listener = UnixListener::bind(&path).expect("bind");
+    listener.set_nonblocking(true).expect("nonblocking");
+    let hello = serde_json::to_string(&hello()).expect("hello serializes");
+    let mut streams: Vec<UnixStream> = (0..3)
+        .map(|_| {
+            let mut stream = UnixStream::connect(&path).expect("connect");
+            writeln!(stream, "{hello}").expect("hello writes");
+            stream
+        })
+        .collect();
+
+    let error = daemon::StartupError::ListenerCount(2);
+    tokio::time::timeout(TIMEOUT, daemon::refuse(listener, &error))
+        .await
+        .expect("refuse returns once the queue is answered");
+
+    for stream in &mut streams {
+        let mut reader = BufReader::new(&*stream);
+        let mut line = String::new();
+        reader.read_line(&mut line).expect("a reply");
+        match serde_json::from_str(&line).expect("a protocol frame") {
+            Event::Final(Final::Error(report)) => {
+                assert_eq!(report.kind, ErrorKind::Startup);
+                assert_eq!(report.message, error.to_string());
+            }
+            other => panic!("expected a Startup refusal, got {other:?}"),
+        }
+        line.clear();
+        assert_eq!(reader.read_line(&mut line).expect("eof"), 0, "then EOF");
+    }
+}

@@ -409,6 +409,11 @@ pub fn daemon_error(report: &ErrorReport, log: &Path) -> String {
         ErrorKind::Internal => {
             format!("daemon error: {}; see {}", report.message, log.display())
         }
+        ErrorKind::Startup => format!(
+            "the daemon failed to start: {}; see {}",
+            report.message,
+            log.display()
+        ),
     }
 }
 

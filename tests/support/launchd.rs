@@ -40,6 +40,10 @@ enum Process {
     /// A stub daemon task started by `bootstrap`; the fake does not boot
     /// it out.
     Daemon(JoinHandle<Result<(), repo_search::daemon::Error>>),
+    /// A task standing in for a daemon that fails after socket activation:
+    /// on the first queued connection it answers every pending one with the
+    /// startup error, as the demand-launched daemon would.
+    Failing(JoinHandle<()>),
 }
 
 struct Loaded {
@@ -58,6 +62,9 @@ enum Control {
     FailNextBootstrap(String),
     /// Make `bootstrap` succeed without binding the socket.
     BootstrapWithoutSocket,
+    /// Make the next `bootstrap` start a daemon that fails the chip check
+    /// on this brand string.
+    BootstrapFailingDaemon(String),
     /// Move the loaded daemon task's join handle to the caller.
     TakeDaemonJoin(mpsc::Sender<Option<JoinHandle<Result<(), repo_search::daemon::Error>>>>),
     /// End the owner thread.
@@ -103,6 +110,7 @@ struct Owner {
     tearing_down: Option<std::process::Child>,
     fail_next_bootstrap: Option<String>,
     bootstrap_without_socket: bool,
+    failing_daemon: Option<String>,
     socket: PathBuf,
     runtime: tokio::runtime::Handle,
     models: tempfile::TempDir,
@@ -143,6 +151,10 @@ impl Owner {
             Process::Daemon(_) => {
                 panic!("the fake does not boot out an in-process daemon")
             }
+            Process::Failing(task) => {
+                task.abort();
+                Ok(())
+            }
         }
     }
 
@@ -163,6 +175,29 @@ impl Owner {
         }
         let process = if self.bootstrap_without_socket {
             Process::None
+        } else if let Some(brand) = self.failing_daemon.take() {
+            // launchd binds the socket; a connection in its queue makes it
+            // launch the daemon, which fails and refuses the queue.
+            let listener = std::os::unix::net::UnixListener::bind(&self.socket)
+                .expect("the fake binds the socket");
+            listener
+                .set_nonblocking(true)
+                .expect("the listener is nonblocking");
+            Process::Failing(self.runtime.spawn(async move {
+                // SAFETY: the std listener owns its fd, open until
+                // `into_inner`.
+                let listener = unsafe { tokio::io::unix::AsyncFd::register(listener) }
+                    .expect("the listener registers");
+                listener
+                    .readable()
+                    .await
+                    .expect("the listener becomes readable")
+                    .retain_ready();
+                let error = repo_search::daemon::StartupError::Chip(
+                    repo_search::daemon::chip::Error::Unknown(brand),
+                );
+                repo_search::daemon::refuse(listener.into_inner(), &error).await;
+            }))
         } else {
             // launchd binds the declared socket when the job loads; the
             // stub daemon then accepts on it.
@@ -200,6 +235,7 @@ impl Owner {
                     let _ = child.wait();
                 }
                 Process::Daemon(task) => task.abort(),
+                Process::Failing(task) => task.abort(),
                 Process::None => {}
             }
         }
@@ -268,6 +304,9 @@ impl Owner {
                     Control::BootstrapWithoutSocket => {
                         self.bootstrap_without_socket = true;
                     }
+                    Control::BootstrapFailingDaemon(brand) => {
+                        self.failing_daemon = Some(brand);
+                    }
                     Control::Shutdown => break,
                 },
             }
@@ -313,6 +352,7 @@ impl FakeLaunchd {
             tearing_down: None,
             fail_next_bootstrap: None,
             bootstrap_without_socket: false,
+            failing_daemon: None,
             socket,
             runtime,
             models: tempfile::tempdir().expect("the fake's model cache"),
@@ -368,6 +408,17 @@ impl FakeLaunchd {
     pub fn bootstrap_without_socket(&self) {
         self.tx
             .send(Request::Control(Control::BootstrapWithoutSocket))
+            .expect("the launchd thread lives");
+    }
+
+    /// The next `bootstrap` loads a daemon that fails to start with an
+    /// unrecognised chip `brand`: it answers the queued connections with
+    /// the startup error and runs no further.
+    pub fn bootstrap_failing_daemon(&self, brand: &str) {
+        self.tx
+            .send(Request::Control(Control::BootstrapFailingDaemon(
+                brand.to_owned(),
+            )))
             .expect("the launchd thread lives");
     }
 
