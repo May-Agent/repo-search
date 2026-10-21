@@ -127,6 +127,10 @@ pub fn activate_socket(name: &str) -> Result<Vec<OwnedFd>, ActivateError> {
 /// Note that launchd's default `ThrottleInterval` (10 s) can delay a
 /// relaunch that follows an exit less than 10 s after launch; only the
 /// protocol-mismatch exit hits this.
+///
+/// A daemon that fails after socket activation answers every queued
+/// connection with `Startup` before exiting, so no connection is left to
+/// drive a relaunch loop.
 #[derive(askama::Template)]
 #[template(path = "launch-agent.plist", escape = "html")]
 pub struct LaunchAgent {

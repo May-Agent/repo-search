@@ -50,29 +50,23 @@ fn client_main(invocation: Invocation) -> ExitCode {
 /// user-initiated QoS — its tasks only route messages, and every blocking
 /// call runs on a thread the daemon or core owns. The `Listener` socket
 /// comes from launchd; exactly one fd is expected, and any other count
-/// means the binary runs under a plist it was not built for. Exit is 0 on
-/// idle exit or SIGTERM and 1 on a fatal error.
+/// means the binary runs under a plist it was not built for. Every check
+/// that can fail runs after socket activation: a failure there is logged
+/// and then answered to each connection already queued on the socket
+/// (`ErrorKind::Startup`), so no client waits on a daemon that has exited.
+/// Only the failures that precede the socket — the runtime and the
+/// activation itself — are logged alone. Exit is 0 on idle exit or SIGTERM
+/// and 1 on a fatal error.
 fn daemon_main(idle_exit: Duration, model_cache: Option<PathBuf>) -> ExitCode {
-    use repo_search::daemon::coreml::CoreMlBackend;
+    use futures_util::future::join_all;
     use repo_search::daemon::{self, Config};
     use repo_search::launchd;
-    use repo_search::model_store::{ModelSpec, ModelStore};
-    use repo_search::protocol::BuildId;
-    use std::os::fd::OwnedFd;
-    use std::sync::Arc;
+    use std::os::unix::net::UnixListener;
 
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_max_level(tracing::Level::INFO)
         .init();
-
-    let build = match BuildId::of_current_exe() {
-        Ok(build) => build,
-        Err(error) => {
-            tracing::error!(%error, "could not identify the running binary");
-            return ExitCode::FAILURE;
-        }
-    };
 
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -92,72 +86,116 @@ fn daemon_main(idle_exit: Duration, model_cache: Option<PathBuf>) -> ExitCode {
     };
 
     let fds = match launchd::activate_socket("Listener") {
+        Ok(fds) if fds.is_empty() => {
+            tracing::error!("launchd returned no Listener fd");
+            return ExitCode::FAILURE;
+        }
         Ok(fds) => fds,
         Err(error) => {
             tracing::error!(%error, "launchd socket activation failed");
             return ExitCode::FAILURE;
         }
     };
-    let [fd]: [OwnedFd; 1] = match fds.try_into() {
-        Ok(fds) => fds,
-        Err(fds) => {
-            tracing::error!(
-                count = fds.len(),
-                "launchd returned a Listener fd count other than 1"
-            );
-            return ExitCode::FAILURE;
-        }
-    };
-
-    let model_store = match model_cache {
-        Some(root) => ModelStore::new(root, ModelSpec::embedding_gemma_2()),
-        None => ModelStore::user_cache(),
-    };
-    let model_store = match model_store {
-        Ok(store) => store,
+    let listeners = fds
+        .into_iter()
+        .map(|fd| {
+            let listener = UnixListener::from(fd);
+            listener.set_nonblocking(true).map(|()| listener)
+        })
+        .collect::<Result<Vec<_>, _>>();
+    let listeners = match listeners {
+        Ok(listeners) => listeners,
         Err(error) => {
-            tracing::error!(%error, "could not open the model cache");
+            tracing::error!(%error, "could not set a Listener fd nonblocking");
             return ExitCode::FAILURE;
         }
     };
 
-    // The chip's class decides which indexing queue the GPU serves; a brand
-    // the parse does not recognise is fatal — no fallback is guessed.
-    let chip = match daemon::chip::host() {
-        Ok(chip) => chip,
-        Err(error) => {
-            tracing::error!(%error, "could not determine the host's chip class");
-            return ExitCode::FAILURE;
-        }
-    };
-
-    // `from_std` registers the fd with this runtime's driver, so it runs
-    // inside the runtime's context.
+    // `from_std` registers the fd with this runtime's driver, so `startup`
+    // runs inside the runtime's context.
     let _guard = runtime.enter();
-    let std_listener = std::os::unix::net::UnixListener::from(fd);
-    let listener = std_listener
-        .set_nonblocking(true)
-        .and_then(|()| tokio::net::UnixListener::from_std(std_listener));
-    let listener = match listener {
-        Ok(listener) => listener,
-        Err(error) => {
-            tracing::error!(%error, "could not adopt the Listener fd");
-            return ExitCode::FAILURE;
+    match startup(listeners, model_cache) {
+        Ok((listener, model_store, chip, build)) => {
+            match runtime.block_on(daemon::run(Config {
+                listener,
+                idle_exit,
+                load_bound: daemon::LOAD_BOUND,
+                model_store,
+                chip,
+                backend: std::sync::Arc::new(daemon::coreml::CoreMlBackend),
+                build,
+            })) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => {
+                    tracing::error!(%error, "the daemon stopped on a fatal error");
+                    ExitCode::FAILURE
+                }
+            }
         }
-    };
-    match runtime.block_on(daemon::run(Config {
-        listener,
-        idle_exit,
-        load_bound: daemon::LOAD_BOUND,
-        model_store,
-        chip,
-        backend: Arc::new(CoreMlBackend),
-        build,
-    })) {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(error) => {
-            tracing::error!(%error, "the daemon stopped on a fatal error");
+        Err((error, listeners)) => {
+            tracing::error!(%error, "the daemon failed to start");
+            runtime.block_on(join_all(
+                listeners
+                    .into_iter()
+                    .map(|listener| daemon::refuse(listener, &error)),
+            ));
             ExitCode::FAILURE
         }
+    }
+}
+
+/// What a successful `startup` hands to `daemon::run`.
+type Started = (
+    tokio::net::UnixListener,
+    repo_search::model_store::ModelStore,
+    repo_search::daemon::chip::ChipClass,
+    repo_search::protocol::BuildId,
+);
+
+/// The reportable startup checks, in order. On failure the std listeners
+/// come back so the caller can answer their queues.
+fn startup(
+    mut listeners: Vec<std::os::unix::net::UnixListener>,
+    model_cache: Option<PathBuf>,
+) -> Result<
+    Started,
+    (
+        repo_search::daemon::StartupError,
+        Vec<std::os::unix::net::UnixListener>,
+    ),
+> {
+    use repo_search::daemon::{StartupError, chip};
+    use repo_search::model_store::{ModelSpec, ModelStore};
+    use repo_search::protocol::BuildId;
+
+    let checks = || {
+        if listeners.len() != 1 {
+            return Err(StartupError::ListenerCount(listeners.len()));
+        }
+        let build = BuildId::of_current_exe().map_err(StartupError::Build)?;
+        let model_store = match &model_cache {
+            Some(root) => ModelStore::new(root.clone(), ModelSpec::embedding_gemma_2()),
+            None => ModelStore::user_cache(),
+        }
+        .map_err(StartupError::ModelStore)?;
+        // The chip's class decides which indexing queue the GPU serves; a
+        // brand the parse does not recognise is fatal — no fallback is
+        // guessed.
+        let chip = chip::host().map_err(StartupError::Chip)?;
+        Ok((model_store, chip, build))
+    };
+    let (model_store, chip, build) = match checks() {
+        Ok(checked) => checked,
+        Err(error) => return Err((error, listeners)),
+    };
+    let std_listener = listeners.pop().expect("the count check left one listener");
+    // `try_clone` keeps a std handle for the refusal path if adoption fails.
+    let spare = match std_listener.try_clone() {
+        Ok(spare) => spare,
+        Err(error) => return Err((StartupError::Adopt(error), vec![std_listener])),
+    };
+    match tokio::net::UnixListener::from_std(std_listener) {
+        Ok(listener) => Ok((listener, model_store, chip, build)),
+        Err(error) => Err((StartupError::Adopt(error), vec![spare])),
     }
 }
