@@ -190,6 +190,9 @@ async fn query_preempts_indexing() {
         Duration::from_secs(5),
     );
     let gate = backend.gate_first_index(Instance::Ane);
+    // Once armed, holds the feeder's next token count: a feed found by the
+    // search's barrier never reaches the scheduler while the search runs.
+    let feed = backend.hold_document_tokens();
     let d = daemon(tmp, backend, Model::Cached, Duration::from_secs(600)).await;
 
     // Stage 1 completes first: every later chunk is stage-2 work, which the
@@ -234,8 +237,20 @@ async fn query_preempts_indexing() {
     let mut log = Vec::new();
     wait_held(&mut log, &d.records);
 
-    // The query's lexical candidates are the edited, unembedded functions:
-    // the search embeds them on the spot.
+    // A second new function the query also finds (its terms are `edited`
+    // and `item`). The search's barrier reconciles it, and the armed hold
+    // keeps its feed in the feeder, so the scheduler has no item for it
+    // when the search's `Documents` job lands: the job holds the hash and
+    // embeds it on the spot.
+    let before = visible_hashes(&repo.root).await;
+    feed.arm();
+    repo::append(
+        &repo.root,
+        "src/spot.rs",
+        &repo::rust_fn("edited_spot", SMALL_BYTES),
+    );
+
+    // The query's lexical candidates are the two new, unembedded functions.
     let sent = Instant::now();
     let responses = stream_request(&d.socket, &hello(), search(&repo.root, "edited_item_3")).await;
     // The request is on the wire: releasing the held call is the test's
@@ -275,23 +290,35 @@ async fn query_preempts_indexing() {
         "at most the held index call starts inside the query's window: {overtaking}"
     );
 
-    // On-the-spot documents are ANE-only at user-interactive QoS. The held
-    // chunk is still in flight when the search runs, so the candidate has
-    // no vector yet and is embedded on the spot.
+    // On-the-spot documents are ANE-only at user-interactive QoS, and only
+    // the chunk no embedder had is embedded. The gated chunk was in flight
+    // on the ANE when the search began. The query embeddings queue behind
+    // it, and the retriever sends its `Documents` job only once they are
+    // answered, so that chunk's `AneDone` has already noted it committed
+    // inside the search's window, and the job skips it.
+    let added: Vec<ContentHash> = visible_hashes(&repo.root)
+        .await
+        .difference(&before)
+        .copied()
+        .collect();
+    assert_eq!(added.len(), 1, "the search's barrier added one chunk");
     let docs: Vec<&Record> = log
         .iter()
         .filter(|r| r.kind == Kind::QueryDocument && r.start >= sent)
         .collect();
-    assert!(
-        !docs.is_empty() && docs.len() <= 100,
-        "0 < {} <= 100 on-the-spot documents",
-        docs.len()
+    assert_eq!(
+        docs.iter().map(|r| r.hash).collect::<Vec<_>>(),
+        vec![Some(added[0])],
+        "only the chunk no embedder held is embedded on the spot: {docs:?}"
     );
     assert!(
         docs.iter()
             .all(|r| r.instance == Instance::Ane && r.qos == QosClass::UserInteractive),
         "query document work is ANE-only at user-interactive QoS"
     );
+
+    wait_feed_held(&feed);
+    tokio::task::block_in_place(|| feed.open());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2388,10 +2415,10 @@ async fn a_change_skips_chunks_a_search_embedded_while_it_was_held() {
     index_request(&d, &repo.root, false).await;
     wait_feed_held(&hold);
 
-    // The hybrid search embeds the new chunk on the spot and commits it
-    // (`put_many`, then `stored`) while the `Change` is held. Its own
-    // barrier is a no-change `Change`, queued in the feeder behind the
-    // held one.
+    // The hybrid search embeds the new chunk on the spot while the
+    // `Change` is held: its `Documents` job holds the hash, sends the
+    // vector to the writer and flushes it. Its own barrier is a no-change
+    // `Change`, queued in the feeder behind the held one.
     let events = request(&d.socket, &hello(), search(&repo.root, EDIT_MARKER)).await;
     let answer = match final_of(&events) {
         Final::Answer(answer) => answer,

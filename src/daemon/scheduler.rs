@@ -10,7 +10,11 @@
 //! later pass's changes, so a pass that changed nothing costs the scheduler
 //! nothing. An `Enqueue` is applied inside the freshness barrier it came
 //! from, and chunks that got a vector after that barrier began are dropped
-//! from it, so a late update never queues committed work again.
+//! from it, so a late update never queues committed work again. A search's
+//! `Documents` job holds the chunks it embeds away from both embedders. It
+//! borrows the chunk the ANE is embedding, and embeds a chunk the GPU is
+//! embedding again rather than depend on its batch. Its vectors go to the
+//! repository writer like indexing vectors.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
@@ -124,74 +128,50 @@ pub enum Interest {
     },
 }
 
-/// A query's embedding request; query work preempts indexing on the ANE.
+/// A query embedding for a search; query work preempts indexing on the ANE.
 #[derive(Debug)]
-pub enum QueryJob {
-    /// One query embedding for a search.
-    Query {
-        /// The worktree asking; stats accumulate under it.
-        worktree: WorktreeId,
-        /// How the query is phrased for the model.
-        task: QueryTask,
-        /// The query text.
-        text: String,
-        /// When the job was handed to the scheduler.
-        enqueued: Instant,
-        /// `dispatched_indexing` at enqueue time; the scheduler assigns it.
-        stamp: u64,
-        /// The answer goes here.
-        reply: oneshot::Sender<Result<UnitVector, EmbedError>>,
-    },
-    /// On-the-spot document embeddings for a search, in order.
-    Documents {
-        /// The worktree asking.
-        worktree: WorktreeId,
-        /// The chunks to embed.
-        chunks: Vec<PendingChunk>,
-        /// When the job was handed to the scheduler.
-        enqueued: Instant,
-        /// `dispatched_indexing` at enqueue time; the scheduler assigns it.
-        stamp: u64,
-        /// The vectors, one per chunk, go here.
-        reply: oneshot::Sender<Result<Vec<UnitVector>, EmbedError>>,
-    },
+pub struct QueryJob {
+    /// The worktree asking; stats accumulate under it.
+    pub worktree: WorktreeId,
+    /// How the query is phrased for the model.
+    pub task: QueryTask,
+    /// The query text.
+    pub text: String,
+    /// When the job was handed to the scheduler.
+    pub enqueued: Instant,
+    /// `dispatched_indexing` at enqueue time; the scheduler assigns it.
+    pub stamp: u64,
+    /// The answer goes here.
+    pub reply: oneshot::Sender<Result<UnitVector, EmbedError>>,
 }
 
-impl QueryJob {
-    /// The job's worktree.
-    pub(crate) fn worktree(&self) -> WorktreeId {
-        match self {
-            Self::Query { worktree, .. } | Self::Documents { worktree, .. } => *worktree,
-        }
-    }
-
-    /// The job's enqueue instant.
-    pub(crate) fn enqueued(&self) -> Instant {
-        match self {
-            Self::Query { enqueued, .. } | Self::Documents { enqueued, .. } => *enqueued,
-        }
-    }
-
-    /// Whether the awaiting end hung up.
-    fn closed(&self) -> bool {
-        match self {
-            Self::Query { reply, .. } => reply.is_closed(),
-            Self::Documents { reply, .. } => reply.is_closed(),
-        }
-    }
-
-    /// Answers the job with `error` if the reply channel is still open.
-    fn fail(self, error: EmbedError) {
-        match self {
-            Self::Query { reply, .. } => {
-                let _ = reply.send(Err(error));
-            }
-            Self::Documents { reply, .. } => {
-                let _ = reply.send(Err(error));
-            }
-        }
-    }
+/// A search's on-the-spot document embeddings. Each chunk's vector goes to
+/// `writer`: from the job's own ANE part, from the ANE index item already
+/// embedding it, or it got there before the job landed. A chunk in flight
+/// on the GPU is embedded by the job's part as well, and the cache keeps
+/// whichever of its two vectors is committed first. The job lands inside
+/// the search's window (`Barrier { running: true }` sent before the
+/// search's first cache read, `running: false` after the job is answered).
+#[derive(Debug)]
+pub struct DocumentsJob {
+    /// The worktree asking; stats accumulate under it.
+    pub worktree: WorktreeId,
+    /// The repository the chunks belong to.
+    pub repo: RepoId,
+    /// The chunks; their content hashes are distinct.
+    pub chunks: Vec<PendingChunk>,
+    /// `repo`'s vector writer.
+    pub writer: WriterHandle,
+    /// When the job was handed to the scheduler.
+    pub enqueued: Instant,
+    /// Answered `Ok` once every chunk's vector is with `writer`; the caller
+    /// flushes it to commit them. Never held back by a GPU batch.
+    pub reply: oneshot::Sender<Result<(), EmbedError>>,
 }
+
+/// A `Documents` job the scheduler is tracking, as it numbered it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SpotId(u64);
 
 /// The query path's failure, as the owner sees it over `EmbedService`.
 #[derive(Debug, thiserror::Error)]
@@ -202,16 +182,36 @@ pub enum EmbedError {
     /// The scheduler went away before answering.
     #[error("the embedding scheduler is gone")]
     SchedulerGone,
+    /// The repository's vector writer failed to commit the vectors.
+    #[error("vector writer: {0}")]
+    Writer(String),
 }
 
 /// A job the scheduler hands the ANE thread.
 #[derive(Debug)]
 pub enum AneJob {
-    /// A query job, preempting indexing; `overtaken` counts indexing items
-    /// dispatched after the job was stamped and must be zero.
+    /// A query embedding, preempting indexing; `overtaken` counts indexing
+    /// items dispatched after the job was stamped and must be zero.
     Query {
         /// The job to run.
         job: QueryJob,
+        /// Indexing items handed to the ANE after the job was enqueued.
+        overtaken: u32,
+    },
+    /// A `Documents` job's part, preempting indexing: its held chunks and
+    /// the chunks in flight on the GPU. Each vector goes to `writer`, then
+    /// `DocumentsDone`.
+    Documents {
+        /// The job, echoed back in `DocumentsDone`.
+        spot: SpotId,
+        /// The worktree asking; echoed back for its stats.
+        worktree: WorktreeId,
+        /// The chunks to embed.
+        chunks: Vec<PendingChunk>,
+        /// The repository's writer.
+        writer: WriterHandle,
+        /// When the job was handed to the scheduler.
+        enqueued: Instant,
         /// Indexing items handed to the ANE after the job was enqueued.
         overtaken: u32,
     },
@@ -257,7 +257,8 @@ pub struct Counts {
     pub queued_stage1: u64,
     /// Items in the background queue.
     pub queued_background: u64,
-    /// Items handed to an embedder, not yet done.
+    /// Items handed to an embedder, or held by a search's `Documents` job,
+    /// not yet done.
     pub in_flight: u64,
     /// Stage-1 completion already ran for this worktree; its `Stage1Done`
     /// is on its way to the owner once the writer flush lands.
@@ -285,8 +286,10 @@ pub enum SchedulerMsg {
     /// A worktree's indexing work: a `Replace` or a `Change` of its
     /// interest.
     Enqueue(Box<Enqueue>),
-    /// A query job.
+    /// A query embedding job.
     Query(Box<QueryJob>),
+    /// A search's on-the-spot `Documents` job.
+    Documents(Box<DocumentsJob>),
     /// The ANE thread's pull for its next job.
     AnePull {
         /// The pulling thread, for QoS overrides.
@@ -302,6 +305,19 @@ pub enum SchedulerMsg {
     },
     /// A query job the ANE finished.
     QueryDone {
+        /// The job's worktree.
+        worktree: WorktreeId,
+        /// How long the job waited behind the index chunk in flight when it
+        /// was enqueued.
+        wait: Duration,
+        /// The `overtaken` the job was dispatched with.
+        overtaken: u32,
+    },
+    /// The ANE embedded a `Documents` job's part; its vectors are already
+    /// with the job's writer.
+    DocumentsDone {
+        /// The job.
+        spot: SpotId,
         /// The job's worktree.
         worktree: WorktreeId,
         /// How long the job waited behind the index chunk in flight when it
@@ -328,15 +344,6 @@ pub enum SchedulerMsg {
         /// The completed items.
         items: Vec<ItemId>,
     },
-    /// A `Documents` job's vectors are committed to `repo`'s cache: queued
-    /// items with these hashes are redundant and leave the queues; in-flight
-    /// ones finish normally.
-    DocumentsStored {
-        /// The repository whose cache holds the vectors.
-        repo: RepoId,
-        /// The committed hashes.
-        hashes: Vec<ContentHash>,
-    },
     /// An embedder call or an `open_gpu` failed: fatal.
     EmbedderFailed {
         /// What failed, for the log and waiting queries.
@@ -356,11 +363,12 @@ pub enum SchedulerMsg {
         /// Where the counts go.
         reply: oneshot::Sender<Counts>,
     },
-    /// A freshness barrier of a worktree of `repo` is running (`running`)
-    /// or ended. Barrier work keeps the daemon busy for the idle exit, and
-    /// while any barrier of `repo` runs, the scheduler remembers the hashes
-    /// of `repo` that get a vector (see [`OpenBarriers`]). A barrier's
-    /// `Enqueue`, when it has one, is sent between its two reports.
+    /// A freshness barrier of a worktree of `repo`, or a search's window,
+    /// is running (`running`) or ended. Both keep the daemon busy for the
+    /// idle exit, and while any of them runs, the scheduler remembers the
+    /// hashes of `repo` that get a vector (see [`OpenBarriers`]). A
+    /// barrier's `Enqueue`, when it has one, is sent between its two
+    /// reports, and so is a search's `Documents` job.
     Barrier {
         /// The repository of the worktree reporting.
         repo: RepoId,
@@ -410,7 +418,7 @@ impl SchedulerHandle {
             .map_err(|_| Closed)
     }
 
-    /// Sends a query job.
+    /// Sends a query embedding job.
     ///
     /// # Errors
     ///
@@ -418,6 +426,18 @@ impl SchedulerHandle {
     pub async fn query(&self, job: QueryJob) -> Result<(), Closed> {
         self.tx
             .send(SchedulerMsg::Query(Box::new(job)))
+            .await
+            .map_err(|_| Closed)
+    }
+
+    /// Sends a search's `Documents` job.
+    ///
+    /// # Errors
+    ///
+    /// When the scheduler is gone.
+    pub async fn documents(&self, job: DocumentsJob) -> Result<(), Closed> {
+        self.tx
+            .send(SchedulerMsg::Documents(Box::new(job)))
             .await
             .map_err(|_| Closed)
     }
@@ -450,25 +470,11 @@ impl SchedulerHandle {
         rx.await.map_err(|_| Closed)
     }
 
-    /// Reports a `Documents` job's vectors committed to `repo`'s cache.
-    ///
-    /// # Errors
-    ///
-    /// When the scheduler is gone.
-    pub async fn documents_stored(
-        &self,
-        repo: RepoId,
-        hashes: Vec<ContentHash>,
-    ) -> Result<(), Closed> {
-        self.tx
-            .send(SchedulerMsg::DocumentsStored { repo, hashes })
-            .await
-            .map_err(|_| Closed)
-    }
-
-    /// Reports a freshness barrier of a worktree of `repo` running or
-    /// ended. `running: true` must be sent before the barrier's first cache
-    /// read, and `running: false` after its `Enqueue`.
+    /// Reports a freshness barrier of a worktree of `repo`, or a search's
+    /// window, running or ended. `running: true` must be sent before the
+    /// first cache read the barrier or the search makes, and
+    /// `running: false` after its `Enqueue` or its `Documents` job's
+    /// answer.
     pub async fn barrier(&self, repo: RepoId, running: bool) {
         let _ = self.tx.send(SchedulerMsg::Barrier { repo, running }).await;
     }
@@ -525,6 +531,9 @@ enum Queue {
     Stage1,
     Background,
     InFlight,
+    /// Held by a search's `Documents` job: in no queue, and no indexing
+    /// embedder takes it.
+    Held,
 }
 
 /// One indexing item: a `(repo, hash)` the worktrees sharing it wait for.
@@ -539,22 +548,66 @@ struct Item {
     worktrees: Vec<WorktreeId>,
 }
 
-/// A repository's running freshness barriers, and the hashes that got a
-/// vector since the first of them began.
+/// A repository's running freshness barriers and search windows, and the
+/// hashes that got a vector since the first of them began.
 ///
 /// Each barrier reads the vector cache after it began, and its `Enqueue`
-/// lands before it ends. A hash that got a vector after that read may be
-/// listed as missing, yet it has already left the queues. `committed`
-/// holds every such hash, so `on_enqueue` drops it instead of queuing it a
-/// second time. Once no barrier of the repository runs, no `Enqueue` built
-/// from an earlier read can land, and the set goes with the entry.
+/// lands before it ends. A search's window reads the cache at its vector
+/// sync, and its `Documents` job lands before it ends; `on_documents`
+/// skips the job's chunks found here the same way. A hash that got a
+/// vector after that read may be listed as missing, yet it has already
+/// left the queues. `committed` holds every such hash, so `on_enqueue`
+/// drops it instead of queuing it a second time. Once no barrier of the
+/// repository runs, no `Enqueue` built from an earlier read can land, and
+/// the set goes with the entry.
 #[derive(Default)]
 struct OpenBarriers {
-    /// Barriers begun and not yet ended.
+    /// Barriers and search windows begun and not yet ended.
     running: u64,
-    /// Hashes whose vector went to the writer (`item_done`) or was
-    /// committed by a search (`DocumentsStored`) while `running > 0`.
+    /// Hashes whose vector went to the writer (`item_done`,
+    /// `on_documents_done`) while `running > 0`. A chunk embedded both by
+    /// the GPU and by a search's part is inserted twice; the set keeps it
+    /// once.
     committed: HashSet<ContentHash>,
+}
+
+/// A query job queued for the ANE, in arrival order.
+enum Waiting {
+    /// A query embedding.
+    Query(QueryJob),
+    /// A `Documents` job's part; the job is in `spots`.
+    Documents(SpotId),
+}
+
+/// A `Documents` job from its arrival until it is answered or dropped.
+struct Spot {
+    worktree: WorktreeId,
+    repo: RepoId,
+    /// What the job's ANE part embeds: the held chunks and the twins. Taken
+    /// when the ANE pulls the part.
+    chunks: Vec<PendingChunk>,
+    /// The held chunks' hashes; finished at `DocumentsDone`, or released
+    /// when the part is dropped unrun.
+    held: Vec<ContentHash>,
+    /// The hashes of `chunks` in flight on the GPU when the job landed.
+    /// Their items stay with the GPU, and `GpuDone` finishes them.
+    twins: Vec<ContentHash>,
+    writer: WriterHandle,
+    enqueued: Instant,
+    /// `dispatched_indexing` when the job landed.
+    stamp: u64,
+    /// Parts not yet done: the ANE part while it is queued or running, and
+    /// the borrowed ANE index item until its `AneDone`.
+    left: usize,
+    reply: oneshot::Sender<Result<(), EmbedError>>,
+}
+
+/// The queue an item of `class` sits in.
+fn queue_of(class: IndexClass) -> Queue {
+    match class {
+        IndexClass::Stage1 => Queue::Stage1,
+        IndexClass::Background => Queue::Background,
+    }
 }
 
 /// How many of `interest` sit in each queue; kept in step with every
@@ -572,7 +625,7 @@ impl Tally {
         match queue {
             Queue::Stage1 => &mut self.stage1,
             Queue::Background => &mut self.background,
-            Queue::InFlight => &mut self.in_flight,
+            Queue::InFlight | Queue::Held => &mut self.in_flight,
         }
     }
 
@@ -635,7 +688,8 @@ struct Scheduler<B: Backend> {
     /// are answered with it.
     fatal: Option<String>,
     headroom: watch::Receiver<Headroom>,
-    queries: VecDeque<QueryJob>,
+    /// Query work queued for the ANE, FIFO.
+    queries: VecDeque<Waiting>,
     /// `(tokens, item)` ordered so `pop_first` is the shortest and `pop_last`
     /// the longest; `ItemId` is a sequence so the key is unique.
     stage1: BTreeMap<(u32, ItemId), ()>,
@@ -678,6 +732,17 @@ struct Scheduler<B: Backend> {
     watchers: HashMap<WorktreeId, Vec<watch::Sender<Counts>>>,
     /// Query jobs on the ANE thread, not yet `QueryDone`.
     queries_in_flight: u64,
+    /// `Documents` jobs not yet answered.
+    spots: HashMap<SpotId, Spot>,
+    /// The next `SpotId`.
+    next_spot: u64,
+    /// Per `(repo, hash)`, how many unanswered `Documents` jobs hold it
+    /// for their ANE part. An item of a key here is `Held`.
+    held: HashMap<(RepoId, ContentHash), u32>,
+    /// `Documents` jobs that borrowed `ane_in_flight`; settled at its
+    /// `AneDone`. Only the ANE's item is ever borrowed: no job depends on
+    /// a GPU batch.
+    ane_borrowers: Vec<SpotId>,
     /// The idle-exit tracker: every queued or in-flight unit of work reports
     /// busy through it.
     busy: watch::Sender<bool>,
@@ -759,6 +824,10 @@ pub fn spawn<B: Backend>(
         barriers: HashMap::new(),
         watchers: HashMap::new(),
         queries_in_flight: 0,
+        spots: HashMap::new(),
+        next_spot: 0,
+        held: HashMap::new(),
+        ane_borrowers: Vec::new(),
         busy,
         last_busy: false,
         stopping: false,
@@ -814,6 +883,7 @@ impl<B: Backend> Scheduler<B> {
         match msg {
             SchedulerMsg::Enqueue(enqueue) => self.on_enqueue(*enqueue),
             SchedulerMsg::Query(job) => self.on_query(*job),
+            SchedulerMsg::Documents(job) => self.on_documents(*job),
             SchedulerMsg::AnePull { thread, reply } => {
                 self.ane_thread = Some(thread);
                 // The in-flight index job is done; a held override ends.
@@ -828,12 +898,24 @@ impl<B: Backend> Scheduler<B> {
                 );
                 self.ane_in_flight = None;
                 self.item_done(item);
+                for spot in std::mem::take(&mut self.ane_borrowers) {
+                    // A job answered at `Stop` is gone.
+                    if self.spots.contains_key(&spot) {
+                        self.part_done(spot);
+                    }
+                }
             }
             SchedulerMsg::QueryDone {
                 worktree,
                 wait,
                 overtaken,
             } => self.on_query_done(worktree, wait, overtaken),
+            SchedulerMsg::DocumentsDone {
+                spot,
+                worktree,
+                wait,
+                overtaken,
+            } => self.on_documents_done(spot, worktree, wait, overtaken),
             SchedulerMsg::GpuPull { reply } => self.on_gpu_pull(reply),
             SchedulerMsg::GpuStarted => self.gpu = Gpu::Running,
             SchedulerMsg::GpuGone => {
@@ -847,12 +929,6 @@ impl<B: Backend> Scheduler<B> {
             SchedulerMsg::GpuDone { items } => {
                 for item in items {
                     self.item_done(item);
-                }
-            }
-            SchedulerMsg::DocumentsStored { repo, hashes } => {
-                for hash in hashes {
-                    self.note_committed(repo, hash);
-                    self.remove_queued(repo, hash);
                 }
             }
             SchedulerMsg::EmbedderFailed { error } => self.on_fatal(error).await,
@@ -894,8 +970,20 @@ impl<B: Backend> Scheduler<B> {
             }
             SchedulerMsg::Stop => {
                 self.stopping = true;
-                for job in self.queries.drain(..) {
-                    job.fail(EmbedError::SchedulerGone);
+                for waiting in std::mem::take(&mut self.queries) {
+                    match waiting {
+                        Waiting::Query(job) => {
+                            let _ = job.reply.send(Err(EmbedError::SchedulerGone));
+                        }
+                        Waiting::Documents(id) => {
+                            let spot = self
+                                .spots
+                                .remove(&id)
+                                .expect("a queued Documents part's job exists");
+                            self.release_holds(spot.repo, spot.held);
+                            let _ = spot.reply.send(Err(EmbedError::SchedulerGone));
+                        }
+                    }
                 }
             }
         }
@@ -1116,11 +1204,14 @@ impl<B: Backend> Scheduler<B> {
             None => {
                 let item = self.next_item;
                 self.next_item += 1;
-                let queue = match class {
-                    IndexClass::Stage1 => Queue::Stage1,
-                    IndexClass::Background => Queue::Background,
+                let queue = if self.held.contains_key(&key) {
+                    // A search's `Documents` job is embedding this hash.
+                    Queue::Held
+                } else {
+                    let queue = queue_of(class);
+                    self.queue_mut(queue).insert((tokens, item), ());
+                    queue
                 };
-                self.queue_mut(queue).insert((tokens, item), ());
                 self.items.insert(
                     item,
                     Item {
@@ -1286,7 +1377,7 @@ impl<B: Backend> Scheduler<B> {
             Queue::Background => {
                 self.background.remove(&(entry.tokens, item));
             }
-            Queue::InFlight => {}
+            Queue::InFlight | Queue::Held => {}
         }
         for worktree in &entry.worktrees {
             if let Some(state) = self.worktrees.get_mut(worktree) {
@@ -1317,34 +1408,233 @@ impl<B: Backend> Scheduler<B> {
         match queue {
             Queue::Stage1 => &mut self.stage1,
             Queue::Background => &mut self.background,
-            Queue::InFlight => unreachable!("in-flight items live in no queue"),
+            Queue::InFlight | Queue::Held => {
+                unreachable!("in-flight and held items live in no queue")
+            }
         }
     }
 
-    /// A query job arrived: fail it while stopping, else stamp it and queue
-    /// it behind earlier queries.
+    /// A query embedding job arrived: fail it while stopping, else stamp it
+    /// and queue it behind earlier query work.
     fn on_query(&mut self, mut job: QueryJob) {
         if self.stopping {
-            let error = match &self.fatal {
-                Some(error) => EmbedError::Model(error.clone()),
-                None => EmbedError::SchedulerGone,
-            };
-            job.fail(error);
+            let _ = job.reply.send(Err(self.stopping_error()));
             return;
         }
-        let stamp = self.dispatched_indexing;
-        match &mut job {
-            QueryJob::Query { stamp: s, .. } | QueryJob::Documents { stamp: s, .. } => *s = stamp,
+        job.stamp = self.dispatched_indexing;
+        self.lift_for_query();
+        self.queries.push_back(Waiting::Query(job));
+    }
+
+    /// What a query job arriving while stopping is answered with.
+    fn stopping_error(&self) -> EmbedError {
+        match &self.fatal {
+            Some(error) => EmbedError::Model(error.clone()),
+            None => EmbedError::SchedulerGone,
         }
-        // The query waits behind the index job on the ANE; lift that thread
-        // out of its job's class so a background chunk cannot starve it.
+    }
+
+    /// Query work sits behind the index job on the ANE; lift that thread
+    /// out of its job's class so a background chunk cannot starve it.
+    fn lift_for_query(&mut self) {
         if self.ane_in_flight.is_some()
             && self.ane_override.is_none()
             && let Some(thread) = self.ane_thread
         {
             self.ane_override = Some(qos::Override::start(thread, QosClass::UserInteractive));
         }
-        self.queries.push_back(job);
+    }
+
+    /// A search's `Documents` job arrived. Each chunk already has a vector
+    /// (it got one inside the search's window), or is the ANE's index item
+    /// and borrowed from it, or is in flight on the GPU and embedded again
+    /// by the job's part, or is held from indexing and embedded by the
+    /// job's part. The job is answered once its part and its borrowed item
+    /// are done; a GPU batch never holds it back.
+    fn on_documents(&mut self, job: DocumentsJob) {
+        let DocumentsJob {
+            worktree,
+            repo,
+            chunks,
+            writer,
+            enqueued,
+            reply,
+        } = job;
+        if self.stopping {
+            let _ = reply.send(Err(self.stopping_error()));
+            return;
+        }
+        let id = SpotId(self.next_spot);
+        self.next_spot += 1;
+        let open = self
+            .barriers
+            .get(&repo)
+            .expect("a Documents job lands inside its search's window");
+        let mut embed = Vec::new();
+        let mut held = Vec::new();
+        let mut twins = Vec::new();
+        let mut borrows = false;
+        for chunk in chunks {
+            let hash = chunk.content_hash;
+            if open.committed.contains(&hash) {
+                continue;
+            }
+            match self.by_hash.get(&(repo, hash)) {
+                // The ANE is embedding it and runs one job at a time: its
+                // vector is with the writer before this job's part runs.
+                Some(&item) if self.ane_in_flight == Some(item) => borrows = true,
+                // The GPU is embedding it. Its batch can take far longer
+                // than embedding the chunk again on the ANE, so the part
+                // embeds it too; the item stays with the GPU.
+                Some(&item) if self.items[&item].queue == Queue::InFlight => {
+                    twins.push(hash);
+                    embed.push(chunk);
+                }
+                _ => {
+                    held.push(hash);
+                    embed.push(chunk);
+                }
+            }
+        }
+        for &hash in &held {
+            self.hold(repo, hash);
+        }
+        let part = !embed.is_empty();
+        let left = usize::from(borrows) + usize::from(part);
+        if left == 0 {
+            let _ = reply.send(Ok(()));
+            return;
+        }
+        if borrows {
+            self.ane_borrowers.push(id);
+        }
+        self.spots.insert(
+            id,
+            Spot {
+                worktree,
+                repo,
+                chunks: embed,
+                held,
+                twins,
+                writer,
+                enqueued,
+                stamp: self.dispatched_indexing,
+                left,
+                reply,
+            },
+        );
+        // Either part sits behind the ANE's index item.
+        self.lift_for_query();
+        if part {
+            self.queries.push_back(Waiting::Documents(id));
+        }
+    }
+
+    /// A `Documents` job embeds `hash` of `repo`: no indexing embedder takes
+    /// it until the job's part ran or was dropped unrun.
+    fn hold(&mut self, repo: RepoId, hash: ContentHash) {
+        *self.held.entry((repo, hash)).or_default() += 1;
+        let Some(&item) = self.by_hash.get(&(repo, hash)) else {
+            return;
+        };
+        let (queue, tokens) = {
+            let entry = &self.items[&item];
+            (entry.queue, entry.tokens)
+        };
+        match queue {
+            Queue::Stage1 | Queue::Background => {
+                self.queue_mut(queue).remove(&(tokens, item));
+                self.set_queue(item, Queue::Held);
+            }
+            Queue::Held => {}
+            Queue::InFlight => {
+                unreachable!("an in-flight item is borrowed or embedded again, never held")
+            }
+        }
+    }
+
+    /// One job fewer holds `hash` of `repo`; `true` when none is left.
+    fn unhold(&mut self, repo: RepoId, hash: ContentHash) -> bool {
+        let key = (repo, hash);
+        let count = self.held.get_mut(&key).expect("a held hash is counted");
+        *count -= 1;
+        if *count > 0 {
+            return false;
+        }
+        self.held.remove(&key);
+        true
+    }
+
+    /// A `Documents` job's part will never run: each of `held` goes back to
+    /// its queue unless another job still holds it.
+    fn release_holds(&mut self, repo: RepoId, held: Vec<ContentHash>) {
+        for hash in held {
+            if !self.unhold(repo, hash) {
+                continue;
+            }
+            let Some(&item) = self.by_hash.get(&(repo, hash)) else {
+                continue;
+            };
+            let (queue, tokens) = {
+                let entry = &self.items[&item];
+                assert_eq!(entry.queue, Queue::Held, "an item of a held hash is Held");
+                (queue_of(entry.class), entry.tokens)
+            };
+            self.queue_mut(queue).insert((tokens, item), ());
+            self.set_queue(item, queue);
+        }
+    }
+
+    /// The ANE embedded `id`'s part and sent its vectors to the writer.
+    /// Each held item is finished as an indexing item would be. Each twin
+    /// is only noted: its GPU item finishes at `GpuDone`.
+    fn on_documents_done(
+        &mut self,
+        id: SpotId,
+        worktree: WorktreeId,
+        wait: Duration,
+        overtaken: u32,
+    ) {
+        self.on_query_done(worktree, wait, overtaken);
+        let Some(spot) = self.spots.get_mut(&id) else {
+            // `on_fatal` already answered it.
+            assert!(self.fatal.is_some(), "DocumentsDone for an unknown job");
+            return;
+        };
+        let repo = spot.repo;
+        let held = std::mem::take(&mut spot.held);
+        let twins = std::mem::take(&mut spot.twins);
+        for hash in held {
+            // The item finishes whether or not another job still holds the
+            // hash: its vector is with the writer either way.
+            self.unhold(repo, hash);
+            self.note_committed(repo, hash);
+            if let Some(&item) = self.by_hash.get(&(repo, hash)) {
+                assert_eq!(
+                    self.items[&item].queue,
+                    Queue::Held,
+                    "an item of a held hash is Held"
+                );
+                self.item_done(item);
+            }
+        }
+        for hash in twins {
+            // The GPU item, if `GpuDone` has not finished it yet, stays in
+            // flight and counted until it does.
+            self.note_committed(repo, hash);
+        }
+        self.part_done(id);
+    }
+
+    /// One part of `id` is done; the last one answers the job.
+    fn part_done(&mut self, id: SpotId) {
+        let spot = self.spots.get_mut(&id).expect("the job is unanswered");
+        spot.left = spot.left.checked_sub(1).expect("a job's parts underflow");
+        if spot.left > 0 {
+            return;
+        }
+        let spot = self.spots.remove(&id).expect("the job is unanswered");
+        let _ = spot.reply.send(Ok(()));
     }
 
     /// The ANE asked for work: queries first, then stage 1 shortest-first,
@@ -1363,18 +1653,47 @@ impl<B: Backend> Scheduler<B> {
     }
 
     fn dispatch_ane(&mut self, reply: oneshot::Sender<AneJob>) {
-        while let Some(job) = self.queries.pop_front() {
-            if job.closed() {
-                continue;
+        while let Some(waiting) = self.queries.pop_front() {
+            match waiting {
+                Waiting::Query(job) => {
+                    if job.reply.is_closed() {
+                        continue;
+                    }
+                    let overtaken = self.overtaken(job.stamp);
+                    self.queries_in_flight += 1;
+                    let _ = reply.send(AneJob::Query { job, overtaken });
+                    return;
+                }
+                Waiting::Documents(id) => {
+                    let closed = self
+                        .spots
+                        .get(&id)
+                        .expect("a queued Documents part's job exists")
+                        .reply
+                        .is_closed();
+                    if closed {
+                        // The search is gone before its part ran: the held
+                        // chunks go back to indexing, and its twins stay
+                        // with the GPU.
+                        let spot = self.spots.remove(&id).expect("checked above");
+                        self.release_holds(spot.repo, spot.held);
+                        continue;
+                    }
+                    let overtaken = self.overtaken(self.spots[&id].stamp);
+                    let spot = self.spots.get_mut(&id).expect("checked above");
+                    let job = AneJob::Documents {
+                        spot: id,
+                        worktree: spot.worktree,
+                        chunks: std::mem::take(&mut spot.chunks),
+                        writer: spot.writer.clone(),
+                        enqueued: spot.enqueued,
+                        overtaken,
+                    };
+                    self.queries_in_flight += 1;
+                    let _ = reply.send(job);
+                    return;
+                }
             }
-            let stamp = match &job {
-                QueryJob::Query { stamp, .. } | QueryJob::Documents { stamp, .. } => *stamp,
-            };
-            let overtaken = u32::try_from(self.dispatched_indexing - stamp)
-                .expect("overtaken cannot exceed dispatched_indexing");
-            self.queries_in_flight += 1;
-            let _ = reply.send(AneJob::Query { job, overtaken });
-            return;
         }
         for (queue, qos) in [
             (Queue::Stage1, QosClass::UserInitiated),
@@ -1399,6 +1718,12 @@ impl<B: Backend> Scheduler<B> {
             }
         }
         self.ane_waiting = Some(reply);
+    }
+
+    /// Indexing items dispatched since `stamp`.
+    fn overtaken(&self, stamp: u64) -> u32 {
+        u32::try_from(self.dispatched_indexing - stamp)
+            .expect("overtaken cannot exceed dispatched_indexing")
     }
 
     /// The GPU pulled: answer with a same-bucket batch off the long end, or
@@ -1490,41 +1815,11 @@ impl<B: Backend> Scheduler<B> {
         stats.overtaken = stats.overtaken.saturating_add(overtaken);
     }
 
-    /// Removes a queued item whose vector was committed another way;
-    /// in-flight items are untouched.
-    fn remove_queued(&mut self, repo: RepoId, hash: ContentHash) {
-        let Some(&item) = self.by_hash.get(&(repo, hash)) else {
-            return;
-        };
-        if self.items[&item].queue == Queue::InFlight {
-            return;
-        }
-        let worktrees = self.items[&item].worktrees.clone();
-        let small_stage1 = {
-            let entry = &self.items[&item];
-            entry.tokens as usize <= STAGE1_MAX_TOKENS && entry.class == IndexClass::Stage1
-        };
-        self.remove_item(item);
-        for worktree in worktrees {
-            if small_stage1 {
-                let state = self
-                    .worktrees
-                    .get_mut(&worktree)
-                    .expect("interested worktree");
-                if state.stage1_active() {
-                    state.stage1_left = state
-                        .stage1_left
-                        .checked_sub(1)
-                        .expect("stage1_left underflow");
-                }
-            }
-            self.maybe_complete_stage1(worktree);
-        }
-    }
-
     /// `hash` of `repo` has a vector, committed or on its way to the
-    /// writer. While a barrier of `repo` runs it is remembered, so an
-    /// `Enqueue` built from a read inside that barrier never queues it.
+    /// writer. While a barrier or search window of `repo` runs it is
+    /// remembered, so neither an `Enqueue` built from a read inside that
+    /// barrier nor a search's `Documents` job queues or embeds it again.
+    /// Noting a hash twice is a no-op.
     fn note_committed(&mut self, repo: RepoId, hash: ContentHash) {
         if let Some(open) = self.barriers.get_mut(&repo) {
             open.committed.insert(hash);
@@ -1569,9 +1864,17 @@ impl<B: Backend> Scheduler<B> {
     /// `run` and stop dispatching. There is no retry and no fallback.
     async fn on_fatal(&mut self, error: String) {
         error!(%error, "embedder failed");
-        for job in self.queries.drain(..) {
-            job.fail(EmbedError::Model(error.clone()));
+        for waiting in std::mem::take(&mut self.queries) {
+            if let Waiting::Query(job) = waiting {
+                let _ = job.reply.send(Err(EmbedError::Model(error.clone())));
+            }
         }
+        // Every unanswered `Documents` job fails, its queued part included:
+        // a running part or a borrowed item may never report.
+        for (_, spot) in self.spots.drain() {
+            let _ = spot.reply.send(Err(EmbedError::Model(error.clone())));
+        }
+        self.ane_borrowers.clear();
         self.fatal = Some(error.clone());
         self.stopping = true;
         self.ane_override = None;

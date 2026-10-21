@@ -147,15 +147,53 @@ fn run<B: Backend>(
             }
             AneJob::Query { job, overtaken } => {
                 set_qos(&mut qos, QosClass::UserInteractive);
-                let worktree = job.worktree();
+                let worktree = job.worktree;
                 let wait = last_index_end
-                    .map(|end| end.saturating_duration_since(job.enqueued()))
+                    .map(|end| end.saturating_duration_since(job.enqueued))
                     .unwrap_or_default();
                 if let Some(error) = run_query(&mut embedder, job) {
                     let _ = sched.blocking_send(SchedulerMsg::EmbedderFailed { error });
                 }
                 if sched
                     .blocking_send(SchedulerMsg::QueryDone {
+                        worktree,
+                        wait,
+                        overtaken,
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            AneJob::Documents {
+                spot,
+                worktree,
+                chunks,
+                writer,
+                enqueued,
+                overtaken,
+            } => {
+                set_qos(&mut qos, QosClass::UserInteractive);
+                let wait = last_index_end
+                    .map(|end| end.saturating_duration_since(enqueued))
+                    .unwrap_or_default();
+                for chunk in &chunks {
+                    match embedder.embed_document(&chunk.title, &chunk.text) {
+                        Ok(vector) => {
+                            let _ = writer.blocking_vector(chunk.content_hash, vector);
+                        }
+                        Err(error) => {
+                            // Fatal: the scheduler answers the job with it.
+                            let _ = sched.blocking_send(SchedulerMsg::EmbedderFailed {
+                                error: error.to_string(),
+                            });
+                            break;
+                        }
+                    }
+                }
+                if sched
+                    .blocking_send(SchedulerMsg::DocumentsDone {
+                        spot,
                         worktree,
                         wait,
                         overtaken,
@@ -182,38 +220,18 @@ fn run_query<E>(embedder: &mut E, job: QueryJob) -> Option<String>
 where
     E: repo_search_core::Embedder,
 {
-    match job {
-        QueryJob::Query {
-            task, text, reply, ..
-        } => match embedder.embed_query(task, &text) {
-            Ok(vector) => {
-                let _ = reply.send(Ok(vector));
-                None
-            }
-            Err(error) => {
-                let error = error.to_string();
-                let _ = reply.send(Err(EmbedError::Model(error.clone())));
-                Some(error)
-            }
-        },
-        QueryJob::Documents { chunks, reply, .. } => {
-            let mut vectors = Vec::with_capacity(chunks.len());
-            let mut failure = None;
-            for chunk in &chunks {
-                match embedder.embed_document(&chunk.title, &chunk.text) {
-                    Ok(vector) => vectors.push(vector),
-                    Err(error) => {
-                        failure = Some(error.to_string());
-                        break;
-                    }
-                }
-            }
-            let result = match &failure {
-                None => Ok(vectors),
-                Some(error) => Err(EmbedError::Model(error.clone())),
-            };
-            let _ = reply.send(result);
-            failure
+    let QueryJob {
+        task, text, reply, ..
+    } = job;
+    match embedder.embed_query(task, &text) {
+        Ok(vector) => {
+            let _ = reply.send(Ok(vector));
+            None
+        }
+        Err(error) => {
+            let error = error.to_string();
+            let _ = reply.send(Err(EmbedError::Model(error.clone())));
+            Some(error)
         }
     }
 }
