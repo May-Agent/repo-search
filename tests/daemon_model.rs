@@ -20,6 +20,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use repo_search::daemon::chip::ChipClass;
 use repo_search::daemon::coreml::CoreMlBackend;
 use repo_search::daemon::{self, Config};
 use repo_search::model_store::{ModelSpec, ModelStore};
@@ -57,6 +58,7 @@ async fn stage_1_query_on_the_ane() {
         idle_exit: Duration::from_secs(600),
         load_bound: daemon::LOAD_BOUND,
         model_store: store,
+        chip: ChipClass::Wide,
         backend: Arc::new(CoreMlBackend),
         build: client::build(),
     }));
@@ -177,6 +179,7 @@ async fn daemon_host_coreml() {
         idle_exit: Duration::from_secs(3600),
         load_bound: daemon::LOAD_BOUND,
         model_store: store,
+        chip: ChipClass::Wide,
         backend: Arc::new(CoreMlBackend),
         build: client::build(),
     })

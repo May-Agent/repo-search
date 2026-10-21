@@ -12,6 +12,7 @@ use std::sync::mpsc;
 use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
 
+use repo_search::daemon::chip::ChipClass;
 use repo_search::daemon::scheduler::{
     Counts, DocumentsJob, EmbedError, Enqueue, IndexClass, Interest, PendingItem, QueryJob,
     SchedulerHandle, Stage1Done, WorktreeId,
@@ -60,8 +61,9 @@ impl Rig {
     }
 }
 
-async fn rig(ane_delay: Duration, gpu_delay: Duration, gated: &[Instance]) -> Rig {
+async fn rig(chip: ChipClass, ane_delay: Duration, gpu_delay: Duration, gated: &[Instance]) -> Rig {
     rig_gated(
+        chip,
         ane_delay,
         gpu_delay,
         &gated
@@ -74,7 +76,12 @@ async fn rig(ane_delay: Duration, gpu_delay: Duration, gated: &[Instance]) -> Ri
 
 /// `rig` with a barrier on chosen calls: each `(instance, call)` gates
 /// `instance`'s `call`-th embed call (1-based over its `embed_*` calls).
-async fn rig_gated(ane_delay: Duration, gpu_delay: Duration, gated: &[(Instance, usize)]) -> Rig {
+async fn rig_gated(
+    chip: ChipClass,
+    ane_delay: Duration,
+    gpu_delay: Duration,
+    gated: &[(Instance, usize)],
+) -> Rig {
     let (record_tx, records) = mpsc::channel();
     let mut backend = StubBackend::new(record_tx);
     backend.set_instance_delay(Instance::Ane, ane_delay);
@@ -118,6 +125,7 @@ async fn rig_gated(ane_delay: Duration, gpu_delay: Duration, gated: &[(Instance,
         model_id: "stub-model".to_owned(),
         buckets,
         headroom: headroom_rx,
+        chip,
         fatal: fatal_tx.clone(),
         busy: busy_tx.clone(),
         ane_exited: exited.clone(),
@@ -417,7 +425,13 @@ async fn query_documents(rig: &Rig, first_seq: u64, n: usize) -> HashSet<Content
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn query_preempts_indexing() {
-    let rig = rig(Duration::from_millis(20), Duration::ZERO, &[]).await;
+    let rig = rig(
+        ChipClass::Wide,
+        Duration::from_millis(20),
+        Duration::ZERO,
+        &[],
+    )
+    .await;
     // Battery keeps the GPU out of this test entirely.
     rig.backend
         .push_headroom(Err(GpuBlocked::NotMains("Battery Power".to_owned())));
@@ -475,7 +489,13 @@ async fn query_preempts_indexing() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn gpu_takes_the_long_end_in_same_bucket_batches() {
-    let rig = rig(Duration::from_millis(20), Duration::from_millis(10), &[]).await;
+    let rig = rig(
+        ChipClass::Wide,
+        Duration::from_millis(20),
+        Duration::from_millis(10),
+        &[],
+    )
+    .await;
     rig.backend.push_headroom(Ok(()));
     let mut done = enqueue(
         &rig,
@@ -561,8 +581,99 @@ async fn gpu_takes_the_long_end_in_same_bucket_batches() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_base_chip_keeps_the_gpu_off_stage_1() {
+    // Every item starts stage-1 classed; the 30 small ones count for
+    // completion. On a base chip the GPU opens only once the stage-1 queue
+    // has drained and the >256-token leftovers are background work.
+    let rig = rig(
+        ChipClass::Base,
+        Duration::from_millis(10),
+        Duration::ZERO,
+        &[],
+    )
+    .await;
+    rig.backend.push_headroom(Ok(()));
+    let mut done = enqueue(
+        &rig,
+        (0..100)
+            .map(|seq| {
+                let tokens = if seq < 70 { 500 } else { 100 };
+                pending(seq, tokens)
+            })
+            .collect(),
+        IndexClass::Stage1,
+    )
+    .await;
+
+    let mut log = Vec::new();
+    tokio::time::timeout(TIMEOUT, done.recv())
+        .await
+        .expect("stage 1 completes")
+        .expect("stage-1 channel open");
+
+    // The leftovers are background work now: the GPU batches them until
+    // the queue drains and its pull is answered `Stop`.
+    let dropped = wait_for(&mut log, &rig.records, |r| r.kind == Kind::Dropped);
+    assert_eq!(log[dropped].instance, Instance::Gpu);
+    assert_eq!(rig.backend.gpu_opens(), 1, "the GPU opened once");
+
+    let gpu: Vec<&Record> = log.iter().filter(|r| r.instance == Instance::Gpu).collect();
+    assert!(
+        gpu.iter().any(|r| r.kind == Kind::Index),
+        "the GPU takes background work once stage 1 is done"
+    );
+    assert!(
+        gpu.iter()
+            .filter(|r| r.kind == Kind::Index)
+            .all(|r| r.tokens == 500),
+        "the GPU took only stage-1 leftovers"
+    );
+
+    // By order, not by the clock: every stage-1 record precedes the GPU's
+    // first, and each small item was embedded on the ANE exactly once.
+    let last_stage1 = log
+        .iter()
+        .rposition(|r| r.kind == Kind::Index && r.tokens == 100)
+        .expect("the stage-1 items embedded");
+    let first_gpu = log
+        .iter()
+        .position(|r| r.instance == Instance::Gpu)
+        .expect("the GPU ran");
+    assert!(
+        first_gpu > last_stage1,
+        "a GPU record precedes the last stage-1 item"
+    );
+    let embedded = index_hashes(&mut log, &rig);
+    assert_each_once(&embedded);
+    for seq in 70..100 {
+        let hash = pending(seq, 100).chunk.content_hash;
+        let embeds: Vec<&Record> = log
+            .iter()
+            .filter(|r| r.kind == Kind::Index && r.hash == Some(hash))
+            .collect();
+        assert_eq!(
+            embeds.len(),
+            1,
+            "a stage-1 item embedded {} times",
+            embeds.len()
+        );
+        assert_eq!(
+            embeds[0].instance,
+            Instance::Ane,
+            "a stage-1 item reached the GPU"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn no_gpu_on_battery() {
-    let rig = rig(Duration::from_millis(5), Duration::from_millis(5), &[]).await;
+    let rig = rig(
+        ChipClass::Wide,
+        Duration::from_millis(5),
+        Duration::from_millis(5),
+        &[],
+    )
+    .await;
     rig.backend
         .push_headroom(Err(GpuBlocked::NotMains("Battery Power".to_owned())));
     let mut done = enqueue(
@@ -587,6 +698,7 @@ async fn gpu_released_on_power_loss() {
     // Both first calls are gated: a GPU batch and an ANE chunk are provably
     // in flight, so the power loss — not an empty stage 1 — drops the GPU.
     let rig = rig(
+        ChipClass::Wide,
         Duration::from_millis(10),
         Duration::from_millis(25),
         &[Instance::Ane, Instance::Gpu],
@@ -659,7 +771,13 @@ async fn stage_2_runs_at_background_qos() {
     // The GPU's first call is gated: it provably takes exactly one batch (8
     // of the 70 long items) and its next pull finds stage 1 empty, leaving
     // 62 long items for the ANE however loaded the host is.
-    let rig = rig(Duration::from_millis(10), Duration::ZERO, &[Instance::Gpu]).await;
+    let rig = rig(
+        ChipClass::Wide,
+        Duration::from_millis(10),
+        Duration::ZERO,
+        &[Instance::Gpu],
+    )
+    .await;
     // Those leftovers are Background work, which a loaded host can starve:
     // lift the thread's effective priority for the run — its requested
     // class stays Background.
@@ -723,7 +841,13 @@ async fn query_lifts_an_in_flight_background_chunk() {
     // The ANE's first call is gated, so a background chunk is provably in
     // flight when the query lands. The test's own Utility override gives
     // the chunk CPU on a loaded host and marks this host's lifted band.
-    let rig = rig(Duration::from_millis(50), Duration::ZERO, &[Instance::Ane]).await;
+    let rig = rig(
+        ChipClass::Wide,
+        Duration::from_millis(50),
+        Duration::ZERO,
+        &[Instance::Ane],
+    )
+    .await;
     let lift = stub::lift_ane(&rig.backend, QosClass::Utility);
     let _done = enqueue(
         &rig,
@@ -775,7 +899,13 @@ async fn query_lifts_an_in_flight_background_chunk() {
 async fn query_after_a_fatal_error_is_answered_and_the_scheduler_exits() {
     // The ANE's first call is gated so it cannot pull its `Stop`: the actor
     // is stopping but cannot exit, and it must still answer the query.
-    let mut rig = rig(Duration::from_millis(10), Duration::ZERO, &[Instance::Ane]).await;
+    let mut rig = rig(
+        ChipClass::Wide,
+        Duration::from_millis(10),
+        Duration::ZERO,
+        &[Instance::Ane],
+    )
+    .await;
     rig.backend.push_headroom(Ok(()));
     rig.backend.fail_gpu_open();
     let _done = enqueue(
@@ -823,6 +953,7 @@ async fn counts_track_an_ane_pull_and_done() {
     // too: the item its `Started` announces is provably in flight while the
     // counts are read.
     let rig = rig_gated(
+        ChipClass::Wide,
         Duration::from_millis(10),
         Duration::ZERO,
         &[
@@ -873,6 +1004,7 @@ async fn counts_track_a_gpu_batch_pull_and_done() {
     // Both first calls are gated: a provably in-flight ANE chunk and GPU
     // batch make the counts exact.
     let rig = rig(
+        ChipClass::Wide,
         Duration::from_millis(10),
         Duration::from_millis(10),
         &[Instance::Ane, Instance::Gpu],
@@ -924,6 +1056,7 @@ async fn counts_drop_a_re_enqueued_in_flight_item() {
     // `AneDone` changes nothing for this worktree. The second call is gated
     // as well, holding its item in flight while its counts are read.
     let rig = rig_gated(
+        ChipClass::Wide,
         Duration::from_millis(10),
         Duration::ZERO,
         &[(Instance::Ane, 1), (Instance::Ane, 2)],
@@ -968,6 +1101,7 @@ async fn counts_are_per_worktree_on_a_shared_item() {
     // before any dispatch; the second call's gate keeps the shared item in
     // flight while the worktrees' counts are read.
     let rig = rig_gated(
+        ChipClass::Wide,
         Duration::from_millis(10),
         Duration::ZERO,
         &[(Instance::Ane, 1), (Instance::Ane, 2)],
@@ -1026,6 +1160,7 @@ async fn counts_move_to_background_at_stage1_completion() {
     // the next `Started` already shows the post-completion queues. Both
     // calls are gated: each counts read sees a provably in-flight item.
     let rig = rig_gated(
+        ChipClass::Wide,
         Duration::from_millis(10),
         Duration::ZERO,
         &[(Instance::Ane, 1), (Instance::Ane, 2)],
@@ -1071,7 +1206,13 @@ async fn counts_move_to_background_at_stage1_completion() {
 async fn a_documents_job_takes_its_queued_twin_out_of_the_queue() {
     // The ANE's first call is gated, so the twin is provably still queued
     // when the `Documents` job lands.
-    let rig = rig(Duration::from_millis(10), Duration::ZERO, &[Instance::Ane]).await;
+    let rig = rig(
+        ChipClass::Wide,
+        Duration::from_millis(10),
+        Duration::ZERO,
+        &[Instance::Ane],
+    )
+    .await;
     rig.backend
         .push_headroom(Err(GpuBlocked::NotMains("Battery Power".to_owned())));
     let query = send_query(&rig, "hold the pull").await;
@@ -1119,6 +1260,7 @@ async fn watch_counts_seeds_and_pushes_counts() {
     // Both ANE calls are gated, so every pushed count is one the scheduler
     // provably holds.
     let rig = rig_gated(
+        ChipClass::Wide,
         Duration::from_millis(10),
         Duration::ZERO,
         &[(Instance::Ane, 1), (Instance::Ane, 2)],
@@ -1204,7 +1346,13 @@ fn assert_each_once(hashes: &[ContentHash]) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_change_adds_and_drops_on_top_of_a_replace() {
-    let rig = rig(Duration::from_millis(10), Duration::ZERO, &[Instance::Ane]).await;
+    let rig = rig(
+        ChipClass::Wide,
+        Duration::from_millis(10),
+        Duration::ZERO,
+        &[Instance::Ane],
+    )
+    .await;
     rig.backend
         .push_headroom(Err(GpuBlocked::NotMains("Battery Power".to_owned())));
     let query = send_query(&rig, "hold the pull").await;
@@ -1252,7 +1400,13 @@ async fn a_change_adds_and_drops_on_top_of_a_replace() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_change_re_adding_a_wanted_item_is_a_no_op() {
-    let rig = rig(Duration::from_millis(10), Duration::ZERO, &[Instance::Ane]).await;
+    let rig = rig(
+        ChipClass::Wide,
+        Duration::from_millis(10),
+        Duration::ZERO,
+        &[Instance::Ane],
+    )
+    .await;
     rig.backend
         .push_headroom(Err(GpuBlocked::NotMains("Battery Power".to_owned())));
     let query = send_query(&rig, "hold the pull").await;
@@ -1295,7 +1449,13 @@ async fn a_change_re_adding_a_wanted_item_is_a_no_op() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_change_dropping_a_finished_or_unknown_hash_is_a_no_op() {
-    let rig = rig(Duration::from_millis(10), Duration::ZERO, &[Instance::Ane]).await;
+    let rig = rig(
+        ChipClass::Wide,
+        Duration::from_millis(10),
+        Duration::ZERO,
+        &[Instance::Ane],
+    )
+    .await;
     rig.backend
         .push_headroom(Err(GpuBlocked::NotMains("Battery Power".to_owned())));
     let query = send_query(&rig, "hold the pull").await;
@@ -1326,7 +1486,13 @@ async fn a_change_dropping_a_finished_or_unknown_hash_is_a_no_op() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_change_on_one_worktree_keeps_a_shared_item_for_the_other() {
     const OTHER: WorktreeId = WorktreeId(2);
-    let rig = rig(Duration::from_millis(10), Duration::ZERO, &[Instance::Ane]).await;
+    let rig = rig(
+        ChipClass::Wide,
+        Duration::from_millis(10),
+        Duration::ZERO,
+        &[Instance::Ane],
+    )
+    .await;
     rig.backend
         .push_headroom(Err(GpuBlocked::NotMains("Battery Power".to_owned())));
     let query = send_query(&rig, "hold the pull").await;
@@ -1383,7 +1549,13 @@ async fn a_change_on_one_worktree_keeps_a_shared_item_for_the_other() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_background_change_after_stage1_done_moves_nothing_back() {
-    let rig = rig(Duration::from_millis(10), Duration::ZERO, &[Instance::Ane]).await;
+    let rig = rig(
+        ChipClass::Wide,
+        Duration::from_millis(10),
+        Duration::ZERO,
+        &[Instance::Ane],
+    )
+    .await;
     rig.backend
         .push_headroom(Err(GpuBlocked::NotMains("Battery Power".to_owned())));
     let query = send_query(&rig, "hold the pull").await;
@@ -1426,7 +1598,13 @@ async fn a_background_change_after_stage1_done_moves_nothing_back() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_stage1_change_after_completion_reopens_stage1_once() {
-    let rig = rig(Duration::from_millis(10), Duration::ZERO, &[Instance::Ane]).await;
+    let rig = rig(
+        ChipClass::Wide,
+        Duration::from_millis(10),
+        Duration::ZERO,
+        &[Instance::Ane],
+    )
+    .await;
     rig.backend
         .push_headroom(Err(GpuBlocked::NotMains("Battery Power".to_owned())));
     let query = send_query(&rig, "hold the pull").await;
@@ -1466,7 +1644,13 @@ async fn a_stage1_change_after_completion_reopens_stage1_once() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_resync_skips_chunks_finished_inside_its_barrier() {
-    let rig = rig(Duration::from_millis(10), Duration::ZERO, &[Instance::Ane]).await;
+    let rig = rig(
+        ChipClass::Wide,
+        Duration::from_millis(10),
+        Duration::ZERO,
+        &[Instance::Ane],
+    )
+    .await;
     rig.backend
         .push_headroom(Err(GpuBlocked::NotMains("Battery Power".to_owned())));
     let query = send_query(&rig, "hold the pull").await;
@@ -1526,7 +1710,13 @@ async fn a_resync_skips_chunks_finished_inside_its_barrier() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_change_skips_chunks_another_worktree_finished_inside_its_barrier() {
     const OTHER: WorktreeId = WorktreeId(2);
-    let rig = rig(Duration::from_millis(10), Duration::ZERO, &[Instance::Ane]).await;
+    let rig = rig(
+        ChipClass::Wide,
+        Duration::from_millis(10),
+        Duration::ZERO,
+        &[Instance::Ane],
+    )
+    .await;
     rig.backend
         .push_headroom(Err(GpuBlocked::NotMains("Battery Power".to_owned())));
     let query = send_query(&rig, "hold the pull").await;
@@ -1585,7 +1775,13 @@ async fn a_change_skips_chunks_another_worktree_finished_inside_its_barrier() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_change_skips_chunks_a_search_embedded_inside_its_barrier() {
-    let rig = rig(Duration::from_millis(10), Duration::ZERO, &[]).await;
+    let rig = rig(
+        ChipClass::Wide,
+        Duration::from_millis(10),
+        Duration::ZERO,
+        &[],
+    )
+    .await;
     rig.backend
         .push_headroom(Err(GpuBlocked::NotMains("Battery Power".to_owned())));
     let _w = enqueue(&rig, vec![], IndexClass::Background).await;
@@ -1635,7 +1831,13 @@ async fn a_change_skips_chunks_a_search_embedded_inside_its_barrier() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_second_worktrees_resync_of_finished_chunks_completes_stage1_at_once() {
     const OTHER: WorktreeId = WorktreeId(2);
-    let rig = rig(Duration::from_millis(10), Duration::ZERO, &[Instance::Ane]).await;
+    let rig = rig(
+        ChipClass::Wide,
+        Duration::from_millis(10),
+        Duration::ZERO,
+        &[Instance::Ane],
+    )
+    .await;
     rig.backend
         .push_headroom(Err(GpuBlocked::NotMains("Battery Power".to_owned())));
     let query = send_query(&rig, "hold the pull").await;
@@ -1684,7 +1886,13 @@ async fn committed_hashes_are_kept_only_while_a_barrier_runs() {
     // vector. No production feed can do that — a read inside the barrier
     // sees the vector — so the steps exist only to observe that the set is
     // not kept.
-    let rig = rig(Duration::from_millis(10), Duration::ZERO, &[Instance::Ane]).await;
+    let rig = rig(
+        ChipClass::Wide,
+        Duration::from_millis(10),
+        Duration::ZERO,
+        &[Instance::Ane],
+    )
+    .await;
     rig.backend
         .push_headroom(Err(GpuBlocked::NotMains("Battery Power".to_owned())));
     let mut done = enqueue(&rig, vec![pending(0, 100)], IndexClass::Stage1).await;
@@ -1779,6 +1987,7 @@ async fn a_search_embeds_its_gpu_chunk_again_without_waiting() {
     // Both first calls are gated: the GPU provably holds `C` in its batch
     // when the search's job lands, and the job answers without it.
     let rig = rig(
+        ChipClass::Wide,
         Duration::from_millis(10),
         Duration::from_millis(10),
         &[Instance::Ane, Instance::Gpu],
@@ -1852,6 +2061,7 @@ async fn a_search_embeds_its_gpu_chunk_again_without_waiting() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_gpu_batch_skips_a_chunk_a_search_holds() {
     let rig = rig(
+        ChipClass::Wide,
         Duration::from_millis(10),
         Duration::from_millis(10),
         &[Instance::Ane],
@@ -1915,7 +2125,13 @@ async fn a_search_borrows_its_chunk_from_the_ane() {
     // The ANE's first call is gated: `C` is provably in flight on the ANE
     // when the job lands. `D` is never enqueued, so the job's own part
     // embeds it behind the borrowed item.
-    let rig = rig(Duration::from_millis(10), Duration::ZERO, &[Instance::Ane]).await;
+    let rig = rig(
+        ChipClass::Wide,
+        Duration::from_millis(10),
+        Duration::ZERO,
+        &[Instance::Ane],
+    )
+    .await;
     rig.backend
         .push_headroom(Err(GpuBlocked::NotMains("Battery Power".to_owned())));
     let mut log = Vec::new();
@@ -1980,7 +2196,13 @@ async fn a_search_borrows_its_chunk_from_the_ane() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_search_skips_a_chunk_finished_inside_its_window() {
-    let rig = rig(Duration::from_millis(10), Duration::ZERO, &[Instance::Ane]).await;
+    let rig = rig(
+        ChipClass::Wide,
+        Duration::from_millis(10),
+        Duration::ZERO,
+        &[Instance::Ane],
+    )
+    .await;
     rig.backend
         .push_headroom(Err(GpuBlocked::NotMains("Battery Power".to_owned())));
     let mut log = Vec::new();
@@ -2019,7 +2241,13 @@ async fn a_search_skips_a_chunk_finished_inside_its_window() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_dropped_search_hands_its_held_chunk_back_to_indexing() {
-    let rig = rig(Duration::from_millis(10), Duration::ZERO, &[Instance::Ane]).await;
+    let rig = rig(
+        ChipClass::Wide,
+        Duration::from_millis(10),
+        Duration::ZERO,
+        &[Instance::Ane],
+    )
+    .await;
     rig.backend
         .push_headroom(Err(GpuBlocked::NotMains("Battery Power".to_owned())));
     let mut log = Vec::new();
@@ -2055,7 +2283,13 @@ async fn a_dropped_search_hands_its_held_chunk_back_to_indexing() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_chunk_two_searches_hold_stays_held_when_one_is_dropped() {
-    let rig = rig(Duration::from_millis(10), Duration::ZERO, &[Instance::Ane]).await;
+    let rig = rig(
+        ChipClass::Wide,
+        Duration::from_millis(10),
+        Duration::ZERO,
+        &[Instance::Ane],
+    )
+    .await;
     rig.backend
         .push_headroom(Err(GpuBlocked::NotMains("Battery Power".to_owned())));
     let mut log = Vec::new();
@@ -2104,7 +2338,13 @@ async fn a_chunk_two_searches_hold_stays_held_when_one_is_dropped() {
 async fn a_search_whose_only_chunk_is_on_the_ane_is_answered_at_its_ane_done() {
     // The ANE's first call is gated: `C` is provably in flight on the ANE
     // when the job lands, and the job has no part of its own.
-    let rig = rig(Duration::from_millis(10), Duration::ZERO, &[Instance::Ane]).await;
+    let rig = rig(
+        ChipClass::Wide,
+        Duration::from_millis(10),
+        Duration::ZERO,
+        &[Instance::Ane],
+    )
+    .await;
     rig.backend
         .push_headroom(Err(GpuBlocked::NotMains("Battery Power".to_owned())));
     let mut log = Vec::new();
@@ -2155,6 +2395,7 @@ async fn a_gpu_twin_finished_before_the_search_part_is_counted_once() {
     // GPU's gate opens first: `GpuDone` finishes the twin's item while the
     // job's part still waits behind the gated query.
     let rig = rig(
+        ChipClass::Wide,
         Duration::from_millis(10),
         Duration::from_millis(10),
         &[Instance::Ane, Instance::Gpu],
@@ -2211,7 +2452,13 @@ async fn a_gpu_twin_finished_before_the_search_part_is_counted_once() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stop_fails_a_queued_search_part_and_requeues_its_held_chunk() {
-    let rig = rig(Duration::from_millis(10), Duration::ZERO, &[Instance::Ane]).await;
+    let rig = rig(
+        ChipClass::Wide,
+        Duration::from_millis(10),
+        Duration::ZERO,
+        &[Instance::Ane],
+    )
+    .await;
     rig.backend
         .push_headroom(Err(GpuBlocked::NotMains("Battery Power".to_owned())));
     let mut log = Vec::new();

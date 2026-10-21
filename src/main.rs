@@ -121,6 +121,16 @@ fn daemon_main(idle_exit: Duration, model_cache: Option<PathBuf>) -> ExitCode {
         }
     };
 
+    // The chip's class decides which indexing queue the GPU serves; a brand
+    // the parse does not recognise is fatal — no fallback is guessed.
+    let chip = match daemon::chip::host() {
+        Ok(chip) => chip,
+        Err(error) => {
+            tracing::error!(%error, "could not determine the host's chip class");
+            return ExitCode::FAILURE;
+        }
+    };
+
     // `from_std` registers the fd with this runtime's driver, so it runs
     // inside the runtime's context.
     let _guard = runtime.enter();
@@ -140,6 +150,7 @@ fn daemon_main(idle_exit: Duration, model_cache: Option<PathBuf>) -> ExitCode {
         idle_exit,
         load_bound: daemon::LOAD_BOUND,
         model_store,
+        chip,
         backend: Arc::new(CoreMlBackend),
         build,
     })) {

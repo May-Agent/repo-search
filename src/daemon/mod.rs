@@ -2,6 +2,7 @@
 //! loader, the worktree registry and the socket server.
 
 pub mod ane;
+pub mod chip;
 pub mod coreml;
 pub mod coverage;
 pub mod feed;
@@ -32,6 +33,7 @@ use crate::protocol::{
     self, BuildId, ErrorKind, ErrorReport, Event, Final, Hello, PROTOCOL, Progress, Request, framed,
 };
 
+use chip::ChipClass;
 use model::{LoaderMsg, ModelState};
 use registry::{GetError, RegistryHandle};
 use worktree::OwnerMsg;
@@ -51,7 +53,8 @@ pub trait Backend: Send + Sync + 'static {
     /// The single-chunk instance on the ANE thread, shared by queries and
     /// indexing.
     type Ane: Embedder + Send + 'static;
-    /// The batch instance on the GPU thread; serves stage-1 indexing only.
+    /// The batch instance on the GPU thread; serves indexing only — stage
+    /// 1 on a wide-class chip, the background queue on a base one.
     type Gpu: BatchEmbedder + Send + 'static;
     /// Counts the model's tokens for chunking and queue ordering.
     type Counter: TokenCounter + 'static;
@@ -182,6 +185,9 @@ pub struct Config<B: Backend> {
     pub load_bound: Duration,
     /// The model cache; the loader starts `ensure` at once.
     pub model_store: ModelStore,
+    /// The host's chip class, read once at startup: on a base chip the GPU
+    /// instance takes no stage-1 work.
+    pub chip: ChipClass,
     /// The embedding backend.
     pub backend: Arc<B>,
     /// The identity of the executable file this process runs; a `Hello`
@@ -233,15 +239,16 @@ pub async fn run<B: Backend>(config: Config<B>) -> Result<(), Error> {
         })
         .await
         .expect("the busy aggregator outlives run");
-    let loader = model::spawn(
+    let loader = model::spawn(model::LoaderConfig {
         backend,
-        Arc::new(config.model_store),
-        config.load_bound,
-        headroom_rx,
-        loader_busy_tx,
-        busy_tx.clone(),
-        fatal_tx.clone(),
-    );
+        store: Arc::new(config.model_store),
+        bound: config.load_bound,
+        chip: config.chip,
+        headroom: headroom_rx,
+        busy: loader_busy_tx,
+        busy_reg: busy_tx.clone(),
+        fatal: fatal_tx.clone(),
+    });
     let registry = registry::spawn(registry::RegistryConfig {
         model_id,
         model: loader.state.clone(),

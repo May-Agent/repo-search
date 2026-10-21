@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::sync::mpsc;
 use std::time::Duration;
 
+use repo_search::daemon::chip::ChipClass;
 use repo_search::daemon::{self, Config, Error};
 use repo_search::model_store::{ModelSpec, ModelStore, Sha256Digest};
 use repo_search::protocol::BuildId;
@@ -85,11 +86,14 @@ pub fn spawn_on(
             .set_nonblocking(true)
             .expect("the listener goes nonblocking");
         let listener = UnixListener::from_std(listener).expect("the listener adopts");
+        // The daemon-level tests exercise today's scheduling: the wide
+        // class keeps the GPU on stage-1 work.
         daemon::run(Config {
             listener,
             idle_exit,
             load_bound,
             model_store,
+            chip: ChipClass::Wide,
             backend,
             build,
         })

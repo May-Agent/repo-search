@@ -1,10 +1,13 @@
 //! The scheduler actor: the sole owner of all embedding work.
 //!
-//! One async task holds the query queue (FIFO, always first), the two-ended
-//! stage-1 queue (the ANE pops the shortest item, the GPU the longest in
-//! same-bucket batches) and the background queue. Indexing items are
-//! de-duplicated by `(repo, hash)` so worktrees of one repository share
-//! vectors. The ANE and GPU threads pull their next job over [`SchedulerMsg`];
+//! One async task holds the query queue (FIFO, always first), the stage-1
+//! queue and the background queue. The ANE pops the shortest stage-1 item,
+//! then background; the GPU pops the longest items in same-bucket batches —
+//! off the stage-1 queue on a wide-class chip, and off the background queue
+//! on a base-class one, where it joins only once stage 1 is done: a GPU
+//! executing alongside the ANE makes stage 1 finish later there. Indexing
+//! items are de-duplicated by `(repo, hash)` so worktrees of one repository
+//! share vectors. The ANE and GPU threads pull their next job over [`SchedulerMsg`];
 //! finished vectors go to the per-repository [`writer`]. A worktree's
 //! interest is replaced whole on a fresh or rescoped pass and edited by each
 //! later pass's changes, so a pass that changed nothing costs the scheduler
@@ -28,6 +31,7 @@ use repo_search_core::{QueryTask, UnitVector};
 use tokio::sync::{mpsc, oneshot, watch};
 use tracing::{debug, error};
 
+use super::chip::ChipClass;
 use super::writer::WriterHandle;
 use super::{Backend, Error, Headroom, gpu};
 
@@ -55,9 +59,11 @@ pub type ItemId = u64;
 /// Which queue an indexing item runs from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IndexClass {
-    /// First-index work: stage-1 priority on the ANE and GPU.
+    /// First-index work: stage-1 priority on the ANE, and on the GPU on a
+    /// wide-class chip.
     Stage1,
-    /// Everything else: ANE only, at background QoS.
+    /// Everything else: the ANE at background QoS, joined by the GPU once
+    /// stage 1 is done on a base-class chip.
     Background,
 }
 
@@ -275,7 +281,7 @@ pub enum GpuState {
     },
     /// The GPU thread is opening its instance (a multi-second cold start).
     Loading,
-    /// Embedding stage-1 index work.
+    /// Embedding index work.
     Running,
 }
 
@@ -688,6 +694,8 @@ struct Scheduler<B: Backend> {
     /// are answered with it.
     fatal: Option<String>,
     headroom: watch::Receiver<Headroom>,
+    /// The host's chip class; it decides which queue the GPU draws from.
+    chip: ChipClass,
     /// Query work queued for the ANE, FIFO.
     queries: VecDeque<Waiting>,
     /// `(tokens, item)` ordered so `pop_first` is the shortest and `pop_last`
@@ -763,6 +771,8 @@ pub struct SchedulerConfig<B: Backend> {
     pub buckets: Box<[usize]>,
     /// Host headroom for the GPU instance.
     pub headroom: watch::Receiver<Headroom>,
+    /// The host's chip class: a base chip keeps the GPU off stage-1 work.
+    pub chip: ChipClass,
     /// Fatal errors go to `run` here.
     pub fatal: mpsc::Sender<Error>,
     /// The scheduler's busy state for the idle-exit tracker.
@@ -772,8 +782,8 @@ pub struct SchedulerConfig<B: Backend> {
 }
 
 /// Spawns the scheduler task. The ANE thread is spawned separately by the
-/// caller; the GPU thread is spawned here whenever stage-1 work and headroom
-/// allow it.
+/// caller; the GPU thread is spawned here whenever work in its queue and
+/// headroom allow it.
 pub fn spawn<B: Backend>(
     config: SchedulerConfig<B>,
 ) -> (
@@ -786,6 +796,7 @@ pub fn spawn<B: Backend>(
         model_id,
         buckets,
         headroom,
+        chip,
         fatal,
         busy,
         ane_exited,
@@ -801,6 +812,7 @@ pub fn spawn<B: Backend>(
         fatal_tx: fatal,
         fatal: None,
         headroom,
+        chip,
         queries: VecDeque::new(),
         stage1: BTreeMap::new(),
         background: BTreeMap::new(),
@@ -1024,13 +1036,26 @@ impl<B: Backend> Scheduler<B> {
         self.gpu_exited.push(exited);
     }
 
-    /// The GPU is wanted when stage-1 work is queued, the host has headroom
-    /// and the daemon is not stopping or blocked from the GPU.
+    /// The GPU is wanted when its queue holds work, the host has headroom
+    /// and the daemon is not stopping or blocked from the GPU. A wide-class
+    /// chip serves it from the stage-1 queue; a base-class one from the
+    /// background queue, and only once the stage-1 queue is empty — a GPU
+    /// executing alongside the ANE there makes stage 1 finish later.
     fn gpu_wanted(&self) -> bool {
-        !self.stopping
-            && !self.gpu_blocked
-            && !self.stage1.is_empty()
-            && self.headroom.borrow().is_ok()
+        let queued = match self.chip {
+            ChipClass::Wide => !self.stage1.is_empty(),
+            ChipClass::Base => self.stage1.is_empty() && !self.background.is_empty(),
+        };
+        !self.stopping && !self.gpu_blocked && queued && self.headroom.borrow().is_ok()
+    }
+
+    /// The queue the GPU draws its batches from: stage 1 on a wide-class
+    /// chip, background on a base one.
+    fn gpu_queue(&self) -> Queue {
+        match self.chip {
+            ChipClass::Wide => Queue::Stage1,
+            ChipClass::Base => Queue::Background,
+        }
     }
 
     /// Applies a worktree's `Enqueue`: a `Replace` or a `Change` of its
@@ -1738,11 +1763,13 @@ impl<B: Backend> Scheduler<B> {
             return;
         }
         // The batch's bucket is the longest queued item's; up to `GPU_BATCH`
-        // items off the back of `stage1` that share it go in one batch.
+        // items off the back of the GPU's queue that share it go in one
+        // batch.
+        let queue = self.gpu_queue();
         let mut batch = Vec::with_capacity(GPU_BATCH);
         let mut bucket = None;
         while batch.len() < GPU_BATCH {
-            let Some((&(_, item), &())) = self.stage1.last_key_value() else {
+            let Some((&(_, item), &())) = self.queue_mut(queue).last_key_value() else {
                 break;
             };
             let item_bucket = self.bucket(self.items[&item].tokens);
@@ -1751,7 +1778,7 @@ impl<B: Backend> Scheduler<B> {
                 Some(b) if b == item_bucket => {}
                 Some(_) => break,
             }
-            self.stage1.pop_last();
+            self.queue_mut(queue).pop_last();
             self.set_queue(item, Queue::InFlight);
             let entry = &self.items[&item];
             let repo = entry.repo;

@@ -13,6 +13,7 @@ use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
+use repo_search::daemon::chip::ChipClass;
 use repo_search::daemon::{self, Config, Error};
 use repo_search::model_store::{ModelSpec, ModelStore};
 use repo_search::protocol::{self, ErrorKind, Event, Final, Request, WirePhase};
@@ -1640,6 +1641,7 @@ async fn daemon_host() {
         idle_exit: Duration::from_secs(3600),
         load_bound: daemon::LOAD_BOUND,
         model_store: store,
+        chip: ChipClass::Wide,
         backend: Arc::new(backend),
         build: support::client::build(),
     })
