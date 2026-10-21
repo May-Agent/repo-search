@@ -152,6 +152,16 @@ impl Books {
             .is_some_and(|entry| entry.rows[0] > 0 || (include_ignored && entry.rows[1] > 0))
     }
 
+    /// Every hash a row visible in the scope holds that has no vector, as
+    /// far as the books know, in no particular order.
+    pub(super) fn uncached(&self, include_ignored: bool) -> Vec<ContentHash> {
+        self.hashes
+            .iter()
+            .filter(|&(hash, entry)| !entry.cached && self.is_visible(hash, include_ignored))
+            .map(|(&hash, _)| hash)
+            .collect()
+    }
+
     /// Every `(hash, side)` pair some stored row holds, in no particular
     /// order.
     #[must_use]

@@ -12,7 +12,7 @@ use counters::CapOff;
 use futures_executor::block_on;
 use repo_search_core::reconcile::{
     Books, Changes, Counts, Options, PendingChunk, Presence, Reads, Reconciled, Reconciler, Report,
-    SkipReason, missing,
+    SkipReason,
 };
 use repo_search_core::store::{ContentHash, Index, Side, VectorCache};
 use repo_search_core::{CHUNKER_FINGERPRINT, UnitVector};
@@ -21,7 +21,7 @@ use tempfile::TempDir;
 const MODEL: &str = "test-model";
 
 /// One pass as the old API returned it, plus its changes: `pending` is
-/// `missing` taken right after the pass.
+/// the reconciler's `missing` taken right after the pass.
 struct Pass {
     report: Report,
     changes: Option<Changes>,
@@ -80,19 +80,11 @@ impl Fixture {
         pass
     }
 
-    /// A pass of `reconciler`, then `missing` read the way the feeder
+    /// A pass of `reconciler`, then its `missing` read the way the feeder
     /// reads it.
     fn run_with(&self, reconciler: &mut Reconciler, chunker: &str, options: Options) -> Pass {
         let reconciled = self.reconcile_with(reconciler, chunker, options);
-        let pending = block_on(missing(
-            &self.index,
-            &self.cache,
-            MODEL,
-            self.tree.path(),
-            options,
-            Vec::new(),
-        ))
-        .unwrap();
+        let pending = self.missing_with(reconciler, options.include_ignored);
         Pass {
             report: reconciled.report,
             changes: reconciled.changes,
@@ -177,6 +169,47 @@ impl Fixture {
         .unwrap()
         .collect::<Result<_, _>>()
         .unwrap()
+    }
+
+    /// `missing` of `reconciler` with its texts, as the feeder reads it.
+    /// Checked: the hashes are what a recount of every row against the
+    /// cache finds, and every listed hash whose text the worktree still
+    /// holds comes back once.
+    fn missing_with(
+        &self,
+        reconciler: &mut Reconciler,
+        include_ignored: bool,
+    ) -> Vec<PendingChunk> {
+        let missing = block_on(reconciler.missing(include_ignored)).unwrap();
+        let listed: HashSet<ContentHash> = missing.hashes().iter().copied().collect();
+        assert_eq!(listed.len(), missing.hashes().len(), "listed once each");
+        assert_eq!(
+            listed,
+            self.uncached(include_ignored),
+            "the books list what a full recount finds"
+        );
+        let pending = block_on(missing.pending(Vec::new())).unwrap().chunks;
+        assert!(
+            pending.iter().all(|c| listed.contains(&c.content_hash)),
+            "only listed hashes come back"
+        );
+        pending
+    }
+
+    /// The distinct hashes of the scope's rows with no cached vector,
+    /// recounted from every row.
+    fn uncached(&self, include_ignored: bool) -> HashSet<ContentHash> {
+        let distinct: Vec<ContentHash> = block_on(self.index.chunk_hashes(include_ignored))
+            .unwrap()
+            .into_iter()
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        let cached = block_on(self.cache.cached(MODEL, &distinct)).unwrap();
+        distinct
+            .into_iter()
+            .filter(|hash| !cached.contains(hash))
+            .collect()
     }
 
     /// `counts` of the fixture's reconciler, checked against a recount.
@@ -1502,4 +1535,133 @@ fn counts_follow_the_scope() {
     let all = fx.counts(true);
     assert_eq!(all.chunks_total, plain.chunks_total + secret as u64);
     assert_eq!(all.reads, Reads::default());
+}
+
+/// What a resync reads once every chunk but those of `m0.rs` to `m2.rs`
+/// has a vector, over `modules` modules: its listing at the barrier, then
+/// its settling after one more vector was stored, and the number of chunks
+/// left and stored.
+fn resync_reads(modules: usize) -> (Reads, Reads, usize, usize) {
+    let fx = Fixture::new();
+    write_modules(&fx, modules);
+    let first = fx.pass();
+    let (left, rest): (Vec<PendingChunk>, Vec<PendingChunk>) = first
+        .pending
+        .into_iter()
+        .partition(|c| ["m0.rs", "m1.rs", "m2.rs"].contains(&c.path.as_str()));
+    assert!(left.len() >= 3);
+    fx.embed(&rest);
+    // The barrier the resync belongs to books the vectors stored since.
+    fx.reconcile_only(Options::default());
+
+    let mut reconciler = fx.reconciler.borrow_mut();
+    let missing = block_on(reconciler.missing(false)).unwrap();
+    let listing = missing.reads;
+    let listed: HashSet<ContentHash> = missing.hashes().iter().copied().collect();
+    assert_eq!(listed, fx.uncached(false));
+    assert_eq!(
+        listed,
+        left.iter().map(|c| c.content_hash).collect::<HashSet<_>>()
+    );
+
+    // One more vector lands before the feeder's flush: settling drops it,
+    // and a text the pass already holds is not rebuilt.
+    fx.embed(&left[..1]);
+    let known = left[left.len() - 1..].to_vec();
+    let pending = block_on(missing.pending(known)).unwrap();
+    assert_eq!(pending.chunks, left[1..], "the texts a pass would offer");
+    (listing, pending.reads, left.len(), rest.len())
+}
+
+#[test]
+fn a_resync_reads_nothing_for_the_chunks_that_have_a_vector() {
+    let small = resync_reads(5);
+    let large = resync_reads(60);
+    // The large tree has over ten times the chunks with a vector...
+    assert!(large.3 >= 10 * small.3, "{} vs {}", large.3, small.3);
+    assert_eq!(large.2, small.2);
+    // ...and every read is the same: the listing reads nothing, settling
+    // reads the one vector stored since and the rows of the hashes left
+    // that the pass held no text for.
+    let rebuilt = small.2 as u64 - 2;
+    for (listing, settling, _, _) in [small, large] {
+        assert_eq!(listing, Reads::default());
+        assert_eq!(
+            settling,
+            Reads {
+                chunk_rows: rebuilt,
+                cache_probes: 0,
+                cache_slots: 1
+            }
+        );
+    }
+}
+
+#[test]
+fn a_scope_flip_resync_lists_the_ignored_chunks_from_the_books() {
+    let fx = Fixture::new();
+    fx.write(".gitignore", "secret.rs\n");
+    fx.write("kept.rs", "fn kept() {}\n");
+    fx.write("secret.rs", "fn hidden() {}\n");
+    let plain = fx.pass();
+    assert_eq!(paths(&plain.pending), ["kept.rs"]);
+    fx.embed(&plain.pending);
+    // The flip's barrier indexes the ignored file and looks up only its
+    // hashes; its resync then reads nothing.
+    let flip = fx.reconcile_only(Options {
+        include_ignored: true,
+    });
+    let mut reconciler = fx.reconciler.borrow_mut();
+    let missing = block_on(reconciler.missing(true)).unwrap();
+    assert_eq!(missing.reads, Reads::default());
+    let listed: HashSet<ContentHash> = missing.hashes().iter().copied().collect();
+    assert_eq!(listed, fx.uncached(true));
+    assert!(!listed.is_empty());
+    let pending = block_on(missing.pending(Vec::new())).unwrap();
+    assert_eq!(paths(&pending.chunks), ["secret.rs"]);
+    assert_eq!(
+        pending.chunks,
+        flip.changes
+            .expect("a plain pass reports its changes")
+            .added
+    );
+    // The plain scope wants nothing.
+    let plain = block_on(reconciler.missing(false)).unwrap();
+    assert!(plain.hashes().is_empty());
+    assert_eq!(plain.reads, Reads::default());
+}
+
+#[test]
+fn a_resync_without_books_loads_them_whole_once() {
+    let fx = Fixture::new();
+    write_modules(&fx, 10);
+    let first = fx.pass();
+    let (half, _) = first.pending.split_at(first.pending.len() / 2);
+    fx.embed(half);
+    let rows: i64 = fx.query("SELECT count(*) FROM chunks");
+    let distinct: i64 = fx.query("SELECT count(DISTINCT content_hash) FROM chunks");
+
+    // A reopened index's owner holds no books: the resync loads them.
+    fx.forget_books();
+    let mut reconciler = fx.reconciler.borrow_mut();
+    let missing = block_on(reconciler.missing(false)).unwrap();
+    assert_eq!(
+        missing.reads,
+        Reads {
+            chunk_rows: rows as u64,
+            cache_probes: distinct as u64,
+            cache_slots: 0
+        }
+    );
+    assert_eq!(
+        missing.hashes().iter().copied().collect::<HashSet<_>>(),
+        fx.uncached(false)
+    );
+    // The books stay for the next resync and the next pass.
+    let again = block_on(reconciler.missing(false)).unwrap();
+    assert_eq!(again.reads, Reads::default());
+    drop(reconciler);
+    let pass = fx.reconcile_only(Options::default());
+    assert_eq!(pass.report.reads, Reads::default());
+    assert!(matches!(pass.presence, Presence::Whole(_)));
 }

@@ -5,7 +5,7 @@ use std::cell::RefCell;
 use std::fs;
 use std::future::Future;
 use std::num::NonZeroUsize;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
@@ -15,7 +15,7 @@ mod support;
 
 use counters::CapOff;
 use futures_executor::block_on;
-use repo_search_core::reconcile::{Books, Options, PendingChunk, Presence, Reconciler, missing};
+use repo_search_core::reconcile::{Books, Options, PendingChunk, Presence, Reconciler};
 use repo_search_core::search::{
     Channel, Error, FilterError, Filters, Mode, ON_THE_SPOT, Reconciliation, Request, Results,
     Retriever, TokenCounter, VectorReads,
@@ -226,15 +226,7 @@ impl Fixture {
             ),
         )
         .unwrap();
-        let code_pending = block_on(missing(
-            &index,
-            &cache,
-            MODEL,
-            tree.path(),
-            Options::default(),
-            Vec::new(),
-        ))
-        .unwrap();
+        let code_pending = missing(&index, &cache, tree.path(), false);
         let mut pending = code_pending.clone();
         let mut total = reconciled.report.chunks_total;
         let mut doc_chunks = 0;
@@ -375,6 +367,19 @@ impl Fixture {
                 .search(request, self.reconciliation.clone(), &Words),
         )
     }
+}
+
+/// The chunks of a scope with no vector, with their texts, listed by a
+/// reconciler of their own so no caller's books move.
+fn missing(
+    index: &Index,
+    cache: &VectorCache,
+    root: &Path,
+    include_ignored: bool,
+) -> Vec<PendingChunk> {
+    let mut reconciler = Reconciler::new(index.clone(), cache.clone(), MODEL, root);
+    let missing = block_on(reconciler.missing(include_ignored)).unwrap();
+    block_on(missing.pending(Vec::new())).unwrap().chunks
 }
 
 fn paths<C>(list: &Option<Vec<repo_search_core::search::FileHit<C>>>) -> Vec<&str> {
@@ -1063,16 +1068,7 @@ fn alternating_searches_show_ignored_files_only_when_asked() {
     let search = |include_ignored: bool, mode: Mode, files_only: bool| {
         let reconciled = pass(include_ignored);
         assert!(
-            block_on(missing(
-                &index,
-                &cache,
-                MODEL,
-                tree.path(),
-                Options { include_ignored },
-                Vec::new()
-            ))
-            .unwrap()
-            .is_empty(),
+            missing(&index, &cache, tree.path(), include_ignored).is_empty(),
             "everything is embedded"
         );
         let report = &reconciled.report;
@@ -1094,17 +1090,7 @@ fn alternating_searches_show_ignored_files_only_when_asked() {
     };
 
     let _first = pass(true);
-    let first_pending = block_on(missing(
-        &index,
-        &cache,
-        MODEL,
-        tree.path(),
-        Options {
-            include_ignored: true,
-        },
-        Vec::new(),
-    ))
-    .unwrap();
+    let first_pending = missing(&index, &cache, tree.path(), true);
     assert!(first_pending.iter().any(|p| p.path == "secret.rs"));
     embed(&first_pending);
 
@@ -1249,15 +1235,7 @@ fn vector_reads(files: usize) -> Scenario {
     let cache = block_on(VectorCache::open(common.path())).unwrap();
     let mut reconciler = Reconciler::new(index.clone(), cache.clone(), MODEL, tree.path());
     let embed_missing = || {
-        let pending = block_on(missing(
-            &index,
-            &cache,
-            MODEL,
-            tree.path(),
-            Options::default(),
-            Vec::new(),
-        ))
-        .unwrap();
+        let pending = missing(&index, &cache, tree.path(), false);
         let batch = pending
             .iter()
             .map(|p| (p.content_hash, document_vector(p)))
