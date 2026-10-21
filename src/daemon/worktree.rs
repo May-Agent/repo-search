@@ -736,6 +736,10 @@ impl<B: Backend> Owner<B> {
     /// `git rev-parse HEAD` concurrently, then hand the pass's outcome to
     /// the feeder, which orders it into the scheduler. It never cancels:
     /// its busy marker is cleared by the feeder, or here on failure.
+    /// `Barrier { running: true }` goes out before the writer flush, so a
+    /// vector the flush leaves uncommitted is reported to the scheduler
+    /// after the barrier began, and the scheduler drops it from this
+    /// barrier's `Enqueue` if the read missed it.
     async fn barrier(
         &mut self,
         model: &Arc<Model<B>>,
@@ -744,7 +748,7 @@ impl<B: Backend> Owner<B> {
     ) -> Result<(Report, String), String> {
         self.verify_index().await?;
         let sched = model.scheduler.clone();
-        sched.barrier(self.id, true).await;
+        sched.barrier(self.repo, true).await;
         match self.barrier_steps(model, include_ignored).await {
             Ok((report, commit, changes)) => {
                 self.report = Some(report.clone());
@@ -789,7 +793,7 @@ impl<B: Backend> Owner<B> {
             Err(message) => {
                 self.sync = None;
                 drop(ack);
-                sched.barrier(self.id, false).await;
+                sched.barrier(self.repo, false).await;
                 Err(message)
             }
         }

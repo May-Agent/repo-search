@@ -85,10 +85,13 @@ type OnChange = Box<dyn Fn(Headroom) + Send + Sync>;
 pub struct StubMonitor;
 
 /// A [`TokenCounter`] counting `len / 4 + 1` tokens; `hold` parks the
-/// first call, which in a barrier lands inside `reconcile`'s walk.
+/// first call, which in a barrier lands inside `reconcile`'s walk;
+/// `document_hold` parks the first `document_tokens` call once armed,
+/// which only the feeder's token counting makes.
 #[derive(Clone, Default)]
 pub struct StubCounter {
     hold: Option<Arc<Hold>>,
+    document_hold: Option<Arc<Hold>>,
 }
 
 impl StubCounter {
@@ -96,6 +99,10 @@ impl StubCounter {
         if let Some(hold) = &self.hold {
             hold.enter();
         }
+    }
+
+    fn tokens_of(title: &str, text: &str) -> usize {
+        (title.len() + text.len()) / 4 + 1
     }
 
     /// The bucket a document of `tokens` lands in.
@@ -115,7 +122,7 @@ impl TokenCounter for StubCounter {
 
     fn fits(&self, title: &str, text: &[&str], max: usize) -> bool {
         self.enter_hold();
-        self.document_tokens(title, &text.concat()) <= max
+        Self::tokens_of(title, &text.concat()) <= max
     }
 
     fn fit_end(&self, title: &str, text: &[&str], max: usize) -> Option<usize> {
@@ -133,7 +140,10 @@ impl TokenCounter for StubCounter {
 
     fn document_tokens(&self, title: &str, text: &str) -> usize {
         self.enter_hold();
-        (title.len() + text.len()) / 4 + 1
+        if let Some(hold) = &self.document_hold {
+            hold.enter();
+        }
+        Self::tokens_of(title, text)
     }
 }
 
@@ -154,6 +164,7 @@ pub struct IndexGate {
 /// signals `entered` and blocks until [`HoldHandle::open`]; every call
 /// after it passes.
 pub struct Hold {
+    armed: AtomicBool,
     entered: mpsc::Sender<()>,
     open: Arc<Barrier>,
     fired: AtomicBool,
@@ -165,6 +176,7 @@ pub struct HoldHandle {
     #[allow(dead_code)] // not every test target reads it
     pub entered: mpsc::Receiver<()>,
     open: Arc<Barrier>,
+    hold: Arc<Hold>,
 }
 
 impl HoldHandle {
@@ -173,25 +185,39 @@ impl HoldHandle {
     pub fn open(&self) {
         self.open.wait();
     }
+
+    /// Arms a hold installed disarmed: the next call into the hook is
+    /// held.
+    #[allow(dead_code)] // only the socket-level tests use it
+    pub fn arm(&self) {
+        self.hold.armed.store(true, Ordering::Release);
+    }
 }
 
 impl Hold {
-    fn install() -> (Arc<Self>, HoldHandle) {
+    fn install(armed: bool) -> (Arc<Self>, HoldHandle) {
         let (entered_tx, entered) = mpsc::channel();
         let open = Arc::new(Barrier::new(2));
-        (
-            Arc::new(Self {
-                entered: entered_tx,
-                open: open.clone(),
-                fired: AtomicBool::new(false),
-            }),
-            HoldHandle { entered, open },
-        )
+        let hold = Arc::new(Self {
+            armed: AtomicBool::new(armed),
+            entered: entered_tx,
+            open: open.clone(),
+            fired: AtomicBool::new(false),
+        });
+        let handle = HoldHandle {
+            entered,
+            open,
+            hold: hold.clone(),
+        };
+        (hold, handle)
     }
 
     /// The first call reports on `entered` and blocks until `open`; calls
     /// after it — and every call once nobody is listening — pass.
     fn enter(&self) {
+        if !self.armed.load(Ordering::Acquire) {
+            return;
+        }
         if self.fired.swap(true, Ordering::AcqRel) {
             return;
         }
@@ -246,6 +272,7 @@ pub struct StubBackend {
     ane_open_fails: AtomicBool,
     open_ane_hold: Option<Arc<Hold>>,
     counter_hold: Option<Arc<Hold>>,
+    document_hold: Option<Arc<Hold>>,
     gpu_opens: AtomicUsize,
     gpu_open_fails: AtomicBool,
     headroom: tokio::sync::watch::Sender<Headroom>,
@@ -276,6 +303,7 @@ impl StubBackend {
             ane_open_fails: AtomicBool::new(false),
             open_ane_hold: None,
             counter_hold: None,
+            document_hold: None,
             gpu_opens: AtomicUsize::new(0),
             gpu_open_fails: AtomicBool::new(false),
             headroom,
@@ -324,7 +352,7 @@ impl StubBackend {
     /// until the handle's `open`.
     #[allow(dead_code)] // only the socket-level tests use it
     pub fn hold_open_ane(&mut self) -> HoldHandle {
-        let (hold, handle) = Hold::install();
+        let (hold, handle) = Hold::install(true);
         self.open_ane_hold = Some(hold);
         handle
     }
@@ -333,8 +361,19 @@ impl StubBackend {
     /// inside a barrier that is `reconcile`'s walk.
     #[allow(dead_code)] // only the socket-level tests use it
     pub fn hold_counter(&mut self) -> HoldHandle {
-        let (hold, handle) = Hold::install();
+        let (hold, handle) = Hold::install(true);
         self.counter_hold = Some(hold);
+        handle
+    }
+
+    /// Installs a disarmed hold on the model counter's
+    /// `document_tokens`: once the handle is armed, the next call (the
+    /// feeder counting a non-empty feed, after its cache read) signals
+    /// `entered` and blocks until the handle's `open`.
+    #[allow(dead_code)] // only the socket-level tests use it
+    pub fn hold_document_tokens(&mut self) -> HoldHandle {
+        let (hold, handle) = Hold::install(false);
+        self.document_hold = Some(hold);
         handle
     }
 
@@ -409,6 +448,7 @@ impl Backend for StubBackend {
         Ok((
             StubCounter {
                 hold: self.counter_hold.clone(),
+                document_hold: self.document_hold.clone(),
             },
             BUCKETS.into(),
         ))

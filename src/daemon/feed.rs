@@ -24,8 +24,9 @@ const INBOX: usize = 8;
 
 /// What a barrier hands the feeder.
 pub enum Feed {
-    /// Rebuild the worktree's whole pending set in `options`' scope with
-    /// `reconcile::missing` and replace the scheduler's interest with it.
+    /// Flush the repository's writer, then rebuild the worktree's whole
+    /// pending set in `options`' scope with `reconcile::missing` and
+    /// replace the scheduler's interest with it.
     Resync {
         /// The index the set is read from: the owner's current handle.
         index: Index,
@@ -112,12 +113,25 @@ pub fn spawn<B: Backend>(config: FeederConfig<B>) -> mpsc::Sender<FeedMsg> {
                     known,
                 } => {
                     scope = Some((index.clone(), options));
-                    match reconcile::missing(&index, &cache, &model_id, &root, options, known).await
-                    {
+                    // Vectors the writer still buffers would read as
+                    // missing: the scheduler would drop them from the
+                    // `Replace`, but only after their text was rebuilt and
+                    // counted for nothing.
+                    let pending = async {
+                        writer
+                            .flush()
+                            .await
+                            .map_err(|e| format!("vector writer flush: {e}"))?;
+                        reconcile::missing(&index, &cache, &model_id, &root, options, known)
+                            .await
+                            .map_err(|e| e.to_string())
+                    }
+                    .await;
+                    match pending {
                         Ok(pending) => count_pending::<B>(pending, counter.clone())
                             .await
                             .map(Interest::Replace),
-                        Err(e) => Err(e.to_string()),
+                        Err(message) => Err(message),
                     }
                 }
                 Feed::Change(reconcile::Changes { added, dropped }) => {
@@ -151,7 +165,9 @@ pub fn spawn<B: Backend>(config: FeederConfig<B>) -> mpsc::Sender<FeedMsg> {
             if let Some(ack) = ack {
                 let _ = ack.send(outcome);
             }
-            sched.barrier(worktree, false).await;
+            // Only after this feed's `Enqueue`: until then the scheduler
+            // keeps the hashes committed since the barrier began.
+            sched.barrier(repo, false).await;
         }
     });
     tx
