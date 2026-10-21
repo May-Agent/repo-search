@@ -65,8 +65,8 @@ impl Client {
             .await
             .ok_or(ClientError::Closed)?
             .map_err(codec_error)?;
-        match serde_json::from_str::<Final>(&line) {
-            Ok(Final::Error(report)) => Err(ClientError::Refused(report)),
+        match serde_json::from_str::<Event>(&line) {
+            Ok(Event::Final(Final::Error(report))) => Err(ClientError::Refused(report)),
             Ok(_) => Err(ClientError::Protocol(
                 "the handshake was answered with a non-error final frame",
             )),
@@ -252,10 +252,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("daemon.sock");
         let listener = UnixListener::bind(&socket).unwrap();
-        let refusal = line(&Final::Error(ErrorReport {
+        let refusal = line(&Event::Final(Final::Error(ErrorReport {
             kind: ErrorKind::ProtocolMismatch,
             message: "daemon is protocol 2".into(),
-        }));
+        })));
         let (counted, connections) = std::sync::mpsc::channel();
         let server = tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {

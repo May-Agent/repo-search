@@ -19,7 +19,8 @@ mod vectors;
 pub use embedder::EmbedService;
 pub use fuse::{Channel, Fused, RRF_K, fuse};
 pub use output::{
-    CodeChunk, DocChunk, FileHit, Freshness, Reconciliation, Results, Unparsable, UnparsableReason,
+    CodeChunk, Coverage, DocChunk, FileHit, Freshness, Reconciliation, Results, Unparsable,
+    UnparsableReason,
 };
 pub use retriever::Retriever;
 pub use scope::Scope;

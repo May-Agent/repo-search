@@ -20,7 +20,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Barrier};
 use std::time::Duration;
 
-use repo_search::install::{self, AgentConfig, Check, SystemLaunchctl, ensure_agent};
+use clap::Parser;
+use repo_search::cli::{self, Cli, Exit, Terminal};
+use repo_search::install::{self, AgentConfig, Check, Launchctl, SystemLaunchctl, ensure_agent};
 use repo_search::kqueue::ExitWatch;
 use repo_search::launchd::{LABEL, LaunchAgent};
 use repo_search::protocol::{Final, Hello, Request};
@@ -104,9 +106,30 @@ fn agent(name: &str, tmp: tempfile::TempDir, model_cache: PathBuf, idle_exit: Du
 
 impl Drop for Agent {
     /// Boot the test agent out of `user/<uid>` whether the test passed or
-    /// panicked; a daemon it relaunched dies with it.
+    /// panicked; a daemon it relaunched dies with it. As in
+    /// `ensure_agent`'s teardown, `bootout` returns before launchd has
+    /// torn the job down, so a running process's exit is awaited — the
+    /// label leaves `launchctl list` only once the teardown ends.
+    /// Assertions run only when the test is not already unwinding, so a
+    /// failure keeps its own panic.
     fn drop(&mut self) {
-        let _ = launchctl(&["bootout", &self.target()]);
+        let mut launchctl = SystemLaunchctl;
+        let pid = launchctl
+            .service(&self.target())
+            .ok()
+            .flatten()
+            .and_then(|service| service.pid);
+        let exit = pid.and_then(|pid| ExitWatch::register(pid).ok());
+        let booted = launchctl.bootout(&self.target());
+        if !std::thread::panicking() {
+            booted.expect("the test agent boots out");
+        }
+        if let Some(exit) = exit {
+            let exited = exit.wait(install::TEARDOWN_TIMEOUT);
+            if !std::thread::panicking() {
+                assert!(exited, "the test agent's daemon exits on bootout");
+            }
+        }
     }
 }
 
@@ -353,4 +376,138 @@ async fn concurrent_installs_bootstrap_once() {
         "exactly one of the racers installs: {outcomes:?}"
     );
     assert!(agent.socket.exists(), "the install left the socket bound");
+}
+/// A client invocation parsed the way `main` parses argv.
+fn invocation(args: &[&str]) -> cli::Invocation {
+    Cli::try_parse_from(args)
+        .expect("the arguments parse")
+        .invocation()
+}
+
+/// The `Env` `cli::run` gets against real launchd: the test `AgentConfig`,
+/// the real `launchctl`, and the handshake matching the binary the plist
+/// names — computed when the `Env` is built, so a replaced program yields
+/// a new `BuildId`.
+fn cli_env(cwd: &Path, config: AgentConfig, program: &Path) -> cli::Env<SystemLaunchctl> {
+    cli::Env {
+        cwd: cwd.to_path_buf(),
+        agent: config,
+        launchctl: SystemLaunchctl,
+        hello: hello(program),
+    }
+}
+
+/// The `Vec<u8>` terminal `cli::run` writes into in tests; stderr is not
+/// a TTY.
+fn vec_term() -> Terminal<Vec<u8>, Vec<u8>> {
+    Terminal {
+        stdout: Vec::new(),
+        stderr: Vec::new(),
+        stderr_tty: false,
+    }
+}
+
+/// `cli::run` end to end through real launchd: a run from a repo
+/// subdirectory installs the agent, the daemon answers the query and the
+/// run exits 0.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "real launchd and model; the release gate runs it"]
+async fn install_answers_through_cli_run() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let model_cache = tmp.path().join("models");
+    let _store = model::model_store(model_cache.clone());
+    let repo = repo::repo(&[("src/lib.rs".into(), repo::rust_fn("cli_probe", 500))]);
+    let config = config(
+        "cli",
+        tmp.path(),
+        program(),
+        model_cache,
+        Duration::from_secs(600),
+    );
+    let _agent = Agent {
+        label: config.agent.label.clone(),
+        socket: config.agent.socket.clone(),
+        _tmp: tmp,
+    };
+
+    let env = cli_env(&repo.root.join("src"), config, &program());
+    let mut term = vec_term();
+    let exit = cli::run(invocation(&["search", "cli_probe"]), env, &mut term).await;
+    assert_eq!(
+        exit,
+        Exit::Ok,
+        "stderr: {}",
+        String::from_utf8_lossy(&term.stderr)
+    );
+    let stdout = String::from_utf8(term.stdout).expect("stdout is utf-8");
+    assert!(stdout.contains("cli_probe"), "stdout: {stdout}");
+}
+
+/// Install and search so the daemon runs, record its pid, then replace
+/// the installed program file by renaming a fresh copy over it — a new
+/// inode and mtime, as installers do (never write into the running
+/// executable, which macOS may kill). The next `cli::run` carries the new
+/// `BuildId`: the mismatched daemon shuts down, launchd restarts the
+/// binary on disk, the query answers and `Status` reports a new pid. The
+/// retry may wait out launchd's `ThrottleInterval`; that is expected.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "real launchd and model; the release gate runs it"]
+async fn replaced_binary_restarts_the_daemon() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let model_cache = tmp.path().join("models");
+    let _store = model::model_store(model_cache.clone());
+    let repo = repo::repo(&[("src/lib.rs".into(), repo::rust_fn("replace_probe", 500))]);
+
+    // The plist's program is a copy in the temp dir, so the test can
+    // replace the file launchd execs.
+    let installed_program = tmp.path().join("search");
+    std::fs::copy(program(), &installed_program).expect("the program copies");
+    let dir = tmp.path().to_path_buf();
+    let make_config = || {
+        config(
+            "replace",
+            &dir,
+            installed_program.clone(),
+            model_cache.clone(),
+            Duration::from_secs(600),
+        )
+    };
+    let socket = make_config().agent.socket;
+    let agent = Agent {
+        label: make_config().agent.label,
+        socket: socket.clone(),
+        _tmp: tmp,
+    };
+
+    let env = cli_env(&repo.root, make_config(), &installed_program);
+    let mut term = vec_term();
+    let exit = cli::run(invocation(&["search", "replace_probe"]), env, &mut term).await;
+    assert_eq!(
+        exit,
+        Exit::Ok,
+        "stderr: {}",
+        String::from_utf8_lossy(&term.stderr)
+    );
+    // This `Hello` was built for the pre-replacement file identity.
+    let old_hello = hello(&installed_program);
+    let first = daemon_pid(&socket, &old_hello, &repo.root).await;
+
+    let replacement = agent._tmp.path().join("search-new");
+    std::fs::copy(program(), &replacement).expect("the replacement copies");
+    std::fs::rename(&replacement, &installed_program).expect("the replacement renames");
+
+    let env = cli_env(&repo.root, make_config(), &installed_program);
+    let mut term = vec_term();
+    let exit = cli::run(invocation(&["search", "replace_probe"]), env, &mut term).await;
+    assert_eq!(
+        exit,
+        Exit::Ok,
+        "stderr: {}",
+        String::from_utf8_lossy(&term.stderr)
+    );
+    let second = daemon_pid(&socket, &hello(&installed_program), &repo.root).await;
+    assert_ne!(
+        first, second,
+        "the replaced binary restarted the daemon under launchd"
+    );
 }

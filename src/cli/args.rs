@@ -1,0 +1,378 @@
+//! The `search` command line: `Cli` parses argv and [`Cli::invocation`]
+//! turns the parse into what `main` dispatches on. `status` and `index`
+//! are subcommands only as a bare first argument — every other first
+//! argument is the free-text query.
+
+use std::path::PathBuf;
+use std::time::Duration;
+
+use clap::{ArgMatches, Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
+
+use crate::daemon;
+use crate::protocol::WireMode;
+
+/// Search a repository for code you can describe but cannot name.
+///
+/// Exit codes follow grep: 0 results, 1 none, 2 error.
+#[derive(Debug, Parser)]
+#[command(
+    name = "search",
+    version = crate::model_store::VERSION_INFO,
+    subcommand_precedence_over_arg = true,
+    subcommand_negates_reqs = true,
+    args_conflicts_with_subcommands = true,
+    disable_help_subcommand = true,
+    after_help = "To search for the single word `status` or `index`, write `search -- status`."
+)]
+struct RawCli {
+    /// Free-text query.
+    #[arg(required_unless_present = "daemon",
+          value_parser = clap::builder::NonEmptyStringValueParser::new())]
+    query: Option<String>,
+
+    #[command(flatten)]
+    options: SearchOptions,
+
+    #[command(subcommand)]
+    command: Option<Command>,
+
+    /// Run as the launchd socket-activated daemon.
+    #[arg(long, hide = true, conflicts_with = "query")]
+    daemon: bool,
+
+    /// Exit after this many seconds with no connections and no work.
+    #[arg(
+        long,
+        hide = true,
+        requires = "daemon",
+        conflicts_with = "query",
+        value_name = "SECS"
+    )]
+    idle_exit_secs: Option<u64>,
+
+    /// The model cache root, defaulting to the per-user cache.
+    #[arg(
+        long,
+        hide = true,
+        requires = "daemon",
+        conflicts_with = "query",
+        value_name = "DIR"
+    )]
+    model_cache: Option<PathBuf>,
+}
+
+/// The parsed `search` command line.
+///
+/// `Cli` wraps the clap derive to add the one check the attributes cannot
+/// express. With `args_conflicts_with_subcommands`, clap tries subcommand
+/// names only until the first valid argument, so `search --budget 10
+/// status` reaches the parser as `Search` with the query `status` — the
+/// option is applied, never dropped, but the subcommand's name is now a
+/// query the user did not write. `search -- status` remains the escape,
+/// and subcommand options go after the subcommand.
+#[derive(Debug)]
+pub struct Cli(RawCli);
+
+impl Cli {
+    /// Rejects a `status`/`index` query carrying arguments: `search
+    /// --budget 10 status` is a usage error, `search -- status` is not.
+    fn checked(raw: RawCli, matches: &ArgMatches) -> Result<Self, clap::Error> {
+        let named_query = matches!(raw.query.as_deref(), Some("status" | "index"));
+        let arguments = matches.ids().any(|id| {
+            id != "query"
+                && matches.value_source(id.as_str()) == Some(clap::parser::ValueSource::CommandLine)
+        });
+        if raw.command.is_none() && named_query && arguments {
+            return Err(Self::command().error(
+                clap::error::ErrorKind::ArgumentConflict,
+                format!(
+                    "options cannot precede a subcommand; to search for `{}`, write `search -- {}`",
+                    raw.query.as_deref().expect("checked"),
+                    raw.query.as_deref().expect("checked"),
+                ),
+            ));
+        }
+        Ok(Self(raw))
+    }
+}
+
+impl clap::CommandFactory for Cli {
+    fn command() -> clap::Command {
+        RawCli::command()
+    }
+
+    fn command_for_update() -> clap::Command {
+        RawCli::command_for_update()
+    }
+}
+
+impl FromArgMatches for Cli {
+    fn from_arg_matches(matches: &ArgMatches) -> Result<Self, clap::Error> {
+        Self::checked(RawCli::from_arg_matches(matches)?, matches)
+    }
+
+    fn from_arg_matches_mut(matches: &mut ArgMatches) -> Result<Self, clap::Error> {
+        Self::checked(RawCli::from_arg_matches_mut(matches)?, matches)
+    }
+
+    fn update_from_arg_matches(&mut self, matches: &ArgMatches) -> Result<(), clap::Error> {
+        self.0.update_from_arg_matches(matches)
+    }
+
+    fn update_from_arg_matches_mut(&mut self, matches: &mut ArgMatches) -> Result<(), clap::Error> {
+        self.0.update_from_arg_matches_mut(matches)
+    }
+}
+
+impl Parser for Cli {}
+
+/// Options for `search <query>`.
+#[derive(Debug, Args)]
+pub struct SearchOptions {
+    /// Return results until the token budget is used.
+    #[arg(long, default_value_t = 4000, value_parser = clap::value_parser!(u32).range(1..))]
+    pub budget: u32,
+
+    /// Ranked file list only.
+    #[arg(short = 'l', long)]
+    pub files: bool,
+
+    /// Retrieval channels.
+    #[arg(long, value_enum, default_value_t = Mode::Hybrid)]
+    pub mode: Mode,
+
+    /// Restrict paths (repeatable).
+    #[arg(long)]
+    pub path: Vec<String>,
+
+    /// Restrict languages (repeatable, comma-separated).
+    #[arg(long, value_delimiter = ',')]
+    pub lang: Vec<String>,
+
+    /// Restrict syntactic kinds (fn, struct, trait, ...).
+    #[arg(long, value_delimiter = ',')]
+    pub kind: Vec<String>,
+
+    /// Restrict symbol path, e.g. `Environment::*`.
+    #[arg(long)]
+    pub symbol: Option<String>,
+
+    /// Include files `.gitignore` excludes.
+    #[arg(long)]
+    pub include_ignored: bool,
+
+    /// Structured output.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum Mode {
+    /// FTS5 BM25 and vector KNN merged by reciprocal-rank fusion.
+    Hybrid,
+    /// FTS5 over chunk title and text.
+    Lexical,
+    /// Vector KNN only.
+    Semantic,
+}
+
+impl From<Mode> for WireMode {
+    fn from(mode: Mode) -> Self {
+        match mode {
+            Mode::Hybrid => Self::Hybrid,
+            Mode::Lexical => Self::Lexical,
+            Mode::Semantic => Self::Semantic,
+        }
+    }
+}
+
+#[derive(Debug, Subcommand)]
+pub enum Command {
+    /// Coverage, pending chunks, model, GPU and daemon state.
+    Status {
+        /// Structured output.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Reconcile now.
+    Index {
+        /// Block until every chunk has a vector.
+        #[arg(long)]
+        wait: bool,
+        /// Structured output.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+/// What a parsed [`Cli`] dispatches on.
+#[derive(Debug)]
+pub enum Invocation {
+    /// `search --daemon`: the launchd job's entry point.
+    Daemon {
+        /// Idle deadline; [`daemon::IDLE_EXIT`] unless `--idle-exit-secs`.
+        idle_exit: Duration,
+        /// `--model-cache`, when given.
+        model_cache: Option<PathBuf>,
+    },
+    /// `search <query>`.
+    Search {
+        /// The free-text query.
+        query: String,
+        /// The search options.
+        options: SearchOptions,
+    },
+    /// `search status`.
+    Status {
+        /// `--json`.
+        json: bool,
+    },
+    /// `search index`.
+    Index {
+        /// `--wait`.
+        wait: bool,
+        /// `--json`.
+        json: bool,
+    },
+}
+
+impl Cli {
+    /// The invocation this parse describes.
+    pub fn invocation(self) -> Invocation {
+        let raw = self.0;
+        if raw.daemon {
+            return Invocation::Daemon {
+                idle_exit: raw
+                    .idle_exit_secs
+                    .map_or(daemon::IDLE_EXIT, Duration::from_secs),
+                model_cache: raw.model_cache,
+            };
+        }
+        match raw.command {
+            Some(Command::Status { json }) => Invocation::Status { json },
+            Some(Command::Index { wait, json }) => Invocation::Index { wait, json },
+            None => Invocation::Search {
+                query: raw.query.expect("clap requires the query"),
+                options: raw.options,
+            },
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use clap::CommandFactory;
+    use repo_search_core::CHUNKER_FINGERPRINT;
+
+    use crate::model_store::{MODEL_LICENSE, MODEL_NAME, VERSION_INFO};
+
+    fn parsed(args: &[&str]) -> Invocation {
+        Cli::try_parse_from(args)
+            .expect("the arguments parse")
+            .invocation()
+    }
+
+    fn search(invocation: Invocation) -> (String, SearchOptions) {
+        match invocation {
+            Invocation::Search { query, options } => (query, options),
+            other => panic!("expected a Search, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn version_flag_reports_binary_and_model() {
+        assert_eq!(Cli::command().get_version(), Some(VERSION_INFO));
+        let text = VERSION_INFO;
+        assert!(text.contains(env!("CARGO_PKG_VERSION")));
+        assert!(text.contains(CHUNKER_FINGERPRINT));
+        assert!(text.contains(MODEL_NAME));
+        assert!(text.contains(MODEL_LICENSE));
+    }
+
+    #[test]
+    fn first_argument_words_are_queries() {
+        for arg in ["daemon", "help", "statu", "status page"] {
+            let (query, _) = search(parsed(&["search", arg]));
+            assert_eq!(query, arg, "{arg:?} is the query, not a subcommand");
+        }
+    }
+
+    #[test]
+    fn double_dash_makes_status_a_query() {
+        let (query, _) = search(parsed(&["search", "--", "status"]));
+        assert_eq!(query, "status");
+    }
+
+    #[test]
+    fn bare_status_and_index_are_subcommands() {
+        match parsed(&["search", "status"]) {
+            Invocation::Status { json } => assert!(!json),
+            other => panic!("expected Status, got {other:?}"),
+        }
+        match parsed(&["search", "status", "--json"]) {
+            Invocation::Status { json } => assert!(json),
+            other => panic!("expected Status --json, got {other:?}"),
+        }
+        match parsed(&["search", "index", "--wait", "--json"]) {
+            Invocation::Index { wait, json } => {
+                assert!(wait);
+                assert!(json);
+            }
+            other => panic!("expected Index --wait --json, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn search_options_and_subcommand_are_a_usage_error() {
+        assert!(Cli::try_parse_from(["search", "--budget", "10", "status"]).is_err());
+    }
+
+    #[test]
+    fn a_missing_or_empty_query_is_a_usage_error() {
+        assert!(Cli::try_parse_from(["search"]).is_err());
+        assert!(Cli::try_parse_from(["search", ""]).is_err());
+    }
+
+    #[test]
+    fn a_zero_budget_is_a_usage_error() {
+        assert!(Cli::try_parse_from(["search", "q", "--budget", "0"]).is_err());
+    }
+
+    #[test]
+    fn lang_and_kind_repeat_and_split_on_commas() {
+        let (_, options) = search(parsed(&[
+            "search",
+            "q",
+            "--lang",
+            "rust,python",
+            "--lang",
+            "go",
+            "--kind",
+            "fn,struct",
+        ]));
+        assert_eq!(options.lang, ["rust", "python", "go"]);
+        assert_eq!(options.kind, ["fn", "struct"]);
+    }
+
+    #[test]
+    fn daemon_flags_form_the_daemon_invocation() {
+        match parsed(&["search", "--daemon"]) {
+            Invocation::Daemon {
+                idle_exit,
+                model_cache,
+            } => {
+                assert_eq!(idle_exit, daemon::IDLE_EXIT);
+                assert_eq!(model_cache, None);
+            }
+            other => panic!("expected Daemon, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn daemon_flags_conflict_with_client_arguments() {
+        assert!(Cli::try_parse_from(["search", "--daemon", "q"]).is_err());
+        assert!(Cli::try_parse_from(["search", "q", "--idle-exit-secs", "3"]).is_err());
+    }
+}

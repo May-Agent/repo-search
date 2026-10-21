@@ -58,6 +58,8 @@ enum Control {
     FailNextBootstrap(String),
     /// Make `bootstrap` succeed without binding the socket.
     BootstrapWithoutSocket,
+    /// Move the loaded daemon task's join handle to the caller.
+    TakeDaemonJoin(mpsc::Sender<Option<JoinHandle<Result<(), repo_search::daemon::Error>>>>),
     /// End the owner thread.
     Shutdown,
 }
@@ -104,6 +106,10 @@ struct Owner {
     socket: PathBuf,
     runtime: tokio::runtime::Handle,
     models: tempfile::TempDir,
+    /// The model layout the bootstrapped daemon's store gets.
+    model: Model,
+    /// The backend every bootstrapped daemon runs.
+    backend: Arc<StubBackend>,
     build: BuildId,
 }
 
@@ -162,12 +168,12 @@ impl Owner {
             // stub daemon then accepts on it.
             let listener = std::os::unix::net::UnixListener::bind(&self.socket)
                 .expect("the fake binds the socket");
-            let store = daemon::model_store(self.models.path().join("models"), &Model::Cached);
+            let store = daemon::model_store(self.models.path().join("models"), &self.model);
             Process::Daemon(daemon::spawn_on(
                 &self.runtime,
                 listener,
                 store,
-                Arc::new(StubBackend::new(mpsc::channel().0)),
+                self.backend.clone(),
                 Duration::from_secs(600),
                 self.build,
             ))
@@ -226,6 +232,19 @@ impl Owner {
                     ));
                 }
                 Request::Control(control) => match control {
+                    Control::TakeDaemonJoin(reply) => {
+                        let handle =
+                            self.loaded.as_mut().and_then(|loaded| {
+                                match std::mem::replace(&mut loaded.process, Process::None) {
+                                    Process::Daemon(join) => Some(join),
+                                    other => {
+                                        loaded.process = other;
+                                        None
+                                    }
+                                }
+                            });
+                        let _ = reply.send(handle);
+                    }
                     Control::LoadStandIn => {
                         let child = std::process::Command::new("/bin/cat")
                             .stdin(std::process::Stdio::piped())
@@ -268,6 +287,24 @@ impl FakeLaunchd {
     /// A fake launchd for a service whose socket lives at `socket`; jobs
     /// it bootstraps run the stub daemon on `runtime` with `build`.
     pub fn new(socket: PathBuf, runtime: tokio::runtime::Handle, build: BuildId) -> Self {
+        Self::with_daemon(
+            socket,
+            runtime,
+            build,
+            Model::Cached,
+            StubBackend::new(mpsc::channel().0),
+        )
+    }
+
+    /// A fake whose bootstrapped daemon runs `model` on `backend` — the
+    /// tests that drive progress output need both knobs.
+    pub fn with_daemon(
+        socket: PathBuf,
+        runtime: tokio::runtime::Handle,
+        build: BuildId,
+        model: Model,
+        backend: StubBackend,
+    ) -> Self {
         let (tx, rx) = mpsc::channel();
         let (calls, calls_rx) = mpsc::channel();
         let owner = Owner {
@@ -278,6 +315,8 @@ impl FakeLaunchd {
             socket,
             runtime,
             models: tempfile::tempdir().expect("the fake's model cache"),
+            model,
+            backend: Arc::new(backend),
             build,
         };
         let thread = std::thread::spawn(move || owner.run(rx, calls));
@@ -329,6 +368,16 @@ impl FakeLaunchd {
         self.tx
             .send(Request::Control(Control::BootstrapWithoutSocket))
             .expect("the launchd thread lives");
+    }
+
+    /// The loaded daemon task's join handle, when a bootstrap started one —
+    /// the test awaits the daemon's `run` on it.
+    pub fn take_daemon_join(&self) -> Option<JoinHandle<Result<(), repo_search::daemon::Error>>> {
+        let (reply, rx) = mpsc::channel();
+        self.tx
+            .send(Request::Control(Control::TakeDaemonJoin(reply)))
+            .expect("the launchd thread lives");
+        rx.recv().expect("the launchd thread answers")
     }
 }
 

@@ -1,0 +1,6 @@
+worktree  {{ worktree.display() }}
+index     {{ self.index_line() }}
+{% if index.is_some() %}pending   {{ self.pending_line() }}
+{% endif %}model     {{ self.model_line() }}
+gpu       {{ self.gpu_line() }}
+daemon    {{ self.daemon_line() }}

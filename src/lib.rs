@@ -1,5 +1,9 @@
 //! `repo-search` library surface.
 
+/// The `search` client: argument parsing, the agent check, progress and
+/// output rendering.
+#[cfg(target_os = "macos")]
+pub mod cli;
 /// The library client of the `search` daemon.
 pub mod client;
 /// The `search` daemon.

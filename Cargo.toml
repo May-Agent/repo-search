@@ -59,6 +59,7 @@ tempfile = { version = "3.27.0", default-features = false }
 thiserror = { version = "2.0.21", default-features = false }
 tokio = { version = "1.54.0", default-features = false, features = [
     "fs",
+    "io-std",
     "io-util",
     "macros",
     "net",
