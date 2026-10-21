@@ -1,15 +1,14 @@
-//! Real launchd tests: a per-pid `LaunchAgent` is bootstrapped into
-//! `gui/<uid>`, and the daemon lifecycle — idle exit, kill, relaunch on the
-//! next connection — runs through launchd itself. They need a GUI launchd
-//! domain, `REPO_SEARCH_MODEL_DIR` and `REPO_SEARCH_CORPUS`, so they are
-//! `#[ignore]`d and run by the release gate.
+//! Real launchd tests: a per-pid `LaunchAgent` is installed into
+//! `user/<uid>` through `ensure_agent`, and the daemon lifecycle — idle
+//! exit, kill, relaunch on the next connection, reinstall — runs through
+//! launchd itself. They need `REPO_SEARCH_MODEL_DIR` and
+//! `REPO_SEARCH_CORPUS`, so they are `#[ignore]`d and run by the release
+//! gate.
 
 #![cfg(target_os = "macos")]
 
-// `daemon.rs` uses `watch_stdin`; this file only waits for exits.
-#[allow(dead_code)]
-#[path = "support/host.rs"]
-mod host;
+#[path = "support/client.rs"]
+mod client;
 #[path = "support/model.rs"]
 mod model;
 // `daemon.rs` uses the rest of the fixture.
@@ -18,81 +17,25 @@ mod model;
 mod repo;
 
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Barrier};
+use std::time::Duration;
 
-use askama::Template;
+use clap::Parser;
+use repo_search::cli::{self, Cli, Exit, Terminal};
+use repo_search::install::{self, AgentConfig, Check, Launchctl, SystemLaunchctl, ensure_agent};
+use repo_search::kqueue::ExitWatch;
 use repo_search::launchd::{LABEL, LaunchAgent};
-use repo_search::protocol::{Final, Request};
+use repo_search::protocol::{Final, Hello, Request};
 
-/// Waits for `path` to appear through a kqueue `EVFILT_VNODE`/`NOTE_WRITE`
-/// watch on its parent directory — event-driven, not polled. `launchctl
-/// bootstrap` returns once the job is loaded but materializes `SockPathName`
-/// a moment later; connecting without the wait races that window and reads
-/// `ENOENT`. Returns `false` on timeout.
-fn wait_for_path(path: &Path, timeout: Duration) -> bool {
-    use std::os::fd::AsRawFd;
-
-    if path.exists() {
-        return true;
-    }
-    let dir = std::fs::File::open(path.parent().expect("path has a parent"))
-        .expect("the socket's parent dir opens");
-    // SAFETY: kqueue() has no preconditions.
-    let kq = unsafe { libc::kqueue() };
-    assert!(
-        kq >= 0,
-        "kqueue failed: {}",
-        std::io::Error::last_os_error()
-    );
-    let change = libc::kevent {
-        ident: dir.as_raw_fd() as libc::uintptr_t,
-        filter: libc::EVFILT_VNODE,
-        flags: libc::EV_ADD | libc::EV_CLEAR,
-        fflags: libc::NOTE_WRITE,
-        data: 0,
-        udata: std::ptr::null_mut(),
-    };
-    let mut event = libc::kevent {
-        ident: 0,
-        filter: 0,
-        flags: 0,
-        fflags: 0,
-        data: 0,
-        udata: std::ptr::null_mut(),
-    };
-    // Register once, then wait; the path check after each event names what
-    // changed.
-    // SAFETY: `kq` is a live kqueue fd and `change` a valid kevent.
-    let rc = unsafe { libc::kevent(kq, &change, 1, std::ptr::null_mut(), 0, std::ptr::null()) };
-    assert_eq!(rc, 0, "the vnode watch failed to register");
-    let deadline = Instant::now() + timeout;
-    let found = loop {
-        if path.exists() {
-            break true;
-        }
-        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-            break false;
-        };
-        let timespec = libc::timespec {
-            tv_sec: remaining.as_secs() as libc::time_t,
-            tv_nsec: libc::c_long::from(remaining.subsec_nanos()),
-        };
-        // SAFETY: `kq` is a live kqueue fd; `event` is a valid kevent.
-        let n = unsafe { libc::kevent(kq, std::ptr::null(), 0, &mut event, 1, &timespec) };
-        if n == 0 {
-            break false;
-        }
-        assert!(n > 0, "kevent failed: {}", std::io::Error::last_os_error());
-    };
-    // SAFETY: `kq` is owned by this call.
-    unsafe { libc::close(kq) };
-    found
+/// The `search` binary the test agents run.
+fn program() -> PathBuf {
+    PathBuf::from(env!("CARGO_BIN_EXE_search"))
 }
 
-/// The calling process's uid, for the `gui/<uid>` domain.
-fn uid() -> u32 {
-    // SAFETY: getuid cannot fail.
-    unsafe { libc::getuid() }
+/// The handshake matching a daemon running `program` — the `search`
+/// binary, not this test binary.
+fn hello(program: &Path) -> Hello {
+    client::hello_for(program)
 }
 
 /// Runs `launchctl` and returns its output.
@@ -103,6 +46,35 @@ fn launchctl(args: &[&str]) -> std::process::Output {
         .expect("launchctl runs")
 }
 
+/// The test config: label `<LABEL>.test-<pid>-<name>` — per test and per
+/// process, because a stray agent from another run cannot collide with it —
+/// and the plist, lock, socket and log all inside `dir`.
+fn config(
+    name: &str,
+    dir: &Path,
+    program: PathBuf,
+    model_cache: PathBuf,
+    idle_exit: Duration,
+) -> AgentConfig {
+    AgentConfig {
+        domain: repo_search::launchd::domain(),
+        plist: dir.join("agent.plist"),
+        lock: dir.join("install.lock"),
+        agent: LaunchAgent {
+            label: format!("{LABEL}.test-{}-{name}", std::process::id()),
+            program,
+            socket: dir.join("daemon.sock"),
+            idle_exit,
+            model_cache: Some(model_cache),
+            stderr: dir.join("daemon.log"),
+        },
+        timeouts: install::Timeouts {
+            teardown: install::TEARDOWN_TIMEOUT,
+            socket: install::SOCKET_TIMEOUT,
+        },
+    }
+}
+
 /// A bootstrapped launchd agent; booted out on drop.
 struct Agent {
     label: String,
@@ -110,39 +82,21 @@ struct Agent {
     _tmp: tempfile::TempDir,
 }
 
-/// Renders the test agent's plist, writes it into `tmp` and bootstraps it
-/// in `gui/<uid>`. The label is `<LABEL>.test-<pid>-<name>`: per test and
-/// per process, because sequential bootstraps of one label race launchd's
-/// asynchronous `bootout` teardown, and a stray agent from another run
-/// cannot collide with it.
+impl Agent {
+    /// The `<domain>/<label>` bootout target.
+    fn target(&self) -> String {
+        format!("{}/{}", repo_search::launchd::domain(), self.label)
+    }
+}
+
+/// Installs the test agent through `ensure_agent` — the production install
+/// path — and returns once its socket is bound.
 fn agent(name: &str, tmp: tempfile::TempDir, model_cache: PathBuf, idle_exit: Duration) -> Agent {
-    let label = format!("{LABEL}.test-{}-{name}", std::process::id());
-    let socket = tmp.path().join("daemon.sock");
-    let document = LaunchAgent {
-        label: label.clone(),
-        program: PathBuf::from(env!("CARGO_BIN_EXE_search")),
-        socket: socket.clone(),
-        idle_exit,
-        model_cache: Some(model_cache),
-        stderr: tmp.path().join("daemon.log"),
-    };
-    let plist = tmp.path().join("agent.plist");
-    std::fs::write(&plist, document.render().expect("the template renders")).expect("plist write");
-    let domain = format!("gui/{}", uid());
-    let out = launchctl(&[
-        "bootstrap",
-        &domain,
-        plist.to_str().expect("utf-8 plist path"),
-    ]);
-    assert!(
-        out.status.success(),
-        "launchctl bootstrap {domain} failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    // `bootstrap` returns once the job is loaded; launchd materializes the
-    // socket a moment later, and connecting before then reads ENOENT.
-    let exists = tokio::task::block_in_place(|| wait_for_path(&socket, Duration::from_secs(30)));
-    assert!(exists, "launchd did not materialize {}", socket.display());
+    let config = config(name, tmp.path(), program(), model_cache, idle_exit);
+    let socket = config.agent.socket.clone();
+    let label = config.agent.label.clone();
+    tokio::task::block_in_place(|| ensure_agent(&config, &mut SystemLaunchctl, Check::Fast))
+        .expect("the agent installs");
     Agent {
         label,
         socket,
@@ -151,24 +105,45 @@ fn agent(name: &str, tmp: tempfile::TempDir, model_cache: PathBuf, idle_exit: Du
 }
 
 impl Drop for Agent {
-    /// Boot the test agent out of `gui/<uid>` whether the test passed or
-    /// panicked; a daemon it relaunched dies with it.
+    /// Boot the test agent out of `user/<uid>` whether the test passed or
+    /// panicked; a daemon it relaunched dies with it. As in
+    /// `ensure_agent`'s teardown, `bootout` returns before launchd has
+    /// torn the job down, so a running process's exit is awaited — the
+    /// label leaves `launchctl list` only once the teardown ends.
+    /// Assertions run only when the test is not already unwinding, so a
+    /// failure keeps its own panic.
     fn drop(&mut self) {
-        let target = format!("gui/{}/{}", uid(), self.label);
-        let _ = launchctl(&["bootout", &target]);
+        let mut launchctl = SystemLaunchctl;
+        let pid = launchctl
+            .service(&self.target())
+            .ok()
+            .flatten()
+            .and_then(|service| service.pid);
+        let exit = pid.and_then(|pid| ExitWatch::register(pid).ok());
+        let booted = launchctl.bootout(&self.target());
+        if !std::thread::panicking() {
+            booted.expect("the test agent boots out");
+        }
+        if let Some(exit) = exit {
+            let exited = exit.wait(install::TEARDOWN_TIMEOUT);
+            if !std::thread::panicking() {
+                assert!(exited, "the test agent's daemon exits on bootout");
+            }
+        }
     }
 }
 
 /// The daemon pid a `Status` request reports.
-async fn daemon_pid(socket: &Path, worktree: &Path) -> u32 {
-    let events = model::request(
+async fn daemon_pid(socket: &Path, hello: &Hello, worktree: &Path) -> u32 {
+    let events = client::request(
         socket,
+        hello,
         Request::Status {
             worktree: worktree.to_path_buf(),
         },
     )
     .await;
-    match model::final_of(&events) {
+    match client::final_of(&events) {
         Final::Status(status) => status.daemon.pid,
         other => panic!("expected a Status, got {other:?}"),
     }
@@ -185,27 +160,31 @@ async fn relaunch_after_idle_exit() {
     let _store = model::model_store(model_cache.clone());
     let agent = agent("idle", tmp, model_cache, Duration::from_secs(3));
     let socket = agent.socket.clone();
+    let hello = hello(&program());
     let repo = repo::repo(&[("src/lib.rs".into(), repo::rust_fn("idle_probe", 500))]);
 
-    let events = model::request(&socket, model::search(&repo.root, "a function")).await;
+    let events = client::request(&socket, &hello, client::search(&repo.root, "a function")).await;
     assert!(
-        matches!(model::final_of(&events), Final::Answer(_)),
+        matches!(client::final_of(&events), Final::Answer(_)),
         "the first query did not answer: {:?}",
-        model::final_of(&events)
+        client::final_of(&events)
     );
-    let first = daemon_pid(&socket, &repo.root).await;
+    let first = daemon_pid(&socket, &hello, &repo.root).await;
 
-    let exited =
-        tokio::task::block_in_place(|| host::wait_for_exit(first, Duration::from_secs(30)));
+    let exited = tokio::task::block_in_place(|| {
+        ExitWatch::register(first)
+            .expect("the daemon's exit registers")
+            .wait(Duration::from_secs(30))
+    });
     assert!(exited, "the daemon did not exit within 30 s of going idle");
 
-    let events = model::request(&socket, model::search(&repo.root, "a function")).await;
+    let events = client::request(&socket, &hello, client::search(&repo.root, "a function")).await;
     assert!(
-        matches!(model::final_of(&events), Final::Answer(_)),
+        matches!(client::final_of(&events), Final::Answer(_)),
         "the second query did not answer: {:?}",
-        model::final_of(&events)
+        client::final_of(&events)
     );
-    let second = daemon_pid(&socket, &repo.root).await;
+    let second = daemon_pid(&socket, &hello, &repo.root).await;
     assert_ne!(first, second, "launchd did not start a replacement daemon");
 }
 
@@ -222,21 +201,313 @@ async fn kill_resumes_through_launchd() {
     let model_id = store.model_id();
     let agent = agent("kill", tmp, model_cache, Duration::from_secs(600));
     let socket = agent.socket.clone();
+    let hello = hello(&program());
 
-    let mut stream = model::index_wait(&socket, &worktree).await;
+    let mut stream = model::index_wait(&socket, &hello, &worktree).await;
     model::await_coverage(&mut stream, 500).await;
     drop(stream);
 
-    let target = format!("gui/{}/{}", uid(), agent.label);
-    let out = launchctl(&["kill", "SIGKILL", &target]);
+    let out = launchctl(&["kill", "SIGKILL", &agent.target()]);
     assert!(
         out.status.success(),
-        "launchctl kill {target} failed: {}",
+        "launchctl kill {} failed: {}",
+        agent.target(),
         String::from_utf8_lossy(&out.stderr)
     );
 
     let committed = model::committed(&worktree, &worktree.join(".git"), &model_id).await;
     assert!(committed >= 500, "{committed} committed vectors");
 
-    model::assert_resume(&socket, &worktree, committed).await;
+    model::assert_resume(&socket, &hello, &worktree, committed).await;
+}
+
+/// Install, search (so the daemon is running), then reinstall with the
+/// `program` changed to a copy of the binary — as an installer replacing
+/// it in place would: the old daemon's exit is awaited, so the
+/// `bootstrap` after `bootout` does not hit `Bootstrap failed: 5`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "real launchd and model; the release gate runs it"]
+async fn reinstall_waits_for_a_running_daemon() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let model_cache = tmp.path().join("models");
+    let _store = model::model_store(model_cache.clone());
+    let repo = repo::repo(&[("src/lib.rs".into(), repo::rust_fn("reinstall_probe", 500))]);
+
+    let mut config = config(
+        "reinstall",
+        tmp.path(),
+        program(),
+        model_cache,
+        Duration::from_secs(600),
+    );
+    let socket = config.agent.socket.clone();
+    let agent = Agent {
+        label: config.agent.label.clone(),
+        socket: socket.clone(),
+        _tmp: tmp,
+    };
+    let mut launchctl = SystemLaunchctl;
+    let outcome =
+        tokio::task::block_in_place(|| ensure_agent(&config, &mut launchctl, Check::Fast))
+            .expect("the first install succeeds");
+    assert_eq!(outcome, install::Agent::Installed);
+
+    let events = client::request(
+        &socket,
+        &hello(&program()),
+        client::search(&repo.root, "a function"),
+    )
+    .await;
+    assert!(
+        matches!(client::final_of(&events), Final::Answer(_)),
+        "the first query did not answer: {:?}",
+        client::final_of(&events)
+    );
+    let first = daemon_pid(&socket, &hello(&program()), &repo.root).await;
+
+    // A binary replaced at a new path: the plist's program changes, so the
+    // install replaces the agent.
+    let copy = agent._tmp.path().join("search-copy");
+    std::fs::copy(program(), &copy).expect("the binary copies");
+    config.agent.program = copy.clone();
+    let outcome =
+        tokio::task::block_in_place(|| ensure_agent(&config, &mut launchctl, Check::Fast))
+            .expect("the reinstall succeeds without `Bootstrap failed: 5`");
+    assert_eq!(
+        outcome,
+        install::Agent::Replaced(install::Reason::PlistChanged)
+    );
+
+    let hello = client::hello_for(&copy);
+    let events = client::request(&socket, &hello, client::search(&repo.root, "a function")).await;
+    assert!(
+        matches!(client::final_of(&events), Final::Answer(_)),
+        "the query after reinstall did not answer: {:?}",
+        client::final_of(&events)
+    );
+    let second = daemon_pid(&socket, &hello, &repo.root).await;
+    assert_ne!(first, second, "the reinstall did not replace the daemon");
+}
+
+/// An agent installed but never connected to has no running process; its
+/// replacement runs `bootstrap` straight after `bootout`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "real launchd and model; the release gate runs it"]
+async fn reinstall_of_an_idle_agent() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let model_cache = tmp.path().join("models");
+    let _store = model::model_store(model_cache.clone());
+
+    let mut config = config(
+        "idle-reinstall",
+        tmp.path(),
+        program(),
+        model_cache,
+        Duration::from_secs(600),
+    );
+    let agent = Agent {
+        label: config.agent.label.clone(),
+        socket: config.agent.socket.clone(),
+        _tmp: tmp,
+    };
+    let mut launchctl = SystemLaunchctl;
+    let outcome =
+        tokio::task::block_in_place(|| ensure_agent(&config, &mut launchctl, Check::Fast))
+            .expect("the first install succeeds");
+    assert_eq!(outcome, install::Agent::Installed);
+
+    let copy = agent._tmp.path().join("search-copy");
+    std::fs::copy(program(), &copy).expect("the binary copies");
+    config.agent.program = copy;
+    let outcome =
+        tokio::task::block_in_place(|| ensure_agent(&config, &mut launchctl, Check::Fast))
+            .expect("the reinstall of an idle agent succeeds without `Bootstrap failed: 5`");
+    assert_eq!(
+        outcome,
+        install::Agent::Replaced(install::Reason::PlistChanged)
+    );
+}
+
+/// Two `search` processes racing a first install serialize on the lock:
+/// both succeed and exactly one bootstraps.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "real launchd and model; the release gate runs it"]
+async fn concurrent_installs_bootstrap_once() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let model_cache = tmp.path().join("models");
+    let _store = model::model_store(model_cache.clone());
+    let config = config(
+        "concurrent",
+        tmp.path(),
+        program(),
+        model_cache,
+        Duration::from_secs(600),
+    );
+    let agent = Agent {
+        label: config.agent.label.clone(),
+        socket: config.agent.socket.clone(),
+        _tmp: tmp,
+    };
+    let barrier = Arc::new(Barrier::new(2));
+    let config = Arc::new(config);
+    let threads: Vec<_> = (0..2)
+        .map(|_| {
+            let config = config.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                ensure_agent(&config, &mut SystemLaunchctl, Check::Fast)
+            })
+        })
+        .collect();
+    let outcomes: Vec<_> = threads
+        .into_iter()
+        .map(|t| t.join().expect("the installer joins"))
+        .collect();
+    for outcome in &outcomes {
+        assert!(outcome.is_ok(), "a concurrent install failed: {outcome:?}");
+    }
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|o| matches!(o, Ok(install::Agent::Installed)))
+            .count(),
+        1,
+        "exactly one of the racers installs: {outcomes:?}"
+    );
+    assert!(agent.socket.exists(), "the install left the socket bound");
+}
+/// A client invocation parsed the way `main` parses argv.
+fn invocation(args: &[&str]) -> cli::Invocation {
+    Cli::try_parse_from(args)
+        .expect("the arguments parse")
+        .invocation()
+}
+
+/// The `Env` `cli::run` gets against real launchd: the test `AgentConfig`,
+/// the real `launchctl`, and the handshake matching the binary the plist
+/// names — computed when the `Env` is built, so a replaced program yields
+/// a new `BuildId`.
+fn cli_env(cwd: &Path, config: AgentConfig, program: &Path) -> cli::Env<SystemLaunchctl> {
+    cli::Env {
+        cwd: cwd.to_path_buf(),
+        agent: config,
+        launchctl: SystemLaunchctl,
+        hello: hello(program),
+    }
+}
+
+/// The `Vec<u8>` terminal `cli::run` writes into in tests; stderr is not
+/// a TTY.
+fn vec_term() -> Terminal<Vec<u8>, Vec<u8>> {
+    Terminal {
+        stdout: Vec::new(),
+        stderr: Vec::new(),
+        stderr_tty: false,
+    }
+}
+
+/// `cli::run` end to end through real launchd: a run from a repo
+/// subdirectory installs the agent, the daemon answers the query and the
+/// run exits 0.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "real launchd and model; the release gate runs it"]
+async fn install_answers_through_cli_run() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let model_cache = tmp.path().join("models");
+    let _store = model::model_store(model_cache.clone());
+    let repo = repo::repo(&[("src/lib.rs".into(), repo::rust_fn("cli_probe", 500))]);
+    let config = config(
+        "cli",
+        tmp.path(),
+        program(),
+        model_cache,
+        Duration::from_secs(600),
+    );
+    let _agent = Agent {
+        label: config.agent.label.clone(),
+        socket: config.agent.socket.clone(),
+        _tmp: tmp,
+    };
+
+    let env = cli_env(&repo.root.join("src"), config, &program());
+    let mut term = vec_term();
+    let exit = cli::run(invocation(&["search", "cli_probe"]), env, &mut term).await;
+    assert_eq!(
+        exit,
+        Exit::Ok,
+        "stderr: {}",
+        String::from_utf8_lossy(&term.stderr)
+    );
+    let stdout = String::from_utf8(term.stdout).expect("stdout is utf-8");
+    assert!(stdout.contains("cli_probe"), "stdout: {stdout}");
+}
+
+/// Install and search so the daemon runs, record its pid, then replace
+/// the installed program file by renaming a fresh copy over it — a new
+/// inode and mtime, as installers do (never write into the running
+/// executable, which macOS may kill). The next `cli::run` carries the new
+/// `BuildId`: the mismatched daemon shuts down, launchd restarts the
+/// binary on disk, the query answers and `Status` reports a new pid. The
+/// retry may wait out launchd's `ThrottleInterval`; that is expected.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "real launchd and model; the release gate runs it"]
+async fn replaced_binary_restarts_the_daemon() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let model_cache = tmp.path().join("models");
+    let _store = model::model_store(model_cache.clone());
+    let repo = repo::repo(&[("src/lib.rs".into(), repo::rust_fn("replace_probe", 500))]);
+
+    // The plist's program is a copy in the temp dir, so the test can
+    // replace the file launchd execs.
+    let installed_program = tmp.path().join("search");
+    std::fs::copy(program(), &installed_program).expect("the program copies");
+    let dir = tmp.path().to_path_buf();
+    let make_config = || {
+        config(
+            "replace",
+            &dir,
+            installed_program.clone(),
+            model_cache.clone(),
+            Duration::from_secs(600),
+        )
+    };
+    let socket = make_config().agent.socket;
+    let agent = Agent {
+        label: make_config().agent.label,
+        socket: socket.clone(),
+        _tmp: tmp,
+    };
+
+    let env = cli_env(&repo.root, make_config(), &installed_program);
+    let mut term = vec_term();
+    let exit = cli::run(invocation(&["search", "replace_probe"]), env, &mut term).await;
+    assert_eq!(
+        exit,
+        Exit::Ok,
+        "stderr: {}",
+        String::from_utf8_lossy(&term.stderr)
+    );
+    // This `Hello` was built for the pre-replacement file identity.
+    let old_hello = hello(&installed_program);
+    let first = daemon_pid(&socket, &old_hello, &repo.root).await;
+
+    let replacement = agent._tmp.path().join("search-new");
+    std::fs::copy(program(), &replacement).expect("the replacement copies");
+    std::fs::rename(&replacement, &installed_program).expect("the replacement renames");
+
+    let env = cli_env(&repo.root, make_config(), &installed_program);
+    let mut term = vec_term();
+    let exit = cli::run(invocation(&["search", "replace_probe"]), env, &mut term).await;
+    assert_eq!(
+        exit,
+        Exit::Ok,
+        "stderr: {}",
+        String::from_utf8_lossy(&term.stderr)
+    );
+    let second = daemon_pid(&socket, &hello(&installed_program), &repo.root).await;
+    assert_ne!(
+        first, second,
+        "the replaced binary restarted the daemon under launchd"
+    );
 }

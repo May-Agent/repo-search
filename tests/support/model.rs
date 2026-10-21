@@ -1,25 +1,21 @@
 //! Helpers for the real-model tests (`tests/daemon_model.rs`,
 //! `tests/launchd.rs`), included through `#[path]` like `stub.rs` is for
-//! `scheduler.rs`: the model-cache layout, the corpus clone, the
-//! request/event plumbing and the kill-and-resume sequence pieces. Each
-//! target uses a subset.
+//! `scheduler.rs`: the model-cache layout, the corpus clone and the
+//! kill-and-resume sequence pieces. The request/event plumbing is
+//! `client.rs`'s, reached here as `super::client`: a `#[path]` includer
+//! declares its own `mod client` at the same level, and `mod support`
+//! provides `support::client`. Each target uses a subset.
 #![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Duration;
 
-use futures_util::StreamExt;
-use repo_search::client::{Client, Responses};
+use repo_search::client::Responses;
 use repo_search::model_store::{ModelSpec, ModelStore};
-use repo_search::protocol::{
-    Event, Final, Format, Progress, Request, SearchRequest, WireMode, WirePhase,
-};
+use repo_search::protocol::{Event, Final, Hello, Progress, Request, WirePhase};
 use repo_search_core::store::{Index, VectorCache};
 
-/// A single event's deadline: a cold model load and a reconcile can take a
-/// while, and the tests assert structure, not latency.
-pub const TIMEOUT: Duration = Duration::from_secs(180);
+use super::client;
 
 /// `REPO_SEARCH_MODEL_DIR`: the extracted model archive.
 pub fn model_dir() -> PathBuf {
@@ -77,64 +73,11 @@ pub fn model_store(root: PathBuf) -> ModelStore {
     ModelStore::new(root, spec).expect("model store")
 }
 
-/// A `search` request for `query` on `worktree`.
-pub fn search(worktree: &Path, query: &str) -> Request {
-    Request::Search(SearchRequest {
-        worktree: worktree.to_path_buf(),
-        query: query.to_owned(),
-        mode: WireMode::Hybrid,
-        paths: vec![],
-        langs: vec![],
-        kinds: vec![],
-        symbol: None,
-        budget: 4000,
-        files_only: false,
-        include_ignored: false,
-        format: Format::Json,
-    })
-}
-
-/// Sends `request` and collects events to the `Final` frame.
-pub async fn request(socket: &Path, request: Request) -> Vec<Event> {
-    let client = Client::connect(socket)
-        .await
-        .expect("connect to the daemon");
-    let responses = client.request(request).await.expect("request sends");
-    tokio::time::timeout(TIMEOUT, responses.collect::<Vec<_>>())
-        .await
-        .expect("the reply stream does not stall")
-        .into_iter()
-        .collect::<Result<_, _>>()
-        .expect("every frame decodes")
-}
-
-/// The events' `Final`.
-pub fn final_of(events: &[Event]) -> &Final {
-    match events.last() {
-        Some(Event::Final(f)) => f,
-        other => panic!("the last event is the Final frame, got {other:?}"),
-    }
-}
-
-/// Sends `request` and returns the live event stream, uncollected.
-pub async fn stream_request(socket: &Path, request: Request) -> Responses {
-    let client = Client::connect(socket).await.expect("connect");
-    client.request(request).await.expect("request sends")
-}
-
-/// The next frame on a live stream within `TIMEOUT`.
-pub async fn next_event(stream: &mut Responses) -> Event {
-    tokio::time::timeout(TIMEOUT, stream.next())
-        .await
-        .expect("a frame arrives")
-        .expect("the stream stays open")
-        .expect("the frame decodes")
-}
-
 /// Opens an `index --wait` stream for `worktree` on `socket`.
-pub async fn index_wait(socket: &Path, worktree: &Path) -> Responses {
-    stream_request(
+pub async fn index_wait(socket: &Path, hello: &Hello, worktree: &Path) -> Responses {
+    client::stream_request(
         socket,
+        hello,
         Request::Index {
             worktree: worktree.to_path_buf(),
             wait: true,
@@ -147,7 +90,7 @@ pub async fn index_wait(socket: &Path, worktree: &Path) -> Responses {
 /// returns the reported count.
 pub async fn await_coverage(stream: &mut Responses, min: u64) -> u64 {
     loop {
-        match next_event(stream).await {
+        match client::next_event(stream).await {
             Event::Progress(Progress::Coverage { with_vector, .. }) => {
                 if with_vector >= min {
                     return with_vector;
@@ -176,15 +119,16 @@ pub async fn committed(worktree: &Path, common_dir: &Path, model_id: &str) -> u6
 /// phase the kill left behind is `first_index`, its index stream resumes at
 /// `at_least` committed vectors, and coverage grows by another 200. The
 /// stream is dropped without waiting for the full index.
-pub async fn assert_resume(socket: &Path, worktree: &Path, at_least: u64) {
-    let events = request(
+pub async fn assert_resume(socket: &Path, hello: &Hello, worktree: &Path, at_least: u64) {
+    let events = client::request(
         socket,
+        hello,
         Request::Status {
             worktree: worktree.to_path_buf(),
         },
     )
     .await;
-    let status = match final_of(&events) {
+    let status = match client::final_of(&events) {
         Final::Status(status) => status,
         other => panic!("expected a Status, got {other:?}"),
     };
@@ -194,10 +138,10 @@ pub async fn assert_resume(socket: &Path, worktree: &Path, at_least: u64) {
         "the kill left the phase at first-index"
     );
 
-    let mut stream = index_wait(socket, worktree).await;
+    let mut stream = index_wait(socket, hello, worktree).await;
     let mut first: Option<u64> = None;
     loop {
-        match next_event(&mut stream).await {
+        match client::next_event(&mut stream).await {
             Event::Progress(Progress::Coverage { with_vector, .. }) => match first {
                 None => {
                     assert!(

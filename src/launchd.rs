@@ -32,6 +32,26 @@ pub fn log_path() -> io::Result<PathBuf> {
     Ok(home()?.join("Library/Logs/repo-search/daemon.log"))
 }
 
+/// The plist the agent is installed as:
+/// `~/Library/LaunchAgents/<label>.plist`.
+pub fn plist_path(label: &str) -> io::Result<PathBuf> {
+    Ok(home()?.join(format!("Library/LaunchAgents/{label}.plist")))
+}
+
+/// The file whose `flock(2)` serializes installs. It sits next to the
+/// socket, in a directory this program owns, rather than in
+/// `~/Library/LaunchAgents`, which belongs to launchd.
+pub fn lock_path() -> io::Result<PathBuf> {
+    Ok(home()?.join("Library/Application Support/repo-search/install.lock"))
+}
+
+/// The launchd domain the agent lives in: `user/<uid>`, so `search` works
+/// over SSH with no GUI login.
+pub fn domain() -> String {
+    // SAFETY: getuid cannot fail.
+    format!("user/{}", unsafe { libc::getuid() })
+}
+
 fn home() -> io::Result<PathBuf> {
     std::env::home_dir().ok_or_else(|| io::Error::other("the home directory is unknown"))
 }
@@ -144,6 +164,7 @@ mod tests {
         let plist = askama::Template::render(&agent()).expect("the template renders");
         for fragment in [
             "<key>Label</key>\n\t<string>com.github.may-agent.repo-search</string>",
+            "<key>LimitLoadToSessionType</key>\n\t<string>Background</string>",
             "<string>/usr/local/bin/search</string>",
             "<string>--idle-exit-secs</string>\n\t\t<string>600</string>",
             "<key>SockPathName</key>\n\t\t\t<string>/tmp/daemon.sock</string>",

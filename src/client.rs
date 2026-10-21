@@ -2,8 +2,8 @@
 //!
 //! [`Client::connect`] performs the `Hello` handshake; [`Client::request`]
 //! sends the connection's one request and returns the streamed reply. The
-//! client knows nothing about launchd: a caller that finds the socket absent
-//! or refused starts the daemon itself.
+//! caller ensures the agent is installed and current; the client knows
+//! nothing about launchd.
 
 use std::io;
 use std::path::Path;
@@ -17,9 +17,7 @@ use thiserror::Error;
 use tokio::net::UnixStream;
 use tokio_util::codec::LinesCodecError;
 
-use crate::protocol::{
-    self, Connection, ErrorKind, ErrorReport, Event, Final, Hello, PROTOCOL, Request,
-};
+use crate::protocol::{self, Connection, ErrorKind, ErrorReport, Event, Final, Hello, Request};
 
 /// One wire message as a frame line: compact JSON, always serializable.
 fn line(value: &impl Serialize) -> String {
@@ -39,19 +37,16 @@ pub struct Client {
 }
 
 impl Client {
-    /// Connect to the socket at `path` and exchange `Hello`s.
+    /// Connect to the socket at `path` and exchange `hello` for the
+    /// daemon's own.
     ///
     /// A [`ErrorKind::ProtocolMismatch`] refusal is retried once on a fresh
     /// connection: the mismatched daemon shuts down, so the retry reaches the
     /// binary that is on disk now.
-    pub async fn connect(socket: &Path) -> Result<Self, ClientError> {
-        let hello = Hello {
-            protocol: PROTOCOL,
-            version: env!("CARGO_PKG_VERSION").to_owned(),
-        };
-        match Self::handshake(socket, &hello).await {
+    pub async fn connect(socket: &Path, hello: &Hello) -> Result<Self, ClientError> {
+        match Self::handshake(socket, hello).await {
             Err(ClientError::Refused(report)) if report.kind == ErrorKind::ProtocolMismatch => {
-                Self::handshake(socket, &hello).await
+                Self::handshake(socket, hello).await
             }
             result => result,
         }
@@ -60,7 +55,9 @@ impl Client {
     /// Send `Hello`, then accept only the peer's identical `Hello` back; a
     /// `Final` frame means the daemon refused the handshake.
     async fn handshake(socket: &Path, hello: &Hello) -> Result<Self, ClientError> {
-        let stream = UnixStream::connect(socket).await?;
+        let stream = UnixStream::connect(socket)
+            .await
+            .map_err(ClientError::Connect)?;
         let mut framed = protocol::framed(stream);
         framed.send(line(hello)).await.map_err(codec_error)?;
         let line = framed
@@ -68,8 +65,8 @@ impl Client {
             .await
             .ok_or(ClientError::Closed)?
             .map_err(codec_error)?;
-        match serde_json::from_str::<Final>(&line) {
-            Ok(Final::Error(report)) => Err(ClientError::Refused(report)),
+        match serde_json::from_str::<Event>(&line) {
+            Ok(Event::Final(Final::Error(report))) => Err(ClientError::Refused(report)),
             Ok(_) => Err(ClientError::Protocol(
                 "the handshake was answered with a non-error final frame",
             )),
@@ -131,7 +128,10 @@ impl Stream for Responses {
 /// [`Responses`] stream.
 #[derive(Debug, Error)]
 pub enum ClientError {
-    /// Socket or stream I/O.
+    /// The `UnixStream::connect` itself failed.
+    #[error("cannot connect to the daemon socket: {0}")]
+    Connect(io::Error),
+    /// Socket or stream I/O after the connect.
     #[error("daemon connection failed: {0}")]
     Io(#[from] io::Error),
     /// The daemon refused the handshake or a request.
@@ -157,9 +157,19 @@ mod tests {
 
     use std::path::PathBuf;
 
-    use crate::protocol::{Format, Progress, StatusReport, WireMode};
+    use crate::protocol::{BuildId, Format, PROTOCOL, Progress, StatusReport, WireMode};
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::UnixListener;
+
+    /// The test client's handshake; the test servers echo it back.
+    fn hello() -> Hello {
+        Hello::new(BuildId {
+            dev: 1,
+            ino: 2,
+            size: 3,
+            mtime_ns: 4,
+        })
+    }
 
     /// A raw test server: accepts one connection, checks the client's Hello,
     /// answers it, then replies to the request with `events` and closes.
@@ -213,7 +223,7 @@ mod tests {
             vec![Event::Progress(Progress::Reconciling), reply.clone()],
         ));
 
-        let client = Client::connect(&socket).await.unwrap();
+        let client = Client::connect(&socket, &hello()).await.unwrap();
         let request = Request::Search(crate::protocol::SearchRequest {
             worktree: PathBuf::from("/repo"),
             query: "where are errors handled".into(),
@@ -242,10 +252,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("daemon.sock");
         let listener = UnixListener::bind(&socket).unwrap();
-        let refusal = line(&Final::Error(ErrorReport {
+        let refusal = line(&Event::Final(Final::Error(ErrorReport {
             kind: ErrorKind::ProtocolMismatch,
             message: "daemon is protocol 2".into(),
-        }));
+        })));
         let (counted, connections) = std::sync::mpsc::channel();
         let server = tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
@@ -258,7 +268,7 @@ mod tests {
             }
         });
 
-        let err = match Client::connect(&socket).await {
+        let err = match Client::connect(&socket, &hello()).await {
             Ok(_) => panic!("the handshake should have been refused"),
             Err(err) => err,
         };

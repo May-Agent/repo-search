@@ -27,7 +27,7 @@ use tokio_util::codec::LinesCodecError;
 
 use crate::model_store::ModelStore;
 use crate::protocol::{
-    self, ErrorKind, ErrorReport, Event, Final, Hello, PROTOCOL, Progress, Request, framed,
+    self, BuildId, ErrorKind, ErrorReport, Event, Final, Hello, PROTOCOL, Progress, Request, framed,
 };
 
 use model::{LoaderMsg, ModelState};
@@ -140,6 +140,9 @@ pub struct Config<B: Backend> {
     pub model_store: ModelStore,
     /// The embedding backend.
     pub backend: Arc<B>,
+    /// The identity of the executable file this process runs; a `Hello`
+    /// naming another build is a `ProtocolMismatch`.
+    pub build: BuildId,
 }
 
 /// What a connection task tells the accept loop.
@@ -169,6 +172,7 @@ pub async fn run<B: Backend>(config: Config<B>) -> Result<(), Error> {
     let (stopping_tx, stopping_rx) = tokio::sync::watch::channel(false);
     let (conn_tx, mut conn_rx) = mpsc::channel::<ConnMsg>(64);
     let backend = config.backend;
+    let build = config.build;
     let model_id = config.model_store.model_id();
 
     // Headroom monitor: the callback may run on any thread.
@@ -227,6 +231,7 @@ pub async fn run<B: Backend>(config: Config<B>) -> Result<(), Error> {
                         registry.clone(),
                         stopping_rx.clone(),
                         conn_tx.clone(),
+                        build,
                     ));
                 }
                 // Every accept error is fatal but goes through the
@@ -371,9 +376,10 @@ async fn connection<B: Backend>(
     registry: RegistryHandle,
     stopping: tokio::sync::watch::Receiver<bool>,
     conn: mpsc::Sender<ConnMsg>,
+    build: BuildId,
 ) {
     let mut framed = framed(stream);
-    let end = serve(&mut framed, &model, &loader, &registry, &stopping).await;
+    let end = serve(&mut framed, &model, &loader, &registry, &stopping, build).await;
     let _ = conn.send(end).await;
 }
 
@@ -383,6 +389,7 @@ async fn serve<B: Backend>(
     loader: &mpsc::Sender<LoaderMsg>,
     registry: &RegistryHandle,
     stopping: &tokio::sync::watch::Receiver<bool>,
+    build: BuildId,
 ) -> ConnMsg {
     // A client that never sends `Hello` must not hold the daemon alive.
     let frame = match tokio::time::timeout(HELLO_TIMEOUT, read_frame(framed, stopping)).await {
@@ -401,17 +408,14 @@ async fn serve<B: Backend>(
             return ConnMsg::Closed;
         }
     };
-    let ours = Hello {
-        protocol: PROTOCOL,
-        version: env!("CARGO_PKG_VERSION").to_owned(),
-    };
+    let ours = Hello::new(build);
     if hello != ours {
         send_final(
             framed,
             ErrorKind::ProtocolMismatch,
             format!(
-                "client is protocol {} {}, daemon is {PROTOCOL} {}",
-                hello.protocol, hello.version, ours.version
+                "client is protocol {} {} build {}, daemon is {PROTOCOL} {} build {}",
+                hello.protocol, hello.version, hello.build, ours.version, ours.build
             ),
         )
         .await;

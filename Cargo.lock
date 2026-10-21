@@ -1486,6 +1486,7 @@ dependencies = [
  "const_format",
  "futures-util",
  "hex",
+ "kqueue",
  "libc",
  "notify",
  "repo-search-core",

@@ -1,112 +1,46 @@
-//! The `search` command-line client.
+//! The `search` binary: a thin dispatcher — `search --daemon` runs the
+//! launchd daemon, everything else is the client over the daemon socket.
 
-use clap::{Args, Parser, Subcommand, ValueEnum};
+#[cfg(not(target_os = "macos"))]
+compile_error!("the search binary runs on macOS only");
+
+use std::io::Write as _;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::time::Duration;
 
-/// Search a repository for code you can describe but cannot name.
-///
-/// Exit codes follow grep: 0 results, 1 none, 2 error.
-#[derive(Parser)]
-#[command(
-    name = "search",
-    version = repo_search::model_store::VERSION_INFO,
-    subcommand_precedence_over_arg = true,
-    subcommand_negates_reqs = true
-)]
-struct Cli {
-    /// Free-text query.
-    #[arg(required_unless_present = "daemon")]
-    query: Option<String>,
-
-    #[command(flatten)]
-    options: SearchOptions,
-
-    #[command(subcommand)]
-    command: Option<Command>,
-
-    /// Run as the launchd socket-activated daemon.
-    #[arg(long, hide = true)]
-    daemon: bool,
-
-    /// Exit after this many seconds with no connections and no work.
-    #[arg(long, hide = true, requires = "daemon", value_name = "SECS")]
-    idle_exit_secs: Option<u64>,
-
-    /// The model cache root, defaulting to the per-user cache.
-    #[arg(long, hide = true, requires = "daemon", value_name = "DIR")]
-    model_cache: Option<PathBuf>,
-}
-
-/// Options for `search <query>`.
-#[derive(Args)]
-struct SearchOptions {
-    /// Return results until the token budget is used.
-    #[arg(long, default_value_t = 4000)]
-    budget: u32,
-
-    /// Ranked file list only.
-    #[arg(short = 'l', long)]
-    files: bool,
-
-    /// Retrieval channels.
-    #[arg(long, value_enum, default_value_t = Mode::Hybrid)]
-    mode: Mode,
-
-    /// Restrict paths (repeatable).
-    #[arg(long)]
-    path: Vec<String>,
-
-    /// Restrict language.
-    #[arg(long)]
-    lang: Option<String>,
-
-    /// Restrict syntactic kinds (fn, struct, trait, ...).
-    #[arg(long, value_delimiter = ',')]
-    kind: Vec<String>,
-
-    /// Restrict symbol path, e.g. `Environment::*`.
-    #[arg(long)]
-    symbol: Option<String>,
-
-    /// Include files `.gitignore` excludes.
-    #[arg(long)]
-    include_ignored: bool,
-
-    /// Structured output.
-    #[arg(long)]
-    json: bool,
-}
-
-#[derive(Clone, ValueEnum)]
-enum Mode {
-    /// FTS5 BM25 and vector KNN merged by reciprocal-rank fusion.
-    Hybrid,
-    /// FTS5 over chunk title and text.
-    Lexical,
-    /// Vector KNN only.
-    Semantic,
-}
-
-#[derive(Subcommand)]
-enum Command {
-    /// Coverage, pending chunks, daemon state.
-    Status,
-    /// Reconcile now.
-    Index {
-        /// Block until every chunk has a vector.
-        #[arg(long)]
-        wait: bool,
-    },
-}
+use clap::Parser;
+use repo_search::cli::{Cli, Env, Invocation, Terminal};
 
 fn main() -> ExitCode {
-    let cli = Cli::parse();
-    if cli.daemon {
-        return daemon_main(&cli);
+    match Cli::parse().invocation() {
+        Invocation::Daemon {
+            idle_exit,
+            model_cache,
+        } => daemon_main(idle_exit, model_cache),
+        client => client_main(client),
     }
-    eprintln!("error: the search daemon is not built yet");
-    ExitCode::from(2)
+}
+
+/// The client entry point: `Env` is gathered before the runtime exists,
+/// and the request runs on a current-thread runtime — the client has one
+/// request in flight, so a multi-thread runtime would only add threads.
+fn client_main(invocation: Invocation) -> ExitCode {
+    let env = match Env::user() {
+        Ok(env) => env,
+        Err(error) => {
+            let _ = std::io::stderr().write_all(format!("search: {error}\n").as_bytes());
+            return ExitCode::from(2);
+        }
+    };
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("the tokio runtime builds");
+    let mut term = Terminal::stdio();
+    runtime
+        .block_on(repo_search::cli::run(invocation, env, &mut term))
+        .into()
 }
 
 /// The `search --daemon` entry point.
@@ -118,20 +52,27 @@ fn main() -> ExitCode {
 /// comes from launchd; exactly one fd is expected, and any other count
 /// means the binary runs under a plist it was not built for. Exit is 0 on
 /// idle exit or SIGTERM and 1 on a fatal error.
-#[cfg(target_os = "macos")]
-fn daemon_main(cli: &Cli) -> ExitCode {
+fn daemon_main(idle_exit: Duration, model_cache: Option<PathBuf>) -> ExitCode {
     use repo_search::daemon::coreml::CoreMlBackend;
     use repo_search::daemon::{self, Config};
     use repo_search::launchd;
     use repo_search::model_store::{ModelSpec, ModelStore};
+    use repo_search::protocol::BuildId;
     use std::os::fd::OwnedFd;
     use std::sync::Arc;
-    use std::time::Duration;
 
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_max_level(tracing::Level::INFO)
         .init();
+
+    let build = match BuildId::of_current_exe() {
+        Ok(build) => build,
+        Err(error) => {
+            tracing::error!(%error, "could not identify the running binary");
+            return ExitCode::FAILURE;
+        }
+    };
 
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -168,7 +109,7 @@ fn daemon_main(cli: &Cli) -> ExitCode {
         }
     };
 
-    let model_store = match cli.model_cache.clone() {
+    let model_store = match model_cache {
         Some(root) => ModelStore::new(root, ModelSpec::embedding_gemma_2()),
         None => ModelStore::user_cache(),
     };
@@ -196,40 +137,15 @@ fn daemon_main(cli: &Cli) -> ExitCode {
     };
     match runtime.block_on(daemon::run(Config {
         listener,
-        idle_exit: cli
-            .idle_exit_secs
-            .map_or(daemon::IDLE_EXIT, Duration::from_secs),
+        idle_exit,
         model_store,
         backend: Arc::new(CoreMlBackend),
+        build,
     })) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             tracing::error!(%error, "the daemon stopped on a fatal error");
             ExitCode::FAILURE
         }
-    }
-}
-
-#[cfg(not(target_os = "macos"))]
-fn daemon_main(_: &Cli) -> ExitCode {
-    eprintln!("error: --daemon runs on macOS only");
-    ExitCode::from(2)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    use clap::CommandFactory;
-    use repo_search::model_store::{MODEL_LICENSE, MODEL_NAME, VERSION_INFO};
-
-    #[test]
-    fn version_flag_reports_binary_and_model() {
-        assert_eq!(Cli::command().get_version(), Some(VERSION_INFO));
-        let text = VERSION_INFO;
-        assert!(text.contains(env!("CARGO_PKG_VERSION")));
-        assert!(text.contains(repo_search_core::CHUNKER_FINGERPRINT));
-        assert!(text.contains(MODEL_NAME));
-        assert!(text.contains(MODEL_LICENSE));
     }
 }

@@ -6,7 +6,9 @@
 //! sends one [`Request`], and reads [`Event::Progress`] frames until the
 //! closing [`Event::Final`], which always ends the stream.
 
-use std::path::PathBuf;
+use std::fmt;
+use std::io;
+use std::path::{Path, PathBuf};
 
 use repo_search_core::search::Mode;
 use repo_search_core::store::Phase;
@@ -15,7 +17,7 @@ use tokio::net::UnixStream;
 use tokio_util::codec::{Framed, LinesCodec};
 
 /// Wire format version, bumped whenever a wire type changes.
-pub const PROTOCOL: u32 = 1;
+pub const PROTOCOL: u32 = 2;
 
 /// The largest frame a peer may send, in bytes.
 pub const MAX_FRAME: usize = 64 << 20;
@@ -28,8 +30,49 @@ pub fn framed(stream: UnixStream) -> Connection {
     Framed::new(stream, LinesCodec::new_with_max_length(MAX_FRAME))
 }
 
+/// The identity of the executable file a process runs. A binary rebuilt or
+/// reinstalled at the same path has a different one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BuildId {
+    /// The filesystem the file lives on (`st_dev`).
+    pub dev: u64,
+    /// The file's inode (`st_ino`).
+    pub ino: u64,
+    /// The file's size in bytes (`st_size`).
+    pub size: u64,
+    /// The file's modification time in nanoseconds (`st_mtime`,
+    /// `st_mtime_nsec`).
+    pub mtime_ns: i128,
+}
+
+impl BuildId {
+    /// The identity of the file at `path`, from `stat`.
+    pub fn of_file(path: &Path) -> io::Result<Self> {
+        use std::os::unix::fs::MetadataExt;
+        let meta = std::fs::metadata(path)?;
+        Ok(Self {
+            dev: meta.dev(),
+            ino: meta.ino(),
+            size: meta.size(),
+            mtime_ns: meta.mtime() as i128 * 1_000_000_000 + i128::from(meta.mtime_nsec()),
+        })
+    }
+
+    /// The identity of the running executable, at its canonical path.
+    pub fn of_current_exe() -> io::Result<Self> {
+        Self::of_file(&std::env::current_exe()?.canonicalize()?)
+    }
+}
+
+impl fmt::Display for BuildId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}@{}", self.ino, self.mtime_ns)
+    }
+}
+
 /// The client's first frame. The daemon answers with its own `Hello` when
-/// both fields are equal, and with `Final::Error` of kind
+/// all three fields are equal, and with `Final::Error` of kind
 /// [`ErrorKind::ProtocolMismatch`] on any difference.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -38,6 +81,20 @@ pub struct Hello {
     pub protocol: u32,
     /// The sender's binary version (`CARGO_PKG_VERSION`).
     pub version: String,
+    /// The sender's binary file's identity.
+    pub build: BuildId,
+}
+
+impl Hello {
+    /// This process's handshake: this [`PROTOCOL`], this binary's version
+    /// and `build`.
+    pub fn new(build: BuildId) -> Self {
+        Self {
+            protocol: PROTOCOL,
+            version: env!("CARGO_PKG_VERSION").to_owned(),
+            build,
+        }
+    }
 }
 
 /// The connection's one request.
@@ -429,6 +486,12 @@ mod tests {
         round_trip(&Hello {
             protocol: PROTOCOL,
             version: "0.0.0".into(),
+            build: BuildId {
+                dev: 1,
+                ino: 2,
+                size: 3,
+                mtime_ns: 4,
+            },
         });
         round_trip(&Request::Search(SearchRequest {
             worktree: PathBuf::from("/repo"),
@@ -524,6 +587,44 @@ mod tests {
         ] {
             round_trip(&gpu);
         }
+    }
+
+    #[test]
+    fn hello_carries_the_build() {
+        let build = BuildId {
+            dev: 1,
+            ino: 2,
+            size: 3,
+            mtime_ns: 4,
+        };
+        let hello = Hello::new(build);
+        assert_eq!(hello.protocol, PROTOCOL);
+        assert_eq!(hello.version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(hello.build, build);
+        round_trip(&hello);
+    }
+
+    #[test]
+    fn build_id_tracks_the_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("bin");
+        std::fs::write(&path, b"aaaa").expect("the file is written");
+        let first = BuildId::of_file(&path).expect("the file stats");
+        assert_eq!(
+            first,
+            BuildId::of_file(&path).expect("the file stats again"),
+            "two stats of an unchanged file are one identity"
+        );
+        // A rename replacement, as installers do: same size, new inode and
+        // mtime.
+        let replacement = dir.path().join("bin.new");
+        std::fs::write(&replacement, b"bbbb").expect("the replacement is written");
+        std::fs::rename(&replacement, &path).expect("the replacement renames over");
+        assert_ne!(
+            first,
+            BuildId::of_file(&path).expect("the replacement stats"),
+            "a same-size rename replacement is a different build"
+        );
     }
 
     #[test]

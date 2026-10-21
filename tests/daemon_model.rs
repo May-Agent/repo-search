@@ -6,7 +6,9 @@
 
 #![cfg(target_os = "macos")]
 
-// `daemon.rs` uses `wait_for_exit`; this file only watches stdin.
+// `daemon.rs` uses the rest of the fixture.
+#[path = "support/client.rs"]
+mod client;
 #[allow(dead_code)]
 #[path = "support/host.rs"]
 mod host;
@@ -55,11 +57,13 @@ async fn stage_1_query_on_the_ane() {
         idle_exit: Duration::from_secs(600),
         model_store: store,
         backend: Arc::new(CoreMlBackend),
+        build: client::build(),
     }));
 
     for query in QUERIES {
-        let events = model::request(&socket, model::search(&worktree, query)).await;
-        let answer = match model::final_of(&events) {
+        let events =
+            client::request(&socket, &client::hello(), client::search(&worktree, query)).await;
+        let answer = match client::final_of(&events) {
             Final::Answer(answer) => answer,
             Final::Error(error) => panic!("{query:?} failed: {error:?}"),
             other => panic!("{query:?} answered with {other:?}"),
@@ -105,22 +109,23 @@ async fn kill_and_resume_on_the_model() {
 
     let mut host = Host::spawn(&host_config("daemon1.sock"));
     let socket = tmp.path().join("daemon1.sock");
-    let mut stream = model::index_wait(&socket, &worktree).await;
+    let mut stream = model::index_wait(&socket, &client::hello(), &worktree).await;
     model::await_coverage(&mut stream, 500).await;
     drop(stream);
 
     // A non-waiting index request runs the barrier, whose first step
     // flushes the vector writer; its `Final` landing means every embedded
     // chunk is committed, not still buffered.
-    let events = model::request(
+    let events = client::request(
         &socket,
+        &client::hello(),
         Request::Index {
             worktree: worktree.clone(),
             wait: false,
         },
     )
     .await;
-    match model::final_of(&events) {
+    match client::final_of(&events) {
         Final::Indexed { .. } => {}
         other => panic!("the flush request failed: {other:?}"),
     }
@@ -133,7 +138,13 @@ async fn kill_and_resume_on_the_model() {
     assert!(committed >= 500, "{committed} committed vectors");
 
     let _host = Host::spawn(&host_config("daemon2.sock"));
-    model::assert_resume(&tmp.path().join("daemon2.sock"), &worktree, committed).await;
+    model::assert_resume(
+        &tmp.path().join("daemon2.sock"),
+        &client::hello(),
+        &worktree,
+        committed,
+    )
+    .await;
 }
 
 /// Configuration handed to a re-executed `daemon_host_coreml` through
@@ -165,6 +176,7 @@ async fn daemon_host_coreml() {
         idle_exit: Duration::from_secs(3600),
         model_store: store,
         backend: Arc::new(CoreMlBackend),
+        build: client::build(),
     })
     .await
     .expect("the host runs");
@@ -217,7 +229,7 @@ impl Host {
         });
         tokio::task::block_in_place(|| {
             ready
-                .recv_timeout(model::TIMEOUT)
+                .recv_timeout(client::TIMEOUT)
                 .expect("the host prints READY after binding");
         });
         Self {
