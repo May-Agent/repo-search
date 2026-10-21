@@ -479,6 +479,37 @@ struct Item {
     worktrees: Vec<WorktreeId>,
 }
 
+/// How many of `interest` sit in each queue; kept in step with every
+/// queue transition and interest change, so `counts_for` never scans.
+#[derive(Debug, Default, Clone, Copy)]
+struct Tally {
+    stage1: u64,
+    background: u64,
+    in_flight: u64,
+}
+
+impl Tally {
+    /// The counter for `queue`.
+    fn slot(&mut self, queue: Queue) -> &mut u64 {
+        match queue {
+            Queue::Stage1 => &mut self.stage1,
+            Queue::Background => &mut self.background,
+            Queue::InFlight => &mut self.in_flight,
+        }
+    }
+
+    /// One more item of `interest` sits in `queue`.
+    fn add(&mut self, queue: Queue) {
+        *self.slot(queue) += 1;
+    }
+
+    /// One fewer item of `interest` sits in `queue`.
+    fn sub(&mut self, queue: Queue) {
+        let slot = self.slot(queue);
+        *slot = slot.checked_sub(1).expect("queue tally underflow");
+    }
+}
+
 /// What the scheduler tracks per worktree.
 struct Worktree {
     /// The last applied `Enqueue` class.
@@ -492,6 +523,8 @@ struct Worktree {
     stage1_left: usize,
     /// The items the last applied `Enqueue` listed.
     interest: HashSet<ItemId>,
+    /// `interest` counted by queue.
+    tally: Tally,
     repo: RepoId,
     stage1_done_tx: mpsc::Sender<Stage1Done>,
 }
@@ -849,6 +882,7 @@ impl<B: Backend> Scheduler<B> {
             stage1_done: false,
             stage1_left: 0,
             interest: HashSet::new(),
+            tally: Tally::default(),
             repo,
             stage1_done_tx: stage1_done.clone(),
         });
@@ -901,6 +935,11 @@ impl<B: Backend> Scheduler<B> {
             let entry = self.items.get_mut(&item).expect("queued item exists");
             if !entry.worktrees.contains(&worktree) {
                 entry.worktrees.push(worktree);
+                self.worktrees
+                    .get_mut(&worktree)
+                    .expect("the worktree exists")
+                    .tally
+                    .add(entry.queue);
             }
             interest.insert(item);
             self.refresh_class(item);
@@ -943,6 +982,12 @@ impl<B: Backend> Scheduler<B> {
     fn lose_interest(&mut self, worktree: WorktreeId, item: ItemId) {
         let entry = self.items.get_mut(&item).expect("interested item exists");
         entry.worktrees.retain(|w| *w != worktree);
+        let queue = entry.queue;
+        self.worktrees
+            .get_mut(&worktree)
+            .expect("interested worktree exists")
+            .tally
+            .sub(queue);
         if entry.class == IndexClass::Stage1
             && entry.tokens as usize <= STAGE1_MAX_TOKENS
             && let Some(state) = self.worktrees.get_mut(&worktree)
@@ -978,18 +1023,21 @@ impl<B: Backend> Scheduler<B> {
         }
         let small = entry.tokens as usize <= STAGE1_MAX_TOKENS;
         let interested: Vec<WorktreeId> = entry.worktrees.clone();
-        let entry = self.items.get_mut(&item).expect("exists");
-        entry.class = class;
-        match (entry.queue, class) {
+        let (queue, tokens) = {
+            let entry = self.items.get_mut(&item).expect("exists");
+            entry.class = class;
+            (entry.queue, entry.tokens)
+        };
+        match (queue, class) {
             (Queue::Stage1, IndexClass::Background) => {
-                self.stage1.remove(&(entry.tokens, item));
-                self.background.insert((entry.tokens, item), ());
-                entry.queue = Queue::Background;
+                self.stage1.remove(&(tokens, item));
+                self.background.insert((tokens, item), ());
+                self.set_queue(item, Queue::Background);
             }
             (Queue::Background, IndexClass::Stage1) => {
-                self.background.remove(&(entry.tokens, item));
-                self.stage1.insert((entry.tokens, item), ());
-                entry.queue = Queue::Stage1;
+                self.background.remove(&(tokens, item));
+                self.stage1.insert((tokens, item), ());
+                self.set_queue(item, Queue::Stage1);
             }
             _ => {}
         }
@@ -1033,8 +1081,26 @@ impl<B: Backend> Scheduler<B> {
         for worktree in &entry.worktrees {
             if let Some(state) = self.worktrees.get_mut(worktree) {
                 state.interest.remove(&item);
+                state.tally.sub(entry.queue);
             }
         }
+    }
+
+    /// Moves `item` to `to`, updating every interested worktree's tally.
+    /// Every `entry.queue` assignment goes through here.
+    fn set_queue(&mut self, item: ItemId, to: Queue) {
+        let entry = self.items.get(&item).expect("queued item exists");
+        let old = entry.queue;
+        for &worktree in &entry.worktrees {
+            let tally = &mut self
+                .worktrees
+                .get_mut(&worktree)
+                .expect("interested worktree exists")
+                .tally;
+            tally.sub(old);
+            tally.add(to);
+        }
+        self.items.get_mut(&item).expect("queued item exists").queue = to;
     }
 
     fn queue_mut(&mut self, queue: Queue) -> &mut BTreeMap<(u32, ItemId), ()> {
@@ -1110,8 +1176,8 @@ impl<B: Backend> Scheduler<B> {
             if let Some((&key, &())) = self.queue_mut(queue).first_key_value() {
                 self.queue_mut(queue).remove(&key);
                 let item = key.1;
-                let entry = self.items.get_mut(&item).expect("queued item exists");
-                entry.queue = Queue::InFlight;
+                self.set_queue(item, Queue::InFlight);
+                let entry = &self.items[&item];
                 let repo = entry.repo;
                 let chunk = entry.chunk.clone();
                 self.dispatched_indexing += 1;
@@ -1154,8 +1220,8 @@ impl<B: Backend> Scheduler<B> {
                 Some(_) => break,
             }
             self.stage1.pop_last();
-            let entry = self.items.get_mut(&item).expect("queued item exists");
-            entry.queue = Queue::InFlight;
+            self.set_queue(item, Queue::InFlight);
+            let entry = &self.items[&item];
             let repo = entry.repo;
             let chunk = entry.chunk.clone();
             batch.push((item, chunk, self.writers[&repo].clone()));
@@ -1185,6 +1251,7 @@ impl<B: Backend> Scheduler<B> {
         for worktree in &entry.worktrees {
             if let Some(state) = self.worktrees.get_mut(worktree) {
                 state.interest.remove(&item);
+                state.tally.sub(entry.queue);
             }
         }
         for worktree in entry.worktrees {
@@ -1303,19 +1370,15 @@ impl<B: Backend> Scheduler<B> {
     }
 
     fn counts_for(&self, worktree: WorktreeId) -> Counts {
-        let mut counts = Counts::default();
         let Some(state) = self.worktrees.get(&worktree) else {
-            return counts;
+            return Counts::default();
         };
-        counts.stage1_done = state.stage1_done;
-        for item in &state.interest {
-            match self.items[item].queue {
-                Queue::Stage1 => counts.queued_stage1 += 1,
-                Queue::Background => counts.queued_background += 1,
-                Queue::InFlight => counts.in_flight += 1,
-            }
+        Counts {
+            queued_stage1: state.tally.stage1,
+            queued_background: state.tally.background,
+            in_flight: state.tally.in_flight,
+            stage1_done: state.stage1_done,
         }
-        counts
     }
 
     /// Pushes each watched worktree's counts when they changed, dropping
