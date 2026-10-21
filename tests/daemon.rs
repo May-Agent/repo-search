@@ -22,7 +22,7 @@ use repo_search_coreml::GpuBlocked;
 use support::client::{final_event, final_of, hello, next_event, request, search, stream_request};
 use support::daemon::{Daemon, Model, daemon, digest_of, sha_7};
 use support::repo::{self, TestRepo};
-use support::stub::{IndexGate, Instance, Kind, Record, StubBackend};
+use support::stub::{HoldHandle, IndexGate, Instance, Kind, Record, StubBackend};
 use tokio::net::UnixListener;
 
 const TIMEOUT: Duration = Duration::from_secs(60);
@@ -2107,5 +2107,329 @@ async fn an_include_ignored_search_and_a_plain_one_resync_the_scope() {
     assert!(
         vendor_hashes.iter().all(|h| !embedded.contains(h)),
         "the scope-false resync dropped the vendored chunks before dispatch"
+    );
+}
+/// A daemon whose ANE holds index calls at an [`IndexGate`] once armed,
+/// and whose model counter holds the feeder's next `document_tokens`
+/// call (a non-empty feed, after its cache read) once the handle is armed.
+async fn start_feed_held(ane: Duration) -> (Daemon, Arc<IndexGate>, HoldHandle) {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let mut backend = StubBackend::new(mpsc::channel().0);
+    backend.set_instance_delay(Instance::Ane, ane);
+    let gate = backend.gate_first_index(Instance::Ane);
+    let hold = backend.hold_document_tokens();
+    let d = daemon(tmp, backend, Model::Cached, Duration::from_secs(600)).await;
+    (d, gate, hold)
+}
+
+/// An `Index` request for `worktree`: its events, which end in `Indexed`,
+/// with every chunk embedded when `wait`.
+async fn index_request(d: &Daemon, worktree: &Path, wait: bool) -> Vec<Event> {
+    let events = request(
+        &d.socket,
+        &hello(),
+        Request::Index {
+            worktree: worktree.to_path_buf(),
+            wait,
+        },
+    )
+    .await;
+    match final_of(&events) {
+        Final::Indexed { with_vector, total } => {
+            if wait {
+                assert_eq!(with_vector, total, "every chunk has a vector");
+            }
+        }
+        other => panic!("expected Indexed, got {other:?}"),
+    }
+    events
+}
+
+/// Blocks, off the executor, until the armed hold parks a feed.
+fn wait_feed_held(hold: &HoldHandle) {
+    tokio::task::block_in_place(|| {
+        hold.entered
+            .recv_timeout(TIMEOUT)
+            .expect("a feed is counting its chunks")
+    });
+}
+
+/// The `Coverage` frames among `events`. An `index --wait` sends one
+/// only while its worktree has queued or in-flight items.
+fn coverage_frames(events: &[Event]) -> usize {
+    events
+        .iter()
+        .filter(|e| matches!(e, Event::Progress(protocol::Progress::Coverage { .. })))
+        .count()
+}
+
+/// Drains `records` into `log`; every embedded document's hash in `log`,
+/// as indexing (`Kind::Index`) or on the spot (`Kind::QueryDocument`).
+fn embeds(log: &mut Vec<Record>, records: &mpsc::Receiver<Record>) -> Vec<(Kind, ContentHash)> {
+    log.extend(records.try_iter());
+    log.iter()
+        .filter(|r| matches!(r.kind, Kind::Index | Kind::QueryDocument))
+        .map(|r| (r.kind, r.hash.expect("a document record carries a hash")))
+        .collect()
+}
+
+/// The distinct chunk hashes visible in `worktree`'s index.
+async fn visible_hashes(worktree: &Path) -> HashSet<ContentHash> {
+    Index::open(worktree)
+        .await
+        .expect("index opens")
+        .chunk_hashes(false)
+        .await
+        .expect("chunk hashes")
+        .into_iter()
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_scope_flip_resync_skips_chunks_finished_while_it_was_held() {
+    let repo = fn_repo(20, SMALL_BYTES, 10);
+    let (d, gate, hold) = start_feed_held(Duration::from_millis(10)).await;
+    gate.arm();
+
+    // The owner's first barrier: a `Resync` of the include-ignored scope.
+    let mut ignored = lexical(&repo.root, MARKER);
+    let Request::Search(inner) = &mut ignored else {
+        unreachable!("search builds a Search request")
+    };
+    inner.include_ignored = true;
+    let events = request(&d.socket, &hello(), ignored).await;
+    assert!(
+        matches!(final_of(&events), Final::Answer(a) if a.has_results),
+        "{events:?}"
+    );
+    // Its `Replace` is in and the ANE holds the first item.
+    let mut log: Vec<Record> = Vec::new();
+    wait_held(&mut log, &d.records);
+    let _lift = support::stub::lift_ane(&d.backend, QosClass::UserInitiated);
+
+    // The plain `index` flips the scope back: a `Resync`, held after its
+    // `missing` read saw nothing cached. The flips are ordered this way so
+    // the final `index --wait` below is a `Change`, not a `Resync` whose
+    // `Replace` would drop the re-queued items before they ran.
+    hold.arm();
+    index_request(&d, &repo.root, false).await;
+    wait_feed_held(&hold);
+    gate.open();
+    let want = visible_hashes(&repo.root).await;
+    assert_eq!(want.len(), 21);
+    // Every chunk embeds from the first `Replace` while the resync is held.
+    tokio::task::block_in_place(|| {
+        loop {
+            let have: HashSet<ContentHash> = log
+                .iter()
+                .filter(|r| r.kind == Kind::Index)
+                .filter_map(|r| r.hash)
+                .collect();
+            if want.is_subset(&have) {
+                break;
+            }
+            log.push(
+                d.records
+                    .recv_timeout(TIMEOUT)
+                    .expect("a record must arrive within the timeout"),
+            );
+        }
+    });
+
+    tokio::task::block_in_place(|| hold.open());
+    // This feed is FIFO behind the held resync, so its `Indexed` follows
+    // the resync's `Enqueue`.
+    index_request(&d, &repo.root, true).await;
+
+    let indexed: Vec<ContentHash> = embeds(&mut log, &d.records)
+        .into_iter()
+        .filter(|(kind, _)| *kind == Kind::Index)
+        .map(|(_, hash)| hash)
+        .collect();
+    let distinct: HashSet<ContentHash> = indexed.iter().copied().collect();
+    assert_eq!(
+        distinct.len(),
+        indexed.len(),
+        "a hash was embedded twice: {indexed:?}"
+    );
+    assert_eq!(distinct, want, "{indexed:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_second_worktrees_first_resync_skips_chunks_finished_while_it_was_held() {
+    let repo = fn_repo(20, SMALL_BYTES, 10);
+    let linked = repo::add_worktree(&repo, "linked", "linked");
+    let (d, gate, hold) = start_feed_held(Duration::from_millis(10)).await;
+    gate.arm();
+    index_request(&d, &repo.root, false).await;
+    // The main worktree's `Replace` is in, its first item held.
+    let mut log: Vec<Record> = Vec::new();
+    wait_held(&mut log, &d.records);
+    let _lift = support::stub::lift_ane(&d.backend, QosClass::UserInitiated);
+
+    // The linked worktree's first barrier is a `Resync`, held after its
+    // `missing` read saw nothing cached.
+    hold.arm();
+    index_request(&d, &linked, false).await;
+    wait_feed_held(&hold);
+    gate.open();
+    // The main worktree embeds and commits every chunk.
+    index_request(&d, &repo.root, true).await;
+    tokio::task::block_in_place(|| hold.open());
+
+    let events = index_request(&d, &linked, true).await;
+    // The linked worktree had nothing left to embed: its `Replace` was
+    // filtered to nothing, `stage1_left` was 0 and stage 1 completed at
+    // once.
+    assert_eq!(coverage_frames(&events), 0, "{events:?}");
+    let want = visible_hashes(&repo.root).await;
+    assert_eq!(want.len(), 21);
+    assert_eq!(visible_hashes(&linked).await, want);
+    let indexed: Vec<ContentHash> = embeds(&mut log, &d.records)
+        .into_iter()
+        .filter(|(kind, _)| *kind == Kind::Index)
+        .map(|(_, hash)| hash)
+        .collect();
+    let distinct: HashSet<ContentHash> = indexed.iter().copied().collect();
+    assert_eq!(
+        distinct.len(),
+        indexed.len(),
+        "a hash was embedded twice: {indexed:?}"
+    );
+    assert_eq!(distinct, want, "{indexed:?}");
+
+    let events = request(
+        &d.socket,
+        &hello(),
+        Request::Status {
+            worktree: linked.clone(),
+        },
+    )
+    .await;
+    let report = match final_of(&events) {
+        Final::Status(report) => report,
+        other => panic!("expected a Status, got {other:?}"),
+    };
+    let index = report
+        .index
+        .as_ref()
+        .expect("the linked worktree is indexed");
+    assert_eq!(index.phase, WirePhase::Maintained);
+    assert_eq!(index.queued_stage1, 0);
+    assert_eq!(index.queued_background, 0);
+    assert_eq!(index.in_flight, 0);
+    assert_eq!(index.chunks_with_vector, index.chunks_total);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_change_skips_chunks_another_worktree_embedded_while_it_was_held() {
+    let repo = fn_repo(20, SMALL_BYTES, 10);
+    let linked = repo::add_worktree(&repo, "linked", "linked");
+    let (d, _gate, hold) = start_feed_held(Duration::from_millis(10)).await;
+    index_request(&d, &repo.root, true).await;
+    index_request(&d, &linked, true).await;
+    let before = visible_hashes(&repo.root).await;
+    let mut log: Vec<Record> = Vec::new();
+    // The work from here runs at background QoS.
+    let _lift = support::stub::lift_ane(&d.backend, QosClass::UserInitiated);
+
+    // The linked worktree's `Change` is held after its reconcile read saw
+    // the new chunk uncached.
+    hold.arm();
+    let edit = repo::rust_fn("shared_edit_fn", SMALL_BYTES);
+    repo::append(&linked, "src/f1.rs", &edit);
+    index_request(&d, &linked, false).await;
+    wait_feed_held(&hold);
+
+    // The main worktree embeds and commits the same chunk.
+    repo::append(&repo.root, "src/f1.rs", &edit);
+    index_request(&d, &repo.root, true).await;
+    tokio::task::block_in_place(|| hold.open());
+    let events = index_request(&d, &linked, true).await;
+    assert_eq!(coverage_frames(&events), 0, "{events:?}");
+
+    let want = visible_hashes(&repo.root).await;
+    assert_eq!(visible_hashes(&linked).await, want);
+    let added: HashSet<ContentHash> = want.difference(&before).copied().collect();
+    assert_eq!(added.len(), 1, "{added:?}");
+    let new = added.iter().next().expect("one new hash");
+    let embedded = embeds(&mut log, &d.records);
+    let distinct: HashSet<ContentHash> = embedded.iter().map(|(_, hash)| *hash).collect();
+    assert_eq!(
+        distinct.len(),
+        embedded.len(),
+        "a hash was embedded twice: {embedded:?}"
+    );
+    assert_eq!(
+        embedded.iter().filter(|(_, hash)| hash == new).count(),
+        1,
+        "the new chunk embedded exactly once: {embedded:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_change_skips_chunks_a_search_embedded_while_it_was_held() {
+    const EDIT_MARKER: &str = "zanzibarmarker";
+    let repo = fn_repo(20, SMALL_BYTES, 10);
+    let (d, _gate, hold) = start_feed_held(Duration::from_millis(10)).await;
+    index_request(&d, &repo.root, true).await;
+    let before = visible_hashes(&repo.root).await;
+    let mut log: Vec<Record> = Vec::new();
+    let _lift = support::stub::lift_ane(&d.backend, QosClass::UserInitiated);
+
+    // The edit's `Change` is held after its reconcile read saw the new
+    // chunk uncached.
+    hold.arm();
+    repo::append(
+        &repo.root,
+        "src/f1.rs",
+        &repo::rust_fn(&format!("{EDIT_MARKER}_fn"), SMALL_BYTES),
+    );
+    index_request(&d, &repo.root, false).await;
+    wait_feed_held(&hold);
+
+    // The hybrid search embeds the new chunk on the spot and commits it
+    // (`put_many`, then `stored`) while the `Change` is held. Its own
+    // barrier is a no-change `Change`, queued in the feeder behind the
+    // held one.
+    let events = request(&d.socket, &hello(), search(&repo.root, EDIT_MARKER)).await;
+    let answer = match final_of(&events) {
+        Final::Answer(answer) => answer,
+        other => panic!("expected an Answer, got {other:?}"),
+    };
+    assert!(answer.has_results, "{events:?}");
+    assert_eq!(answer.stats.embedded_on_the_spot, 1, "{events:?}");
+
+    tokio::task::block_in_place(|| hold.open());
+    let events = index_request(&d, &repo.root, true).await;
+    assert_eq!(coverage_frames(&events), 0, "{events:?}");
+
+    let added: HashSet<ContentHash> = visible_hashes(&repo.root)
+        .await
+        .difference(&before)
+        .copied()
+        .collect();
+    assert_eq!(added.len(), 1, "{added:?}");
+    let new = added.iter().next().expect("one new hash");
+    let embedded = embeds(&mut log, &d.records);
+    let distinct: HashSet<ContentHash> = embedded.iter().map(|(_, hash)| *hash).collect();
+    assert_eq!(
+        distinct.len(),
+        embedded.len(),
+        "a hash was embedded twice: {embedded:?}"
+    );
+    assert_eq!(
+        embedded
+            .iter()
+            .filter(|(kind, hash)| *kind == Kind::QueryDocument && hash == new)
+            .count(),
+        1,
+        "the new chunk embedded exactly once, on the spot: {embedded:?}"
+    );
+    assert!(
+        !embedded
+            .iter()
+            .any(|(kind, hash)| *kind == Kind::Index && hash == new),
+        "the new chunk was never index-embedded: {embedded:?}"
     );
 }

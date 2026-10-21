@@ -8,7 +8,9 @@
 //! finished vectors go to the per-repository [`writer`]. A worktree's
 //! interest is replaced whole on a fresh or rescoped pass and edited by each
 //! later pass's changes, so a pass that changed nothing costs the scheduler
-//! nothing.
+//! nothing. An `Enqueue` is applied inside the freshness barrier it came
+//! from, and chunks that got a vector after that barrier began are dropped
+//! from it, so a late update never queues committed work again.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
@@ -70,7 +72,9 @@ pub struct PendingItem {
 pub struct Stage1Done;
 
 /// A worktree's indexing work. A worktree's `Enqueue`s are applied in the
-/// order sent, and its first one is an `Interest::Replace`.
+/// order sent, its first one is an `Interest::Replace`, and each is sent
+/// between its barrier's `Barrier { running: true }` and
+/// `Barrier { running: false }`.
 #[derive(Debug)]
 pub struct Enqueue {
     /// The worktree these items belong to.
@@ -99,6 +103,12 @@ pub struct Enqueue {
 /// than some queued `Change`s is corrected by them. A hash `missing` left
 /// out because its file changed after the pass is offered again by the next
 /// pass.
+///
+/// Both lists are read from the cache inside the barrier the `Enqueue`
+/// belongs to. A hash that got a vector between that read and the
+/// `Enqueue`, by any worktree of the repository or by a search, is dropped
+/// from `Replace` and `added` when the `Enqueue` is applied (see
+/// `OpenBarriers`).
 #[derive(Debug)]
 pub enum Interest {
     /// Every chunk of the worktree's scope that lacks a vector: replaces
@@ -346,11 +356,14 @@ pub enum SchedulerMsg {
         /// Where the counts go.
         reply: oneshot::Sender<Counts>,
     },
-    /// A worktree's freshness barrier is running (`running`) or ended:
-    /// barrier work keeps the daemon busy for the idle exit.
+    /// A freshness barrier of a worktree of `repo` is running (`running`)
+    /// or ended. Barrier work keeps the daemon busy for the idle exit, and
+    /// while any barrier of `repo` runs, the scheduler remembers the hashes
+    /// of `repo` that get a vector (see [`OpenBarriers`]). A barrier's
+    /// `Enqueue`, when it has one, is sent between its two reports.
     Barrier {
-        /// The worktree reporting.
-        worktree: WorktreeId,
+        /// The repository of the worktree reporting.
+        repo: RepoId,
         /// Whether the barrier is running.
         running: bool,
     },
@@ -453,13 +466,11 @@ impl SchedulerHandle {
             .map_err(|_| Closed)
     }
 
-    /// Reports a worktree's freshness barrier running or ended; a running
-    /// barrier keeps the daemon busy for the idle exit.
-    pub async fn barrier(&self, worktree: WorktreeId, running: bool) {
-        let _ = self
-            .tx
-            .send(SchedulerMsg::Barrier { worktree, running })
-            .await;
+    /// Reports a freshness barrier of a worktree of `repo` running or
+    /// ended. `running: true` must be sent before the barrier's first cache
+    /// read, and `running: false` after its `Enqueue`.
+    pub async fn barrier(&self, repo: RepoId, running: bool) {
+        let _ = self.tx.send(SchedulerMsg::Barrier { repo, running }).await;
     }
 
     /// The worktree's counts, pushed on change until the receiver is
@@ -526,6 +537,24 @@ struct Item {
     class: IndexClass,
     queue: Queue,
     worktrees: Vec<WorktreeId>,
+}
+
+/// A repository's running freshness barriers, and the hashes that got a
+/// vector since the first of them began.
+///
+/// Each barrier reads the vector cache after it began, and its `Enqueue`
+/// lands before it ends. A hash that got a vector after that read may be
+/// listed as missing, yet it has already left the queues. `committed`
+/// holds every such hash, so `on_enqueue` drops it instead of queuing it a
+/// second time. Once no barrier of the repository runs, no `Enqueue` built
+/// from an earlier read can land, and the set goes with the entry.
+#[derive(Default)]
+struct OpenBarriers {
+    /// Barriers begun and not yet ended.
+    running: u64,
+    /// Hashes whose vector went to the writer (`item_done`) or was
+    /// committed by a search (`DocumentsStored`) while `running > 0`.
+    committed: HashSet<ContentHash>,
 }
 
 /// How many of `interest` sit in each queue; kept in step with every
@@ -639,9 +668,10 @@ struct Scheduler<B: Backend> {
     gpu_blocked: bool,
     dispatched_indexing: u64,
     stats: HashMap<WorktreeId, AneStats>,
-    /// Freshness barriers running per worktree, counted: a barrier's end
-    /// report can arrive after a later barrier already started.
-    barriers: HashMap<WorktreeId, u64>,
+    /// Running freshness barriers per repository, counted: a barrier's end
+    /// report can arrive after a later barrier already started. An entry
+    /// exists only while its count is above zero.
+    barriers: HashMap<RepoId, OpenBarriers>,
     /// `index --wait` watches, pushing each worktree's counts on change —
     /// one sender per waiting task, since waits no longer serialize on the
     /// owner.
@@ -821,6 +851,7 @@ impl<B: Backend> Scheduler<B> {
             }
             SchedulerMsg::DocumentsStored { repo, hashes } => {
                 for hash in hashes {
+                    self.note_committed(repo, hash);
                     self.remove_queued(repo, hash);
                 }
             }
@@ -831,17 +862,18 @@ impl<B: Backend> Scheduler<B> {
             SchedulerMsg::CountsFor { worktree, reply } => {
                 let _ = reply.send(self.counts_for(worktree));
             }
-            SchedulerMsg::Barrier { worktree, running } => {
+            SchedulerMsg::Barrier { repo, running } => {
                 if running {
-                    *self.barriers.entry(worktree).or_default() += 1;
+                    self.barriers.entry(repo).or_default().running += 1;
                 } else {
-                    let count = self
-                        .barriers
-                        .get_mut(&worktree)
-                        .expect("unreported barrier");
-                    *count = count.checked_sub(1).expect("barrier count underflow");
-                    if *count == 0 {
-                        self.barriers.remove(&worktree);
+                    let open = self.barriers.get_mut(&repo).expect("unreported barrier");
+                    open.running = open
+                        .running
+                        .checked_sub(1)
+                        .expect("barrier count underflow");
+                    if open.running == 0 {
+                        // No `Enqueue` built from an earlier read can land.
+                        self.barriers.remove(&repo);
                     }
                 }
             }
@@ -920,10 +952,24 @@ impl<B: Backend> Scheduler<B> {
             worktree,
             repo,
             class,
-            interest,
+            mut interest,
             writer,
             stage1_done,
         } = enqueue;
+        let open = self
+            .barriers
+            .get(&repo)
+            .expect("an Enqueue lands inside one of its repository's barriers");
+        // Chunks that got a vector after the read this interest was built
+        // from: they need none, so they are neither queued nor counted.
+        if !open.committed.is_empty() {
+            let needs_vector =
+                |item: &PendingItem| !open.committed.contains(&item.chunk.content_hash);
+            match &mut interest {
+                Interest::Replace(items) => items.retain(needs_vector),
+                Interest::Change { added, .. } => added.retain(needs_vector),
+            }
+        }
         self.writers.entry(repo).or_insert(writer);
         match interest {
             Interest::Replace(items) => {
@@ -1409,6 +1455,7 @@ impl<B: Backend> Scheduler<B> {
     fn item_done(&mut self, item: ItemId) {
         let entry = self.items.remove(&item).expect("done item exists");
         self.by_hash.remove(&(entry.repo, entry.hash));
+        self.note_committed(entry.repo, entry.hash);
         for worktree in &entry.worktrees {
             if let Some(state) = self.worktrees.get_mut(worktree) {
                 state.interest.remove(&item);
@@ -1472,6 +1519,15 @@ impl<B: Backend> Scheduler<B> {
                 }
             }
             self.maybe_complete_stage1(worktree);
+        }
+    }
+
+    /// `hash` of `repo` has a vector, committed or on its way to the
+    /// writer. While a barrier of `repo` runs it is remembered, so an
+    /// `Enqueue` built from a read inside that barrier never queues it.
+    fn note_committed(&mut self, repo: RepoId, hash: ContentHash) {
+        if let Some(open) = self.barriers.get_mut(&repo) {
+            open.committed.insert(hash);
         }
     }
 

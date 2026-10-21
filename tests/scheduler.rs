@@ -143,8 +143,8 @@ fn pending(seq: u64, tokens: u32) -> scheduler::PendingItem {
 }
 
 /// Sends `items` to the scheduler for `worktree` as `class`, replacing its
-/// interest.
-async fn enqueue_for(
+/// interest. The caller holds a barrier of `REPO` open around it.
+async fn send_replace(
     rig: &Rig,
     worktree: WorktreeId,
     items: Vec<scheduler::PendingItem>,
@@ -165,6 +165,20 @@ async fn enqueue_for(
     done_rx
 }
 
+/// Sends `items` to the scheduler for `worktree` as `class`, replacing its
+/// interest inside a barrier of its own, as the feeder sends it.
+async fn enqueue_for(
+    rig: &Rig,
+    worktree: WorktreeId,
+    items: Vec<scheduler::PendingItem>,
+    class: IndexClass,
+) -> tokio::sync::mpsc::Receiver<Stage1Done> {
+    rig.sched.barrier(REPO, true).await;
+    let done = send_replace(rig, worktree, items, class).await;
+    rig.sched.barrier(REPO, false).await;
+    done
+}
+
 /// Sends `items` to the scheduler as `class`, replacing its interest.
 async fn enqueue(
     rig: &Rig,
@@ -174,8 +188,9 @@ async fn enqueue(
     enqueue_for(rig, WORKTREE, items, class).await
 }
 
-/// Sends one pass's changes for `worktree` as `class`.
-async fn change_for(
+/// Sends one pass's changes for `worktree` as `class`. The caller holds a
+/// barrier of `REPO` open around it.
+async fn send_change(
     rig: &Rig,
     worktree: WorktreeId,
     added: Vec<scheduler::PendingItem>,
@@ -195,6 +210,21 @@ async fn change_for(
         .await
         .expect("scheduler is up");
     done_rx
+}
+
+/// Sends one pass's changes for `worktree` as `class`, inside a barrier of
+/// its own, as the feeder sends it.
+async fn change_for(
+    rig: &Rig,
+    worktree: WorktreeId,
+    added: Vec<scheduler::PendingItem>,
+    dropped: Vec<ContentHash>,
+    class: IndexClass,
+) -> tokio::sync::mpsc::Receiver<Stage1Done> {
+    rig.sched.barrier(REPO, true).await;
+    let done = send_change(rig, worktree, added, dropped, class).await;
+    rig.sched.barrier(REPO, false).await;
+    done
 }
 
 /// The expected `Counts` for the scheduler-level assertions.
@@ -1044,6 +1074,26 @@ fn index_records(rig: &Rig) -> Vec<ContentHash> {
         .collect()
 }
 
+/// Drains the record channel into `log`; every `Kind::Index` hash in
+/// `log`, in order.
+fn index_hashes(log: &mut Vec<Record>, rig: &Rig) -> Vec<ContentHash> {
+    log.extend(rig.records.try_iter());
+    log.iter()
+        .filter(|r| r.kind == Kind::Index)
+        .map(|r| r.hash.expect("an Index record carries a hash"))
+        .collect()
+}
+
+/// Asserts that no hash repeats in `hashes`.
+fn assert_each_once(hashes: &[ContentHash]) {
+    let distinct: HashSet<&ContentHash> = hashes.iter().collect();
+    assert_eq!(
+        distinct.len(),
+        hashes.len(),
+        "a hash was embedded twice: {hashes:?}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_change_adds_and_drops_on_top_of_a_replace() {
     let rig = rig(Duration::from_millis(10), Duration::ZERO, &[Instance::Ane]).await;
@@ -1332,4 +1382,318 @@ async fn a_documents_job_keeps_its_queued_twin_until_stored() {
         .await
         .expect("stage 1 completes")
         .expect("stage-1 channel open");
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_resync_skips_chunks_finished_inside_its_barrier() {
+    let rig = rig(Duration::from_millis(10), Duration::ZERO, &[Instance::Ane]).await;
+    rig.backend
+        .push_headroom(Err(GpuBlocked::NotMains("Battery Power".to_owned())));
+    let query = send_query(&rig, "hold the pull").await;
+    let mut done = enqueue(
+        &rig,
+        (0..3).map(|seq| pending(seq, 100)).collect(),
+        IndexClass::Stage1,
+    )
+    .await;
+    let mut log = Vec::new();
+    wait_started(&mut log, &rig.records, 1);
+
+    // The resync's barrier, whose read saw 0, 1 and 2 uncached.
+    rig.sched.barrier(REPO, true).await;
+    open(rig.gate(Instance::Ane));
+    query.await.expect("query answered").expect("embeds fine");
+    tokio::time::timeout(TIMEOUT, done.recv())
+        .await
+        .expect("stage 1 completes")
+        .expect("stage-1 channel open");
+
+    // The resync's `Replace`, built from that read.
+    let mut again = send_replace(
+        &rig,
+        WORKTREE,
+        (0..4).map(|seq| pending(seq, 100)).collect(),
+        IndexClass::Stage1,
+    )
+    .await;
+    let now = counts_of(&rig, WORKTREE).await;
+    assert!(!now.stage1_done, "{now:?}");
+    assert_eq!(now.queued_stage1 + now.in_flight, 1, "{now:?}");
+    tokio::time::timeout(TIMEOUT, again.recv())
+        .await
+        .expect("stage 1 completes")
+        .expect("stage-1 channel open");
+    rig.sched.barrier(REPO, false).await;
+
+    let embedded = index_hashes(&mut log, &rig);
+    assert_each_once(&embedded);
+    let want: HashSet<ContentHash> = [
+        pending(0, 100).chunk.content_hash,
+        pending(1, 100).chunk.content_hash,
+        pending(2, 100).chunk.content_hash,
+        pending(3, 100).chunk.content_hash,
+    ]
+    .into_iter()
+    .collect();
+    assert_eq!(
+        embedded.iter().copied().collect::<HashSet<_>>(),
+        want,
+        "{embedded:?}"
+    );
+    assert_eq!(counts_of(&rig, WORKTREE).await, counts(0, 0, 0, true));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_change_skips_chunks_another_worktree_finished_inside_its_barrier() {
+    const OTHER: WorktreeId = WorktreeId(2);
+    let rig = rig(Duration::from_millis(10), Duration::ZERO, &[Instance::Ane]).await;
+    rig.backend
+        .push_headroom(Err(GpuBlocked::NotMains("Battery Power".to_owned())));
+    let query = send_query(&rig, "hold the pull").await;
+    let _other = enqueue_for(&rig, OTHER, vec![], IndexClass::Background).await;
+    let mut done = enqueue(
+        &rig,
+        (0..2).map(|seq| pending(seq, 100)).collect(),
+        IndexClass::Stage1,
+    )
+    .await;
+    let mut log = Vec::new();
+    wait_started(&mut log, &rig.records, 1);
+    // OTHER's work runs at background QoS, which a loaded host can starve;
+    // the `Started` record proves `open_ane` ran.
+    let _lift = stub::lift_ane(&rig.backend, QosClass::UserInitiated);
+
+    // OTHER's barrier, whose reconcile read saw 0 and 1 uncached.
+    rig.sched.barrier(REPO, true).await;
+    open(rig.gate(Instance::Ane));
+    query.await.expect("query answered").expect("embeds fine");
+    tokio::time::timeout(TIMEOUT, done.recv())
+        .await
+        .expect("stage 1 completes")
+        .expect("stage-1 channel open");
+
+    let _change = send_change(
+        &rig,
+        OTHER,
+        (0..3).map(|seq| pending(seq, 100)).collect(),
+        vec![],
+        IndexClass::Background,
+    )
+    .await;
+    let now = counts_of(&rig, OTHER).await;
+    assert_eq!(now.queued_background + now.in_flight, 1, "{now:?}");
+    wait_for(&mut log, &rig.records, |r| {
+        r.kind == Kind::Index && r.hash == Some(pending(2, 100).chunk.content_hash)
+    });
+    rig.sched.barrier(REPO, false).await;
+
+    let embedded = index_hashes(&mut log, &rig);
+    assert_each_once(&embedded);
+    let want: HashSet<ContentHash> = [
+        pending(0, 100).chunk.content_hash,
+        pending(1, 100).chunk.content_hash,
+        pending(2, 100).chunk.content_hash,
+    ]
+    .into_iter()
+    .collect();
+    assert_eq!(
+        embedded.iter().copied().collect::<HashSet<_>>(),
+        want,
+        "{embedded:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_change_skips_chunks_a_search_stored_inside_its_barrier() {
+    let rig = rig(Duration::from_millis(10), Duration::ZERO, &[]).await;
+    rig.backend
+        .push_headroom(Err(GpuBlocked::NotMains("Battery Power".to_owned())));
+    let _w = enqueue(&rig, vec![], IndexClass::Background).await;
+
+    // The edit's barrier, whose reconcile read saw 5, 6 and 7 uncached.
+    rig.sched.barrier(REPO, true).await;
+    // A search embeds 5 and 6 on the spot; `documents_stored` stands for
+    // the retriever's `put_many` and `stored`. The scheduler holds neither
+    // hash.
+    let stored = query_documents(&rig, 5, 2).await;
+    rig.sched
+        .documents_stored(REPO, stored.iter().copied().collect())
+        .await
+        .expect("scheduler is up");
+    let mut log = Vec::new();
+    // The `Documents` job's records prove `open_ane` ran.
+    let _lift = stub::lift_ane(&rig.backend, QosClass::UserInitiated);
+    let _change = send_change(
+        &rig,
+        WORKTREE,
+        (5..8).map(|seq| pending(seq, 100)).collect(),
+        vec![],
+        IndexClass::Background,
+    )
+    .await;
+    let now = counts_of(&rig, WORKTREE).await;
+    assert_eq!(now.queued_background + now.in_flight, 1, "{now:?}");
+    wait_for(&mut log, &rig.records, |r| {
+        r.kind == Kind::Index && r.hash == Some(pending(7, 100).chunk.content_hash)
+    });
+    rig.sched.barrier(REPO, false).await;
+
+    let embedded = index_hashes(&mut log, &rig);
+    for hash in [
+        pending(5, 100).chunk.content_hash,
+        pending(6, 100).chunk.content_hash,
+    ] {
+        assert!(
+            !embedded.contains(&hash),
+            "a stored hash was embedded again: {embedded:?}"
+        );
+        assert_eq!(
+            log.iter()
+                .filter(|r| r.kind == Kind::QueryDocument && r.hash == Some(hash))
+                .count(),
+            1,
+            "one QueryDocument record for {hash:?}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_second_worktrees_resync_of_finished_chunks_completes_stage1_at_once() {
+    const OTHER: WorktreeId = WorktreeId(2);
+    let rig = rig(Duration::from_millis(10), Duration::ZERO, &[Instance::Ane]).await;
+    rig.backend
+        .push_headroom(Err(GpuBlocked::NotMains("Battery Power".to_owned())));
+    let query = send_query(&rig, "hold the pull").await;
+    let mut done = enqueue(
+        &rig,
+        (0..2).map(|seq| pending(seq, 100)).collect(),
+        IndexClass::Stage1,
+    )
+    .await;
+    let mut log = Vec::new();
+    wait_started(&mut log, &rig.records, 1);
+
+    // OTHER's first barrier; its `missing` read saw 0 and 1 uncached.
+    rig.sched.barrier(REPO, true).await;
+    open(rig.gate(Instance::Ane));
+    query.await.expect("query answered").expect("embeds fine");
+    tokio::time::timeout(TIMEOUT, done.recv())
+        .await
+        .expect("stage 1 completes")
+        .expect("stage-1 channel open");
+
+    let mut other_done = send_replace(
+        &rig,
+        OTHER,
+        (0..2).map(|seq| pending(seq, 100)).collect(),
+        IndexClass::Stage1,
+    )
+    .await;
+    // FIFO-exact: stage-1 completion runs at the end of the same
+    // `on_enqueue`, before `CountsFor` is served.
+    assert_eq!(counts_of(&rig, OTHER).await, counts(0, 0, 0, true));
+    tokio::time::timeout(TIMEOUT, other_done.recv())
+        .await
+        .expect("stage 1 completes")
+        .expect("stage-1 channel open");
+    rig.sched.barrier(REPO, false).await;
+
+    let embedded = index_hashes(&mut log, &rig);
+    assert_each_once(&embedded);
+    assert_eq!(embedded.len(), 2, "{embedded:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn committed_hashes_are_kept_only_while_a_barrier_runs() {
+    // Steps 2 and 4 send a `Change` naming a hash that already has a
+    // vector. No production feed can do that — a read inside the barrier
+    // sees the vector — so the steps exist only to observe that the set is
+    // not kept.
+    let rig = rig(Duration::from_millis(10), Duration::ZERO, &[Instance::Ane]).await;
+    rig.backend
+        .push_headroom(Err(GpuBlocked::NotMains("Battery Power".to_owned())));
+    let mut done = enqueue(&rig, vec![pending(0, 100)], IndexClass::Stage1).await;
+    // Item 0's embed waits at the gate until the bracketed `Enqueue`'s
+    // barrier has ended.
+    let mut log = Vec::new();
+    wait_started(&mut log, &rig.records, 1);
+    open(rig.gate(Instance::Ane));
+    tokio::time::timeout(TIMEOUT, done.recv())
+        .await
+        .expect("stage 1 completes")
+        .expect("stage-1 channel open");
+
+    // Not kept without a barrier.
+    rig.sched.barrier(REPO, true).await;
+    let _a = send_change(
+        &rig,
+        WORKTREE,
+        vec![pending(0, 100)],
+        vec![],
+        IndexClass::Stage1,
+    )
+    .await;
+    let now = counts_of(&rig, WORKTREE).await;
+    assert!(!now.stage1_done, "{now:?}");
+    assert_eq!(now.queued_stage1 + now.in_flight, 1, "{now:?}");
+    tokio::time::timeout(TIMEOUT, done.recv())
+        .await
+        .expect("stage 1 completes")
+        .expect("stage-1 channel open");
+    rig.sched.barrier(REPO, false).await;
+
+    // Kept until the last of two overlapping barriers ends.
+    rig.sched.barrier(REPO, true).await;
+    rig.sched.barrier(REPO, true).await;
+    let _b = send_change(
+        &rig,
+        WORKTREE,
+        vec![pending(1, 100)],
+        vec![],
+        IndexClass::Stage1,
+    )
+    .await;
+    tokio::time::timeout(TIMEOUT, done.recv())
+        .await
+        .expect("stage 1 completes")
+        .expect("stage-1 channel open");
+    rig.sched.barrier(REPO, false).await;
+    let _c = send_change(
+        &rig,
+        WORKTREE,
+        vec![pending(1, 100)],
+        vec![],
+        IndexClass::Stage1,
+    )
+    .await;
+    assert_eq!(counts_of(&rig, WORKTREE).await, counts(0, 0, 0, true));
+    rig.sched.barrier(REPO, false).await;
+
+    // Dropped once none runs.
+    rig.sched.barrier(REPO, true).await;
+    let _d = send_change(
+        &rig,
+        WORKTREE,
+        vec![pending(1, 100)],
+        vec![],
+        IndexClass::Stage1,
+    )
+    .await;
+    let now = counts_of(&rig, WORKTREE).await;
+    assert!(!now.stage1_done, "{now:?}");
+    assert_eq!(now.queued_stage1 + now.in_flight, 1, "{now:?}");
+    tokio::time::timeout(TIMEOUT, done.recv())
+        .await
+        .expect("stage 1 completes")
+        .expect("stage-1 channel open");
+    rig.sched.barrier(REPO, false).await;
+
+    let embedded = index_hashes(&mut log, &rig);
+    for seq in [0, 1] {
+        let hash = pending(seq, 100).chunk.content_hash;
+        assert_eq!(
+            embedded.iter().filter(|h| **h == hash).count(),
+            2,
+            "hash {seq} embedded exactly twice: {embedded:?}"
+        );
+    }
 }
