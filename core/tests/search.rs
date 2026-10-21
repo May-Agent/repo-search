@@ -15,10 +15,10 @@ mod support;
 
 use counters::CapOff;
 use futures_executor::block_on;
-use repo_search_core::reconcile::{Options, PendingChunk, Reconciler, missing};
+use repo_search_core::reconcile::{Books, Options, PendingChunk, Presence, Reconciler, missing};
 use repo_search_core::search::{
     Channel, Error, FilterError, Filters, Mode, ON_THE_SPOT, Reconciliation, Request, Results,
-    Retriever, TokenCounter,
+    Retriever, TokenCounter, VectorReads,
 };
 use repo_search_core::store::{
     ChunkFilter, ChunkRecord, ContentHash, FileState, Index, MemberRecord, Side, VectorCache,
@@ -237,6 +237,7 @@ impl Fixture {
         .unwrap();
         let mut pending = code_pending.clone();
         let mut total = reconciled.report.chunks_total;
+        let mut doc_chunks = 0;
         let changed = reconciled.report.files_changed();
 
         if with_docs {
@@ -282,6 +283,7 @@ impl Fixture {
                 })
                 .collect();
             total += records.len() as u64;
+            doc_chunks += records.len() as u64;
             block_on(index.replace_file(
                 FileState {
                     path: "docs/guide.md".to_owned(),
@@ -334,16 +336,21 @@ impl Fixture {
             changed_files: changed + u64::from(with_docs),
             chunks_total: total,
             chunks_with_vector: embedded.min(total),
+            doc_chunks,
             unparsable: Vec::new(),
         };
         let embedder = FakeEmbedder::default();
         let seen = Arc::clone(&embedder.seen);
+        // The docs rows went in outside the reconciler: the retriever's
+        // pairs come from books read after them.
+        let (books, _) = block_on(Books::load(&index, &cache, MODEL)).unwrap();
         let retriever = Retriever::new(
             index.clone(),
             cache.clone(),
             EmbedThread::spawn(embedder, cache.clone()).unwrap(),
             PathBuf::from(tree.path()),
             NonZeroUsize::new(2).unwrap(),
+            books.pairs(),
         )
         .unwrap();
         Self {
@@ -916,6 +923,14 @@ fn a_content_hash_shared_by_code_and_docs_is_searched_on_both_sides() {
         }],
     ))
     .unwrap();
+    // The row went in outside a reconciler: what a pass would report.
+    block_on(fixture.retriever.follow(Presence::Changed {
+        appeared: vec![(shared.content_hash, Side::Docs)],
+        vanished: Vec::new(),
+    }))
+    .unwrap();
+    fixture.reconciliation.chunks_total += 1;
+    fixture.reconciliation.doc_chunks += 1;
 
     // Semantic mode isolates the vector channel: a lexical hit cannot mask a
     // missing row in the docs index.
@@ -1013,13 +1028,30 @@ fn alternating_searches_show_ignored_files_only_when_asked() {
         MODEL,
         tree.path(),
     ));
+    let embedder = FakeEmbedder::default();
+    let seen = Arc::clone(&embedder.seen);
+    // Built before the first pass, which reports every pair.
+    let retriever = RefCell::new(
+        Retriever::new(
+            index.clone(),
+            cache.clone(),
+            EmbedThread::spawn(embedder, cache.clone()).unwrap(),
+            PathBuf::from(tree.path()),
+            NonZeroUsize::new(2).unwrap(),
+            Vec::new(),
+        )
+        .unwrap(),
+    );
+    // Every pass is followed, as the daemon's barrier does.
     let pass = |include_ignored| {
-        block_on(reconciler.borrow_mut().reconcile(
+        let reconciled = block_on(reconciler.borrow_mut().reconcile(
             CHUNKER_FINGERPRINT,
             Options { include_ignored },
             Arc::new(CapOff),
         ))
-        .unwrap()
+        .unwrap();
+        block_on(retriever.borrow().follow(reconciled.presence.clone())).unwrap();
+        reconciled
     };
     let embed = |pending: &[PendingChunk]| {
         let batch = pending
@@ -1028,17 +1060,7 @@ fn alternating_searches_show_ignored_files_only_when_asked() {
             .collect();
         block_on(cache.put_many(MODEL, batch)).unwrap();
     };
-    let embedder = FakeEmbedder::default();
-    let seen = Arc::clone(&embedder.seen);
-    let mut retriever = Retriever::new(
-        index.clone(),
-        cache.clone(),
-        EmbedThread::spawn(embedder, cache.clone()).unwrap(),
-        PathBuf::from(tree.path()),
-        NonZeroUsize::new(2).unwrap(),
-    )
-    .unwrap();
-    let mut search = |include_ignored: bool, mode: Mode, files_only: bool| {
+    let search = |include_ignored: bool, mode: Mode, files_only: bool| {
         let reconciled = pass(include_ignored);
         assert!(
             block_on(missing(
@@ -1063,7 +1085,7 @@ fn alternating_searches_show_ignored_files_only_when_asked() {
             budget: 100_000,
             ..Request::new("widgets count")
         };
-        block_on(retriever.search(
+        block_on(retriever.borrow_mut().search(
             &request,
             Reconciliation::new("abc123", &reconciled.report),
             &Words,
@@ -1190,4 +1212,169 @@ fn a_split_part_without_a_vector_is_embedded_on_the_spot() {
         ..Request::new("rows push render")
     });
     assert_eq!(fixture.retriever_embedder_documents(), candidates);
+}
+
+/// What one semantic search read to bring its vector indexes up to date, in
+/// the scenario [`vector_reads`] runs.
+struct Scenario {
+    /// Distinct chunk hashes of the worktree when the retriever was seeded.
+    distinct: u64,
+    /// Chunks of the edited file new to the index.
+    edited: u64,
+    /// The searches' reads, in order: the first search, one after a
+    /// barrier that changed nothing, one after an edit, one after the
+    /// edit's chunks were embedded, and one more with nothing changed.
+    reads: [VectorReads; 5],
+    /// The file the last search found for the edited chunk's own text.
+    found: Vec<String>,
+}
+
+/// A fully embedded worktree of `files` files, searched with the vector
+/// channel alone after each barrier, as the daemon searches: the retriever
+/// is seeded from the reconciler's books and follows every later pass.
+fn vector_reads(files: usize) -> Scenario {
+    let tree = tempfile::tempdir().unwrap();
+    let common = tempfile::tempdir().unwrap();
+    for i in 0..files {
+        fs::write(
+            tree.path().join(format!("m{i}.rs")),
+            rust_item(
+                &format!("Counts the widgets of shelf {i}."),
+                &format!("pub fn shelf_{i}() -> usize {{\n    {i}\n}}"),
+            ),
+        )
+        .unwrap();
+    }
+    let index = block_on(Index::open(tree.path())).unwrap();
+    let cache = block_on(VectorCache::open(common.path())).unwrap();
+    let mut reconciler = Reconciler::new(index.clone(), cache.clone(), MODEL, tree.path());
+    let embed_missing = || {
+        let pending = block_on(missing(
+            &index,
+            &cache,
+            MODEL,
+            tree.path(),
+            Options::default(),
+            Vec::new(),
+        ))
+        .unwrap();
+        let batch = pending
+            .iter()
+            .map(|p| (p.content_hash, document_vector(p)))
+            .collect();
+        block_on(cache.put_many(MODEL, batch)).unwrap();
+        pending
+    };
+
+    let first =
+        block_on(reconciler.reconcile(CHUNKER_FINGERPRINT, Options::default(), Arc::new(CapOff)))
+            .unwrap();
+    embed_missing();
+    let pairs = reconciler.books().unwrap().pairs();
+    let distinct = pairs
+        .iter()
+        .map(|(hash, _)| *hash)
+        .collect::<std::collections::HashSet<_>>()
+        .len() as u64;
+    let mut retriever = Retriever::new(
+        index.clone(),
+        cache.clone(),
+        EmbedThread::spawn(FakeEmbedder::default(), cache.clone()).unwrap(),
+        PathBuf::from(tree.path()),
+        NonZeroUsize::new(2).unwrap(),
+        pairs,
+    )
+    .unwrap();
+    assert!(first.report.chunks_total >= files as u64);
+
+    let mut search = |query: &str| {
+        let reconciled = block_on(reconciler.reconcile(
+            CHUNKER_FINGERPRINT,
+            Options::default(),
+            Arc::new(CapOff),
+        ))
+        .unwrap();
+        block_on(retriever.follow(reconciled.presence.clone())).unwrap();
+        block_on(retriever.search(
+            &Request {
+                mode: Mode::Semantic,
+                files_only: true,
+                ..Request::new(query)
+            },
+            Reconciliation::new("abc123", &reconciled.report),
+            &Words,
+        ))
+        .unwrap()
+    };
+
+    let first = search("count the widgets").vector_reads;
+    let unchanged = search("count the widgets").vector_reads;
+    fs::write(
+        tree.path().join("m0.rs"),
+        rust_item(
+            "Restocks the gadgets of the front shelf.",
+            "pub fn restock_front() -> usize {\n    7\n}",
+        ),
+    )
+    .unwrap();
+    let after_edit = search("count the widgets").vector_reads;
+    let edited = embed_missing();
+    let chunk = edited
+        .iter()
+        .find(|p| p.text.contains("restock_front"))
+        .expect("the edited function is a chunk");
+    let query = format!("{} {}", chunk.title, chunk.text);
+    let embedded = search(&query);
+    let idle = search(&query).vector_reads;
+    Scenario {
+        distinct,
+        edited: edited.len() as u64,
+        reads: [first, unchanged, after_edit, embedded.vector_reads, idle],
+        found: paths(&embedded.code)
+            .into_iter()
+            .take(1)
+            .map(str::to_owned)
+            .collect(),
+    }
+}
+
+#[test]
+fn a_vector_search_reads_only_what_changed_since_the_last_one() {
+    for files in [4, 40] {
+        let s = vector_reads(files);
+        let [first, unchanged, after_edit, embedded, idle] = s.reads;
+        // Seeded indexes ask the cache about every hash once.
+        assert_eq!(
+            first,
+            VectorReads {
+                cache_lookups: s.distinct,
+                cache_slots: 0
+            },
+            "{files} files"
+        );
+        // Nothing changed and nothing stored: nothing read, whatever the
+        // worktree holds.
+        assert_eq!(unchanged, VectorReads::default(), "{files} files");
+        assert_eq!(idle, VectorReads::default(), "{files} files");
+        // An edit: only the edited file's new hashes are looked up.
+        assert!(s.edited > 0);
+        assert_eq!(
+            after_edit,
+            VectorReads {
+                cache_lookups: s.edited,
+                cache_slots: 0
+            },
+            "{files} files"
+        );
+        // Its vectors, stored since: read from the slot log, and searchable.
+        assert_eq!(
+            embedded,
+            VectorReads {
+                cache_lookups: 0,
+                cache_slots: s.edited
+            },
+            "{files} files"
+        );
+        assert_eq!(s.found, ["m0.rs"], "{files} files");
+    }
 }

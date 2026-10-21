@@ -10,6 +10,14 @@
 //! left unread while its stat holds, restamped when only the stat moved, and
 //! tried again when its content changed. All changes land in one transaction.
 //! A first index is the same pass over an empty table.
+//!
+//! A [`Reconciler`] keeps [`Books`] between passes: every stored row's hash
+//! and side, and which hashes have a vector. A pass updates them from its
+//! own changes and from the vectors the cache stored since the last pass, so
+//! a pass that changed nothing reads no chunk row and looks up no hash. The
+//! same books answer [`Reconciler::counts`] between passes, and each pass
+//! reports how the set of `(hash, side)` pairs changed ([`Presence`]), which
+//! is what a retriever's vector indexes follow.
 
 mod books;
 mod scan;
@@ -26,7 +34,7 @@ use tokio::sync::oneshot;
 
 use crate::TokenCounter;
 use crate::store::{
-    self, Applied, ContentHash, Index, StoredChunk, UnchunkableReason, VectorCache,
+    self, Applied, ContentHash, Index, Side, StoredChunk, UnchunkableReason, VectorCache,
 };
 
 /// Failures of a reconcile pass.
@@ -169,6 +177,9 @@ pub struct Report {
     pub chunks_total: u64,
     /// Chunk rows whose vector is in the cache for the model.
     pub chunks_with_vector: u64,
+    /// Chunk rows on the docs side visible to a search with the pass's
+    /// `include_ignored`.
+    pub doc_chunks: u64,
     /// The index was built by another chunker (or token counter) and was
     /// emptied, so every file was re-chunked this pass.
     pub rechunked: bool,
@@ -215,6 +226,29 @@ pub struct Changes {
     pub dropped: Vec<ContentHash>,
 }
 
+/// How a pass changed the `(hash, side)` pairs the index holds: a content
+/// hash with a side some stored row of that side holds, ignored files
+/// included.
+///
+/// Applied in pass order on top of [`Books::pairs`] taken after some earlier
+/// pass of the same reconciler, successive passes' presences keep that set
+/// current.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Presence {
+    /// The reconciler read its books whole this pass (its first pass, the
+    /// pass after a failed one, a re-chunk, or after [`Reconciler::counts`]
+    /// loaded them): every pair the index holds.
+    Whole(Vec<(ContentHash, Side)>),
+    /// The pairs the pass added and removed; each pair is in at most one
+    /// list, and both are empty when the pass changed no row.
+    Changed {
+        /// Pairs the index did not hold before the pass and holds now.
+        appeared: Vec<(ContentHash, Side)>,
+        /// Pairs the index held before the pass and holds no longer.
+        vanished: Vec<(ContentHash, Side)>,
+    },
+}
+
 /// The outcome of a pass.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Reconciled {
@@ -224,6 +258,19 @@ pub struct Reconciled {
     /// (`report.rechunked`), whose deleted hashes nothing recorded: a caller
     /// keeping a pending set rebuilds it with [`missing`].
     pub changes: Option<Changes>,
+    /// How the pass changed the pairs the index holds.
+    pub presence: Presence,
+}
+
+/// A scope's coverage between passes, read from a reconciler's books.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Counts {
+    /// Chunk rows visible in the scope.
+    pub chunks_total: u64,
+    /// Chunk rows visible in the scope whose vector is in the cache.
+    pub chunks_with_vector: u64,
+    /// What answering read.
+    pub reads: Reads,
 }
 
 /// Reconciles one index against its worktree, keeping the [`Books`] that
@@ -239,6 +286,9 @@ pub struct Reconciler {
     model_id: String,
     worktree: PathBuf,
     books: Option<Books>,
+    /// The books were read whole since a pass last reported its presence,
+    /// so the next pass reports [`Presence::Whole`].
+    whole: bool,
 }
 
 impl Reconciler {
@@ -256,6 +306,7 @@ impl Reconciler {
             model_id: model_id.into(),
             worktree: worktree.into(),
             books: None,
+            whole: true,
         }
     }
 
@@ -311,8 +362,10 @@ impl Reconciler {
         // whole while the worktree is walked.
         let books = async {
             match books {
-                Some(books) if !rechunked => Ok((books, Reads::default())),
-                _ => Books::load(&self.index, &self.cache, &self.model_id).await,
+                Some(books) if !rechunked => Ok((books, Reads::default(), false)),
+                _ => Books::load(&self.index, &self.cache, &self.model_id)
+                    .await
+                    .map(|(books, reads)| (books, reads, true)),
             }
         };
         let (plan, books) = tokio::join!(
@@ -322,7 +375,8 @@ impl Reconciler {
             books,
         );
         let plan = plan??;
-        let (mut books, mut reads) = books?;
+        let (mut books, mut reads, loaded) = books?;
+        self.whole |= loaded;
 
         let mut fresh = Vec::new();
         for change in &plan.changes {
@@ -417,12 +471,54 @@ impl Reconciler {
             chunks_removed: applied.chunks_removed,
             chunks_total: books.chunks_total(include_ignored),
             chunks_with_vector: books.chunks_with_vector(include_ignored),
+            doc_chunks: books.doc_chunks(include_ignored),
             rechunked,
             skipped: plan.skipped,
             reads,
         };
+        let presence = books.take_presence();
+        let presence = if std::mem::take(&mut self.whole) {
+            Presence::Whole(books.pairs())
+        } else {
+            presence
+        };
         self.books = Some(books);
-        Ok(Reconciled { report, changes })
+        Ok(Reconciled {
+            report,
+            changes,
+            presence,
+        })
+    }
+
+    /// The coverage of `include_ignored`'s scope now, from the books: the
+    /// rows as the last pass left them, and every vector the cache stored
+    /// since the books last looked. Without books (before the first pass or
+    /// after a failed one) they are read whole first and kept for the next
+    /// pass.
+    ///
+    /// # Errors
+    ///
+    /// When the index or the cache rejects a read. The books are dropped
+    /// then; the next pass loads them again.
+    pub async fn counts(&mut self, include_ignored: bool) -> Result<Counts, Error> {
+        let (mut books, mut reads) = match self.books.take() {
+            Some(books) => (books, Reads::default()),
+            None => {
+                let loaded = Books::load(&self.index, &self.cache, &self.model_id).await?;
+                self.whole = true;
+                loaded
+            }
+        };
+        let slots = self.cache.since(&self.model_id, books.high_water()).await?;
+        reads.cache_slots += slots.len() as u64;
+        books.advance(&slots);
+        let counts = Counts {
+            chunks_total: books.chunks_total(include_ignored),
+            chunks_with_vector: books.chunks_with_vector(include_ignored),
+            reads,
+        };
+        self.books = Some(books);
+        Ok(counts)
     }
 }
 

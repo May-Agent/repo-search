@@ -20,7 +20,7 @@ pub use embedder::EmbedService;
 pub use fuse::{Channel, Fused, RRF_K, fuse};
 pub use output::{
     CodeChunk, Coverage, DocChunk, FileHit, Freshness, Reconciliation, Results, Unparsable,
-    UnparsableReason,
+    UnparsableReason, VectorReads,
 };
 pub use retriever::Retriever;
 pub use scope::Scope;

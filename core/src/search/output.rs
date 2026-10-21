@@ -33,6 +33,8 @@ pub struct Reconciliation {
     pub chunks_total: u64,
     /// Chunk rows whose vector is cached.
     pub chunks_with_vector: u64,
+    /// Chunk rows on the docs side; with none, a search runs no docs list.
+    pub doc_chunks: u64,
     /// Files the index holds but could not chunk.
     pub unparsable: Vec<Unparsable>,
 }
@@ -67,6 +69,7 @@ impl Reconciliation {
             changed_files: report.files_changed(),
             chunks_total: report.chunks_total,
             chunks_with_vector: report.chunks_with_vector,
+            doc_chunks: report.doc_chunks,
             unparsable: report
                 .skipped
                 .iter()
@@ -245,6 +248,22 @@ pub struct Results {
     /// `freshness.vectors`.
     #[serde(skip)]
     pub embedded_on_the_spot: u64,
+    /// What bringing the vector indexes up to date read for this query.
+    #[serde(skip)]
+    pub vector_reads: VectorReads,
+}
+
+/// What a search read from the vector cache to bring its vector indexes up
+/// to date: the measure of that cost that does not depend on the machine.
+/// It never reads the index; a search after a barrier that changed nothing,
+/// with no vector stored since the last search, reads nothing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VectorReads {
+    /// Hashes looked up in the cache by hash: those new to the indexes.
+    pub cache_lookups: u64,
+    /// Entries read from the cache's slot log: the vectors stored since the
+    /// last search.
+    pub cache_slots: u64,
 }
 
 impl Results {
@@ -749,6 +768,7 @@ mod tests {
                 changed_files: 2,
                 chunks_total: 10,
                 chunks_with_vector: 9,
+                doc_chunks: 0,
                 unparsable: Vec::new(),
             },
             0,
@@ -1017,6 +1037,7 @@ mod tests {
             docs: doc_hits(&docs, dg),
             freshness: freshness(),
             embedded_on_the_spot: 0,
+            vector_reads: VectorReads::default(),
         }
     }
 
@@ -1068,6 +1089,7 @@ mod tests {
             docs: None,
             freshness: freshness(),
             embedded_on_the_spot: 0,
+            vector_reads: VectorReads::default(),
         };
         let json: serde_json::Value = serde_json::from_str(&r.to_json()).unwrap();
         assert_eq!(json["code"][0]["path"], "a.rs");
@@ -1155,6 +1177,7 @@ docs/guide.md
             docs: None,
             freshness: freshness(),
             embedded_on_the_spot: 0,
+            vector_reads: VectorReads::default(),
         };
         assert_eq!(
             r.to_text(),
@@ -1171,6 +1194,7 @@ docs/guide.md
                     changed_files: 0,
                     chunks_total: 1000,
                     chunks_with_vector: with_vector,
+                    doc_chunks: 0,
                     unparsable: Vec::new(),
                 },
                 embedded,
@@ -1187,6 +1211,7 @@ docs/guide.md
                 changed_files: 0,
                 chunks_total: 0,
                 chunks_with_vector: 0,
+                doc_chunks: 0,
                 unparsable: Vec::new(),
             },
             0,

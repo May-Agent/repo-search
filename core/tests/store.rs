@@ -767,10 +767,9 @@ fn chunk_queries_bind_the_doc_kind_and_expose_filters() {
     assert!(!filter(Side::Code, Some(vec![]), vec![]).is_unrestricted());
 
     // The sides split on the reserved kind.
-    assert_eq!(block_on(index.count(Side::Code, true)).unwrap(), 2);
-    assert_eq!(block_on(index.count(Side::Docs, true)).unwrap(), 1);
-    let sides = block_on(index.hash_sides()).unwrap();
-    assert_eq!(sides.iter().filter(|(_, s)| *s == Side::Docs).count(), 1);
+    let rows = block_on(index.row_hashes()).unwrap();
+    let on = |side| rows.iter().filter(|row| row.side == side).count();
+    assert_eq!((on(Side::Code), on(Side::Docs)), (2, 1));
 
     let hash_of = |path: &str, text: &str| ContentHash::of_chunk(&format!("{path} › {text}"), text);
     let code = block_on(index.hashes_matching(filter(Side::Code, None, vec![]))).unwrap();

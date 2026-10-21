@@ -132,7 +132,10 @@ struct Owner<B: Backend> {
     /// a failed barrier or a reopened index.
     sync: Option<reconcile::Options>,
     /// Reconciles `index`, keeping its books between barriers; built at
-    /// the first barrier and dropped with the index handle it holds.
+    /// the first barrier or `Status` and dropped with the index handle it
+    /// holds. Its books answer `Status`'s coverage, and every barrier's
+    /// presence is passed on to the retriever, which never reads the
+    /// index's hashes itself.
     reconciler: Option<Reconciler>,
     /// The feeder, spawned at the first barrier.
     feeder: Option<mpsc::Sender<feed::FeedMsg>>,
@@ -309,8 +312,8 @@ impl<B: Backend> Owner<B> {
 
     /// Before every barrier: the index file must still be the inode it was
     /// opened with — a recreated `.repo-search/` leaves the handle writing
-    /// into an unlinked file. On a mismatch the index and retriever are
-    /// dropped and reopened.
+    /// into an unlinked file. On a mismatch the index, its reconciler and the
+    /// retriever are dropped and reopened.
     async fn verify_index(&mut self) -> Result<(), String> {
         let Some(id) = self.index_id else {
             return Ok(());
@@ -495,12 +498,21 @@ impl<B: Backend> Owner<B> {
                 sched: model.scheduler.tx(),
                 writer: self.writer.clone().expect("opened by shared"),
             };
+            // Seeded from the books the barrier just left; every later
+            // barrier's presence follows (see `barrier_steps`).
+            let pairs = self
+                .reconciler
+                .as_ref()
+                .and_then(Reconciler::books)
+                .expect("a barrier that succeeded leaves books")
+                .pairs();
             match Retriever::new(
                 self.index.as_ref().expect("opened").clone(),
                 self.cache.clone().expect("opened above"),
                 handle,
                 self.root.clone(),
                 knn_threads,
+                pairs,
             ) {
                 Ok(retriever) => self.retriever = Some(retriever),
                 Err(e) => {
@@ -660,32 +672,26 @@ impl<B: Backend> Owner<B> {
         } else {
             None
         };
-        let index_reads = async {
+        let phase = async {
             match &index {
-                Some(index) => {
-                    let (phase, hashes) = tokio::join!(index.phase(), index.chunk_hashes(false));
-                    Some((phase, hashes))
-                }
+                Some(index) => Some(index.phase().await),
                 None => None,
             }
         };
-        // Independent reads run together; `cached` waits on `hashes`.
-        let (reads, counts, gpu, worktrees) =
-            tokio::join!(index_reads, counts, gpu, self.registry.count());
+        // Independent reads run together; the coverage counts wait on the
+        // stage-1 completion below.
+        let (phase, counts, gpu, worktrees) =
+            tokio::join!(phase, counts, gpu, self.registry.count());
         let (Ok(counts), Ok(gpu), Some(worktrees)) = (counts, gpu, worktrees) else {
             send(events, shutting_down()).await;
             return;
         };
-        let index_status = match reads {
+        let index_status = match phase {
             None => None,
-            Some((phase, hashes)) => {
-                let (phase, hashes) = match (phase, hashes) {
-                    (Ok(phase), Ok(hashes)) => (phase, hashes),
-                    (Err(e), _) => {
-                        send(events, error(ErrorKind::Internal, e.to_string())).await;
-                        return;
-                    }
-                    (_, Err(e)) => {
+            Some(phase) => {
+                let phase = match phase {
+                    Ok(phase) => phase,
+                    Err(e) => {
                         send(events, error(ErrorKind::Internal, e.to_string())).await;
                         return;
                     }
@@ -702,25 +708,27 @@ impl<B: Backend> Owner<B> {
                     self.apply_stage1_done().await;
                     phase = self.phase;
                 }
-                let cached = match self.shared().await {
-                    Ok((cache, _)) => cache.cached(&self.model_id, &hashes).await,
-                    Err(message) => {
-                        send(events, error(ErrorKind::Internal, message)).await;
-                        return;
-                    }
-                };
-                let cached = match cached {
-                    Ok(cached) => cached,
+                if let Err(message) = self.shared().await {
+                    send(events, error(ErrorKind::Internal, message)).await;
+                    return;
+                }
+                // From the books the barriers keep: no chunk row is read and
+                // no hash looked up, only the vectors stored since.
+                let coverage = match self.reconciler().counts(false).await {
+                    Ok(coverage) => coverage,
                     Err(e) => {
                         send(events, error(ErrorKind::Internal, e.to_string())).await;
                         return;
                     }
                 };
+                tracing::debug!(root = %self.root.display(),
+                                chunk_rows = coverage.reads.chunk_rows,
+                                cache_probes = coverage.reads.cache_probes,
+                                cache_slots = coverage.reads.cache_slots, "status counted");
                 Some(IndexStatus {
                     phase: WirePhase::from(phase),
-                    chunks_total: hashes.len() as u64,
-                    chunks_with_vector: hashes.iter().filter(|hash| cached.contains(hash)).count()
-                        as u64,
+                    chunks_total: coverage.chunks_total,
+                    chunks_with_vector: coverage.chunks_with_vector,
                     queued_stage1: counts.queued_stage1,
                     queued_background: counts.queued_background,
                     in_flight: counts.in_flight,
@@ -853,6 +861,19 @@ impl<B: Backend> Owner<B> {
         self.feeder.as_ref().expect("spawned above").clone()
     }
 
+    /// The reconciler of the open index, built on first use; the index and
+    /// cache are open by then.
+    fn reconciler(&mut self) -> &mut Reconciler {
+        self.reconciler.get_or_insert_with(|| {
+            Reconciler::new(
+                self.index.clone().expect("opened"),
+                self.cache.clone().expect("opened"),
+                self.model_id.clone(),
+                self.root.clone(),
+            )
+        })
+    }
+
     async fn barrier_steps(
         &mut self,
         model: &Arc<Model<B>>,
@@ -865,15 +886,8 @@ impl<B: Backend> Owner<B> {
             .await
             .map_err(|e| format!("vector writer flush: {e}"))?;
         let counter = model.counter.clone();
-        let reconciler = match &mut self.reconciler {
-            Some(reconciler) => reconciler,
-            none => none.insert(Reconciler::new(
-                self.index.clone().expect("opened"),
-                self.cache.clone().expect("opened"),
-                model.id.clone(),
-                self.root.clone(),
-            )),
-        };
+        let root = self.root.clone();
+        let reconciler = self.reconciler();
         let (reconciled, head) = tokio::join!(
             reconciler.reconcile(
                 CHUNKER_FINGERPRINT,
@@ -882,11 +896,19 @@ impl<B: Backend> Owner<B> {
             ),
             tokio::process::Command::new("git")
                 .arg("-C")
-                .arg(&self.root)
+                .arg(&root)
                 .args(["rev-parse", "HEAD"])
                 .output(),
         );
         let reconciled = reconciled.map_err(|e| e.to_string())?;
+        // The pass is committed: the retriever follows it whatever happens
+        // next, or its vector indexes would part from the books.
+        if let Some(retriever) = &self.retriever {
+            retriever
+                .follow(reconciled.presence)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
         let head = head.map_err(|e| e.to_string())?;
         if !head.status.success() {
             return Err(format!(

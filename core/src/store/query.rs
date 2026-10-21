@@ -1,9 +1,9 @@
 //! Read queries over the index that retrieval needs: BM25 candidates, chunks
-//! of a content hash, chunk rows with their members, and per-side counts.
+//! of a content hash, and chunk rows with their members.
 
 use std::ops::{Range, RangeInclusive};
 
-use rusqlite::{Connection, named_params, params};
+use rusqlite::{Connection, named_params};
 
 use crate::chunk::ChunkKind;
 
@@ -12,7 +12,7 @@ use super::{ContentHash, Error, StoredMemberKind};
 /// The kind string of a documentation chunk: the one chunker kind the store
 /// itself gives meaning to. It is the one source of the `doc` string; SQL
 /// receives it as a bound parameter, never as a literal.
-const DOC_KIND: &str = match ChunkKind::Doc.static_name() {
+pub(super) const DOC_KIND: &str = match ChunkKind::Doc.static_name() {
     Some(name) => name,
     None => panic!("ChunkKind::Doc has a static name"),
 };
@@ -248,30 +248,6 @@ pub(super) fn chunks(conn: &Connection, ids: &[ChunkId]) -> Result<Vec<ChunkRow>
         out.push(row);
     }
     Ok(out)
-}
-
-/// The number of chunk rows on `side`, those of ignored files only when
-/// `include_ignored`.
-pub(super) fn count(conn: &Connection, side: Side, include_ignored: bool) -> Result<u64, Error> {
-    let n: i64 = conn.query_row(
-        "SELECT count(*) FROM chunks c WHERE (c.kind = ?1) = ?2 AND (?3 OR c.path NOT IN \
-         (SELECT path FROM files WHERE ignored = 1))",
-        params![DOC_KIND, side == Side::Docs, include_ignored],
-        |row| row.get(0),
-    )?;
-    Ok(u64::try_from(n).expect("a count is non-negative"))
-}
-
-/// Every distinct chunk content hash with its side.
-pub(super) fn hash_sides(conn: &Connection) -> Result<Vec<(ContentHash, Side)>, Error> {
-    let mut stmt = conn.prepare("SELECT DISTINCT content_hash, kind = ?1 FROM chunks")?;
-    let rows = stmt
-        .query_map([DOC_KIND], |row| {
-            let docs: bool = row.get(1)?;
-            Ok((row.get(0)?, if docs { Side::Docs } else { Side::Code }))
-        })?
-        .collect::<Result<_, _>>()?;
-    Ok(rows)
 }
 
 /// The distinct content hashes of the chunks passing `filter`: the rows a
