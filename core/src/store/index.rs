@@ -53,7 +53,7 @@ pub struct Applied {
 }
 
 /// One stored chunk row's content hash, with its file's path and ignored
-/// flag: what reconcile's books are loaded from.
+/// flag and the row's side: what reconcile's books are loaded from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RowHash {
     /// Worktree-relative path of the file.
@@ -62,6 +62,8 @@ pub struct RowHash {
     pub content_hash: ContentHash,
     /// The file's `ignored` flag.
     pub ignored: bool,
+    /// The list the row's chunk belongs to.
+    pub side: Side,
 }
 
 /// Where a stored chunk's text lives: enough to rebuild it from the file's
@@ -207,14 +209,6 @@ enum Request {
     Chunks {
         ids: Vec<ChunkId>,
         reply: oneshot::Sender<Result<Vec<ChunkRow>, Error>>,
-    },
-    Count {
-        side: Side,
-        include_ignored: bool,
-        reply: oneshot::Sender<Result<u64, Error>>,
-    },
-    HashSides {
-        reply: oneshot::Sender<Result<Vec<(ContentHash, Side)>, Error>>,
     },
     HashesMatching {
         filter: ChunkFilter,
@@ -463,30 +457,6 @@ impl Index {
         send_and_wait(&self.tx, |reply| Request::Chunks { ids, reply }).await
     }
 
-    /// The number of chunk rows on `side`, those of ignored files only when
-    /// `include_ignored`.
-    ///
-    /// # Errors
-    ///
-    /// When SQLite rejects the read or the actor is gone.
-    pub async fn count(&self, side: Side, include_ignored: bool) -> Result<u64, Error> {
-        send_and_wait(&self.tx, |reply| Request::Count {
-            side,
-            include_ignored,
-            reply,
-        })
-        .await
-    }
-
-    /// Every distinct chunk content hash with the side its chunks are on.
-    ///
-    /// # Errors
-    ///
-    /// When SQLite rejects the read or the actor is gone.
-    pub async fn hash_sides(&self) -> Result<Vec<(ContentHash, Side)>, Error> {
-        send_and_wait(&self.tx, |reply| Request::HashSides { reply }).await
-    }
-
     /// The distinct content hashes of the chunks that pass `filter`.
     ///
     /// # Errors
@@ -613,16 +583,6 @@ fn serve(mut conn: Connection, mut rx: mpsc::Receiver<Request>) {
             }
             Request::Chunks { ids, reply } => {
                 let _ = reply.send(query::chunks(&conn, &ids));
-            }
-            Request::Count {
-                side,
-                include_ignored,
-                reply,
-            } => {
-                let _ = reply.send(query::count(&conn, side, include_ignored));
-            }
-            Request::HashSides { reply } => {
-                let _ = reply.send(query::hash_sides(&conn));
             }
             Request::HashesMatching { filter, reply } => {
                 let _ = reply.send(query::hashes_matching(&conn, &filter));
@@ -972,15 +932,17 @@ fn chunk_hashes(conn: &Connection, include_ignored: bool) -> Result<Vec<ContentH
 
 fn row_hashes(conn: &Connection) -> Result<Vec<RowHash>, Error> {
     let mut stmt = conn.prepare(
-        "SELECT c.path, c.content_hash, f.ignored FROM chunks c \
+        "SELECT c.path, c.content_hash, f.ignored, c.kind = ?1 FROM chunks c \
          JOIN files f ON f.path = c.path ORDER BY c.id",
     )?;
     let rows = stmt
-        .query_map([], |row| {
+        .query_map([query::DOC_KIND], |row| {
+            let docs: bool = row.get(3)?;
             Ok(RowHash {
                 path: row.get(0)?,
                 content_hash: row.get(1)?,
                 ignored: row.get(2)?,
+                side: if docs { Side::Docs } else { Side::Code },
             })
         })?
         .collect::<Result<_, _>>()?;

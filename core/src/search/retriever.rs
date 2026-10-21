@@ -11,14 +11,14 @@ use std::thread;
 use tokio::sync::oneshot;
 
 use crate::qos::{QosClass, set_current_thread};
-use crate::reconcile::PendingChunk;
+use crate::reconcile::{PendingChunk, Presence};
 use crate::store::{ChunkFilter, ChunkId, ChunkRow, ContentHash, Index, Side, VectorCache};
 use crate::{QueryTask, UnitVector};
 
 use super::EmbedService;
 use super::fuse::{Fused, fuse};
 use super::output::{
-    self, Freshness, RankedChunk, ReadError, Reconciliation, Results, Selector, Step,
+    self, Freshness, RankedChunk, ReadError, Reconciliation, Results, Selector, Step, VectorReads,
 };
 use super::scope::Scope;
 use super::terms::{QueryTerms, SymbolName};
@@ -37,9 +37,12 @@ const NON_DEFINITION_KINDS: &[&str] = &["impl_item"];
 /// Answers queries against one worktree.
 ///
 /// Embeds through the caller's [`EmbedService`] and owns the in-memory vector
-/// indexes of the worktree's chunks, one per list (on a thread of its own),
-/// kept in step with the index and the cache by every search. The thread does
-/// not block the executor, and a search dropped half way leaves it usable.
+/// indexes of the worktree's chunks, one per list (on a thread of its own).
+/// They follow the worktree's `(hash, side)` pairs as the caller's
+/// [`Reconciler`](crate::reconcile::Reconciler) reports them, never reading
+/// the index for that, and every search brings them in step with the cache.
+/// The thread does not block the executor, and a search dropped half way
+/// leaves it usable.
 pub struct Retriever<S: EmbedService> {
     index: Index,
     cache: VectorCache,
@@ -51,8 +54,11 @@ pub struct Retriever<S: EmbedService> {
 
 impl<S: EmbedService> Retriever<S> {
     /// A retriever over `worktree`, whose chunks `index` stores, extending
-    /// `cache` through `service`. KNN scans run on `knn_threads` threads
-    /// (the performance cores, see [`qos::performance_cores`](crate::qos)).
+    /// `cache` through `service`. `pairs` are the `(hash, side)` pairs the
+    /// index holds, [`Books::pairs`](crate::reconcile::Books::pairs) of the
+    /// reconciler whose every later pass's presence is passed to
+    /// [`Self::follow`]. KNN scans run on `knn_threads` threads (the
+    /// performance cores, see [`qos::performance_cores`](crate::qos)).
     ///
     /// # Errors
     ///
@@ -63,6 +69,7 @@ impl<S: EmbedService> Retriever<S> {
         service: S,
         worktree: PathBuf,
         knn_threads: NonZeroUsize,
+        pairs: Vec<(ContentHash, Side)>,
     ) -> io::Result<Self> {
         Ok(Self {
             index,
@@ -70,8 +77,20 @@ impl<S: EmbedService> Retriever<S> {
             service,
             worktree,
             threads: knn_threads,
-            vectors: Vectors::spawn()?,
+            vectors: Vectors::spawn(pairs)?,
         })
+    }
+
+    /// Follows a reconcile pass: the vector indexes drop the pairs that
+    /// vanished and look up those that appeared at the next search. Every
+    /// pass of the reconciler the retriever was seeded from must be
+    /// followed, in order, before the next search.
+    ///
+    /// # Errors
+    ///
+    /// When the vector index thread is gone.
+    pub async fn follow(&self, presence: Presence) -> Result<(), Error<S::Error>> {
+        self.vectors.follow(presence).await
     }
 
     /// Answers `request`. `reconciliation` is what the caller's freshness
@@ -127,17 +146,16 @@ impl<S: EmbedService> Retriever<S> {
         // unfiltered search stays unrestricted and needs no mask.
         let include_ignored = request.include_ignored || !has_ignored?;
         let scope = Scope::resolve(&request.filters, include_ignored, &files, &kinds)?;
-        let docs_present = match scope.docs {
-            Some(_) => self.index.count(Side::Docs, include_ignored).await? > 0,
-            None => false,
-        };
+        // The barrier counted the docs rows of the request's scope; with no
+        // ignored file indexed, the widened scope holds the same rows.
+        let docs_present = reconciliation.doc_chunks > 0;
         let filters = [scope.code, scope.docs.filter(|_| docs_present)];
 
         // Lexical candidates, query vectors and the in-memory index sync are
         // independent.
         let model = self.service.model_id().to_owned();
         let bm25_expr = terms.fts_match().filter(|_| use_bm25);
-        let (bm25_code, bm25_docs, query_code, query_docs, synced) = tokio::join!(
+        let (bm25_code, bm25_docs, query_code, query_docs, vector_reads) = tokio::join!(
             bm25::<S::Error>(&self.index, bm25_expr.as_deref(), filters[0].as_ref()),
             bm25::<S::Error>(&self.index, bm25_expr.as_deref(), filters[1].as_ref()),
             self.query_vector(
@@ -152,15 +170,13 @@ impl<S: EmbedService> Retriever<S> {
             ),
             async {
                 if use_vector {
-                    self.vectors
-                        .sync::<S::Error>(&self.index, &self.cache, &model)
-                        .await
+                    self.vectors.sync::<S::Error>(&self.cache, &model).await
                 } else {
-                    Ok(())
+                    Ok(VectorReads::default())
                 }
             },
         );
-        synced?;
+        let vector_reads = vector_reads?;
         let bm25_lists = [bm25_code?, bm25_docs?];
         let query_vectors = [query_code?, query_docs?];
 
@@ -201,6 +217,7 @@ impl<S: EmbedService> Retriever<S> {
             docs: output::doc_hits(&ranked[1], doc_groups),
             freshness,
             embedded_on_the_spot: embedded,
+            vector_reads,
         })
     }
 
@@ -237,7 +254,6 @@ impl<S: EmbedService> Retriever<S> {
     ) -> Result<u64, Error<S::Error>> {
         let mut missing: Vec<ChunkRow> = Vec::new();
         let mut seen: HashSet<ContentHash> = HashSet::new();
-        let mut sides: HashMap<ContentHash, Vec<Side>> = HashMap::new();
         // The two lists' reads are independent, on the index and the vectors
         // actors alike: the rows are fetched together, then what is missing.
         let (code_rows, doc_rows) = tokio::join!(
@@ -259,13 +275,6 @@ impl<S: EmbedService> Retriever<S> {
             doc_lacking?.into_iter().collect::<HashSet<_>>(),
         ];
         for (rows, lacking) in rows.into_iter().zip(lacking) {
-            for row in &rows {
-                let side = Side::of_kind(&row.kind);
-                let entry = sides.entry(row.content_hash).or_default();
-                if !entry.contains(&side) {
-                    entry.push(side);
-                }
-            }
             missing.extend(
                 rows.into_iter()
                     .filter(|row| lacking.contains(&row.content_hash))
@@ -311,18 +320,14 @@ impl<S: EmbedService> Retriever<S> {
             hashes.len(),
             "the embed service commits a vector for every chunk"
         );
+        // Each vector is loaded on every side the worktree holds its hash on.
         self.vectors
             .adopt::<S::Error>(
                 &self.cache,
                 model,
                 stored
                     .into_iter()
-                    .flat_map(|v| {
-                        sides[&v.content_hash]
-                            .iter()
-                            .map(move |&side| (v.content_hash, v.slot, side))
-                            .collect::<Vec<_>>()
-                    })
+                    .map(|v| (v.content_hash, v.slot))
                     .collect(),
             )
             .await?;

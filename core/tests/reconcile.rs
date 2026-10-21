@@ -11,10 +11,10 @@ mod counters;
 use counters::CapOff;
 use futures_executor::block_on;
 use repo_search_core::reconcile::{
-    Books, Changes, Options, PendingChunk, Reads, Reconciled, Reconciler, Report, SkipReason,
-    missing,
+    Books, Changes, Counts, Options, PendingChunk, Presence, Reads, Reconciled, Reconciler, Report,
+    SkipReason, missing,
 };
-use repo_search_core::store::{ContentHash, Index, VectorCache};
+use repo_search_core::store::{ContentHash, Index, Side, VectorCache};
 use repo_search_core::{CHUNKER_FINGERPRINT, UnitVector};
 use tempfile::TempDir;
 
@@ -25,6 +25,7 @@ const MODEL: &str = "test-model";
 struct Pass {
     report: Report,
     changes: Option<Changes>,
+    presence: Presence,
     pending: Vec<PendingChunk>,
 }
 
@@ -35,6 +36,9 @@ struct Fixture {
     cache: VectorCache,
     /// The reconciler of `index`, kept across passes as the daemon keeps it.
     reconciler: RefCell<Reconciler>,
+    /// The pairs the presences of `reconciler`'s passes add up to, as a
+    /// retriever follows them.
+    followed: RefCell<HashSet<(ContentHash, Side)>>,
 }
 
 impl Fixture {
@@ -55,6 +59,7 @@ impl Fixture {
             index,
             cache,
             reconciler,
+            followed: RefCell::new(HashSet::new()),
         }
     }
 
@@ -68,9 +73,11 @@ impl Fixture {
         self.run_chunker(CHUNKER_FINGERPRINT, options)
     }
 
-    /// A pass of the fixture's reconciler under `chunker`.
+    /// A pass of the fixture's reconciler under `chunker`, followed.
     fn run_chunker(&self, chunker: &str, options: Options) -> Pass {
-        self.run_with(&mut self.reconciler.borrow_mut(), chunker, options)
+        let pass = self.run_with(&mut self.reconciler.borrow_mut(), chunker, options);
+        self.follow(&pass.presence);
+        pass
     }
 
     /// A pass of `reconciler`, then `missing` read the way the feeder
@@ -89,13 +96,15 @@ impl Fixture {
         Pass {
             report: reconciled.report,
             changes: reconciled.changes,
+            presence: reconciled.presence,
             pending,
         }
     }
 
     /// One pass of `reconciler`. Every pass is also checked: the books it
-    /// keeps are the books a fresh load reads, and its counts are what a
-    /// recount of every row finds.
+    /// keeps are the books a fresh load reads, its counts are what a
+    /// recount of every row finds, and a whole presence is the index's
+    /// pairs.
     fn reconcile_with(
         &self,
         reconciler: &mut Reconciler,
@@ -113,22 +122,85 @@ impl Fixture {
         assert_eq!(
             (
                 reconciled.report.chunks_total,
-                reconciled.report.chunks_with_vector
+                reconciled.report.chunks_with_vector,
+                reconciled.report.doc_chunks
             ),
             self.recount(options.include_ignored),
             "the counts are a full recount's"
         );
+        match &reconciled.presence {
+            Presence::Whole(pairs) => assert_eq!(
+                pairs.iter().copied().collect::<HashSet<_>>(),
+                self.pairs(),
+                "a whole presence is every pair"
+            ),
+            Presence::Changed { appeared, vanished } => assert!(
+                appeared.iter().all(|pair| !vanished.contains(pair)),
+                "a pair is in one list"
+            ),
+        }
         reconciled
     }
 
+    /// Applies a presence of the fixture's reconciler to `followed`, as a
+    /// retriever applies it, and checks that it gives the index's pairs.
+    fn follow(&self, presence: &Presence) {
+        let mut followed = self.followed.borrow_mut();
+        match presence {
+            Presence::Whole(pairs) => *followed = pairs.iter().copied().collect(),
+            Presence::Changed { appeared, vanished } => {
+                for pair in vanished {
+                    assert!(followed.remove(pair), "a vanished pair was held");
+                }
+                for pair in appeared {
+                    assert!(followed.insert(*pair), "an appeared pair was not held");
+                }
+            }
+        }
+        assert_eq!(
+            *followed,
+            self.pairs(),
+            "the followed presences are the index's pairs"
+        );
+    }
+
+    /// Every `(hash, side)` pair the index holds, read with SQL.
+    fn pairs(&self) -> HashSet<(ContentHash, Side)> {
+        let conn = rusqlite::Connection::open(self.db()).unwrap();
+        let mut stmt = conn
+            .prepare("SELECT DISTINCT content_hash, kind = 'doc' FROM chunks")
+            .unwrap();
+        stmt.query_map([], |row| {
+            let docs: bool = row.get(1)?;
+            Ok((row.get(0)?, if docs { Side::Docs } else { Side::Code }))
+        })
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+    }
+
+    /// `counts` of the fixture's reconciler, checked against a recount.
+    fn counts(&self, include_ignored: bool) -> Counts {
+        let counts = block_on(self.reconciler.borrow_mut().counts(include_ignored)).unwrap();
+        let (total, with_vector, _) = self.recount(include_ignored);
+        assert_eq!(
+            (counts.chunks_total, counts.chunks_with_vector),
+            (total, with_vector),
+            "counts are a full recount's"
+        );
+        counts
+    }
+
     /// Runs only a pass of the fixture's reconciler, which therefore reads
-    /// no file outside the pass itself.
+    /// no file outside the pass itself, and follows it.
     fn reconcile_only(&self, options: Options) -> Reconciled {
-        self.reconcile_with(
+        let reconciled = self.reconcile_with(
             &mut self.reconciler.borrow_mut(),
             CHUNKER_FINGERPRINT,
             options,
-        )
+        );
+        self.follow(&reconciled.presence);
+        reconciled
     }
 
     /// A new reconciler of `index` over the fixture's tree and cache.
@@ -142,21 +214,23 @@ impl Fixture {
         *self.reconciler.borrow_mut() = self.reconciler_for(&self.index);
     }
 
-    /// `(rows, rows with a cached vector)` in the scope, counted from every
-    /// stored row the way a pass counted before it kept books.
-    fn recount(&self, include_ignored: bool) -> (u64, u64) {
+    /// `(rows, rows with a cached vector, docs rows)` in the scope, counted
+    /// from every stored row the way a pass counted before it kept books.
+    fn recount(&self, include_ignored: bool) -> (u64, u64, u64) {
         let conn = rusqlite::Connection::open(self.db()).unwrap();
         let mut stmt = conn
             .prepare(
-                "SELECT content_hash FROM chunks WHERE ?1 OR path NOT IN \
+                "SELECT content_hash, kind = 'doc' FROM chunks WHERE ?1 OR path NOT IN \
                  (SELECT path FROM files WHERE ignored = 1)",
             )
             .unwrap();
-        let rows: Vec<ContentHash> = stmt
-            .query_map([include_ignored], |row| row.get(0))
+        let rows: Vec<(ContentHash, bool)> = stmt
+            .query_map([include_ignored], |row| Ok((row.get(0)?, row.get(1)?)))
             .unwrap()
             .collect::<Result<_, _>>()
             .unwrap();
+        let docs = rows.iter().filter(|(_, docs)| *docs).count() as u64;
+        let rows: Vec<ContentHash> = rows.into_iter().map(|(hash, _)| hash).collect();
         let distinct: Vec<ContentHash> = rows
             .iter()
             .copied()
@@ -165,7 +239,7 @@ impl Fixture {
             .collect();
         let cached = block_on(self.cache.cached(MODEL, &distinct)).unwrap();
         let with_vector = rows.iter().filter(|hash| cached.contains(hash)).count();
-        (rows.len() as u64, with_vector as u64)
+        (rows.len() as u64, with_vector as u64, docs)
     }
 
     fn pass(&self) -> Pass {
@@ -1299,4 +1373,133 @@ fn a_failed_pass_drops_the_books() {
         r.report.reads.chunk_rows, rows as u64,
         "the next pass loads the books again"
     );
+}
+
+#[test]
+fn a_pass_reports_only_the_pairs_it_changed() {
+    let fx = Fixture::new();
+    write_modules(&fx, 20);
+    fx.write(
+        "guide.md",
+        "# Guide\n\n## Stacks\n\nStacks align their children.\n\n## Values\n\nValues live in the environment.\n",
+    );
+    let first = fx.pass();
+    // A new reconciler reads its books whole: every pair, docs included.
+    let Presence::Whole(pairs) = &first.presence else {
+        panic!("a first pass is whole: {:?}", first.presence);
+    };
+    assert!(pairs.iter().any(|(_, side)| *side == Side::Docs));
+    assert!(first.report.doc_chunks > 0);
+    let pairs = pairs.len();
+
+    // Nothing changed: an empty presence, however many pairs the index holds.
+    let unchanged = fx.reconcile_only(Options::default());
+    assert_eq!(
+        unchanged.presence,
+        Presence::Changed {
+            appeared: Vec::new(),
+            vanished: Vec::new()
+        }
+    );
+
+    // One file changed: only its pairs move. `alpha_3` and `Gamma3` keep
+    // their hashes, so they neither appear nor vanish.
+    fx.write(
+        "m3.rs",
+        "fn alpha_3() { 3; }\n\nfn changed_3() { 33; }\n\nstruct Gamma3;\n",
+    );
+    let r = fx.reconcile_only(Options::default());
+    let Presence::Changed { appeared, vanished } = &r.presence else {
+        panic!("a pass with books reports changes: {:?}", r.presence);
+    };
+    assert!(!appeared.is_empty() && !vanished.is_empty());
+    assert!(appeared.len() + vanished.len() < pairs);
+    assert!(appeared.len() as u64 <= r.report.chunks_added);
+    assert!(vanished.len() as u64 <= r.report.chunks_removed);
+}
+
+#[test]
+fn a_pass_after_reloaded_books_reports_every_pair() {
+    let fx = Fixture::new();
+    write_modules(&fx, 5);
+    fx.pass();
+    fx.reconcile_only(Options::default());
+
+    // Books read whole between passes, as `counts` does without them.
+    fx.forget_books();
+    fx.counts(false);
+    let r = fx.reconcile_only(Options::default());
+    assert!(matches!(r.presence, Presence::Whole(_)), "{:?}", r.presence);
+    assert_eq!(r.report.reads, Reads::default(), "counts loaded the books");
+
+    let again = fx.reconcile_only(Options::default());
+    assert!(matches!(again.presence, Presence::Changed { .. }));
+}
+
+#[test]
+fn counts_between_passes_read_only_the_vectors_stored_since() {
+    let fx = Fixture::new();
+    write_modules(&fx, 20);
+    let first = fx.pass();
+    assert!(first.report.chunks_total >= 20);
+
+    // Nothing stored since the pass: nothing is read, whatever the index
+    // holds.
+    let idle = fx.counts(false);
+    assert_eq!(idle.reads, Reads::default());
+    assert_eq!(idle.chunks_with_vector, 0);
+
+    // Vectors stored since: only those are read, from the slot log.
+    let (half, _) = first.pending.split_at(first.pending.len() / 2);
+    fx.embed(half);
+    let after = fx.counts(false);
+    assert_eq!(
+        after.reads,
+        Reads {
+            chunk_rows: 0,
+            cache_probes: 0,
+            cache_slots: half.len() as u64
+        }
+    );
+    assert!(after.chunks_with_vector > 0);
+    assert_eq!(fx.counts(false).reads, Reads::default());
+
+    // The next pass picks up from where `counts` left the books.
+    let r = fx.reconcile_only(Options::default());
+    assert_eq!(r.report.reads, Reads::default());
+    assert_eq!(r.report.chunks_with_vector, after.chunks_with_vector);
+}
+
+#[test]
+fn counts_without_books_read_them_whole_once() {
+    let fx = Fixture::new();
+    write_modules(&fx, 20);
+    let first = fx.pass();
+    fx.embed(&first.pending);
+    let rows: i64 = fx.query("SELECT count(*) FROM chunks");
+    let distinct: i64 = fx.query("SELECT count(DISTINCT content_hash) FROM chunks");
+
+    fx.forget_books();
+    let loaded = fx.counts(false);
+    assert_eq!(
+        loaded.reads,
+        Reads {
+            chunk_rows: rows as u64,
+            cache_probes: distinct as u64,
+            cache_slots: 0
+        }
+    );
+    assert_eq!(loaded.chunks_with_vector, loaded.chunks_total);
+    assert_eq!(fx.counts(false).reads, Reads::default());
+}
+
+#[test]
+fn counts_follow_the_scope() {
+    let fx = ignored_fixture();
+    fx.reconcile_only(Options::default());
+    let secret: i64 = fx.query("SELECT count(*) FROM chunks WHERE path = 'secret.rs'");
+    let plain = fx.counts(false);
+    let all = fx.counts(true);
+    assert_eq!(all.chunks_total, plain.chunks_total + secret as u64);
+    assert_eq!(all.reads, Reads::default());
 }
