@@ -1,6 +1,6 @@
 [package]
 name = "repo-search-coreml"
-version = "0.0.0"
+version = "0.0.1"
 description = "Core ML Embedder backend for repo-search (Apple Silicon)"
 edition.workspace = true
 rust-version.workspace = true
