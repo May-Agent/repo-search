@@ -99,6 +99,7 @@ tokio = { version = "1.54.0", default-features = false, features = ["test-util"]
 libc = { version = "0.2.191", default-features = false, features = ["std"] }
 repo-search-coreml.workspace = true
 repo-search-server = { workspace = true, features = ["stub"] }
+rusqlite = { version = "0.40.2", default-features = false }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 repo-search-server.workspace = true
