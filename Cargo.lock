@@ -1515,10 +1515,14 @@ name = "repo-search"
 version = "0.0.2"
 dependencies = [
  "askama",
+ "bytes",
  "clap",
  "const_format",
  "futures-util",
  "hex",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "kqueue",
  "libc",
  "notify",

@@ -47,6 +47,7 @@ futures-util = { version = "0.3.34", default-features = false, features = [
 ] }
 hex = { version = "0.4.3", default-features = false, features = ["alloc"] }
 reqwest = { version = "0.13.5", default-features = false, features = [
+    "json",
     "native-tls",
 ] }
 serde = { version = "1.0.229", default-features = false, features = [
@@ -82,6 +83,16 @@ tracing-subscriber = { version = "0.3.23", default-features = false, features = 
 zstd = { version = "0.14.3", default-features = false }
 
 [dev-dependencies]
+bytes = { version = "1.11.0", default-features = false }
+http-body-util = { version = "0.1.5", default-features = false }
+hyper = { version = "1.12.0", default-features = false, features = [
+    "http1",
+    "server",
+] }
+hyper-util = { version = "0.1.21", default-features = false, features = [
+    "http1",
+    "tokio",
+] }
 tokio = { version = "1.54.0", default-features = false, features = ["test-util"] }
 
 [target.'cfg(target_os = "macos")'.dev-dependencies]

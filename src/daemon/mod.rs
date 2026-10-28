@@ -11,6 +11,8 @@ pub mod gpu;
 pub mod model;
 pub mod registry;
 pub mod scheduler;
+pub mod scheduler_http;
+pub mod server;
 pub mod watch;
 pub mod worktree;
 pub mod writer;
@@ -121,6 +123,10 @@ pub enum Error {
     /// There is no retry and no fallback to the other instance.
     #[error("embedder failed: {0}")]
     Embedder(String),
+    /// An embed request to the embedding server failed past its retry,
+    /// or the server answered a non-2xx status.
+    #[error("embedding server failed: {0}")]
+    Server(String),
     /// A writer's `put_many` failed.
     #[error("vector writer failed: {0}")]
     Writer(String),
