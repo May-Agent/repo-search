@@ -18,9 +18,10 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use clap::Parser;
 use repo_search::cli::{Cli, Env, Exit, Invocation, Terminal};
-use repo_search::install::{AgentConfig, Timeouts};
-use repo_search::launchd::LaunchAgent;
+use repo_search::install::{AgentConfig, Plist, Timeouts};
+use repo_search::launchd::{LaunchAgent, ServerAgent};
 use repo_search::protocol::BuildId;
+use std::net::{IpAddr, Ipv4Addr};
 use support::client;
 use support::daemon::Model;
 use support::launchd::{FakeLaunchctl, FakeLaunchd};
@@ -31,7 +32,7 @@ use support::stub::{Instance, StubBackend};
 /// `Hello` the test sends — they must match for the handshake to pass.
 fn launchd(config: &AgentConfig) -> FakeLaunchd {
     FakeLaunchd::new(
-        config.agent.socket.clone(),
+        config.agent.socket().to_path_buf(),
         tokio::runtime::Handle::current(),
         client::build(),
     )
@@ -39,13 +40,45 @@ fn launchd(config: &AgentConfig) -> FakeLaunchd {
 
 /// A test `AgentConfig`: `plist`, `lock`, `socket` and `stderr` inside the
 /// temp dir, the production `user/<uid>` domain, the spec's test timeouts.
+/// The server agent `cli::run` keeps current beside the daemon's. Its
+/// plist and socket file are written at construction so every ensure
+/// reads it as `Current` without touching the fake's single-job state.
+fn server_config(tmp: &Path) -> AgentConfig {
+    let config = AgentConfig {
+        domain: repo_search::launchd::domain(),
+        plist: tmp.join("LaunchAgents/com.github.may-agent.repo-search.server.cli-test.plist"),
+        lock: tmp.join("support/install.lock"),
+        agent: Plist::Server(ServerAgent {
+            label: "com.github.may-agent.repo-search.server.cli-test".to_owned(),
+            program: tmp.join("search"),
+            socket: tmp.join("support/server.sock"),
+            idle_exit: Duration::from_secs(600),
+            build: "cli-test".to_owned(),
+            model_cache: None,
+            token_file: None,
+            bind: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: 41827,
+            stderr: tmp.join("logs/server.log"),
+        }),
+        timeouts: Timeouts {
+            teardown: Duration::from_secs(10),
+            socket: Duration::from_secs(2),
+        },
+    };
+    std::fs::create_dir_all(config.plist.parent().unwrap()).unwrap();
+    std::fs::write(&config.plist, config.agent.render().unwrap()).unwrap();
+    std::fs::create_dir_all(config.agent.socket().parent().unwrap()).unwrap();
+    std::fs::write(config.agent.socket(), b"").unwrap();
+    config
+}
+
 fn config(tmp: &tempfile::TempDir) -> AgentConfig {
     let root = tmp.path();
     AgentConfig {
         domain: repo_search::launchd::domain(),
         plist: root.join("LaunchAgents/com.github.may-agent.repo-search.test.plist"),
         lock: root.join("support/install.lock"),
-        agent: LaunchAgent {
+        agent: Plist::Daemon(LaunchAgent {
             label: "com.github.may-agent.repo-search.cli-test".to_owned(),
             program: root.join("search"),
             socket: root.join("support/daemon.sock"),
@@ -53,7 +86,7 @@ fn config(tmp: &tempfile::TempDir) -> AgentConfig {
             model_cache: None,
             state_dir: None,
             stderr: root.join("logs/daemon.log"),
-        },
+        }),
         timeouts: Timeouts {
             teardown: Duration::from_secs(10),
             socket: Duration::from_secs(2),
@@ -66,6 +99,7 @@ fn config(tmp: &tempfile::TempDir) -> AgentConfig {
 fn cli_env(config: AgentConfig, launchd: &FakeLaunchd, cwd: &Path) -> Env<FakeLaunchctl> {
     Env {
         cwd: cwd.to_path_buf(),
+        server_agent: server_config(config.plist.parent().unwrap().parent().unwrap()),
         agent: config,
         launchctl: launchd.launchctl(),
         hello: client::hello(),
@@ -287,7 +321,7 @@ async fn index_wait_reaches_full_coverage() {
     backend.set_instance_delay(Instance::Ane, Duration::from_millis(50));
     let config = config(&tmp);
     let launchd = FakeLaunchd::with_daemon(
-        config.agent.socket.clone(),
+        config.agent.socket().to_path_buf(),
         tokio::runtime::Handle::current(),
         client::build(),
         Model::Cached,
@@ -343,7 +377,7 @@ async fn stale_build_shuts_the_daemon_down() {
         mtime_ns: 0,
     };
     let launchd = FakeLaunchd::new(
-        config.agent.socket.clone(),
+        config.agent.socket().to_path_buf(),
         tokio::runtime::Handle::current(),
         stale,
     );
@@ -372,7 +406,7 @@ async fn install_failure_exits_2() {
     let tmp = tempfile::tempdir().expect("tmp");
     let config = config(&tmp);
     let launchd = FakeLaunchd::new(
-        config.agent.socket.clone(),
+        config.agent.socket().to_path_buf(),
         tokio::runtime::Handle::current(),
         client::build(),
     );
@@ -403,7 +437,7 @@ async fn install_failure_exits_2() {
 async fn daemon_startup_failure_exits_2() {
     let tmp = tempfile::tempdir().expect("tmp");
     let config = config(&tmp);
-    let log = config.agent.stderr.clone();
+    let log = config.agent.stderr().to_path_buf();
     let launchd = launchd(&config);
     launchd.bootstrap_failing_daemon("Apple Z1");
     let repo = marked_repo();
@@ -474,7 +508,7 @@ async fn non_tty_shows_only_announcements() {
     let tmp = tempfile::tempdir().expect("tmp");
     let config = config(&tmp);
     let launchd = FakeLaunchd::with_daemon(
-        config.agent.socket.clone(),
+        config.agent.socket().to_path_buf(),
         tokio::runtime::Handle::current(),
         client::build(),
         Model::Served {

@@ -11,11 +11,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Barrier;
 use std::time::Duration;
 
-use askama::Template;
 use repo_search::install::{
-    Agent, AgentConfig, Check, InstallError, Reason, Timeouts, ensure_agent,
+    Agent, AgentConfig, Check, InstallError, Plist, Reason, Timeouts, ensure_agent,
 };
-use repo_search::launchd::LaunchAgent;
+use repo_search::launchd::{DEFAULT_PORT, LaunchAgent, ServerAgent};
+use std::net::{IpAddr, Ipv4Addr};
 use support::client;
 use support::launchd::{Call, FakeLaunchd};
 
@@ -27,7 +27,7 @@ fn test_config(tmp: &tempfile::TempDir, program: &Path) -> AgentConfig {
         domain: repo_search::launchd::domain(),
         plist: root.join("LaunchAgents/com.github.may-agent.repo-search.test.plist"),
         lock: root.join("support/install.lock"),
-        agent: LaunchAgent {
+        agent: Plist::Daemon(LaunchAgent {
             label: "com.github.may-agent.repo-search.test".to_owned(),
             program: program.to_path_buf(),
             socket: root.join("support/daemon.sock"),
@@ -35,7 +35,7 @@ fn test_config(tmp: &tempfile::TempDir, program: &Path) -> AgentConfig {
             model_cache: None,
             state_dir: None,
             stderr: root.join("logs/daemon.log"),
-        },
+        }),
         timeouts: Timeouts {
             teardown: Duration::from_secs(10),
             socket: Duration::from_secs(2),
@@ -50,7 +50,7 @@ fn program() -> PathBuf {
 /// The fake for `config`, with the daemon identity the test binary gives.
 fn launchd(config: &AgentConfig) -> FakeLaunchd {
     FakeLaunchd::new(
-        config.agent.socket.clone(),
+        config.agent.socket().to_path_buf(),
         tokio::runtime::Handle::current(),
         client::build(),
     )
@@ -90,11 +90,11 @@ async fn first_run_installs() {
         "the installed plist is the rendered agent"
     );
     assert!(
-        config.agent.stderr.parent().unwrap().is_dir(),
+        config.agent.stderr().parent().unwrap().is_dir(),
         "the log directory is created for the daemon's StandardErrorPath"
     );
     assert!(
-        std::fs::symlink_metadata(&config.agent.socket)
+        std::fs::symlink_metadata(config.agent.socket())
             .expect("the socket exists")
             .file_type()
             .is_socket(),
@@ -172,7 +172,7 @@ async fn missing_socket_is_reinstalled() {
         .expect("the reinstall succeeds");
     assert_eq!(outcome, Agent::Replaced(Reason::NotRunning));
     assert!(
-        std::fs::symlink_metadata(&config.agent.socket)
+        std::fs::symlink_metadata(config.agent.socket())
             .expect("the socket exists")
             .file_type()
             .is_socket(),
@@ -186,14 +186,14 @@ async fn stale_socket_file_is_removed() {
     let config = test_config(&tmp, &program());
     let launchd = launchd(&config);
     write_plist(&config);
-    std::fs::create_dir_all(config.agent.socket.parent().unwrap()).expect("the socket dir");
-    std::fs::write(&config.agent.socket, b"stale").expect("the stale socket file");
+    std::fs::create_dir_all(config.agent.socket().parent().unwrap()).expect("the socket dir");
+    std::fs::write(config.agent.socket(), b"stale").expect("the stale socket file");
     let mut lctl = launchd.launchctl();
 
     let outcome = tokio::task::block_in_place(|| ensure_agent(&config, &mut lctl, Check::Verify))
         .expect("the reinstall succeeds");
     assert_eq!(outcome, Agent::Replaced(Reason::NotRunning));
-    let meta = std::fs::symlink_metadata(&config.agent.socket).expect("the socket exists");
+    let meta = std::fs::symlink_metadata(config.agent.socket()).expect("the socket exists");
     assert!(
         meta.file_type().is_socket(),
         "the stale file was replaced by launchd's real socket"
@@ -286,9 +286,97 @@ async fn socket_wait_times_out() {
         .expect_err("a bootstrap that never binds the socket fails");
     match error {
         InstallError::Socket { path, after } => {
-            assert_eq!(path, config.agent.socket);
+            assert_eq!(path, config.agent.socket());
             assert_eq!(after, config.timeouts.socket);
         }
         other => panic!("expected a Socket error, got {other:?}"),
     }
+}
+
+/// A `Plist::Server` test config: same layout as [`test_config`], sharing
+/// the one install lock as production's two agents do.
+fn server_test_config(tmp: &tempfile::TempDir, program: &Path) -> AgentConfig {
+    let root = tmp.path();
+    AgentConfig {
+        domain: repo_search::launchd::domain(),
+        plist: root.join("LaunchAgents/com.github.may-agent.repo-search.server.test.plist"),
+        lock: root.join("support/install.lock"),
+        agent: Plist::Server(ServerAgent {
+            label: "com.github.may-agent.repo-search.server.test".to_owned(),
+            program: program.to_path_buf(),
+            socket: root.join("support/server.sock"),
+            idle_exit: Duration::from_secs(600),
+            build: "test-build".to_owned(),
+            model_cache: None,
+            token_file: None,
+            bind: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: DEFAULT_PORT,
+            stderr: root.join("logs/server.log"),
+        }),
+        timeouts: Timeouts {
+            teardown: Duration::from_secs(10),
+            socket: Duration::from_secs(2),
+        },
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn first_run_installs_the_server_agent() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let config = server_test_config(&tmp, &program());
+    let launchd = launchd(&config);
+    let mut lctl = launchd.launchctl();
+
+    let outcome = tokio::task::block_in_place(|| ensure_agent(&config, &mut lctl, Check::Fast))
+        .expect("the first install succeeds");
+    assert_eq!(outcome, Agent::Installed);
+
+    assert_eq!(
+        launchd.calls(),
+        vec![
+            Call::Service,
+            Call::Bootstrap {
+                plist_contents: config.agent.render().unwrap()
+            },
+        ],
+        "a first run asks launchd once, then bootstraps"
+    );
+    assert!(
+        std::fs::symlink_metadata(config.agent.socket())
+            .expect("the socket exists")
+            .file_type()
+            .is_socket(),
+        "launchd bound the server's unix socket"
+    );
+}
+
+/// The two agents install one after another under the one install lock:
+/// each gets its own bootstrap and socket, and neither's steps interleave.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn both_agents_install_under_one_lock() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let daemon = test_config(&tmp, &program());
+    let server = server_test_config(&tmp, &program());
+    let daemon_launchd = launchd(&daemon);
+    let server_launchd = launchd(&server);
+    let mut daemon_lctl = daemon_launchd.launchctl();
+    let mut server_lctl = server_launchd.launchctl();
+
+    let (daemon_outcome, server_outcome) = tokio::task::block_in_place(|| {
+        (
+            ensure_agent(&daemon, &mut daemon_lctl, Check::Fast),
+            ensure_agent(&server, &mut server_lctl, Check::Fast),
+        )
+    });
+    assert_eq!(daemon_outcome.unwrap(), Agent::Installed);
+    assert_eq!(server_outcome.unwrap(), Agent::Installed);
+    assert!(
+        daemon.agent.socket().exists() && server.agent.socket().exists(),
+        "both sockets are bound"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&server.plist).unwrap(),
+        server.agent.render().unwrap(),
+        "the installed server plist is the rendered agent"
+    );
 }

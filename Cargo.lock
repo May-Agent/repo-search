@@ -1535,6 +1535,7 @@ dependencies = [
  "tokenizers",
  "tokio",
  "tokio-util",
+ "toml_edit",
  "tracing",
  "tracing-subscriber",
  "zstd",
