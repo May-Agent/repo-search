@@ -1685,47 +1685,81 @@ async fn a_daemon_with_an_unreachable_server_fails_the_request_with_model() {
     join.abort();
 }
 
-/// A server that answers `/v1/models` with a different model than the
-/// daemon expects is fatal: the request is answered `Model` naming the
-/// mismatch and `run` returns the error.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_model_id_mismatch_is_fatal() {
-    let repo = fn_repo(5, SMALL_BYTES, 10);
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let socket = tmp.path().join("daemon.sock");
-    let server_socket = tmp.path().join("server.sock");
-    let listener = std::os::unix::net::UnixListener::bind(&socket).expect("socket binds");
-    let server_listener =
-        std::os::unix::net::UnixListener::bind(&server_socket).expect("server socket binds");
-    let runtime = tokio::runtime::Handle::current();
-    let _server = support::daemon::spawn_server_on(
-        &runtime,
-        server_listener,
-        support::daemon::ServerSetup {
-            model_store: model_store(tmp.path().join("models"), &Model::Cached),
-            chip: ChipClass::Wide,
-            backend: Arc::new(StubBackend::new(mpsc::channel().0)),
-            idle_exit: Duration::from_secs(600),
-            load_bound: repo_search_core::embed_api::LOAD_BOUND,
-        },
-    );
-    let join = support::daemon::spawn_on(
-        &runtime,
-        listener,
-        support::daemon::Setup {
-            tokens: StubTokens::default(),
-            server: repo_search::daemon::server::Endpoint::Unix(server_socket),
-            // Not the stub server's id: the probe's list cannot contain it.
-            model_id: "ff".repeat(64),
-            state: StateDir::new(tmp.path().join("state")),
-            idle_exit: Duration::from_secs(600),
-            load_bound: daemon::LOAD_BOUND,
-            build: support::client::build(),
-        },
-    );
+/// A daemon whose expected model-id the stub server does not list, with
+/// the server held back: its socket is bound, so the link's probe queues
+/// on it, but nothing answers until [`MismatchedDaemon::release_server`].
+/// The test decides where its connection stands when the mismatch lands.
+struct MismatchedDaemon {
+    tmp: tempfile::TempDir,
+    socket: PathBuf,
+    server_listener: Option<std::os::unix::net::UnixListener>,
+    join: tokio::task::JoinHandle<Result<(), Error>>,
+}
 
-    let events = request(&socket, &hello(), search(&repo.root, MARKER)).await;
-    match final_of(&events) {
+impl MismatchedDaemon {
+    fn start() -> Self {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let socket = tmp.path().join("daemon.sock");
+        let server_socket = tmp.path().join("server.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).expect("socket binds");
+        let server_listener =
+            std::os::unix::net::UnixListener::bind(&server_socket).expect("server socket binds");
+        let join = support::daemon::spawn_on(
+            &tokio::runtime::Handle::current(),
+            listener,
+            support::daemon::Setup {
+                tokens: StubTokens::default(),
+                server: repo_search::daemon::server::Endpoint::Unix(server_socket),
+                // Not the stub server's id: the probe's list cannot contain it.
+                model_id: "ff".repeat(64),
+                state: StateDir::new(tmp.path().join("state")),
+                idle_exit: Duration::from_secs(600),
+                load_bound: daemon::LOAD_BOUND,
+                build: support::client::build(),
+            },
+        );
+        Self {
+            tmp,
+            socket,
+            server_listener: Some(server_listener),
+            join,
+        }
+    }
+
+    /// Starts the stub server: the probe's answer lacks the expected id,
+    /// and the daemon stops fatally.
+    fn release_server(&mut self) {
+        let listener = self.server_listener.take().expect("the server starts once");
+        // The server runs until the test runtime shuts down.
+        drop(support::daemon::spawn_server_on(
+            &tokio::runtime::Handle::current(),
+            listener,
+            support::daemon::ServerSetup {
+                model_store: model_store(self.tmp.path().join("models"), &Model::Cached),
+                chip: ChipClass::Wide,
+                backend: Arc::new(StubBackend::new(mpsc::channel().0)),
+                idle_exit: Duration::from_secs(600),
+                load_bound: repo_search_core::embed_api::LOAD_BOUND,
+            },
+        ));
+    }
+
+    /// Awaits `run`, whose outcome must be the mismatch as a fatal error.
+    async fn assert_fatal(self) {
+        let outcome = tokio::time::timeout(TIMEOUT, self.join)
+            .await
+            .expect("run returns on the mismatch")
+            .expect("run task does not panic");
+        assert!(
+            matches!(outcome, Err(Error::Server(_))),
+            "the mismatch is run's fatal error: {outcome:?}"
+        );
+    }
+}
+
+/// Asserts `answer` is the `Model` error naming the id the daemon expects.
+fn assert_mismatch_report(answer: &Final) {
+    match answer {
         Final::Error(report) => {
             assert_eq!(report.kind, ErrorKind::Model);
             assert!(
@@ -1736,14 +1770,74 @@ async fn a_model_id_mismatch_is_fatal() {
         }
         other => panic!("expected a Model error, got {other:?}"),
     }
-    let outcome = tokio::time::timeout(TIMEOUT, join)
-        .await
-        .expect("run returns on the mismatch")
-        .expect("run task does not panic");
+}
+
+/// A server that answers `/v1/models` with a different model than the
+/// daemon expects is fatal: the request is answered `Model` naming the
+/// mismatch and `run` returns the error.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_model_id_mismatch_is_fatal() {
+    let repo = fn_repo(5, SMALL_BYTES, 10);
+    let mut d = MismatchedDaemon::start();
+    let mut responses = stream_request(&d.socket, &hello(), search(&repo.root, MARKER)).await;
+    // A progress frame: the request is waiting on the model, so the
+    // mismatch lands on a request in flight.
+    let first = next_event(&mut responses).await;
     assert!(
-        matches!(outcome, Err(Error::Server(_))),
-        "the mismatch is run's fatal error: {outcome:?}"
+        matches!(first, Event::Progress(_)),
+        "the request waits on the model load: {first:?}"
     );
+    d.release_server();
+    assert_mismatch_report(&final_event(&mut responses).await);
+    d.assert_fatal().await;
+}
+
+/// A connection past its handshake whose request has not arrived when the
+/// mismatch stops the daemon is still answered: the fatal error at once,
+/// and its request write then lands on an open socket.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fatal_stop_answers_a_connection_before_its_request() {
+    use futures_util::SinkExt;
+
+    let repo = fn_repo(5, SMALL_BYTES, 10);
+    let mut d = MismatchedDaemon::start();
+    let stream = tokio::net::UnixStream::connect(&d.socket)
+        .await
+        .expect("connect");
+    let mut framed = protocol::framed(stream);
+    framed
+        .send(serde_json::to_string(&hello()).expect("hello serializes"))
+        .await
+        .expect("hello writes");
+    let peer = tokio::time::timeout(TIMEOUT, framed.next())
+        .await
+        .expect("the handshake is answered in time")
+        .expect("the daemon answers the handshake")
+        .expect("the handshake frame decodes");
+    assert_eq!(
+        serde_json::from_str::<protocol::Hello>(&peer).expect("the daemon's Hello"),
+        hello()
+    );
+
+    d.release_server();
+    let frame = tokio::time::timeout(TIMEOUT, framed.next())
+        .await
+        .expect("the stop is answered in time")
+        .expect("the stop is answered before the connection closes")
+        .expect("the stop's frame decodes");
+    match serde_json::from_str::<Event>(&frame).expect("a protocol frame") {
+        Event::Final(answer) => assert_mismatch_report(&answer),
+        other => panic!("expected the stop's Final, got {other:?}"),
+    }
+    framed
+        .send(serde_json::to_string(&search(&repo.root, MARKER)).expect("request serializes"))
+        .await
+        .expect("the request write lands on an open connection");
+    let end = tokio::time::timeout(TIMEOUT, framed.next())
+        .await
+        .expect("the connection closes in time");
+    assert!(end.is_none(), "nothing follows the Final: {end:?}");
+    d.assert_fatal().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

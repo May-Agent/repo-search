@@ -150,7 +150,8 @@ pub(crate) async fn answer_queued(
     tracing::info!(answered, kind = ?kind, "answered pending connections");
 }
 
-/// A connection that sends no `Hello` within this long is closed.
+/// A connection that sends no `Hello` within this long is closed; it also
+/// bounds the wait for the frame of a connection the stop answered early.
 const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The daemon exits after this long with no connections and no work.
@@ -468,8 +469,13 @@ async fn serve<T: Tokens>(
     stopping: &tokio::sync::watch::Receiver<bool>,
     build: BuildId,
 ) -> ConnMsg {
-    let Some(frame) = read_hello(framed, stopping).await else {
-        return ConnMsg::Closed;
+    let frame = match read_hello(framed, stopping).await {
+        Read::Frame(frame) => frame,
+        Read::Gone => return ConnMsg::Closed,
+        Read::Stopping => {
+            answer_stop(framed, model).await;
+            return ConnMsg::Closed;
+        }
     };
     let hello = match serde_json::from_str::<Hello>(&frame) {
         Ok(hello) => hello,
@@ -499,8 +505,13 @@ async fn serve<T: Tokens>(
     if framed.send(line(&ours)).await.is_err() {
         return ConnMsg::Closed;
     }
-    let Some(frame) = read_frame(framed, stopping).await else {
-        return ConnMsg::Closed;
+    let frame = match read_frame(framed, stopping).await {
+        Read::Frame(frame) => frame,
+        Read::Gone => return ConnMsg::Closed,
+        Read::Stopping => {
+            answer_stop(framed, model).await;
+            return ConnMsg::Closed;
+        }
     };
     let request = match serde_json::from_str::<Request>(&frame) {
         Ok(request) => request,
@@ -675,24 +686,41 @@ async fn await_model<T: Tokens>(
             changed = model.changed() => if changed.is_err() { return ModelWait::Stop },
             _ = framed.next() => return ModelWait::Stop,
             _ = stopping.changed() => {
-                // A published fatal failure outranks the generic shutdown
-                // error: `Fatal` precedes the fatal channel, which precedes
-                // `stopping`, so it is always already there.
-                let message = match &*model.borrow() {
-                    EmbeddingState::Fatal(message) => Some(message.clone()),
-                    _ => None,
-                };
-                match message {
-                    Some(message) => send_final(framed, ErrorKind::Model, message).await,
-                    None => {
-                        send_final(framed, ErrorKind::ShuttingDown, "the daemon is shutting down".into())
-                            .await
-                    }
-                }
+                let (kind, message) = stop_report(&model);
+                send_final(framed, kind, message).await;
                 return ModelWait::Stop;
             }
         }
     }
+}
+
+/// The error a connection is answered with when the daemon stops under
+/// it. A published fatal failure outranks the generic shutdown error:
+/// `Fatal` precedes the fatal channel, which precedes `stopping`, so it is
+/// always already there.
+fn stop_report<T: Tokens>(
+    model: &tokio::sync::watch::Receiver<EmbeddingState<T>>,
+) -> (ErrorKind, String) {
+    match &*model.borrow() {
+        EmbeddingState::Fatal(message) => (ErrorKind::Model, message.clone()),
+        _ => (
+            ErrorKind::ShuttingDown,
+            "the daemon is shutting down".into(),
+        ),
+    }
+}
+
+/// Answers a connection the stop caught before its `Hello` or `Request`
+/// arrived, then waits within [`HELLO_TIMEOUT`] for that frame or the
+/// close: the client writes it regardless, and closing first would turn
+/// the write into `EPIPE` before the answer is read.
+async fn answer_stop<T: Tokens>(
+    framed: &mut protocol::Connection,
+    model: &tokio::sync::watch::Receiver<EmbeddingState<T>>,
+) {
+    let (kind, message) = stop_report(model);
+    send_final(framed, kind, message).await;
+    let _ = tokio::time::timeout(HELLO_TIMEOUT, framed.next()).await;
 }
 
 fn error_too_large() -> Event {
@@ -803,34 +831,45 @@ async fn get_owner(
     }
 }
 
-/// Reads the first frame within [`HELLO_TIMEOUT`], or `None`: a client that
-/// never sends `Hello` must not hold the daemon alive.
+/// A frame read's outcome.
+enum Read {
+    /// The peer's frame.
+    Frame(String),
+    /// Closed, failed, too large (already answered) or past its deadline:
+    /// nothing left to answer.
+    Gone,
+    /// The daemon began stopping before the frame arrived; the connection
+    /// is still owed an answer.
+    Stopping,
+}
+
+/// Reads the first frame within [`HELLO_TIMEOUT`]: a client that never
+/// sends `Hello` must not hold the daemon alive.
 async fn read_hello(
     framed: &mut protocol::Connection,
     stopping: &tokio::sync::watch::Receiver<bool>,
-) -> Option<String> {
+) -> Read {
     tokio::time::timeout(HELLO_TIMEOUT, read_frame(framed, stopping))
         .await
-        .ok()
-        .flatten()
+        .unwrap_or(Read::Gone)
 }
 
-/// Reads one frame, or `None` on close, error or shutdown.
+/// Reads one frame, unless the peer goes first or the daemon stops.
 async fn read_frame(
     framed: &mut protocol::Connection,
     stopping: &tokio::sync::watch::Receiver<bool>,
-) -> Option<String> {
+) -> Read {
     let mut stopping = stopping.clone();
     tokio::select! {
         frame = framed.next() => match frame {
-            Some(Ok(line)) => Some(line),
+            Some(Ok(line)) => Read::Frame(line),
             Some(Err(LinesCodecError::MaxLineLengthExceeded)) => {
                 send_final(framed, ErrorKind::TooLarge, "frame exceeds the maximum length".into()).await;
-                None
+                Read::Gone
             }
-            _ => None,
+            _ => Read::Gone,
         },
-        _ = stopping.changed() => None,
+        _ = stopping.changed() => Read::Stopping,
     }
 }
 
