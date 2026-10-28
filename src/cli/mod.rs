@@ -6,10 +6,12 @@
 //! on stderr. The client installs no tracing subscriber and has no log.
 
 mod args;
+mod launcher;
 mod progress;
 mod render;
 
 pub use args::{Cli, Command, Invocation, Mode, SearchOptions};
+pub use launcher::{LaunchdAgents, Launcher, Report};
 pub use render::{IndexedOutput, StatusOutput};
 
 use std::io;
@@ -20,24 +22,18 @@ use futures_util::StreamExt;
 use progress::ProgressLine;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
-use crate::client::{Client, ClientError};
-use crate::install::{
-    Agent, AgentConfig, Check, InstallError, Launchctl, SystemLaunchctl, ensure_agent,
-};
+use crate::client::Client;
+use crate::install::{AgentConfig, SystemLaunchctl};
 use crate::protocol::{BuildId, Event, Final, Format, Hello, Request, SearchRequest};
 
-/// The process's own environment: the working directory, the agent to
-/// install, the `launchctl` that installs it and the handshake to send.
-/// Production values come from [`Env::user`], test values from the tests.
-pub struct Env<L: Launchctl> {
+/// The process's own environment: the working directory, the launcher
+/// that keeps the daemon reachable and the handshake to send. Production
+/// values come from [`Env::user`], test values from the tests.
+pub struct Env<A: Launcher> {
     /// The directory `search` ran in; the worktree is resolved under it.
     pub cwd: PathBuf,
-    /// The embedding server's agent, ensured before the daemon's.
-    pub server_agent: AgentConfig,
-    /// The daemon agent the client keeps current.
-    pub agent: AgentConfig,
-    /// The `launchctl` implementation.
-    pub launchctl: L,
+    /// Brings the daemon up before the request and after a refused connect.
+    pub launcher: A,
     /// The handshake: this binary's protocol, version and file identity.
     pub hello: Hello,
 }
@@ -57,7 +53,7 @@ impl EnvError {
     }
 }
 
-impl Env<SystemLaunchctl> {
+impl Env<LaunchdAgents<SystemLaunchctl>> {
     /// The real user: `cwd`, the canonical current executable, its
     /// [`BuildId`], and [`AgentConfig::user`]. Runs synchronously before
     /// any runtime exists; every step is a cheap filesystem call.
@@ -80,9 +76,7 @@ impl Env<SystemLaunchctl> {
             .map_err(|e| EnvError::new("cannot resolve the agent's paths", e))?;
         Ok(Self {
             cwd,
-            server_agent,
-            agent,
-            launchctl: SystemLaunchctl,
+            launcher: LaunchdAgents::new(server_agent, agent, SystemLaunchctl),
             hello,
         })
     }
@@ -141,35 +135,18 @@ fn mb(bytes: u64) -> String {
     format!("{:.1}", bytes as f64 / 1e6)
 }
 
-/// Announces the server agent's then the daemon agent's `ensure`
-/// outcome; false, after telling the error, when either failed.
-async fn announce_both(
-    outcomes: [(Result<Agent, InstallError>, &AgentConfig); 2],
-    stderr: &mut (impl AsyncWrite + Unpin),
-) -> bool {
-    for (outcome, config) in outcomes {
-        match outcome {
-            Ok(outcome) => announce(outcome, config, stderr).await,
-            Err(error) => {
-                tell(stderr, &error.to_string()).await;
-                return false;
-            }
-        }
+/// Tells a launcher step's notes then its error; false when it failed.
+async fn announce(report: Report, stderr: &mut (impl AsyncWrite + Unpin)) -> bool {
+    for note in &report.notes {
+        tell(stderr, note).await;
     }
-    true
-}
-
-/// The `installed`/`replaced` stderr line an install outcome reports —
-/// written on a TTY or not.
-async fn announce(outcome: Agent, agent: &AgentConfig, stderr: &mut (impl AsyncWrite + Unpin)) {
-    let line = match outcome {
-        Agent::Current => return,
-        Agent::Installed => format!("installed launch agent {}", agent.plist.display()),
-        Agent::Replaced(reason) => {
-            format!("replaced launch agent {} ({reason})", agent.plist.display())
+    match report.error {
+        Some(error) => {
+            tell(stderr, &error).await;
+            false
         }
-    };
-    tell(stderr, &line).await;
+        None => true,
+    }
 }
 
 /// The worktree `cwd` belongs to, as `git rev-parse` prints it — the
@@ -193,39 +170,13 @@ async fn resolve_worktree(cwd: &Path) -> Result<PathBuf, String> {
     ))
 }
 
-/// Runs `ensure_agent` off the executor (flock, launchctl, kqueue) and
-/// hands back the config and handle it consumed.
-async fn ensure<L: Launchctl + Send + 'static>(
-    server_agent: AgentConfig,
-    agent: AgentConfig,
-    launchctl: L,
-    check: Check,
-) -> (
-    AgentConfig,
-    AgentConfig,
-    L,
-    Result<Agent, InstallError>,
-    Result<Agent, InstallError>,
-) {
-    tokio::task::spawn_blocking(move || {
-        let mut launchctl = launchctl;
-        // The server agent first, then the daemon's — sequentially, so
-        // the shared install lock serializes the two agents' steps.
-        let server = ensure_agent(&server_agent, &mut launchctl, check);
-        let daemon = ensure_agent(&agent, &mut launchctl, check);
-        (server_agent, agent, launchctl, server, daemon)
-    })
-    .await
-    .expect("the install thread does not panic")
-}
-
 /// One request's end to end: install check and worktree resolution
 /// concurrently, connect, stream progress to stderr, render the `Final`
 /// and return the grep exit code. `main` dispatches `Invocation::Daemon`
 /// before `run`, so the variant is unreachable here.
-pub async fn run<L, O, E>(invocation: Invocation, env: Env<L>, term: &mut Terminal<O, E>) -> Exit
+pub async fn run<A, O, E>(invocation: Invocation, env: Env<A>, term: &mut Terminal<O, E>) -> Exit
 where
-    L: Launchctl + Send + 'static,
+    A: Launcher,
     O: AsyncWrite + Unpin,
     E: AsyncWrite + Unpin,
 {
@@ -234,16 +185,11 @@ where
     }
     let Env {
         cwd,
-        server_agent,
-        agent,
-        launchctl,
+        mut launcher,
         hello,
     } = env;
 
-    let (worktree, ensured) = tokio::join!(
-        resolve_worktree(&cwd),
-        ensure(server_agent, agent, launchctl, Check::Fast)
-    );
+    let (worktree, prepared) = tokio::join!(resolve_worktree(&cwd), launcher.prepare());
     let worktree = match worktree {
         Ok(worktree) => worktree,
         Err(message) => {
@@ -251,43 +197,23 @@ where
             return Exit::Error;
         }
     };
-    let (server_agent, mut agent, launchctl, server_ensured, ensured) = ensured;
-    if !announce_both(
-        [(server_ensured, &server_agent), (ensured, &agent)],
-        &mut term.stderr,
-    )
-    .await
-    {
+    if !announce(prepared, &mut term.stderr).await {
         return Exit::Error;
     }
 
-    // A refused or missing socket after `Check::Fast` means the trust was
-    // wrong: `Check::Verify` asks launchd itself, then connect once more.
-    let client = match Client::connect(agent.agent.socket(), &hello).await {
+    let client = match Client::connect(launcher.socket(), &hello).await {
         Ok(client) => client,
-        Err(ClientError::Connect(error))
-            if matches!(
-                error.kind(),
-                io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
-            ) =>
-        {
-            let (checked_server, checked, _, server_ensured, ensured) =
-                ensure(server_agent, agent, launchctl, Check::Verify).await;
-            agent = checked;
-            if !announce_both(
-                [(server_ensured, &checked_server), (ensured, &agent)],
-                &mut term.stderr,
-            )
-            .await
-            {
+        Err(error) if launcher.recoverable(&error) => {
+            let recovered = launcher.recover().await;
+            if !announce(recovered, &mut term.stderr).await {
                 return Exit::Error;
             }
-            match Client::connect(agent.agent.socket(), &hello).await {
+            match Client::connect(launcher.socket(), &hello).await {
                 Ok(client) => client,
                 Err(error) => {
                     tell(
                         &mut term.stderr,
-                        &render::client_error(&error, agent.agent.socket(), agent.agent.stderr()),
+                        &render::client_error(&error, launcher.socket(), launcher.log()),
                     )
                     .await;
                     return Exit::Error;
@@ -297,7 +223,7 @@ where
         Err(error) => {
             tell(
                 &mut term.stderr,
-                &render::client_error(&error, agent.agent.socket(), agent.agent.stderr()),
+                &render::client_error(&error, launcher.socket(), launcher.log()),
             )
             .await;
             return Exit::Error;
@@ -336,7 +262,7 @@ where
         Err(error) => {
             tell(
                 &mut term.stderr,
-                &render::client_error(&error, agent.agent.socket(), agent.agent.stderr()),
+                &render::client_error(&error, launcher.socket(), launcher.log()),
             )
             .await;
             return Exit::Error;
@@ -359,7 +285,7 @@ where
                     Final::Error(report) => {
                         tell(
                             &mut term.stderr,
-                            &render::daemon_error(&report, agent.agent.stderr()),
+                            &render::daemon_error(&report, launcher.log()),
                         )
                         .await;
                         Exit::Error
@@ -390,7 +316,7 @@ where
                 progress.clear(&mut term.stderr).await;
                 tell(
                     &mut term.stderr,
-                    &render::client_error(&error, agent.agent.socket(), agent.agent.stderr()),
+                    &render::client_error(&error, launcher.socket(), launcher.log()),
                 )
                 .await;
                 return Exit::Error;

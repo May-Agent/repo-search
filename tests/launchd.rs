@@ -21,7 +21,7 @@ use std::sync::{Arc, Barrier};
 use std::time::Duration;
 
 use clap::Parser;
-use repo_search::cli::{self, Cli, Exit, Terminal};
+use repo_search::cli::{self, Cli, Exit, LaunchdAgents, Terminal};
 use repo_search::install::Plist;
 use repo_search::install::{self, AgentConfig, Check, Launchctl, SystemLaunchctl, ensure_agent};
 use repo_search::kqueue::ExitWatch;
@@ -408,7 +408,11 @@ fn invocation(args: &[&str]) -> cli::Invocation {
 /// the real `launchctl`, and the handshake matching the binary the plist
 /// names — computed when the `Env` is built, so a replaced program yields
 /// a new `BuildId`.
-fn cli_env(cwd: &Path, config: AgentConfig, program: &Path) -> cli::Env<SystemLaunchctl> {
+fn cli_env(
+    cwd: &Path,
+    config: AgentConfig,
+    program: &Path,
+) -> cli::Env<LaunchdAgents<SystemLaunchctl>> {
     // The server agent installs for real beside the daemon's: a per-test
     /// label and paths inside the config's own dir, `--build` naming the
     /// test binary so a started server accepts it.
@@ -438,9 +442,7 @@ fn cli_env(cwd: &Path, config: AgentConfig, program: &Path) -> cli::Env<SystemLa
     let dir = config.plist.parent().unwrap().parent().unwrap();
     cli::Env {
         cwd: cwd.to_path_buf(),
-        server_agent: server_config(dir, program),
-        agent: config,
-        launchctl: SystemLaunchctl,
+        launcher: LaunchdAgents::new(server_config(dir, program), config, SystemLaunchctl),
         hello: hello(program),
     }
 }
