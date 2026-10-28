@@ -7,8 +7,6 @@
 //! every component that opens or stats a stored file; nothing below the
 //! daemon's own startup looks it up.
 
-#[cfg(target_os = "macos")]
-use std::io;
 use std::path::{Path, PathBuf};
 
 /// The daemon's per-user state root.
@@ -21,19 +19,6 @@ use std::path::{Path, PathBuf};
 pub struct StateDir(PathBuf);
 
 impl StateDir {
-    /// The per-user state root on macOS:
-    /// `~/Library/Application Support/repo-search`.
-    ///
-    /// # Errors
-    ///
-    /// When the home directory is unknown.
-    #[cfg(target_os = "macos")]
-    pub fn user() -> io::Result<Self> {
-        let home = std::env::home_dir()
-            .ok_or_else(|| io::Error::other("the home directory is unknown"))?;
-        Ok(Self(home.join("Library/Application Support/repo-search")))
-    }
-
     /// A state dir rooted at `root`; tests pass a tempdir.
     pub fn new(root: PathBuf) -> Self {
         Self(root)

@@ -363,7 +363,11 @@ fn checks(
     .map_err(StartupError::ModelStore)?;
     let state = match &state_dir {
         Some(root) => StateDir::new(root.clone()),
-        None => StateDir::user().map_err(StartupError::StateDir)?,
+        None => StateDir::new(
+            repo_search::paths::UserPaths::user()
+                .map_err(StartupError::StateDir)?
+                .state,
+        ),
     };
     let server = endpoint(server)?;
     Ok((tokens, server, state, build))
@@ -405,7 +409,7 @@ fn endpoint(
         (Some(path), None) => Ok(Endpoint::Unix(path)),
         (None, Some(addr)) => Ok(Endpoint::Tcp { addr, token }),
         (None, None) => Ok(Endpoint::Unix(
-            repo_search::launchd::server_socket_path().map_err(StartupError::StateDir)?,
+            repo_search::paths::server_socket_path().map_err(StartupError::StateDir)?,
         )),
         (Some(_), Some(_)) => unreachable!("clap marks the flags conflicting"),
     }
@@ -459,7 +463,7 @@ fn adopt(
 /// agent wants another build, so the server fails fast after answering
 /// every queued connection 503.
 fn server_main(
-    idle_exit: Duration,
+    idle_exit: Option<Duration>,
     model_cache: Option<PathBuf>,
     token_file: Option<PathBuf>,
     build: Option<String>,
@@ -641,7 +645,7 @@ fn server_main(
         unix: unix_listener.expect("the count check left one listener"),
         tcp,
         token,
-        idle_exit,
+        idle_exit: idle_exit.unwrap_or(repo_search_server::IDLE_EXIT),
         load_bound: repo_search_core::embed_api::LOAD_BOUND,
         model: model_store,
         chip,

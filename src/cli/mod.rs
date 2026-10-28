@@ -11,9 +11,12 @@ mod progress;
 mod render;
 
 pub use args::{Cli, Command, Invocation, Mode, SearchOptions};
-pub use launcher::{LaunchdAgents, Launcher, Report};
+#[cfg(target_os = "macos")]
+pub use launcher::LaunchdAgents;
+pub use launcher::{Launcher, Report};
 pub use render::{IndexedOutput, StatusOutput};
 
+#[cfg(target_os = "macos")]
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -23,8 +26,11 @@ use progress::ProgressLine;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 use crate::client::Client;
+#[cfg(target_os = "macos")]
 use crate::install::{AgentConfig, SystemLaunchctl};
-use crate::protocol::{BuildId, Event, Final, Format, Hello, Request, SearchRequest};
+#[cfg(target_os = "macos")]
+use crate::protocol::BuildId;
+use crate::protocol::{Event, Final, Format, Hello, Request, SearchRequest};
 
 /// The process's own environment: the working directory, the launcher
 /// that keeps the daemon reachable and the handshake to send. Production
@@ -38,8 +44,9 @@ pub struct Env<A: Launcher> {
     pub hello: Hello,
 }
 
-/// A failure of [`Env::user`]: one of the process's own paths did not
+/// A failure of `Env::user`: one of the process's own paths did not
 /// resolve.
+#[cfg(target_os = "macos")]
 #[derive(Debug, thiserror::Error)]
 #[error("{what}: {source}")]
 pub struct EnvError {
@@ -47,12 +54,14 @@ pub struct EnvError {
     source: io::Error,
 }
 
+#[cfg(target_os = "macos")]
 impl EnvError {
     fn new(what: &'static str, source: io::Error) -> Self {
         Self { what, source }
     }
 }
 
+#[cfg(target_os = "macos")]
 impl Env<LaunchdAgents<SystemLaunchctl>> {
     /// The real user: `cwd`, the canonical current executable, its
     /// [`BuildId`], and [`AgentConfig::user`]. Runs synchronously before

@@ -2,10 +2,13 @@
 //! launchd implementation.
 
 use std::future::Future;
-use std::io;
 use std::path::Path;
 
+#[cfg(target_os = "macos")]
+use std::io;
+
 use crate::client::ClientError;
+#[cfg(target_os = "macos")]
 use crate::install::{Agent, AgentConfig, Check, InstallError, Launchctl, ensure_agent};
 
 /// What one launcher step tells the user: `notes` are told in order, then
@@ -38,12 +41,14 @@ pub trait Launcher {
 
 /// The launchd agents of a macOS user: the embedding server's and the
 /// daemon's, kept current through `launchctl`.
+#[cfg(target_os = "macos")]
 pub struct LaunchdAgents<L: Launchctl> {
     /// Taken for the duration of an install step, which runs off the
     /// executor and hands the parts back.
     parts: Option<Parts<L>>,
 }
 
+#[cfg(target_os = "macos")]
 struct Parts<L> {
     /// The embedding server's agent, ensured before the daemon's.
     server_agent: AgentConfig,
@@ -53,6 +58,7 @@ struct Parts<L> {
     launchctl: L,
 }
 
+#[cfg(target_os = "macos")]
 impl<L: Launchctl> LaunchdAgents<L> {
     /// The agents, installed through `launchctl`.
     pub fn new(server_agent: AgentConfig, agent: AgentConfig, launchctl: L) -> Self {
@@ -70,6 +76,7 @@ impl<L: Launchctl> LaunchdAgents<L> {
     }
 }
 
+#[cfg(target_os = "macos")]
 impl<L: Launchctl + Send + 'static> LaunchdAgents<L> {
     /// Runs `ensure_agent` for both agents off the executor (flock,
     /// launchctl, kqueue) and reports what it did.
@@ -103,6 +110,7 @@ impl<L: Launchctl + Send + 'static> LaunchdAgents<L> {
     }
 }
 
+#[cfg(target_os = "macos")]
 impl<L: Launchctl + Send + 'static> Launcher for LaunchdAgents<L> {
     fn socket(&self) -> &Path {
         self.parts().agent.agent.socket()
@@ -136,6 +144,7 @@ impl<L: Launchctl + Send + 'static> Launcher for LaunchdAgents<L> {
 
 /// The server agent's then the daemon agent's `ensure` outcome as one
 /// report, ending at the first error.
+#[cfg(target_os = "macos")]
 fn report_both(outcomes: [(Result<Agent, InstallError>, &AgentConfig); 2]) -> Report {
     let mut report = Report::default();
     for (outcome, config) in outcomes {
@@ -152,6 +161,7 @@ fn report_both(outcomes: [(Result<Agent, InstallError>, &AgentConfig); 2]) -> Re
 
 /// The `installed`/`replaced` stderr line an install outcome reports —
 /// written on a TTY or not.
+#[cfg(target_os = "macos")]
 fn announcement(outcome: Agent, agent: &AgentConfig) -> Option<String> {
     match outcome {
         Agent::Current => None,

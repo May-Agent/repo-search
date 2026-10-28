@@ -309,9 +309,9 @@ pub enum Command {
 pub enum Invocation {
     /// `search --server`: the embedding server's entry point.
     Server {
-        /// Idle deadline; [`IDLE_EXIT`](repo_search_server::IDLE_EXIT)
-        /// unless `--idle-exit-secs`.
-        idle_exit: Duration,
+        /// `--idle-exit-secs`, when given; the server's own default
+        /// applies otherwise.
+        idle_exit: Option<Duration>,
         /// `--model-cache`, when given.
         model_cache: Option<PathBuf>,
         /// `--token-file`, when given.
@@ -366,9 +366,7 @@ impl Cli {
         let raw = self.0;
         if raw.server {
             return Invocation::Server {
-                idle_exit: raw
-                    .idle_exit_secs
-                    .map_or(repo_search_server::IDLE_EXIT, Duration::from_secs),
+                idle_exit: raw.idle_exit_secs.map(Duration::from_secs),
                 model_cache: raw.model_cache,
                 token_file: raw.token_file,
                 build: raw.build,
@@ -504,7 +502,7 @@ mod tests {
                 token_file,
                 build,
             } => {
-                assert_eq!(idle_exit, repo_search_server::IDLE_EXIT);
+                assert_eq!(idle_exit, None);
                 assert_eq!(model_cache, None);
                 assert_eq!(token_file, None);
                 assert_eq!(build, None);
@@ -527,7 +525,7 @@ mod tests {
                 build,
                 ..
             } => {
-                assert_eq!(idle_exit, Duration::from_secs(30));
+                assert_eq!(idle_exit, Some(Duration::from_secs(30)));
                 assert_eq!(token_file, Some(PathBuf::from("/tmp/tok")));
                 assert_eq!(build.as_deref(), Some("1:2:3:4"));
             }

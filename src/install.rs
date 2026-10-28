@@ -20,9 +20,10 @@ use askama::Template;
 
 use crate::daemon::IDLE_EXIT;
 use crate::kqueue::{DirWatch, ExitWatch};
-use crate::launchd::{
-    LABEL, LaunchAgent, SERVER_LABEL, ServerAgent, ServerConfig, domain, lock_path, log_path,
-    plist_path, server_config_path, server_log_path, server_socket_path, socket_path,
+use crate::launchd::{LABEL, LaunchAgent, SERVER_LABEL, ServerAgent, ServerConfig, domain};
+use crate::paths::{
+    lock_path, log_path, plist_path, server_config_path, server_log_path, server_socket_path,
+    socket_path,
 };
 use crate::protocol::BuildId;
 

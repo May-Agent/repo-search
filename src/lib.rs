@@ -2,12 +2,10 @@
 
 /// The `search` client: argument parsing, the agent check, progress and
 /// output rendering.
-#[cfg(target_os = "macos")]
 pub mod cli;
 /// The library client of the `search` daemon.
 pub mod client;
 /// The `search` daemon.
-#[cfg(target_os = "macos")]
 pub mod daemon;
 /// Installing and replacing the per-user LaunchAgent.
 #[cfg(target_os = "macos")]
@@ -20,5 +18,7 @@ pub mod kqueue;
 pub mod launchd;
 /// First-use download and verified unpacking of the model archive.
 pub mod model_store;
+/// The per-user paths: `~/Library` on macOS, XDG on Linux.
+pub mod paths;
 /// The daemon's wire types and JSON-lines framing.
 pub mod protocol;

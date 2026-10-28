@@ -1,8 +1,11 @@
-//! The FSEvents watcher: one `notify` watcher per worktree plus a
+//! The filesystem watcher: one `notify` watcher per worktree plus a
 //! debounce task.
 //!
-//! The notify handler runs on the FSEvents thread and only filters and
-//! signals — it never blocks. The debounce task waits for a quiet spell,
+//! The notify handler runs on the watcher's event thread and only filters
+//! and signals — it never blocks. `Access` events are dropped outright:
+//! inotify reports every open and close, so the reconciler's own reads
+//! would retrigger indexing forever, while real writes still arrive as
+//! `Modify`/`Create`/`Remove`. The debounce task waits for a quiet spell,
 //! capped so a busy tree still reports, then sends one `Changed`-mark to
 //! the owning worktree task. An event that names the worktree root itself
 //! with the path gone is a `Gone`: the tree was removed.
@@ -10,7 +13,7 @@
 use std::path::Path;
 use std::time::Duration;
 
-use notify::{Event, RecursiveMode, Watcher as _};
+use notify::{Event, EventKind, RecursiveMode, Watcher as _};
 use tokio::sync::mpsc;
 
 /// A change lands after this long without a further event.
@@ -36,11 +39,11 @@ enum Signal {
 }
 
 /// A running watch. `changed` receives one message per debounced burst; the
-/// FSEvents stream stops when the value is dropped.
+/// event stream stops when the value is dropped.
 pub struct Watcher {
     /// Debounced change marks for the owner.
     pub changed: mpsc::Receiver<WatchMsg>,
-    _watcher: notify::FsEventWatcher,
+    _watcher: notify::RecommendedWatcher,
 }
 
 /// Watches `root` recursively, and `git_dir` too when it lies outside
@@ -61,39 +64,19 @@ pub fn start(root: &Path, git_dir: &Path) -> Result<Watcher, notify::Error> {
                 // A dropped or garbled event is treated as a change: a
                 // rescan barrier is cheap and never loses an edit.
                 Err(error) => {
-                    tracing::warn!(%error, "FSEvents error");
+                    tracing::warn!(%error, "watcher error");
                     let _ = signal_tx.try_send(Signal::Changed);
                     return;
                 }
             };
-            let mut gone = false;
-            let mut changed = false;
-            for path in &event.paths {
-                if path == &root {
-                    // The root's own event is a removal or a rename away.
-                    gone |= !root.exists();
-                } else if path.starts_with(&git_dir) && path == &head
-                    || !path.starts_with(&git_dir)
-                        && !path.components().any(|part| part.as_os_str() == ".git")
-                {
-                    changed = true;
-                }
-            }
-            let signal = if gone {
-                Some(Signal::Gone)
-            } else if changed {
-                Some(Signal::Changed)
-            } else {
-                None
-            };
-            if let Some(signal) = signal {
+            if let Some(signal) = classify(&event, &root, &git_dir, &head) {
                 // A full channel means a signal is already pending, which
                 // coalesces the burst.
                 let _ = signal_tx.try_send(signal);
             }
         }
     };
-    let mut watcher = notify::FsEventWatcher::new(handler, notify::Config::default())?;
+    let mut watcher = notify::RecommendedWatcher::new(handler, notify::Config::default())?;
     watcher.watch(&root, RecursiveMode::Recursive)?;
     if !git_dir.starts_with(&root) {
         watcher.watch(&git_dir, RecursiveMode::Recursive)?;
@@ -105,6 +88,35 @@ pub fn start(root: &Path, git_dir: &Path) -> Result<Watcher, notify::Error> {
         changed,
         _watcher: watcher,
     })
+}
+
+/// What one notify event means for the worktree; `None` is dropped.
+/// `Access` events are dropped before the path check: FSEvents never
+/// emits them, and real writes arrive under other kinds.
+fn classify(event: &Event, root: &Path, git_dir: &Path, head: &Path) -> Option<Signal> {
+    if matches!(event.kind, EventKind::Access(_)) {
+        return None;
+    }
+    let mut gone = false;
+    let mut changed = false;
+    for path in &event.paths {
+        if path.as_path() == root {
+            // The root's own event is a removal or a rename away.
+            gone |= !root.exists();
+        } else if path.starts_with(git_dir) && path.as_path() == head
+            || !path.starts_with(git_dir)
+                && !path.components().any(|part| part.as_os_str() == ".git")
+        {
+            changed = true;
+        }
+    }
+    if gone {
+        Some(Signal::Gone)
+    } else if changed {
+        Some(Signal::Changed)
+    } else {
+        None
+    }
 }
 
 /// Folds the raw signal stream into debounced `Changed` marks and `Gone`.
@@ -139,6 +151,26 @@ async fn debounce(mut signal_rx: mpsc::Receiver<Signal>, changed_tx: mpsc::Sende
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use notify::event::{AccessKind, ModifyKind};
+
+    /// `Access` events produce no signal — inotify's reports of the
+    /// reconciler's own reads cannot start a reindex loop — while a write
+    /// still classifies as `Changed`.
+    #[test]
+    fn access_events_are_dropped() {
+        let root = Path::new("/worktree");
+        let git_dir = root.join(".git");
+        let head = git_dir.join("HEAD");
+        let file = root.join("src/a.rs");
+        let read = Event::new(EventKind::Access(AccessKind::Read)).add_path(file.clone());
+        assert_eq!(classify(&read, root, &git_dir, &head), None);
+        let write = Event::new(EventKind::Modify(ModifyKind::Any)).add_path(file);
+        assert_eq!(
+            classify(&write, root, &git_dir, &head),
+            Some(Signal::Changed)
+        );
+    }
 
     /// A burst of signals longer than `MAX_DELAY` still produces its
     /// `Changed` exactly `MAX_DELAY` after the first signal. Time is paused

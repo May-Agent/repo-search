@@ -12,8 +12,6 @@ use std::os::fd::{FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use repo_search_core::StateDir;
-
 unsafe extern "C" {
     fn launch_activate_socket(name: *const c_char, fds: *mut *mut c_int, cnt: *mut usize) -> c_int;
 }
@@ -21,60 +19,14 @@ unsafe extern "C" {
 /// The launchd label of the `search` daemon's agent.
 pub const LABEL: &str = "com.github.may-agent.repo-search";
 
-/// The socket the LaunchAgent binds: launchd holds it while no daemon runs
-/// and launches the daemon when a connection arrives. `Application Support`
-/// rather than `Caches`, which the system may purge while the agent is
-/// loaded.
-pub fn socket_path() -> io::Result<PathBuf> {
-    Ok(StateDir::user()?.root().join("daemon.sock"))
-}
-
-/// The file the agent's `StandardErrorPath` writes the daemon's tracing
-/// output to.
-pub fn log_path() -> io::Result<PathBuf> {
-    Ok(home()?.join("Library/Logs/repo-search/daemon.log"))
-}
-
 /// The launchd label of the embedding server's agent.
 pub const SERVER_LABEL: &str = "com.github.may-agent.repo-search.server";
-
-/// The server's unix socket, next to the daemon's.
-pub fn server_socket_path() -> io::Result<PathBuf> {
-    Ok(StateDir::user()?.root().join("server.sock"))
-}
-
-/// The file the server agent's `StandardErrorPath` writes to.
-pub fn server_log_path() -> io::Result<PathBuf> {
-    Ok(home()?.join("Library/Logs/repo-search/server.log"))
-}
-
-/// The server agent's configuration file.
-pub fn server_config_path() -> io::Result<PathBuf> {
-    Ok(StateDir::user()?.root().join("server.toml"))
-}
-
-/// The plist the agent is installed as:
-/// `~/Library/LaunchAgents/<label>.plist`.
-pub fn plist_path(label: &str) -> io::Result<PathBuf> {
-    Ok(home()?.join(format!("Library/LaunchAgents/{label}.plist")))
-}
-
-/// The file whose `flock(2)` serializes installs. It sits next to the
-/// socket, in a directory this program owns, rather than in
-/// `~/Library/LaunchAgents`, which belongs to launchd.
-pub fn lock_path() -> io::Result<PathBuf> {
-    Ok(StateDir::user()?.root().join("install.lock"))
-}
 
 /// The launchd domain the agent lives in: `user/<uid>`, so `search` works
 /// over SSH with no GUI login.
 pub fn domain() -> String {
     // SAFETY: getuid cannot fail.
     format!("user/{}", unsafe { libc::getuid() })
-}
-
-fn home() -> io::Result<PathBuf> {
-    std::env::home_dir().ok_or_else(|| io::Error::other("the home directory is unknown"))
 }
 
 /// The failure of [`activate_socket`].
