@@ -193,7 +193,7 @@ pub fn spawn_on<T: Tokens>(
             .expect("the listener goes nonblocking");
         let listener = UnixListener::from_std(listener).expect("the listener adopts");
         daemon::run(Config {
-            listener,
+            listener: daemon::listen::Activated(listener),
             idle_exit,
             load_bound,
             tokens,

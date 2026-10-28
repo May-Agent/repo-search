@@ -69,7 +69,7 @@ async fn stage_1_query_on_the_ane() {
         backend: Arc::new(CoreMlBackend),
     }));
     let daemon = tokio::spawn(daemon::run(Config {
-        listener,
+        listener: daemon::listen::Activated(listener),
         idle_exit: Duration::from_secs(600),
         load_bound: daemon::LOAD_BOUND,
         tokens: model::tokenizer_store(tmp.path().join("models")),
@@ -210,7 +210,7 @@ async fn daemon_host_coreml() {
     // The harness left its `test ... ` prefix unterminated on this line.
     println!("\nREADY");
     daemon::run(Config {
-        listener,
+        listener: daemon::listen::Activated(listener),
         idle_exit: Duration::from_secs(3600),
         load_bound: daemon::LOAD_BOUND,
         tokens: model::tokenizer_store(config.model_cache.join("tokenizer")),

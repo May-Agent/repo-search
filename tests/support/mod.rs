@@ -4,6 +4,7 @@
 pub mod client;
 #[cfg(target_os = "macos")]
 pub mod daemon;
+pub mod embed_server;
 #[cfg(target_os = "macos")]
 pub mod host;
 pub mod http;

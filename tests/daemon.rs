@@ -2286,7 +2286,7 @@ async fn daemon_host() {
     // The harness left its `test ... ` prefix unterminated on this line.
     println!("\nREADY");
     daemon::run(Config {
-        listener,
+        listener: daemon::listen::Activated(listener),
         idle_exit: Duration::from_secs(3600),
         load_bound: daemon::LOAD_BOUND,
         tokens: StubTokens::default(),
