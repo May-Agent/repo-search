@@ -22,6 +22,7 @@ use objc2_core_ml::{
     MLMultiArrayDataType,
 };
 use objc2_foundation::{NSArray, NSDictionary, NSError, NSInteger, NSNumber, NSString, NSURL};
+use repo_search_core::model::DOCUMENT;
 use repo_search_core::{BatchEmbedder, Embedder, QueryTask, TokenCounter, UnitVector};
 use tokenizers::{Tokenizer, TruncationParams};
 
@@ -161,14 +162,11 @@ pub struct CoreMlEmbedder {
     embedding: String,
 }
 
-/// Counts the model's tokens for the chunker's cap. The tokenizer and the
-/// document prompt the count applies to are the model's own, loaded from
-/// `tokenizer.json` and `manifest.json`, so `repo-search-core` never
-/// formats a prompt.
+/// Counts the model's tokens for the chunker's cap. The tokenizer is the
+/// model's own, loaded from `tokenizer.json`; the document prompt the count
+/// applies to is [`repo_search_core::model::DOCUMENT`].
 pub struct DocumentCounter {
     tokenizer: Tokenizer,
-    /// `prompts.document` split around `{title}` and `{text}`.
-    document: (String, String, String),
     /// Tokens the post-processor adds to every encoding (`<s>`, `</s>`).
     specials: usize,
     /// The manifest's function lengths, ascending.
@@ -190,7 +188,6 @@ impl DocumentCounter {
         let specials = specials(&tokenizer)?;
         Ok(Self {
             tokenizer,
-            document: document_parts(&manifest),
             specials,
             buckets: bucket_lengths(&manifest),
         })
@@ -202,35 +199,24 @@ impl DocumentCounter {
         &self.buckets
     }
 
-    /// The document `prompts.document` formats for `title` and `text`.
-    fn document(&self, title: &str, text: &str) -> String {
-        let (before, between, after) = &self.document;
-        format!("{before}{title}{between}{text}{after}")
-    }
-
     /// The document `title` and `text` encode to, when the byte bound does
     /// not decide it first: `None` when it fits `max` tokens, else the
     /// formatted prompt.
     fn document_over(&self, title: &str, text: &[&str], max: usize) -> Option<String> {
-        let (before, between, after) = &self.document;
-        let bytes = before.len()
-            + title.len()
-            + between.len()
-            + text.iter().map(|part| part.len()).sum::<usize>()
-            + after.len();
+        let bytes = DOCUMENT.bytes(title, text);
         // Every token covers at least one byte, so a document whose bytes
         // plus the special tokens stay under `max` fits without an encode.
         if bytes + self.specials <= max {
             return None;
         }
         let mut doc = String::with_capacity(bytes);
-        doc.push_str(before);
+        doc.push_str(DOCUMENT.before);
         doc.push_str(title);
-        doc.push_str(between);
+        doc.push_str(DOCUMENT.between);
         for part in text {
             doc.push_str(part);
         }
-        doc.push_str(after);
+        doc.push_str(DOCUMENT.after);
         Some(doc)
     }
 }
@@ -259,7 +245,7 @@ impl TokenCounter for DocumentCounter {
         if encoding.len() <= max {
             return None;
         }
-        let head = self.document.0.len() + title.len() + self.document.1.len();
+        let head = DOCUMENT.head_len(title);
         // The end of the `max`-th token in the document, mapped back into
         // `text`. The estimate is exact only up to merges spanning the cut.
         Some(
@@ -270,7 +256,7 @@ impl TokenCounter for DocumentCounter {
     }
 
     fn document_tokens(&self, title: &str, text: &str) -> usize {
-        self.count(&self.document(title, text))
+        self.count(&DOCUMENT.format(title, text))
     }
 }
 
@@ -349,7 +335,6 @@ impl CoreMlEmbedder {
         }))?;
 
         let counter = DocumentCounter {
-            document: document_parts(&manifest),
             specials: specials(&tokenizer)?,
             buckets: bucket_lengths(&manifest),
             tokenizer,
@@ -420,9 +405,7 @@ impl BatchEmbedder for CoreMlEmbedder {
     fn embed_documents(&mut self, docs: &[(&str, &str)]) -> Result<Vec<UnitVector>, Error> {
         let ids = docs
             .iter()
-            .map(|(title, text)| {
-                encode(&self.counter.tokenizer, &self.counter.document(title, text))
-            })
+            .map(|(title, text)| encode(&self.counter.tokenizer, &DOCUMENT.format(title, text)))
             .collect::<Result<Vec<_>, Error>>()?;
         let Some(first) = ids.first() else {
             return Ok(Vec::new());
@@ -481,7 +464,7 @@ impl Embedder for CoreMlEmbedder {
     }
 
     fn embed_document(&mut self, title: &str, text: &str) -> Result<UnitVector, Self::Error> {
-        let ids = encode(&self.counter.tokenizer, &self.counter.document(title, text))?;
+        let ids = encode(&self.counter.tokenizer, &DOCUMENT.format(title, text))?;
         self.embed_tokens(&ids)
     }
 
@@ -507,19 +490,6 @@ fn bucket_lengths(manifest: &Manifest) -> Box<[usize]> {
     let mut lens: Vec<usize> = manifest.functions.values().copied().collect();
     lens.sort_unstable();
     lens.into_boxed_slice()
-}
-
-/// `prompts.document` split around `{title}` and `{text}`.
-fn document_parts(manifest: &Manifest) -> (String, String, String) {
-    let (before, rest) = manifest
-        .prompts
-        .document
-        .split_once("{title}")
-        .expect("manifest validation checked the markers");
-    let (between, after) = rest
-        .split_once("{text}")
-        .expect("manifest validation checked the markers");
-    (before.to_owned(), between.to_owned(), after.to_owned())
 }
 
 /// The one `*.mlmodelc` bundle in `dir`, canonicalized.

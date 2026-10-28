@@ -21,7 +21,9 @@ use std::time::Duration;
 
 use tokio::sync::{mpsc, oneshot, watch};
 
-use crate::model_store::{Fetch, ModelStore};
+use repo_search_core::model::Fetch;
+
+use crate::model_store::ModelStore;
 
 use super::ane;
 use super::chip::ChipClass;

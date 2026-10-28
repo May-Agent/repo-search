@@ -33,6 +33,7 @@ toml_edit = { version = "0.25.17", default-features = false, features = ["parse"
 
 [dependencies]
 askama = { version = "0.16.1", default-features = false, features = ["derive", "std"] }
+base64 = { version = "0.23.1", default-features = false, features = ["std"] }
 blake3 = { version = "1.8.7", default-features = false }
 globset = { version = "0.4.20", default-features = false }
 ignore = { version = "0.4.33", default-features = false }
@@ -44,6 +45,7 @@ rusqlite = { version = "0.40.2", default-features = false, features = ["bundled"
 saphyr-parser = { version = "0.2.2", default-features = false }
 serde = { version = "1.0.229", default-features = false, features = ["derive", "std"] }
 serde_json = { version = "1.0.154", default-features = false, features = ["std"] }
+sfv = { version = "0.16.0", default-features = false, features = ["parsed-types"] }
 smallvec = { version = "1.16.3", default-features = false }
 thiserror = { version = "2.0.21", default-features = false }
 tokio = { version = "1.54.0", default-features = false, features = ["macros", "sync"] }

@@ -2,7 +2,9 @@
 
 pub mod chunk;
 mod embed;
+pub mod embed_api;
 pub mod knn;
+pub mod model;
 pub mod qos;
 pub mod reconcile;
 pub mod search;
@@ -13,7 +15,8 @@ pub mod store;
 /// Lowercase hex, 32 characters.
 pub const CHUNKER_FINGERPRINT: &str = env!("REPO_SEARCH_CHUNKER_FINGERPRINT");
 
-pub use embed::{BatchEmbedder, Embedder, QueryTask, TokenCounter, UnitVector};
+pub use embed::{BatchEmbedder, Embedder, TokenCounter, UnitVector};
+pub use model::QueryTask;
 
 // Lets the shared test counters (included from `tests/counters`) name the
 // crate the same way the integration tests do.

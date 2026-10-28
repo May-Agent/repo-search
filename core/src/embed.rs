@@ -1,5 +1,7 @@
 //! The embedding interface every model backend implements.
 
+use crate::model::QueryTask;
+
 /// A unit-length embedding; only constructible by normalizing.
 #[derive(Debug, Clone, PartialEq)]
 pub struct UnitVector(Box<[f32]>);
@@ -34,31 +36,9 @@ impl UnitVector {
     }
 }
 
-/// How a query is phrased for the embedding model.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum QueryTask {
-    /// The code list: `task: code retrieval | query: <query>`.
-    CodeRetrieval,
-    /// The docs list: `task: question answering | query: <query>`.
-    QuestionAnswering,
-}
-
-impl QueryTask {
-    /// The prompt text the model is given for `query`.
-    #[must_use]
-    pub fn prompt(self, query: &str) -> String {
-        let task = match self {
-            Self::CodeRetrieval => "code retrieval",
-            Self::QuestionAnswering => "question answering",
-        };
-        format!("task: {task} | query: {query}")
-    }
-}
-
 /// Counts the model's tokens. The chunker enforces its cap on every chunk's
-/// embedded document through this interface; the tokenizer and the document
-/// prompt the count applies to live in the embedding crate, so core never
-/// formats a prompt.
+/// embedded document through this interface; implementations tokenize the
+/// document [`crate::model::DOCUMENT`] formats.
 pub trait TokenCounter: Send + Sync {
     /// The number of tokens `text` encodes to, special tokens included — the
     /// count the model consumes.
@@ -120,19 +100,7 @@ pub trait BatchEmbedder: Embedder {
 
 #[cfg(test)]
 mod tests {
-    use super::{QueryTask, UnitVector};
-
-    #[test]
-    fn prompts_name_the_task() {
-        assert_eq!(
-            QueryTask::CodeRetrieval.prompt("find x"),
-            "task: code retrieval | query: find x"
-        );
-        assert_eq!(
-            QueryTask::QuestionAnswering.prompt("what is x"),
-            "task: question answering | query: what is x"
-        );
-    }
+    use super::UnitVector;
 
     #[test]
     fn normalize_scales_to_unit_length() {

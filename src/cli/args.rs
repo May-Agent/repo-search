@@ -11,13 +11,25 @@ use clap::{ArgMatches, Args, CommandFactory, FromArgMatches, Parser, Subcommand,
 use crate::daemon;
 use crate::protocol::WireMode;
 
+/// `--version` output: the binary version, the chunker fingerprint and the
+/// model's identity from [`repo_search_core::model`]'s card.
+pub const VERSION_INFO: &str = const_format::concatcp!(
+    env!("CARGO_PKG_VERSION"),
+    "\nchunker: ",
+    repo_search_core::CHUNKER_FINGERPRINT,
+    "\nmodel: ",
+    repo_search_core::model::MODEL_NAME,
+    "\nlicense: ",
+    repo_search_core::model::MODEL_LICENSE
+);
+
 /// Search a repository for code you can describe but cannot name.
 ///
 /// Exit codes follow grep: 0 results, 1 none, 2 error.
 #[derive(Debug, Parser)]
 #[command(
     name = "search",
-    version = crate::model_store::VERSION_INFO,
+    version = VERSION_INFO,
     subcommand_precedence_over_arg = true,
     subcommand_negates_reqs = true,
     args_conflicts_with_subcommands = true,
@@ -265,8 +277,7 @@ mod tests {
 
     use clap::CommandFactory;
     use repo_search_core::CHUNKER_FINGERPRINT;
-
-    use crate::model_store::{MODEL_LICENSE, MODEL_NAME, VERSION_INFO};
+    use repo_search_core::model::{MODEL_LICENSE, MODEL_NAME};
 
     fn parsed(args: &[&str]) -> Invocation {
         Cli::try_parse_from(args)

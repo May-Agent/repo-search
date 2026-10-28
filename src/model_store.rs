@@ -10,28 +10,11 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use repo_search_core::model::{ARCHIVE, Fetch};
 use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 use thiserror::Error;
 use tokio::io::AsyncWriteExt;
-
-/// Human-readable name of the embedded model, shown by `search --version`.
-pub const MODEL_NAME: &str = "google/embeddinggemma-2 (Core ML conversion)";
-
-/// SPDX identifier of the model's license, shown by `search --version`.
-pub const MODEL_LICENSE: &str = "Apache-2.0";
-
-/// `--version` output: the binary version, the chunker fingerprint and the
-/// model's identity.
-pub const VERSION_INFO: &str = const_format::concatcp!(
-    env!("CARGO_PKG_VERSION"),
-    "\nchunker: ",
-    repo_search_core::CHUNKER_FINGERPRINT,
-    "\nmodel: ",
-    MODEL_NAME,
-    "\nlicense: ",
-    MODEL_LICENSE
-);
 
 /// Upper bound on the archive size, far above the published archive.
 const MAX_ARCHIVE_BYTES: u64 = 4 << 30;
@@ -78,14 +61,13 @@ pub struct ModelSpec {
 }
 
 impl ModelSpec {
-    /// The published EmbeddingGemma 2 Core ML archive.
+    /// The published EmbeddingGemma 2 Core ML archive, from
+    /// [`repo_search_core::model`]'s model card.
     pub fn embedding_gemma_2() -> Self {
         Self {
-            url: "https://huggingface.co/lexoliu/repo-search-embeddinggemma2-coreml/resolve/5bb9f08270c0e2968d048a0a35e120863f32962c/eg2-coreml-914f7f89-57287aaa.tar.zst".into(),
-            sha256: Sha256Digest::from_hex(
-                "57287aaa3fea181447dd2bd378d064aeef77684da0c722302e893dd95e43ab2c",
-            )
-            .expect("pinned archive digest is valid hex"),
+            url: ARCHIVE.url.to_owned(),
+            sha256: Sha256Digest::from_hex(ARCHIVE.sha256)
+                .expect("pinned archive digest is valid hex"),
         }
     }
 }
@@ -97,16 +79,6 @@ fn client_builder() -> reqwest::ClientBuilder {
     reqwest::Client::builder()
         .connect_timeout(CONNECT_TIMEOUT)
         .read_timeout(READ_TIMEOUT)
-}
-
-/// Progress of an archive download, sent on the `watch` channel
-/// [`ModelStore::ensure`] takes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Fetch {
-    /// Bytes received so far.
-    pub received: u64,
-    /// The server's declared length, when known.
-    pub total: Option<u64>,
 }
 
 /// A cache of verified, unpacked model archives.

@@ -2,6 +2,7 @@
 //! through `#[path]` in the crate root) and the integration tests.
 
 use repo_search_core::TokenCounter;
+use repo_search_core::model::DOCUMENT;
 
 /// A `TokenCounter` reporting zero tokens: the cap never binds, for tests of
 /// rules the cap does not change.
@@ -36,8 +37,7 @@ impl TokenCounter for CharTokens {
     }
 
     fn fits(&self, title: &str, text: &[&str], max: usize) -> bool {
-        let doc = format!("title: {title} | text: {}", text.concat());
-        self.count(&doc) <= max
+        self.count(&DOCUMENT.format(title, &text.concat())) <= max
     }
 
     fn fit_end(&self, title: &str, text: &[&str], max: usize) -> Option<usize> {
@@ -46,7 +46,12 @@ impl TokenCounter for CharTokens {
         }
         // `max` tokens cover `max * unit` chars of the document, of which
         // the `title: {title} | text: ` head is not part of `text`.
-        let head = format!("title: {title} | text: ").chars().count();
+        let head = DOCUMENT
+            .before
+            .chars()
+            .chain(title.chars())
+            .chain(DOCUMENT.between.chars())
+            .count();
         let chars = max.saturating_mul(self.0).saturating_sub(head);
         let joined = text.concat();
         Some(
@@ -58,6 +63,6 @@ impl TokenCounter for CharTokens {
     }
 
     fn document_tokens(&self, title: &str, text: &str) -> usize {
-        self.count(&format!("title: {title} | text: {text}"))
+        self.count(&DOCUMENT.format(title, text))
     }
 }

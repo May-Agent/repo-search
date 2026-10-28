@@ -7,17 +7,13 @@ use std::ops::{Range, RangeInclusive};
 use smallvec::SmallVec;
 
 use crate::TokenCounter;
+use crate::model::MAX_TOKENS;
 use crate::store::StoredMemberKind;
 
 use super::{Chunk, ChunkKind, Member, MemberKind};
 
 /// Largest emitted unit before an item is split, in bytes.
 pub(super) const MAX_BYTES: usize = 2400;
-/// Largest token count of a chunk's document — `title: <title> | text:
-/// <text>` — under the model's [`TokenCounter`]. The check is on the final
-/// document: the title including the worst-case `(part n/m)` suffix, the
-/// signature prefix a later part carries, and packed groups.
-pub(super) const MAX_TOKENS: usize = 512;
 /// The `…` + newline that ends a split part's signature prefix.
 pub(crate) const SIGNATURE_SUFFIX: &str = " …\n";
 /// The longest first-sentence note a file's module docs put into titles.
