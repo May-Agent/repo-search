@@ -266,6 +266,60 @@ impl TokenCounter for DocumentCounter {
 // never overlap; moving the embedder between threads preserves that.
 unsafe impl Send for CoreMlEmbedder {}
 
+/// Turns request text into token ids: the model's tokenizer loaded without
+/// the compiled model, capped at the largest bucket.
+pub struct Encoder {
+    tokenizer: Tokenizer,
+    max_len: usize,
+    buckets: Box<[usize]>,
+}
+
+impl Encoder {
+    /// Loads `tokenizer.json` and `manifest.json` from the model directory;
+    /// the compiled model is not needed for encoding.
+    ///
+    /// # Errors
+    ///
+    /// The manifest, tokenizer or model load failures of
+    /// [`CoreMlEmbedder::open`], minus the model's own.
+    pub fn open(dir: impl AsRef<Path>) -> Result<Self, Error> {
+        let dir = dir.as_ref();
+        let manifest = Manifest::load(dir)?;
+        let tokenizer = Tokenizer::from_file(dir.join("tokenizer.json"))?;
+        let buckets = bucket_lengths(&manifest);
+        let max_len = *buckets
+            .last()
+            .expect("manifest validation requires a function");
+        Ok(Self {
+            tokenizer,
+            max_len,
+            buckets,
+        })
+    }
+
+    /// The model's bucket lengths in tokens, ascending.
+    pub fn buckets(&self) -> &[usize] {
+        &self.buckets
+    }
+
+    /// Encodes `text` with special tokens on.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::TooLong`] when the encoding exceeds the largest bucket, and
+    /// [`Error::Tokenizer`] when encoding fails.
+    pub fn encode(&self, text: &str) -> Result<Vec<u32>, Error> {
+        let ids = encode(&self.tokenizer, text)?;
+        if ids.len() > self.max_len {
+            return Err(Error::TooLong {
+                tokens: ids.len(),
+                max: self.max_len,
+            });
+        }
+        Ok(ids)
+    }
+}
+
 impl CoreMlEmbedder {
     /// Loads the model directory (the extracted archive: `*.mlmodelc`,
     /// `tokenizer.json`, `manifest.json`) for `units`.
@@ -383,6 +437,68 @@ impl CoreMlEmbedder {
         read_embedding(&out, &self.embedding, self.dim)
     }
 
+    /// One Core ML batch prediction over already-tokenized inputs, all of
+    /// which must land in the first one's bucket.
+    ///
+    /// # Panics
+    ///
+    /// When the inputs do not all fall in the first one's bucket: the
+    /// scheduler batches per bucket, so a mix is a caller bug.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::TooLong`] when the first input exceeds the largest bucket,
+    /// [`Error::BatchSize`] when the model returns a different count and the
+    /// Core ML failures above.
+    pub fn embed_tokens_batch(&mut self, ids: &[Vec<u32>]) -> Result<Vec<UnitVector>, Error> {
+        let Some(first) = ids.first() else {
+            return Ok(Vec::new());
+        };
+        let bucket = self.bucket_for(first.len())?;
+        let providers = ids
+            .iter()
+            .map(|ids| {
+                assert_eq!(
+                    self.bucket_for(ids.len())?.len,
+                    bucket.len,
+                    "inputs of one batch must share a bucket"
+                );
+                let provider = input_features(ids, bucket.len, self.pad)?;
+                Ok(ProtocolObject::from_retained(provider))
+            })
+            .collect::<Result<Vec<_>, Error>>()?;
+        let providers = NSArray::from_retained_slice(&providers);
+        // SAFETY: `providers` holds valid MLFeatureProviders.
+        let batch = unsafe {
+            MLArrayBatchProvider::initWithFeatureProviderArray(
+                MLArrayBatchProvider::alloc(),
+                &providers,
+            )
+        };
+        // SAFETY: `batch` is a valid MLBatchProvider.
+        let out = unsafe {
+            bucket
+                .model
+                .predictionsFromBatch_error(&ProtocolObject::from_retained(batch))
+        }
+        .map_err(core_ml)?;
+        // SAFETY: `out` is a batch provider the model returned.
+        let count = unsafe { out.count() } as usize;
+        if count != ids.len() {
+            return Err(Error::BatchSize {
+                got: count,
+                want: ids.len(),
+            });
+        }
+        (0..ids.len())
+            .map(|i| {
+                // SAFETY: `i` is below `out.count()`.
+                let features = unsafe { out.featuresAtIndex(i as NSInteger) };
+                read_embedding(&features, &self.embedding, self.dim)
+            })
+            .collect()
+    }
+
     /// The smallest bucket that holds `tokens`.
     fn bucket_for(&self, tokens: usize) -> Result<&Bucket, Error> {
         self.buckets
@@ -407,52 +523,7 @@ impl BatchEmbedder for CoreMlEmbedder {
             .iter()
             .map(|(title, text)| encode(&self.counter.tokenizer, &DOCUMENT.format(title, text)))
             .collect::<Result<Vec<_>, Error>>()?;
-        let Some(first) = ids.first() else {
-            return Ok(Vec::new());
-        };
-        let bucket = self.bucket_for(first.len())?;
-        let providers = ids
-            .iter()
-            .map(|ids| {
-                assert_eq!(
-                    self.bucket_for(ids.len())?.len,
-                    bucket.len,
-                    "documents of one batch must share a bucket"
-                );
-                let provider = input_features(ids, bucket.len, self.pad)?;
-                Ok(ProtocolObject::from_retained(provider))
-            })
-            .collect::<Result<Vec<_>, Error>>()?;
-        let providers = NSArray::from_retained_slice(&providers);
-        // SAFETY: `providers` holds valid MLFeatureProviders.
-        let batch = unsafe {
-            MLArrayBatchProvider::initWithFeatureProviderArray(
-                MLArrayBatchProvider::alloc(),
-                &providers,
-            )
-        };
-        // SAFETY: `batch` is a valid MLBatchProvider.
-        let out = unsafe {
-            bucket
-                .model
-                .predictionsFromBatch_error(&ProtocolObject::from_retained(batch))
-        }
-        .map_err(core_ml)?;
-        // SAFETY: `out` is a batch provider the model returned.
-        let count = unsafe { out.count() } as usize;
-        if count != docs.len() {
-            return Err(Error::BatchSize {
-                got: count,
-                want: docs.len(),
-            });
-        }
-        (0..docs.len())
-            .map(|i| {
-                // SAFETY: `i` is below `out.count()`.
-                let features = unsafe { out.featuresAtIndex(i as NSInteger) };
-                read_embedding(&features, &self.embedding, self.dim)
-            })
-            .collect()
+        self.embed_tokens_batch(&ids)
     }
 }
 

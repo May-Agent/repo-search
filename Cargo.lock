@@ -1589,6 +1589,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "repo-search-server"
+version = "0.0.2"
+dependencies = [
+ "libc",
+ "repo-search-core",
+ "repo-search-coreml",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "reqwest"
 version = "0.13.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
