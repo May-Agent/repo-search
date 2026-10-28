@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Barrier, OnceLock};
+use std::sync::{Arc, Barrier, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
 use std::collections::HashMap;
@@ -95,8 +95,13 @@ pub struct StubError(&'static str);
 /// The callback `watch_headroom` stores and `push_headroom` drives.
 type OnChange = Box<dyn Fn(Headroom) + Send + Sync>;
 
-/// The headroom monitor's guard; dropping it stops nothing in the stub.
-pub struct StubMonitor;
+/// The headroom monitor's guard. Like `HeadroomMonitor`, it owns the
+/// callback: dropping it drops the callback and whatever the callback
+/// holds, and `push_headroom` reaches it only while the guard lives.
+pub struct StubMonitor {
+    /// The strong handle; the backend keeps only a weak one.
+    _on_change: Arc<OnChange>,
+}
 
 /// The ids→document map the encoder and embedders share: `encode`
 /// registers a `DOCUMENT` input's hash under the ids it produced, so the
@@ -263,8 +268,8 @@ fn held_record(instance: Instance, now: Instant) -> Record {
 }
 
 /// The test-side [`Backend`]. `open_gpu` counts its calls and is `Blocked`
-/// while the pushed headroom says so; `watch_headroom` stores the callback
-/// `push_headroom` drives.
+/// while the pushed headroom says so; `watch_headroom` keeps a weak handle
+/// on the callback `push_headroom` drives.
 pub struct StubBackend {
     records: mpsc::Sender<Record>,
     delays: BTreeMap<(Instance, usize), Duration>,
@@ -279,7 +284,7 @@ pub struct StubBackend {
     headroom: watch::Sender<Headroom>,
     /// Keeps the watch alive so `send_replace` stores; never read.
     _headroom_rx: watch::Receiver<Headroom>,
-    on_change: OnceLock<OnChange>,
+    on_change: OnceLock<Weak<OnChange>>,
     gates: BTreeMap<Instance, BTreeMap<usize, Arc<Barrier>>>,
     index_gates: BTreeMap<Instance, Arc<IndexGate>>,
     dim: usize,
@@ -404,10 +409,17 @@ impl StubBackend {
     ///
     /// # Panics
     ///
-    /// When `watch_headroom` has not been called yet.
+    /// When `watch_headroom` has not been called yet, or its monitor was
+    /// dropped.
     pub fn push_headroom(&self, headroom: Headroom) {
         let _ = self.headroom.send_replace(headroom.clone());
-        self.on_change.get().expect("watch_headroom was not called")(headroom);
+        let on_change = self
+            .on_change
+            .get()
+            .expect("watch_headroom was not called")
+            .upgrade()
+            .expect("the headroom monitor was dropped");
+        on_change(headroom);
     }
 
     fn embedder(&self, instance: Instance) -> StubEmbedder {
@@ -468,13 +480,15 @@ impl Backend for StubBackend {
     }
 
     fn watch_headroom(&self, on_change: OnChange) -> Self::Monitor {
+        let on_change = Arc::new(on_change);
         self.on_change
-            .set(on_change)
-            .ok()
+            .set(Arc::downgrade(&on_change))
             .expect("watch_headroom called once");
         let headroom = self.headroom.borrow().clone();
         self.push_headroom(headroom);
-        StubMonitor
+        StubMonitor {
+            _on_change: on_change,
+        }
     }
 }
 

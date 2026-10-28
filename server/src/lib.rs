@@ -293,10 +293,12 @@ pub async fn spawn<B: Backend, M: ModelSource>(config: Config<B, M>) -> Result<R
     let (busy_tx, busy_rx) = busy_channel();
     let conns = http::serve(config.unix, config.tcp);
 
-    // Headroom monitor: the callback may run on any thread.
+    // Headroom monitor: the callback may run on any thread. The monitor
+    // owns the callback and with it `headroom_tx`, whose drop ends the
+    // scheduler, so `drive` holds it until the pipeline has stopped.
     let (headroom_tx, headroom_rx) =
         watch::channel(Err(repo_search_coreml::GpuBlocked::PowerSourceUnknown));
-    let _monitor = config.backend.watch_headroom(Box::new(move |h| {
+    let monitor = config.backend.watch_headroom(Box::new(move |h| {
         let _ = headroom_tx.send_replace(h);
     }));
 
@@ -335,6 +337,7 @@ pub async fn spawn<B: Backend, M: ModelSource>(config: Config<B, M>) -> Result<R
     });
     let accepts = conns.run(shared.clone());
     let task = tokio::spawn(drive(
+        monitor,
         accepts,
         loader.tx.clone(),
         fatal_rx,
@@ -353,8 +356,10 @@ pub async fn spawn<B: Backend, M: ModelSource>(config: Config<B, M>) -> Result<R
 /// The accept loop's tail: the idle/fatal/signal select, then the
 /// ordered shutdown — connections drain first so in-flight requests
 /// complete, then the loader stops the scheduler and joins the
-/// embedding threads.
-async fn drive(
+/// embedding threads. `monitor` — the backend's headroom monitor — is
+/// dropped last, once the scheduler watching it has exited.
+async fn drive<Monitor: Send + 'static>(
+    monitor: Monitor,
     accepts: http::Accepts,
     loader: mpsc::Sender<LoaderMsg>,
     mut fatal_rx: mpsc::Receiver<Error>,
@@ -402,6 +407,7 @@ async fn drive(
     let (stopped, stopping) = tokio::sync::oneshot::channel();
     let _ = loader.send(LoaderMsg::Shutdown { reply: stopped }).await;
     let _ = stopping.await;
+    drop(monitor);
     outcome
 }
 

@@ -18,7 +18,7 @@ use repo_search_core::UnitVector;
 use repo_search_core::embed_api::{ServerTiming, Urgency};
 use repo_search_core::qos::{self, QosClass};
 use tokio::sync::{mpsc, oneshot, watch};
-use tracing::{debug, error};
+use tracing::error;
 
 use crate::backend::{Backend, Headroom};
 use crate::chip::ChipClass;
@@ -462,10 +462,10 @@ impl<B: Backend> Scheduler<B> {
                     self.handle(msg).await;
                 }
                 changed = self.headroom.changed() => {
-                    if changed.is_err() {
-                        debug!("the headroom monitor is gone; the scheduler exits");
-                        return;
-                    }
+                    assert!(
+                        changed.is_ok(),
+                        "the headroom monitor was dropped while the scheduler runs"
+                    );
                     self.gpu_blocked = false;
                     self.eval_gpu();
                 }
