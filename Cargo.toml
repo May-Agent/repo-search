@@ -59,7 +59,7 @@ sha2 = { version = "0.11.1", default-features = false }
 tar = { version = "0.4.46", default-features = false }
 tempfile = { version = "3.27.0", default-features = false }
 thiserror = { version = "2.0.21", default-features = false }
-tokio = { version = "1.54.0", default-features = false, features = [
+tokio = { version = "1.54.1", default-features = false, features = [
     "fs",
     "io-std",
     "io-util",
@@ -93,7 +93,7 @@ hyper-util = { version = "0.1.21", default-features = false, features = [
     "http1",
     "tokio",
 ] }
-tokio = { version = "1.54.0", default-features = false, features = ["test-util"] }
+tokio = { version = "1.54.1", default-features = false, features = ["test-util"] }
 
 [target.'cfg(target_os = "macos")'.dev-dependencies]
 libc = { version = "0.2.191", default-features = false, features = ["std"] }
