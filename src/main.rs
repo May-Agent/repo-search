@@ -17,7 +17,8 @@ fn main() -> ExitCode {
         Invocation::Daemon {
             idle_exit,
             model_cache,
-        } => daemon_main(idle_exit, model_cache),
+            state_dir,
+        } => daemon_main(idle_exit, model_cache, state_dir),
         client => client_main(client),
     }
 }
@@ -57,7 +58,11 @@ fn client_main(invocation: Invocation) -> ExitCode {
 /// Only the failures that precede the socket — the runtime and the
 /// activation itself — are logged alone. Exit is 0 on idle exit or SIGTERM
 /// and 1 on a fatal error.
-fn daemon_main(idle_exit: Duration, model_cache: Option<PathBuf>) -> ExitCode {
+fn daemon_main(
+    idle_exit: Duration,
+    model_cache: Option<PathBuf>,
+    state_dir: Option<PathBuf>,
+) -> ExitCode {
     use futures_util::future::join_all;
     use repo_search::daemon::{self, Config};
     use repo_search::launchd;
@@ -114,13 +119,14 @@ fn daemon_main(idle_exit: Duration, model_cache: Option<PathBuf>) -> ExitCode {
     // `from_std` registers the fd with this runtime's driver, so `startup`
     // runs inside the runtime's context.
     let _guard = runtime.enter();
-    match startup(listeners, model_cache) {
-        Ok((listener, model_store, chip, build)) => {
+    match startup(listeners, model_cache, state_dir) {
+        Ok((listener, model_store, state, chip, build)) => {
             match runtime.block_on(daemon::run(Config {
                 listener,
                 idle_exit,
                 load_bound: daemon::LOAD_BOUND,
                 model_store,
+                state,
                 chip,
                 backend: std::sync::Arc::new(daemon::coreml::CoreMlBackend),
                 build,
@@ -148,6 +154,7 @@ fn daemon_main(idle_exit: Duration, model_cache: Option<PathBuf>) -> ExitCode {
 type Started = (
     tokio::net::UnixListener,
     repo_search::model_store::ModelStore,
+    repo_search_core::StateDir,
     repo_search::daemon::chip::ChipClass,
     repo_search::protocol::BuildId,
 );
@@ -157,6 +164,7 @@ type Started = (
 fn startup(
     mut listeners: Vec<std::os::unix::net::UnixListener>,
     model_cache: Option<PathBuf>,
+    state_dir: Option<PathBuf>,
 ) -> Result<
     Started,
     (
@@ -167,6 +175,7 @@ fn startup(
     use repo_search::daemon::{StartupError, chip};
     use repo_search::model_store::{ModelSpec, ModelStore};
     use repo_search::protocol::BuildId;
+    use repo_search_core::StateDir;
 
     let checks = || {
         if listeners.len() != 1 {
@@ -178,13 +187,17 @@ fn startup(
             None => ModelStore::user_cache(),
         }
         .map_err(StartupError::ModelStore)?;
+        let state = match &state_dir {
+            Some(root) => StateDir::new(root.clone()),
+            None => StateDir::user().map_err(StartupError::StateDir)?,
+        };
         // The chip's class decides which indexing queue the GPU serves; a
         // brand the parse does not recognise is fatal — no fallback is
         // guessed.
         let chip = chip::host().map_err(StartupError::Chip)?;
-        Ok((model_store, chip, build))
+        Ok((model_store, state, chip, build))
     };
-    let (model_store, chip, build) = match checks() {
+    let (model_store, state, chip, build) = match checks() {
         Ok(checked) => checked,
         Err(error) => return Err((error, listeners)),
     };
@@ -195,7 +208,7 @@ fn startup(
         Err(error) => return Err((StartupError::Adopt(error), vec![std_listener])),
     };
     match tokio::net::UnixListener::from_std(std_listener) {
-        Ok(listener) => Ok((listener, model_store, chip, build)),
+        Ok(listener) => Ok((listener, model_store, state, chip, build)),
         Err(error) => Err((StartupError::Adopt(error), vec![spare])),
     }
 }

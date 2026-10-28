@@ -44,16 +44,14 @@ pub struct Watcher {
 }
 
 /// Watches `root` recursively, and `git_dir` too when it lies outside
-/// `root` (a linked worktree). Events under `.repo-search/` and under
-/// `.git/` directories are dropped — the index's own writes would loop —
-/// except `HEAD` directly in the git dir.
+/// `root` (a linked worktree). Events under `.git/` directories are
+/// dropped — git's own writes are not worktree changes — except `HEAD`
+/// directly in the git dir.
 pub fn start(root: &Path, git_dir: &Path) -> Result<Watcher, notify::Error> {
     let (signal_tx, signal_rx) = mpsc::channel::<Signal>(1);
     let root = root.to_path_buf();
     let git_dir = git_dir.to_path_buf();
-    let index_dir = root.join(".repo-search");
     let handler = {
-        let index_dir = index_dir.clone();
         let git_dir = git_dir.clone();
         let head = git_dir.join("HEAD");
         let root = root.clone();
@@ -74,12 +72,9 @@ pub fn start(root: &Path, git_dir: &Path) -> Result<Watcher, notify::Error> {
                 if path == &root {
                     // The root's own event is a removal or a rename away.
                     gone |= !root.exists();
-                } else if !path.starts_with(&index_dir)
-                    && if path.starts_with(&git_dir) {
-                        path == &head
-                    } else {
-                        !path.components().any(|part| part.as_os_str() == ".git")
-                    }
+                } else if path.starts_with(&git_dir) && path == &head
+                    || !path.starts_with(&git_dir)
+                        && !path.components().any(|part| part.as_os_str() == ".git")
                 {
                     changed = true;
                 }

@@ -46,7 +46,7 @@ use crate::store::{
 
 /// Directories that are never part of the indexed tree, even when ignore rules
 /// are switched off.
-const RESERVED_DIRS: [&str; 2] = [".git", ".repo-search"];
+const RESERVED_DIRS: [&str; 1] = [".git"];
 
 /// The chunkers that carry state across files: the tree-sitter parsers
 /// are reused, the documentation and configuration chunkers are stateless.

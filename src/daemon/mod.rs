@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 
 use futures_util::SinkExt;
 use futures_util::stream::StreamExt;
-use repo_search_core::{BatchEmbedder, Embedder, TokenCounter};
+use repo_search_core::{BatchEmbedder, Embedder, StateDir, TokenCounter};
 use repo_search_coreml::GpuBlocked;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, oneshot};
@@ -147,6 +147,9 @@ pub enum StartupError {
     /// The host's chip class could not be decided.
     #[error("could not determine the host's chip class: {0}")]
     Chip(#[source] chip::Error),
+    /// The state directory could not be resolved.
+    #[error("could not resolve the state directory: {0}")]
+    StateDir(#[source] io::Error),
     /// The `Listener` fd could not be adopted into the runtime.
     #[error("could not adopt the Listener fd: {0}")]
     Adopt(#[source] io::Error),
@@ -265,6 +268,10 @@ pub struct Config<B: Backend> {
     pub load_bound: Duration,
     /// The model cache; the loader starts `ensure` at once.
     pub model_store: ModelStore,
+    /// The daemon's state root: the per-worktree indexes and the
+    /// per-repository vector caches live under it, never under a
+    /// worktree.
+    pub state: StateDir,
     /// The host's chip class, read once at startup: on a base chip the GPU
     /// instance takes no stage-1 work.
     pub chip: ChipClass,
@@ -338,6 +345,7 @@ pub async fn run<B: Backend>(config: Config<B>) -> Result<(), Error> {
         fatal: fatal_tx.clone(),
     });
     let registry = registry::spawn(registry::RegistryConfig {
+        state: config.state,
         model_id,
         model: loader.state.clone(),
         started,

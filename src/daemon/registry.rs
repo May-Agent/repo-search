@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+use repo_search_core::StateDir;
 use repo_search_core::store::VectorCache;
 use tokio::sync::{mpsc, oneshot, watch};
 
@@ -23,7 +24,7 @@ use super::{Backend, BusySource, Error};
 
 /// A repository's shared state: the vector cache and its writer task,
 /// opened lazily on the first `Search` or `Index` — a `Status` never
-/// creates `<common>/repo-search/`.
+/// creates the repository's cache directory.
 struct RepoShared {
     /// The scheduler's repository id.
     id: RepoId,
@@ -221,6 +222,8 @@ impl RegistryHandle {
 
 /// What the registry needs to build owners and writers.
 pub struct RegistryConfig<B: Backend> {
+    /// The daemon's state root, handed to every owner and shared cache.
+    pub state: StateDir,
     /// The model-id vectors are stored under.
     pub model_id: String,
     /// The model readiness watch, handed to every owner.
@@ -323,6 +326,7 @@ impl<B: Backend> Registry<B> {
             let id = WorktreeId(self.next_worktree);
             self.next_worktree += 1;
             let tx = worktree::spawn(OwnerConfig {
+                state: self.config.state.clone(),
                 id,
                 root: w.toplevel.clone(),
                 common_dir: w.common_dir.clone(),
@@ -354,7 +358,7 @@ impl<B: Backend> Registry<B> {
             GetError::Internal(format!("unknown repository {}", common_dir.display()))
         })?;
         if shared.open.is_none() {
-            let cache = VectorCache::open(common_dir)
+            let cache = VectorCache::open(&self.config.state, common_dir)
                 .await
                 .map_err(|e| GetError::Internal(e.to_string()))?;
             let (busy_tx, busy_rx) = watch::channel(false);

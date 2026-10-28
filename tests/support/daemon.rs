@@ -12,6 +12,7 @@ use repo_search::daemon::chip::ChipClass;
 use repo_search::daemon::{self, Config, Error};
 use repo_search::model_store::{ModelSpec, ModelStore, Sha256Digest};
 use repo_search::protocol::BuildId;
+use repo_search_core::StateDir;
 use sha2::Digest;
 use tokio::net::UnixListener;
 use tokio::task::JoinHandle;
@@ -23,6 +24,8 @@ use super::stub::{Record, StubBackend};
 /// and the run task's handle.
 pub struct Daemon {
     pub socket: PathBuf,
+    /// The daemon's state root, `tmp/state`: indexes and caches live here.
+    pub state: StateDir,
     /// The store's archive dir: `<models>/<sha>` appears only on a
     /// completed download.
     pub model_dir: PathBuf,
@@ -68,6 +71,22 @@ pub fn model_store(root: PathBuf, model: &Model) -> ModelStore {
     store
 }
 
+/// Everything but the socket a stub daemon starts with.
+pub struct Setup {
+    /// The model cache.
+    pub model_store: ModelStore,
+    /// The daemon's state root.
+    pub state: StateDir,
+    /// The stub embedder.
+    pub backend: Arc<StubBackend>,
+    /// Idle exit.
+    pub idle_exit: Duration,
+    /// The model-load bound.
+    pub load_bound: Duration,
+    /// The daemon's build identity.
+    pub build: BuildId,
+}
+
 /// Starts the stub daemon on an already-bound `listener` — the caller owns
 /// the socket path. `runtime` spawns the run task, so a non-tokio thread
 /// (the fake launchd) can start it too; `from_std` registers the fd with
@@ -75,12 +94,16 @@ pub fn model_store(root: PathBuf, model: &Model) -> ModelStore {
 pub fn spawn_on(
     runtime: &tokio::runtime::Handle,
     listener: std::os::unix::net::UnixListener,
-    model_store: ModelStore,
-    backend: Arc<StubBackend>,
-    idle_exit: Duration,
-    load_bound: Duration,
-    build: BuildId,
+    setup: Setup,
 ) -> JoinHandle<Result<(), Error>> {
+    let Setup {
+        model_store,
+        state,
+        backend,
+        idle_exit,
+        load_bound,
+        build,
+    } = setup;
     runtime.spawn(async move {
         listener
             .set_nonblocking(true)
@@ -93,6 +116,7 @@ pub fn spawn_on(
             idle_exit,
             load_bound,
             model_store,
+            state,
             chip: ChipClass::Wide,
             backend,
             build,
@@ -113,6 +137,7 @@ pub async fn daemon(
     let root = tmp.path().join("models");
     let store = model_store(root, &model);
     let model_dir = store.dir();
+    let state = StateDir::new(tmp.path().join("state"));
     let socket = tmp.path().join("daemon.sock");
     let listener = std::os::unix::net::UnixListener::bind(&socket).expect("socket binds");
     let (records_tx, records) = mpsc::channel();
@@ -121,14 +146,18 @@ pub async fn daemon(
     let join = spawn_on(
         &tokio::runtime::Handle::current(),
         listener,
-        store,
-        backend.clone(),
-        idle_exit,
-        load_bound,
-        client::build(),
+        Setup {
+            model_store: store,
+            state: state.clone(),
+            backend: backend.clone(),
+            idle_exit,
+            load_bound,
+            build: client::build(),
+        },
     );
     Daemon {
         socket,
+        state,
         model_dir,
         records,
         backend,

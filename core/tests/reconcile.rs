@@ -10,6 +10,7 @@ mod counters;
 
 use counters::CapOff;
 use futures_executor::block_on;
+use repo_search_core::StateDir;
 use repo_search_core::reconcile::{
     Books, Changes, Counts, Options, PendingChunk, Presence, Reads, Reconciled, Reconciler, Report,
     SkipReason,
@@ -32,6 +33,7 @@ struct Pass {
 struct Fixture {
     tree: TempDir,
     _common: TempDir,
+    dirs: StateDir,
     index: Index,
     cache: VectorCache,
     /// The reconciler of `index`, kept across passes as the daemon keeps it.
@@ -45,8 +47,9 @@ impl Fixture {
     fn new() -> Self {
         let tree = tempfile::tempdir().unwrap();
         let common = tempfile::tempdir().unwrap();
-        let index = block_on(Index::open(tree.path())).unwrap();
-        let cache = block_on(VectorCache::open(common.path())).unwrap();
+        let dirs = StateDir::new(common.path().join("state"));
+        let index = block_on(Index::open(&dirs, tree.path())).unwrap();
+        let cache = block_on(VectorCache::open(&dirs, common.path())).unwrap();
         let reconciler = RefCell::new(Reconciler::new(
             index.clone(),
             cache.clone(),
@@ -56,6 +59,7 @@ impl Fixture {
         Self {
             tree,
             _common: common,
+            dirs,
             index,
             cache,
             reconciler,
@@ -289,7 +293,7 @@ impl Fixture {
     }
 
     fn db(&self) -> std::path::PathBuf {
-        self.tree.path().join(".repo-search/index.db")
+        self.dirs.worktree_index(self.tree.path())
     }
 
     fn query<T: rusqlite::types::FromSql>(&self, sql: &str) -> T {
@@ -946,7 +950,7 @@ fn another_chunker_rechunks_and_reuses_cached_vectors() {
         .unwrap();
     let total = first.report.chunks_total;
 
-    let mut reopened = fx.reconciler_for(&block_on(Index::open(fx.tree.path())).unwrap());
+    let mut reopened = fx.reconciler_for(&block_on(Index::open(&fx.dirs, fx.tree.path())).unwrap());
     let second = fx.run_with(&mut reopened, "chunker-b", Options::default());
     assert!(second.changes.is_none(), "a rechunk reports no changes");
     let r = &second.report;
@@ -975,7 +979,7 @@ fn the_same_chunker_reopens_without_rechunking() {
     let fx = Fixture::new();
     fx.write("a.rs", "fn alpha() { 1; }\n");
     fx.run_chunker("chunker-a", Options::default());
-    let mut reopened = fx.reconciler_for(&block_on(Index::open(fx.tree.path())).unwrap());
+    let mut reopened = fx.reconciler_for(&block_on(Index::open(&fx.dirs, fx.tree.path())).unwrap());
     let again = fx.run_with(&mut reopened, "chunker-a", Options::default());
     assert!(!again.report.rechunked);
     assert_eq!(again.report.chunks_added, 0);

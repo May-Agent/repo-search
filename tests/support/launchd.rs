@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use repo_search::install::{Launchctl, LaunchctlError, Service};
 use repo_search::protocol::BuildId;
+use repo_search_core::StateDir;
 use tokio::task::JoinHandle;
 
 use super::daemon::{self, Model};
@@ -114,6 +115,8 @@ struct Owner {
     socket: PathBuf,
     runtime: tokio::runtime::Handle,
     models: tempfile::TempDir,
+    /// The state root every bootstrapped daemon gets.
+    state: tempfile::TempDir,
     /// The model layout the bootstrapped daemon's store gets.
     model: Model,
     /// The backend every bootstrapped daemon runs.
@@ -207,11 +210,14 @@ impl Owner {
             Process::Daemon(daemon::spawn_on(
                 &self.runtime,
                 listener,
-                store,
-                self.backend.clone(),
-                Duration::from_secs(600),
-                repo_search::daemon::LOAD_BOUND,
-                self.build,
+                daemon::Setup {
+                    model_store: store,
+                    state: StateDir::new(self.state.path().to_path_buf()),
+                    backend: self.backend.clone(),
+                    idle_exit: Duration::from_secs(600),
+                    load_bound: repo_search::daemon::LOAD_BOUND,
+                    build: self.build,
+                },
             ))
         };
         self.loaded = Some(Loaded {
@@ -356,6 +362,7 @@ impl FakeLaunchd {
             socket,
             runtime,
             models: tempfile::tempdir().expect("the fake's model cache"),
+            state: tempfile::tempdir().expect("the fake's state dir"),
             model,
             backend: Arc::new(backend),
             build,

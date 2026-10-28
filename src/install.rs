@@ -68,6 +68,7 @@ impl AgentConfig {
                 socket: socket_path()?,
                 idle_exit: IDLE_EXIT,
                 model_cache: None,
+                state_dir: None,
                 stderr: log_path()?,
             },
             timeouts: Timeouts {

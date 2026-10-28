@@ -11,6 +11,8 @@ use std::os::fd::{FromRawFd, OwnedFd};
 use std::path::PathBuf;
 use std::time::Duration;
 
+use repo_search_core::StateDir;
+
 unsafe extern "C" {
     fn launch_activate_socket(name: *const c_char, fds: *mut *mut c_int, cnt: *mut usize) -> c_int;
 }
@@ -23,7 +25,7 @@ pub const LABEL: &str = "com.github.may-agent.repo-search";
 /// rather than `Caches`, which the system may purge while the agent is
 /// loaded.
 pub fn socket_path() -> io::Result<PathBuf> {
-    Ok(home()?.join("Library/Application Support/repo-search/daemon.sock"))
+    Ok(StateDir::user()?.root().join("daemon.sock"))
 }
 
 /// The file the agent's `StandardErrorPath` writes the daemon's tracing
@@ -42,7 +44,7 @@ pub fn plist_path(label: &str) -> io::Result<PathBuf> {
 /// socket, in a directory this program owns, rather than in
 /// `~/Library/LaunchAgents`, which belongs to launchd.
 pub fn lock_path() -> io::Result<PathBuf> {
-    Ok(home()?.join("Library/Application Support/repo-search/install.lock"))
+    Ok(StateDir::user()?.root().join("install.lock"))
 }
 
 /// The launchd domain the agent lives in: `user/<uid>`, so `search` works
@@ -144,6 +146,8 @@ pub struct LaunchAgent {
     pub idle_exit: Duration,
     /// The `--model-cache` argument, when a non-default cache is used.
     pub model_cache: Option<PathBuf>,
+    /// The `--state-dir` argument, when a non-default state dir is used.
+    pub state_dir: Option<PathBuf>,
     /// The `StandardErrorPath` log file.
     pub stderr: PathBuf,
 }
@@ -159,6 +163,7 @@ mod tests {
             socket: PathBuf::from("/tmp/daemon.sock"),
             idle_exit: Duration::from_secs(600),
             model_cache: None,
+            state_dir: None,
             stderr: PathBuf::from("/tmp/daemon.log"),
         }
     }
@@ -181,6 +186,7 @@ mod tests {
             );
         }
         assert!(!plist.contains("--model-cache"));
+        assert!(!plist.contains("--state-dir"));
     }
 
     #[test]
@@ -189,5 +195,13 @@ mod tests {
         agent.model_cache = Some(PathBuf::from("/tmp/models"));
         let plist = askama::Template::render(&agent).expect("the template renders");
         assert!(plist.contains("<string>--model-cache</string>\n\t\t<string>/tmp/models</string>"));
+    }
+
+    #[test]
+    fn the_plist_renders_a_state_dir() {
+        let mut agent = agent();
+        agent.state_dir = Some(PathBuf::from("/tmp/state"));
+        let plist = askama::Template::render(&agent).expect("the template renders");
+        assert!(plist.contains("<string>--state-dir</string>\n\t\t<string>/tmp/state</string>"));
     }
 }
