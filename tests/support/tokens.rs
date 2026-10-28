@@ -2,9 +2,9 @@
 //!
 //! `StubTokens::load` returns at once — no download — with a
 //! [`StubCounter`] carrying the holds the test installed. The counter
-//! keeps the arithmetic the old `Embedder`-based stub derived its
-//! `tokens` from (`len / 4 + 1`), so the server's `StubEncoder` reports
-//! the same token counts for the same document prompts.
+//! keeps the arithmetic the server-side stub derives its `tokens` from
+//! (`len / 4 + 1`), so the server's `StubEncoder` reports the same token
+//! counts for the same document prompts.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;

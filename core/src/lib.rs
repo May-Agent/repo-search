@@ -18,7 +18,7 @@ pub use state::StateDir;
 /// Lowercase hex, 32 characters.
 pub const CHUNKER_FINGERPRINT: &str = env!("REPO_SEARCH_CHUNKER_FINGERPRINT");
 
-pub use embed::{BatchEmbedder, Embedder, TokenCounter, UnitVector};
+pub use embed::{TokenCounter, UnitVector};
 pub use model::QueryTask;
 
 // Lets the shared test counters (included from `tests/counters`) name the

@@ -167,40 +167,73 @@ fn corpus() -> Vec<(PathBuf, PathBuf, String)> {
     work
 }
 
-/// `PromptCounter` and coreml's `DocumentCounter` answer `count`, `fits`,
-/// `fit_end` and `document_tokens` identically over the whole corpus: the
-/// daemon's own counter sees the same tokens the server's will.
+/// The token-count maxima the parity digest was recorded at.
+const PARITY_MAXES: [usize; 4] = [128, 256, 512, 1024];
+
+/// The number of corpus files the parity digest covers.
+const PARITY_FILES: usize = 2311;
+
+/// SHA-256 of every corpus file's [`parity_line`], in path order, as the
+/// model crate's own document counter answered them.
+const PARITY_DIGEST: &str = "924b350188c2e0f2839a98adb30160d8f0bd5dfc20743b4425507b8563a271ed";
+
+/// One corpus file's counts as one line: `count` of `DOCUMENT.format(rel,
+/// src)`, `document_tokens(rel, src)`, and `fits` and `fit_end` at each of
+/// [`PARITY_MAXES`]. `key` is `<corpus root name>/<worktree-relative path>`.
+fn parity_line(
+    key: &str,
+    count: usize,
+    document_tokens: usize,
+    fits: [bool; PARITY_MAXES.len()],
+    fit_end: [Option<usize>; PARITY_MAXES.len()],
+) -> String {
+    format!("{key}\t{count}\t{document_tokens}\t{fits:?}\t{fit_end:?}\n")
+}
+
+/// The digest of `lines`, keyed by path so the order is the path order.
+fn parity_digest(lines: &std::collections::BTreeMap<String, String>) -> String {
+    use sha2::Digest as _;
+    let mut hasher = sha2::Sha256::new();
+    for line in lines.values() {
+        hasher.update(line.as_bytes());
+    }
+    hex::encode(hasher.finalize())
+}
+
+/// `PromptCounter` answers `count`, `fits`, `fit_end` and `document_tokens`
+/// over the whole corpus exactly as the model crate's own document counter
+/// did, pinned by [`PARITY_DIGEST`], so the daemon's counter sees the same
+/// tokens the server's encoder will.
 #[test]
 #[ignore = "needs the corpora (REPO_SEARCH_CORPUS) and the model (REPO_SEARCH_MODEL_DIR); the release gate runs it"]
-fn prompt_counter_matches_document_counter() {
+fn prompt_counter_matches_the_recorded_counts() {
     let dir = std::env::var("REPO_SEARCH_MODEL_DIR").expect("REPO_SEARCH_MODEL_DIR is unset");
     let prompt = PromptCounter::open(Path::new(&dir).join("tokenizer.json"))
         .expect("the prompt counter loads");
-    let document =
-        repo_search_coreml::DocumentCounter::open(&dir).expect("the document counter loads");
-
+    let mut lines = std::collections::BTreeMap::new();
     for (root, path, src) in corpus() {
         let rel = path.strip_prefix(&root).unwrap().to_str().unwrap();
+        let key = format!("{}/{rel}", root.file_name().unwrap().to_str().unwrap());
         let doc = DOCUMENT.format(rel, &src);
-        assert_eq!(prompt.count(&doc), document.count(&doc), "count {rel}");
-        for max in [128, 256, 512, 1024] {
-            assert_eq!(
-                prompt.fits(rel, &[&src], max),
-                document.fits(rel, &[&src], max),
-                "fits {rel} at {max}"
-            );
-            assert_eq!(
-                prompt.fit_end(rel, &[&src], max),
-                document.fit_end(rel, &[&src], max),
-                "fit_end {rel} at {max}"
-            );
-        }
-        assert_eq!(
+        let line = parity_line(
+            &key,
+            prompt.count(&doc),
             prompt.document_tokens(rel, &src),
-            document.document_tokens(rel, &src),
-            "document_tokens {rel}"
+            PARITY_MAXES.map(|max| prompt.fits(rel, &[&src], max)),
+            PARITY_MAXES.map(|max| prompt.fit_end(rel, &[&src], max)),
         );
+        lines.insert(key, line);
     }
+    assert_eq!(
+        lines.len(),
+        PARITY_FILES,
+        "the corpus is the one the digest covers"
+    );
+    assert_eq!(
+        parity_digest(&lines),
+        PARITY_DIGEST,
+        "the counts match the recorded ones"
+    );
 }
 
 /// No chunk of the corpora exceeds 512 tokens of the embedding tokenizer.

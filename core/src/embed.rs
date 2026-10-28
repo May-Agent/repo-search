@@ -1,6 +1,4 @@
-//! The embedding interface every model backend implements.
-
-use crate::model::QueryTask;
+//! The token-counting interface every model tokenizer implements.
 
 /// A unit-length embedding; only constructible by normalizing.
 #[derive(Debug, Clone, PartialEq)]
@@ -62,40 +60,6 @@ pub trait TokenCounter: Send + Sync {
     /// Tokens of the document the model embeds for `title` and `text`,
     /// special tokens included.
     fn document_tokens(&self, title: &str, text: &str) -> usize;
-}
-
-/// A text encoder. Calls block: callers run it on a thread they own and set its QoS.
-pub trait Embedder {
-    /// The backend's failure.
-    type Error: std::error::Error + Send + Sync + 'static;
-
-    /// Identifies the model build; vectors with different ids never mix.
-    fn model_id(&self) -> &str;
-
-    /// Embeds a document chunk under its title.
-    ///
-    /// # Errors
-    ///
-    /// When the backend fails to run the model.
-    fn embed_document(&mut self, title: &str, text: &str) -> Result<UnitVector, Self::Error>;
-
-    /// Embeds a search query for `task`; the implementation applies
-    /// [`QueryTask::prompt`].
-    ///
-    /// # Errors
-    ///
-    /// When the backend fails to run the model.
-    fn embed_query(&mut self, task: QueryTask, query: &str) -> Result<UnitVector, Self::Error>;
-}
-
-/// An encoder that embeds several documents in one model call.
-pub trait BatchEmbedder: Embedder {
-    /// One vector per `(title, text)`, in order. All documents fall in the same bucket.
-    ///
-    /// # Errors
-    ///
-    /// When the backend fails to run the model.
-    fn embed_documents(&mut self, docs: &[(&str, &str)]) -> Result<Vec<UnitVector>, Self::Error>;
 }
 
 #[cfg(test)]

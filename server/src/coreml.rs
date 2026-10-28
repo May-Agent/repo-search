@@ -3,7 +3,6 @@
 use std::path::Path;
 
 use repo_search_core::UnitVector;
-use repo_search_core::model::MODEL_ID;
 use repo_search_coreml::{ComputeUnits, CoreMlEmbedder, Encoder, Error, HeadroomMonitor};
 use tokio::sync::watch;
 
@@ -57,11 +56,11 @@ impl Backend for CoreMlBackend {
         dir: &Path,
         stage: &watch::Sender<LoadStage>,
     ) -> Result<Self::Ane, Self::LoadError> {
-        let mut embedder = CoreMlEmbedder::open(dir, MODEL_ID, ComputeUnits::CpuAndNeuralEngine)?;
+        let mut embedder = CoreMlEmbedder::open(dir, ComputeUnits::CpuAndNeuralEngine)?;
         stage.send_replace(LoadStage::WarmUp);
         // Warm every bucket once so the first request does not pay the ANE
         // compile.
-        let buckets: Vec<usize> = embedder.counter().buckets().to_vec();
+        let buckets: Vec<usize> = embedder.buckets().collect();
         for len in buckets {
             embedder.embed_tokens(&vec![0; len])?;
         }
@@ -69,7 +68,7 @@ impl Backend for CoreMlBackend {
     }
 
     fn open_gpu(&self, dir: &Path) -> Result<Self::Gpu, GpuOpen<Self::LoadError>> {
-        CoreMlEmbedder::open(dir, MODEL_ID, ComputeUnits::CpuAndGpu).map_err(|error| match error {
+        CoreMlEmbedder::open(dir, ComputeUnits::CpuAndGpu).map_err(|error| match error {
             Error::GpuBlocked(blocked) => GpuOpen::Blocked(blocked),
             other => GpuOpen::Failed(other),
         })

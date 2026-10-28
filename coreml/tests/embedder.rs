@@ -6,12 +6,11 @@ use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use repo_search_core::{BatchEmbedder, Embedder, QueryTask, UnitVector};
-use repo_search_coreml::{ComputeUnits, CoreMlEmbedder, Error, gpu_headroom};
+use repo_search_core::model::DOCUMENT;
+use repo_search_core::{QueryTask, UnitVector};
+use repo_search_coreml::{ComputeUnits, CoreMlEmbedder, Encoder, Error, gpu_headroom};
 use serde::Deserialize;
-
-/// The model archive's sha256: the model id vectors are cached under.
-const MODEL_ID: &str = "57287aaa3fea181447dd2bd378d064aeef77684da0c722302e893dd95e43ab2c";
+use tokenizers::{Tokenizer, TruncationParams};
 
 const MIN_COSINE: f32 = 0.9999;
 
@@ -74,6 +73,21 @@ fn reference(model_dir: &Path) -> Reference {
     serde_json::from_slice(&out.stdout).expect("reference output is JSON")
 }
 
+/// The model's tokenizer with truncation at the largest bucket — the path
+/// the Python reference takes for queries, which keeps the post-processed
+/// `<eos>` a plain `ids` cut would drop.
+fn truncating_tokenizer(dir: &Path, max_len: usize) -> Tokenizer {
+    let mut tokenizer =
+        Tokenizer::from_file(dir.join("tokenizer.json")).expect("the model tokenizer loads");
+    tokenizer
+        .with_truncation(Some(TruncationParams {
+            max_length: max_len,
+            ..Default::default()
+        }))
+        .expect("truncation configures");
+    tokenizer
+}
+
 fn cosine(a: &[f32], b: &[f32]) -> f32 {
     assert_eq!(a.len(), b.len(), "vector lengths differ");
     a.iter().zip(b).map(|(x, y)| x * y).sum()
@@ -84,8 +98,8 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
 fn embeddings_match_python_reference() {
     let dir = model_dir();
     let reference = reference(&dir);
-    let mut embedder =
-        CoreMlEmbedder::open(&dir, MODEL_ID, ComputeUnits::CpuAndNeuralEngine).unwrap();
+    let encoder = Encoder::open(&dir).unwrap();
+    let mut embedder = CoreMlEmbedder::open(&dir, ComputeUnits::CpuAndNeuralEngine).unwrap();
     let mut worst = (f32::INFINITY, String::new());
     let mut check = |label: String, got: &UnitVector, want: &[f32]| {
         let c = cosine(got.as_slice(), want);
@@ -103,13 +117,19 @@ fn embeddings_match_python_reference() {
         );
     }
     for d in &reference.documents {
-        let v = embedder.embed_document(&d.title, &d.text).unwrap();
+        let ids = encoder.encode(&DOCUMENT.format(&d.title, &d.text)).unwrap();
+        let v = embedder.embed_tokens(&ids).unwrap();
         check(format!("document {}", d.title), &v, &d.embedding);
     }
+    let max_len = *encoder.buckets().last().expect("manifest has buckets");
+    let queries = truncating_tokenizer(&dir, max_len);
     for q in &reference.queries {
-        let v = embedder
-            .embed_query(QueryTask::CodeRetrieval, &q.query)
-            .unwrap();
+        let ids = queries
+            .encode(QueryTask::CodeRetrieval.prompt(&q.query), true)
+            .expect("query encodes")
+            .get_ids()
+            .to_vec();
+        let v = embedder.embed_tokens(&ids).unwrap();
         let shown: String = q.query.chars().take(40).collect();
         check(
             format!("query {shown:?} ({} tokens)", q.tokens),
@@ -132,17 +152,19 @@ fn ane_and_gpu_instances_run_concurrently() {
     let dir = model_dir();
     const TEXT: &str = "fn main() { index_everything(); }";
     const ITERATIONS: usize = 30;
+    let encoder = Encoder::open(&dir).unwrap();
+    let ids = encoder.encode(&DOCUMENT.format("main.rs", TEXT)).unwrap();
     match gpu_headroom() {
         Ok(()) => {
             // Both threads finish `open` first, then release together so
             // their embedding loops actually overlap.
             let barrier = std::sync::Barrier::new(2);
             let run = |units: ComputeUnits| {
-                let mut e = CoreMlEmbedder::open(&dir, MODEL_ID, units).unwrap();
+                let mut e = CoreMlEmbedder::open(&dir, units).unwrap();
                 barrier.wait();
                 let mut vs = Vec::with_capacity(ITERATIONS);
                 for _ in 0..ITERATIONS {
-                    vs.push(e.embed_document("main.rs", TEXT).unwrap());
+                    vs.push(e.embed_tokens(&ids).unwrap());
                 }
                 vs
             };
@@ -164,7 +186,7 @@ fn ane_and_gpu_instances_run_concurrently() {
         }
         Err(blocked) => {
             // Without headroom the guard must refuse construction.
-            let err = match CoreMlEmbedder::open(&dir, MODEL_ID, ComputeUnits::CpuAndGpu) {
+            let err = match CoreMlEmbedder::open(&dir, ComputeUnits::CpuAndGpu) {
                 Err(e) => e,
                 Ok(_) => panic!("GPU embedder must not open without headroom"),
             };
@@ -178,10 +200,10 @@ fn ane_and_gpu_instances_run_concurrently() {
 
 #[test]
 #[ignore = "needs REPO_SEARCH_MODEL_DIR; run with --ignored"]
-fn document_over_cap_errors_and_query_truncates() {
+fn an_input_over_the_cap_is_too_long() {
     let dir = model_dir();
-    let mut embedder =
-        CoreMlEmbedder::open(&dir, MODEL_ID, ComputeUnits::CpuAndNeuralEngine).unwrap();
+    let encoder = Encoder::open(&dir).unwrap();
+    let mut embedder = CoreMlEmbedder::open(&dir, ComputeUnits::CpuAndNeuralEngine).unwrap();
     let err = match embedder.embed_tokens(&vec![5; 600]) {
         Err(e) => e,
         Ok(_) => panic!("600 tokens exceed the largest bucket"),
@@ -191,13 +213,9 @@ fn document_over_cap_errors_and_query_truncates() {
     // is a chunker bug, not an input to truncate.
     let long_doc = "token ".repeat(600);
     assert!(matches!(
-        embedder.embed_document("long.rs", &long_doc),
+        encoder.encode(&DOCUMENT.format("long.rs", &long_doc)),
         Err(Error::TooLong { .. })
     ));
-    // A query is truncated at the cap instead of failing.
-    embedder
-        .embed_query(QueryTask::CodeRetrieval, &long_doc)
-        .expect("query is truncated at the cap");
 }
 
 /// Eight documents of one bucket.
@@ -217,30 +235,34 @@ fn batch_documents() -> Vec<(String, String)> {
 fn a_batch_of_eight_equals_eight_single_embeds() {
     let dir = model_dir();
     let docs = batch_documents();
-    let docs: Vec<(&str, &str)> = docs.iter().map(|(t, x)| (t.as_str(), x.as_str())).collect();
-    let mut ane = CoreMlEmbedder::open(&dir, MODEL_ID, ComputeUnits::CpuAndNeuralEngine).unwrap();
-    let singles: Vec<UnitVector> = docs
+    let encoder = Encoder::open(&dir).unwrap();
+    let ids: Vec<Vec<u32>> = docs
         .iter()
-        .map(|(title, text)| ane.embed_document(title, text).unwrap())
+        .map(|(title, text)| encoder.encode(&DOCUMENT.format(title, text)).unwrap())
         .collect();
-    let batch = ane.embed_documents(&docs).unwrap();
-    assert_eq!(batch.len(), docs.len());
+    let mut ane = CoreMlEmbedder::open(&dir, ComputeUnits::CpuAndNeuralEngine).unwrap();
+    let singles: Vec<UnitVector> = ids
+        .iter()
+        .map(|ids| ane.embed_tokens(ids).unwrap())
+        .collect();
+    let batch = ane.embed_tokens_batch(&ids).unwrap();
+    assert_eq!(batch.len(), ids.len());
     for (i, (b, s)) in batch.iter().zip(&singles).enumerate() {
         let c = cosine(b.as_slice(), s.as_slice());
         assert!(c >= MIN_COSINE, "document {i}: cosine {c} < {MIN_COSINE}");
     }
     match gpu_headroom() {
         Ok(()) => {
-            let mut gpu = CoreMlEmbedder::open(&dir, MODEL_ID, ComputeUnits::CpuAndGpu).unwrap();
-            let batch = gpu.embed_documents(&docs).unwrap();
-            assert_eq!(batch.len(), docs.len());
+            let mut gpu = CoreMlEmbedder::open(&dir, ComputeUnits::CpuAndGpu).unwrap();
+            let batch = gpu.embed_tokens_batch(&ids).unwrap();
+            assert_eq!(batch.len(), ids.len());
             for (i, (b, s)) in batch.iter().zip(&singles).enumerate() {
                 let c = cosine(b.as_slice(), s.as_slice());
                 assert!(c > 0.99, "document {i}: GPU batch vs ANE cosine {c}");
             }
         }
         Err(blocked) => {
-            let err = match CoreMlEmbedder::open(&dir, MODEL_ID, ComputeUnits::CpuAndGpu) {
+            let err = match CoreMlEmbedder::open(&dir, ComputeUnits::CpuAndGpu) {
                 Err(e) => e,
                 Ok(_) => panic!("GPU embedder must not open without headroom"),
             };

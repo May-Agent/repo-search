@@ -11,7 +11,7 @@ fn main() {
     let mut args = env::args().skip(1);
     let dir = args.next().expect("usage: bench <model_dir> [iterations]");
     let iters: usize = args.next().map_or(40, |s| s.parse().expect("iterations"));
-    let mut embedder = CoreMlEmbedder::open(&dir, "bench", ComputeUnits::CpuAndNeuralEngine)
+    let mut embedder = CoreMlEmbedder::open(&dir, ComputeUnits::CpuAndNeuralEngine)
         .expect("open the model directory");
     for len in [128_usize, 256, 512] {
         // A full-length input routes to the `len_*` function of that bucket.
