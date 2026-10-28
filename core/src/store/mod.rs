@@ -15,11 +15,12 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
 
-use rusqlite::{Connection, TransactionBehavior};
+use rusqlite::{Connection, OpenFlags, TransactionBehavior};
 use tokio::sync::{mpsc, oneshot};
 
 pub use index::{
     Applied, FileChange, Index, Phase, RowHash, StoredChunk, StoredMember, StoredMemberKind,
+    StoredMeta, stored_meta, vacuum_into,
 };
 pub use query::{ChunkFilter, ChunkId, ChunkRow, MemberRow, Side};
 pub use records::{
@@ -150,6 +151,14 @@ async fn spawn_actor<M: Send + 'static>(
 /// wait on a lock held by a sibling daemon.
 fn open_conn(path: &Path) -> Result<Connection, Error> {
     let conn = Connection::open(path)?;
+    conn.busy_timeout(BUSY_TIMEOUT)?;
+    Ok(conn)
+}
+
+/// Opens `path` read-only with the same busy timeout: a writer serializes
+/// the reads behind its commit.
+fn open_read_only(path: &Path) -> Result<Connection, Error> {
+    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     conn.busy_timeout(BUSY_TIMEOUT)?;
     Ok(conn)
 }

@@ -18,7 +18,7 @@ use repo_search::model_store::{ModelSpec, ModelStore};
 use repo_search::protocol::{self, ErrorKind, Event, Final, Request, WirePhase};
 use repo_search_core::StateDir;
 use repo_search_core::qos::QosClass;
-use repo_search_core::store::{ContentHash, Index, VectorCache};
+use repo_search_core::store::{ContentHash, Index, Phase, VectorCache};
 use repo_search_coreml::GpuBlocked;
 use repo_search_server::chip::ChipClass;
 use repo_search_server::stub::{IndexGate, Instance, Kind, Record, StubBackend};
@@ -1868,6 +1868,347 @@ async fn worktrees_and_repositories_get_separate_index_files() {
         !repo.common_dir.join("repo-search").exists(),
         "the daemon wrote under the common dir"
     );
+}
+
+/// A worktree added next to an indexed sibling copies the sibling's index
+/// instead of rebuilding: its first barrier re-chunks only the edited
+/// files and restamps the rest, and the seeded index searches as a freshly
+/// built one does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_new_worktree_seeds_its_index_from_a_sibling() {
+    let repo = fn_repo(20, SMALL_BYTES, 5);
+    let (d, gate) = start_index_gated(Duration::from_millis(20)).await;
+    let linked = repo::add_worktree(&repo, "linked", "linked");
+    let scratch = repo::add_worktree(&repo, "scratch", "scratch");
+
+    // Nothing is indexed yet: `scratch` builds from scratch, then
+    // `repo.root` seeds from it — an indexed, maintained sibling.
+    index_request(&d, &scratch, true).await;
+    index_request(&d, &repo.root, true).await;
+
+    // Two files edited in `linked`, the same edits already reconciled in
+    // `scratch` so the answers can be compared.
+    for (path, name) in [("src/f0.rs", "seed_edit_0"), ("src/f1.rs", "seed_edit_1")] {
+        let edit = repo::rust_fn(name, SMALL_BYTES);
+        repo::append(&linked, path, &edit);
+        repo::append(&scratch, path, &edit);
+    }
+    index_request(&d, &scratch, true).await;
+
+    // `linked`'s first request seeds, then its barrier restamps the fresh
+    // checkout — a new file can never carry the stored inode — and
+    // re-chunks only the two edited files: the report's `changed_files`,
+    // which the answer's freshness carries, counts exactly them.
+    gate.arm();
+    let events = answer_search(&d, &linked, MARKER).await;
+    let answer = match final_of(&events) {
+        Final::Answer(answer) => answer,
+        other => panic!("expected an Answer, got {other:?}"),
+    };
+    assert!(answer.has_results, "{events:?}");
+    let output: serde_json::Value =
+        serde_json::from_str(&answer.output).expect("the answer is JSON");
+    assert_eq!(
+        output["freshness"]["changed_files"], 2,
+        "the seeded barrier re-chunks only the two edited files: {output}"
+    );
+
+    // The stored phase is kept: `Maintained` at once — the seeded chunks
+    // are all in the shared vector cache, so nothing embeds at all. The
+    // armed gate keeps a from-scratch index first-index, so `Maintained`
+    // here can only come from the seed.
+    let events = request(
+        &d.socket,
+        &hello(),
+        Request::Status {
+            worktree: linked.clone(),
+        },
+    )
+    .await;
+    let status = match final_of(&events) {
+        Final::Status(status) => status,
+        other => panic!("expected a Status, got {other:?}"),
+    };
+    let index = status.index.as_ref().expect("the worktree is indexed");
+    assert_eq!(index.phase, WirePhase::Maintained);
+    assert_eq!(index.queued_stage1, 0, "no stage-1 work on a kept phase");
+    assert_eq!(
+        (index.chunks_with_vector, index.chunks_total),
+        (23, 23),
+        "every seeded chunk is already cached"
+    );
+    gate.open();
+
+    // The seeded index searches as `scratch`'s freshly built one does.
+    let events = answer_search(&d, &scratch, MARKER).await;
+    let fresh = match final_of(&events) {
+        Final::Answer(answer) => answer,
+        other => panic!("expected an Answer, got {other:?}"),
+    };
+    assert!(fresh.has_results, "{events:?}");
+    let fresh_output: serde_json::Value =
+        serde_json::from_str(&fresh.output).expect("the answer is JSON");
+    // A hybrid answer's fused scores and its order within a file are no
+    // function of the index: the vector channel breaks equal scores by the
+    // row a vector holds in the in-memory index, the order vectors were
+    // adopted in (a `HashSet`'s, then the cache's slots'), and the stub's
+    // one-hot vectors make nearly every score equal. Two fresh builds of
+    // one tree differ the same way. The selection — same files, same
+    // chunks, found by the same channels — is identical.
+    let selection = |output: &serde_json::Value| {
+        let mut files = Vec::new();
+        for list in ["code", "docs"] {
+            for file in output[list].as_array().into_iter().flatten() {
+                let mut chunks: Vec<String> = file["chunks"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(serde_json::Value::to_string)
+                    .collect();
+                chunks.sort_unstable();
+                files.push(format!("{list}:{}:{chunks:?}", file["path"]));
+            }
+        }
+        files.sort_unstable();
+        files
+    };
+    assert_eq!(selection(&output), selection(&fresh_output), "{output}");
+    // The lexical channel alone ranks by the index's rows: BM25 over its
+    // FTS statistics, equal scores by chunk id. The seeded index answers
+    // exactly as `scratch`'s, which reconciled the same edits — `usize`
+    // matches every chunk at one score, so its order is the ids'.
+    for query in [MARKER, "usize"] {
+        let mut answers = Vec::new();
+        for worktree in [&linked, &scratch] {
+            let events = request(&d.socket, &hello(), lexical(worktree, query)).await;
+            let answer = match final_of(&events) {
+                Final::Answer(answer) => answer,
+                other => panic!("expected an Answer, got {other:?}"),
+            };
+            assert!(answer.has_results, "{events:?}");
+            let output: serde_json::Value =
+                serde_json::from_str(&answer.output).expect("the answer is JSON");
+            answers.push((output["code"].clone(), output["docs"].clone()));
+        }
+        assert_eq!(answers[0], answers[1], "lexical {query:?}");
+    }
+    assert_eq!(
+        visible_hashes(&d.state, &linked).await,
+        visible_hashes(&d.state, &scratch).await,
+        "the seeded index holds the same chunks"
+    );
+
+    index_request(&d, &linked, true).await;
+}
+
+/// A sibling index stored under another chunker fingerprint is no seed:
+/// the new worktree builds its index from scratch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_sibling_index_with_another_chunker_is_not_seeded() {
+    let repo = fn_repo(10, SMALL_BYTES, 5);
+    let (d, gate) = start_index_gated(Duration::from_millis(20)).await;
+    let linked = repo::add_worktree(&repo, "linked", "linked");
+
+    // A maintained index stored under another chunker fingerprint: the
+    // seed's `meta` check must pass it over.
+    let sibling = Index::open(&d.state, &repo.root)
+        .await
+        .expect("index opens");
+    sibling
+        .align_chunker("another-chunker", repo_search_core::model::MODEL_ID)
+        .await
+        .expect("the realign lands");
+    sibling
+        .set_phase(Phase::Maintained)
+        .await
+        .expect("the phase lands");
+    drop(sibling);
+
+    // No copy: the fresh index is first-index with an embed held at the
+    // gate. A copy would have kept the sibling's `Maintained` through the
+    // realign.
+    gate.arm();
+    index_request(&d, &linked, false).await;
+    let mut log = Vec::new();
+    wait_held(&mut log, &d.records);
+    let events = request(
+        &d.socket,
+        &hello(),
+        Request::Status {
+            worktree: linked.clone(),
+        },
+    )
+    .await;
+    let status = match final_of(&events) {
+        Final::Status(status) => status,
+        other => panic!("expected a Status, got {other:?}"),
+    };
+    let index = status.index.as_ref().expect("the worktree is indexed");
+    assert_eq!(index.phase, WirePhase::FirstIndex);
+    assert!(
+        index.chunks_with_vector < index.chunks_total,
+        "the held call leaves embedding unfinished: {index:?}"
+    );
+    gate.open();
+
+    index_request(&d, &linked, true).await;
+    assert_eq!(visible_hashes(&d.state, &linked).await.len(), 11);
+    let events = answer_search(&d, &linked, MARKER).await;
+    assert!(
+        matches!(final_of(&events), Final::Answer(a) if a.has_results),
+        "{events:?}"
+    );
+}
+
+/// A worktree whose siblings are not indexed builds its index from
+/// scratch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_worktree_without_an_indexed_sibling_builds_from_scratch() {
+    let repo = fn_repo(10, SMALL_BYTES, 5);
+    let (d, _, _) = start(&repo, Duration::ZERO, Duration::ZERO, &[]).await;
+    let linked = repo::add_worktree(&repo, "linked", "linked");
+
+    // `git worktree list` names `repo.root`, but nothing is indexed: no
+    // seed, so the barrier counts every file as added.
+    let events = answer_search(&d, &linked, MARKER).await;
+    let answer = match final_of(&events) {
+        Final::Answer(answer) => answer,
+        other => panic!("expected an Answer, got {other:?}"),
+    };
+    assert!(answer.has_results, "{events:?}");
+    let output: serde_json::Value =
+        serde_json::from_str(&answer.output).expect("the answer is JSON");
+    assert_eq!(
+        output["freshness"]["changed_files"], 2,
+        "a fresh index counts every file as added: {output}"
+    );
+    assert!(
+        !d.state.worktree_index(&repo.root).exists(),
+        "the sibling stays unindexed"
+    );
+
+    index_request(&d, &linked, true).await;
+    assert_eq!(visible_hashes(&d.state, &linked).await.len(), 11);
+}
+
+/// A sibling holding a write transaction seeds a consistent copy: the
+/// `VACUUM INTO` read serializes behind the commit under `busy_timeout`,
+/// and the marker the transaction commits is in the copy.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_sibling_holding_a_write_transaction_seeds_a_committed_copy() {
+    let repo = fn_repo(10, SMALL_BYTES, 5);
+    let (d, _, _) = start(&repo, Duration::ZERO, Duration::ZERO, &[]).await;
+    let linked = repo::add_worktree(&repo, "linked", "linked");
+    index_request(&d, &repo.root, true).await;
+
+    // An exclusive transaction on the sibling's index; readers block
+    // behind its commit. The marked chunk titles are the copy's proof.
+    let source = d.state.worktree_index(&repo.root);
+    let (held_tx, held) = mpsc::channel();
+    let (release_tx, release) = mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        let mut conn = rusqlite::Connection::open(&source).expect("source opens");
+        conn.busy_timeout(TIMEOUT).expect("busy timeout set");
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Exclusive)
+            .expect("the exclusive transaction begins");
+        tx.execute(
+            "UPDATE chunks SET title = 'seeded_marker' WHERE path = 'src/f0.rs'",
+            [],
+        )
+        .expect("the marker write");
+        held_tx.send(()).expect("the test is listening");
+        release.recv().expect("the test releases the writer");
+        tx.commit().expect("the write commits");
+    });
+    held.recv_timeout(TIMEOUT)
+        .expect("the writer holds the index");
+
+    let socket = d.socket.clone();
+    let worktree = linked.clone();
+    let index_request = tokio::spawn(async move {
+        request(
+            &socket,
+            &hello(),
+            Request::Index {
+                worktree,
+                wait: false,
+            },
+        )
+        .await
+    });
+    release_tx.send(()).expect("the writer is listening");
+    let events = index_request.await.expect("the request task answers");
+    assert!(
+        matches!(final_of(&events), Final::Indexed { .. }),
+        "{events:?}"
+    );
+
+    let titles: Vec<String> = Index::open(&d.state, &linked)
+        .await
+        .expect("index opens")
+        .chunks_in(vec!["src/f0.rs".to_owned()])
+        .await
+        .expect("chunks read")
+        .into_iter()
+        .map(|chunk| chunk.title)
+        .collect();
+    assert!(
+        !titles.is_empty() && titles.iter().all(|t| t == "seeded_marker"),
+        "the copy holds the committed write: {titles:?}"
+    );
+}
+
+/// A failed seed copy fails the request and leaves no `index.db`; the next
+/// request, the matching sibling still there, builds from scratch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_seed_leaves_no_index_and_the_next_request_builds_fresh() {
+    let repo = fn_repo(10, SMALL_BYTES, 5);
+    let (d, _, _) = start(&repo, Duration::ZERO, Duration::ZERO, &[]).await;
+    index_request(&d, &repo.root, true).await;
+    let linked = repo::add_worktree(&repo, "linked", "linked");
+
+    // A directory where the copy's temporary file goes fails the seed.
+    let index = d.state.worktree_index(&linked);
+    let tmp = index.with_extension("db.seed");
+    std::fs::create_dir_all(index.parent().expect("the index has a parent"))
+        .expect("the fingerprint dir");
+    std::fs::create_dir(&tmp).expect("the blocker");
+    let events = request(
+        &d.socket,
+        &hello(),
+        Request::Index {
+            worktree: linked.clone(),
+            wait: false,
+        },
+    )
+    .await;
+    assert!(
+        matches!(final_of(&events), Final::Error(e) if e.kind == ErrorKind::Internal),
+        "the failed copy fails the request: {events:?}"
+    );
+    assert!(!index.exists(), "a failed copy leaves no index.db");
+
+    // A worktree tries its sibling once: with the blocker and the sibling
+    // still in place, the next request builds a fresh index, whose barrier
+    // counts every file as added.
+    assert!(
+        d.state.worktree_index(&repo.root).exists(),
+        "the sibling stays"
+    );
+    let events = answer_search(&d, &linked, MARKER).await;
+    let answer = match final_of(&events) {
+        Final::Answer(answer) => answer,
+        other => panic!("expected an Answer, got {other:?}"),
+    };
+    assert!(answer.has_results, "{events:?}");
+    let output: serde_json::Value =
+        serde_json::from_str(&answer.output).expect("the answer is JSON");
+    assert_eq!(
+        output["freshness"]["changed_files"], 2,
+        "a fresh index counts every file as added: {output}"
+    );
+    index_request(&d, &linked, true).await;
 }
 
 /// Configuration handed to a re-executed `daemon_host` through

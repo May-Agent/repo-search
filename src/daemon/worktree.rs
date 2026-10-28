@@ -7,15 +7,19 @@
 //! whose changes its feeder orders into the scheduler. Its spawned
 //! `index --wait` tasks and its feeder read off its books by asking it.
 
+use std::ffi::OsStr;
+use std::fs;
+use std::io;
 use std::num::NonZeroUsize;
-use std::path::PathBuf;
+use std::os::unix::ffi::OsStrExt;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use repo_search_core::qos::performance_cores;
 use repo_search_core::reconcile::{self, Counts, PendingChunk, Reconciler, Report};
 use repo_search_core::search::{self, EmbedService, Reconciliation, Retriever};
-use repo_search_core::store::{Index, Phase, VectorCache};
+use repo_search_core::store::{self, Index, Phase, VectorCache};
 use repo_search_core::{CHUNKER_FINGERPRINT, QueryTask, StateDir, TokenCounter, UnitVector};
 use tokio::sync::{mpsc, oneshot, watch};
 
@@ -130,6 +134,10 @@ struct Owner<T: Tokens> {
     /// `(dev, ino)` of `index.db` as opened; a recreated file means the
     /// handle points at an unlinked inode.
     index_id: Option<(u64, u64)>,
+    /// Whether [`Owner::seed_index`] has run: a worktree tries a sibling's
+    /// index once, so a failed copy fails one request and the next builds
+    /// from scratch.
+    seed_tried: bool,
     phase: Phase,
     retriever: Option<Retriever<AneHandle>>,
     report: Option<Report>,
@@ -188,6 +196,7 @@ impl<T: Tokens> Owner<T> {
             rx,
             index: None,
             index_id: None,
+            seed_tried: false,
             phase: Phase::FirstIndex,
             retriever: None,
             report: None,
@@ -328,9 +337,16 @@ impl<T: Tokens> Owner<T> {
 
     /// Opens the index on first use, reading the stored phase and the file's
     /// identity; a `Status` on a worktree with no index file never reaches
-    /// here.
+    /// here. When the worktree has no index file, [`Owner::seed_index`] first
+    /// tries a sibling's index.
     async fn ensure_index(&mut self) -> Result<(), String> {
         if self.index.is_none() {
+            if !tokio::fs::try_exists(self.index_path())
+                .await
+                .map_err(|e| e.to_string())?
+            {
+                self.seed_index().await?;
+            }
             let index = Index::open(&self.state, &self.root)
                 .await
                 .map_err(|e| e.to_string())?;
@@ -343,6 +359,54 @@ impl<T: Tokens> Owner<T> {
             self.set_phase(phase);
         }
         Ok(())
+    }
+
+    /// When `index.db` does not exist, copies a sibling worktree's index
+    /// that this build's schema, chunker and model recorded — `Maintained`
+    /// preferred — into the worktree's state dir, keeping the stored phase.
+    /// Index rows are worktree-relative and `meta` holds no path, so a
+    /// sibling's index is valid as it is: the first barrier restamps every
+    /// file whose bytes are unchanged and re-chunks the rest. No matching
+    /// sibling means a fresh index, as before. Runs once per owner: a failed
+    /// copy fails this request, leaves no `index.db`, and the next request
+    /// builds from scratch.
+    async fn seed_index(&mut self) -> Result<(), String> {
+        if self.seed_tried {
+            return Ok(());
+        }
+        self.seed_tried = true;
+        let output = tokio::process::Command::new("git")
+            .arg("-C")
+            .arg(&self.root)
+            .args(["worktree", "list", "--porcelain", "-z"])
+            .output()
+            .await
+            .map_err(|e| format!("git worktree list: {e}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "git worktree list failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+        let listed: Vec<PathBuf> = output
+            .stdout
+            .split(|&byte| byte == 0)
+            .filter_map(|field| field.strip_prefix(b"worktree "))
+            .map(|path| PathBuf::from(OsStr::from_bytes(path)))
+            .collect();
+        let seed = Seed {
+            state: self.state.clone(),
+            root: self.root.clone(),
+            dest: self.index_path(),
+            model_id: self.model_id.clone(),
+        };
+        let seeded = tokio::task::spawn_blocking(move || seed.copy(&listed))
+            .await
+            .map_err(|e| e.to_string())?;
+        if let Err(error) = &seeded {
+            tracing::error!(%error, root = %self.root.display(), "seeding the index from a sibling failed");
+        }
+        seeded
     }
 
     /// Before every barrier: the index file must still be the inode it was
@@ -1210,6 +1274,83 @@ async fn ask(coverage: &Asker, events: &mpsc::Sender<Event>) -> Option<Counts> {
 /// Completes once `stopping` shows `true` or its sender is gone.
 async fn stopped(stopping: &mut watch::Receiver<bool>) {
     let _ = stopping.wait_for(|stopping| *stopping).await;
+}
+
+/// What a seed copy needs, moved onto a blocking thread.
+struct Seed {
+    state: StateDir,
+    /// The canonical root of the worktree being seeded.
+    root: PathBuf,
+    /// Its `index.db`.
+    dest: PathBuf,
+    model_id: String,
+}
+
+impl Seed {
+    /// Canonicalizes each worktree `git worktree list` named, reads the
+    /// `meta` of each sibling's index on a read-only connection — a writer
+    /// serializes the read behind its commit under the busy timeout — and
+    /// takes one matching this build's chunker and model, `Maintained`
+    /// preferred. That index is `VACUUM INTO`'d to a temporary file beside
+    /// `dest` and linked to `dest`; a `dest` that appeared while the copy ran
+    /// is left to its opener. A listed worktree whose directory is gone is
+    /// no sibling; every other error fails the seed.
+    fn copy(&self, listed: &[PathBuf]) -> Result<(), String> {
+        let mut source: Option<PathBuf> = None;
+        for listed in listed {
+            let path = match fs::canonicalize(listed) {
+                Ok(path) => path,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(format!("{}: {e}", listed.display())),
+            };
+            if path == self.root {
+                continue;
+            }
+            let index = self.state.worktree_index(&path);
+            if !index
+                .try_exists()
+                .map_err(|e| format!("{}: {e}", index.display()))?
+            {
+                continue;
+            }
+            let Some(meta) =
+                store::stored_meta(&index).map_err(|e| format!("{}: {e}", index.display()))?
+            else {
+                continue;
+            };
+            if meta.chunker == CHUNKER_FINGERPRINT && meta.model_id == self.model_id {
+                source = Some(index);
+                if meta.phase == Phase::Maintained {
+                    break;
+                }
+            }
+        }
+        let Some(source) = source else { return Ok(()) };
+        let dir = self.dest.parent().expect("worktree_index names index.db");
+        fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        let mut tmp = self.dest.clone().into_os_string();
+        tmp.push(".seed");
+        let tmp = PathBuf::from(tmp);
+        remove_if_present(&tmp)?;
+        let seeded = store::vacuum_into(&source, &tmp)
+            .map_err(|e| format!("copying {}: {e}", source.display()))
+            .and_then(|()| match fs::hard_link(&tmp, &self.dest) {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+                Err(e) => Err(format!("{}: {e}", self.dest.display())),
+            });
+        let removed = remove_if_present(&tmp);
+        seeded.and(removed)
+    }
+}
+
+/// Removes the file at `path`; one already gone is no error.
+fn remove_if_present(path: &Path) -> Result<(), String> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("{}: {e}", path.display())),
+    }
 }
 
 /// `(dev, ino)` of a file's metadata.
