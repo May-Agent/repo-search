@@ -1,4 +1,5 @@
-//! The repository-wide vector cache at `<git common dir>/repo-search/`:
+//! The repository-wide vector cache under the daemon's [`StateDir`]
+//! ([`StateDir::repo_cache`]):
 //! `vectors.v1.db` maps (model id, content hash) to a slot, and each model's
 //! fp16 vectors live in a flat file `vectors.v1.<model hash>.f16` where row
 //! `slot` sits at byte offset `slot * dim * 2`. Keyed per model id and shared
@@ -25,7 +26,7 @@ use numkong::f16;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use tokio::sync::{mpsc, oneshot};
 
-use crate::UnitVector;
+use crate::{StateDir, UnitVector};
 
 use super::{ContentHash, Error, ensure_version, open_conn, send_and_wait, spawn_actor};
 
@@ -184,10 +185,12 @@ pub struct VectorCache {
 }
 
 impl VectorCache {
-    /// Opens — creating if needed — `<git_common_dir>/repo-search/
-    /// vectors.v1.db`. Resolving the git common dir is the caller's job. The
-    /// filesystem and SQLite work runs on the actor thread; `open` only awaits
-    /// its outcome.
+    /// Opens — creating if needed — the repository's cache under `state`
+    /// ([`StateDir::repo_cache`]); nothing is written under the worktree
+    /// `git_common_dir` belongs to. `git_common_dir` is the repository's
+    /// canonical git common dir — resolving it is the caller's job. The
+    /// filesystem and SQLite work runs on the actor thread; `open` only
+    /// awaits its outcome.
     ///
     /// The schema version is part of the file name; a `vectors.v1.db` whose
     /// `user_version` is not 1 is corrupt and [`Error::BadSchemaVersion`] is
@@ -195,16 +198,17 @@ impl VectorCache {
     ///
     /// # Errors
     ///
-    /// When `git_common_dir` is not a directory, the store directory cannot be
+    /// When `git_common_dir` is not a directory, the state directory cannot be
     /// written, the file is a corrupt cache, WAL mode is refused, SQLite
     /// rejects the file, or the actor thread fails to spawn.
-    pub async fn open(git_common_dir: &Path) -> Result<Self, Error> {
+    pub async fn open(state: &StateDir, git_common_dir: &Path) -> Result<Self, Error> {
+        let dir = state.repo_cache(git_common_dir);
         let git_common_dir = git_common_dir.to_path_buf();
-        let dir = git_common_dir.join("repo-search");
+        let serve_dir = dir.clone();
         let tx = spawn_actor(
             "repo-search-vectors",
-            move || init(&git_common_dir),
-            move |conn, rx| serve(conn, &dir, rx),
+            move || init(&git_common_dir, &dir),
+            move |conn, rx| serve(conn, &serve_dir, rx),
         )
         .await?;
         Ok(Self { tx })
@@ -375,14 +379,13 @@ impl VectorCache {
     }
 }
 
-/// Creates `repo-search/` when missing and opens the cache database. Runs on
-/// the actor thread.
-fn init(git_common_dir: &Path) -> Result<Connection, Error> {
+/// Creates the repository's cache directory under the state root when
+/// missing and opens the cache database. Runs on the actor thread.
+fn init(git_common_dir: &Path, dir: &Path) -> Result<Connection, Error> {
     if !git_common_dir.is_dir() {
         return Err(Error::NotDirectory(git_common_dir.to_path_buf()));
     }
-    let dir = git_common_dir.join("repo-search");
-    fs::create_dir_all(&dir)?;
+    fs::create_dir_all(dir)?;
     let path = dir.join(format!("vectors.v{SCHEMA_VERSION}.db"));
     let mut conn = open_conn(&path)?;
     if let Some(found) = ensure_version(&mut conn, SCHEMA_VERSION, include_str!("vectors.sql"))? {

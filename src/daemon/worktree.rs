@@ -16,7 +16,7 @@ use repo_search_core::qos::performance_cores;
 use repo_search_core::reconcile::{self, Counts, PendingChunk, Reconciler, Report};
 use repo_search_core::search::{self, EmbedService, Reconciliation, Retriever};
 use repo_search_core::store::{Index, Phase, VectorCache};
-use repo_search_core::{CHUNKER_FINGERPRINT, QueryTask, TokenCounter, UnitVector};
+use repo_search_core::{CHUNKER_FINGERPRINT, QueryTask, StateDir, TokenCounter, UnitVector};
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::protocol::{
@@ -56,7 +56,7 @@ pub enum OwnerMsg {
         /// Events sink.
         events: mpsc::Sender<Event>,
     },
-    /// A `status` request; never creates `.repo-search/`.
+    /// A `status` request; never creates the index file.
     Status {
         /// Events sink.
         events: mpsc::Sender<Event>,
@@ -75,6 +75,8 @@ impl OwnerMsg {
 
 /// Everything the registry hands a new owner.
 pub struct OwnerConfig<B: Backend> {
+    /// The daemon's state root: the worktree's index lives under it.
+    pub state: StateDir,
     /// The scheduler's worktree id.
     pub id: WorktreeId,
     /// Canonical worktree root.
@@ -106,6 +108,7 @@ pub fn spawn<B: Backend>(config: OwnerConfig<B>) -> mpsc::Sender<OwnerMsg> {
 }
 
 struct Owner<B: Backend> {
+    state: StateDir,
     id: WorktreeId,
     root: PathBuf,
     common_dir: PathBuf,
@@ -162,6 +165,7 @@ impl<B: Backend> Owner<B> {
         let (phase_tx, _) = watch::channel(Phase::FirstIndex);
         let (asker, asks) = coverage::channel();
         Self {
+            state: config.state,
             id: config.id,
             root: config.root,
             common_dir: config.common_dir,
@@ -310,13 +314,20 @@ impl<B: Backend> Owner<B> {
         ))
     }
 
+    /// The worktree's index file under the daemon's state dir.
+    fn index_path(&self) -> PathBuf {
+        self.state.worktree_index(&self.root)
+    }
+
     /// Opens the index on first use, reading the stored phase and the file's
     /// identity; a `Status` on a worktree with no index file never reaches
     /// here.
     async fn ensure_index(&mut self) -> Result<(), String> {
         if self.index.is_none() {
-            let index = Index::open(&self.root).await.map_err(|e| e.to_string())?;
-            let meta = tokio::fs::metadata(self.root.join(".repo-search/index.db"))
+            let index = Index::open(&self.state, &self.root)
+                .await
+                .map_err(|e| e.to_string())?;
+            let meta = tokio::fs::metadata(self.index_path())
                 .await
                 .map_err(|e| e.to_string())?;
             let phase = index.phase().await.map_err(|e| e.to_string())?;
@@ -328,14 +339,14 @@ impl<B: Backend> Owner<B> {
     }
 
     /// Before every barrier: the index file must still be the inode it was
-    /// opened with — a recreated `.repo-search/` leaves the handle writing
-    /// into an unlinked file. On a mismatch the index, its reconciler and the
-    /// retriever are dropped and reopened.
+    /// opened with — a recreated index file under the state dir leaves the
+    /// handle writing into an unlinked file. On a mismatch the index, its
+    /// reconciler and the retriever are dropped and reopened.
     async fn verify_index(&mut self) -> Result<(), String> {
         let Some(id) = self.index_id else {
             return Ok(());
         };
-        let meta = tokio::fs::metadata(self.root.join(".repo-search/index.db")).await;
+        let meta = tokio::fs::metadata(self.index_path()).await;
         if matches!(&meta, Ok(meta) if file_id(meta) == id) {
             return Ok(());
         }
@@ -648,7 +659,7 @@ impl<B: Backend> Owner<B> {
     }
 
     async fn status(&mut self, events: &mpsc::Sender<Event>) {
-        let db = self.root.join(".repo-search/index.db");
+        let db = self.index_path();
         let index_exists = match tokio::fs::try_exists(&db).await {
             Ok(exists) => exists,
             Err(e) => {

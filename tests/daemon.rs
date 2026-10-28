@@ -17,6 +17,7 @@ use repo_search::daemon::chip::ChipClass;
 use repo_search::daemon::{self, Config, Error};
 use repo_search::model_store::{ModelSpec, ModelStore};
 use repo_search::protocol::{self, ErrorKind, Event, Final, Request, WirePhase};
+use repo_search_core::StateDir;
 use repo_search_core::qos::QosClass;
 use repo_search_core::store::{ContentHash, Index, VectorCache};
 use repo_search_coreml::GpuBlocked;
@@ -264,7 +265,7 @@ async fn query_preempts_indexing() {
     // keeps its feed in the feeder, so the scheduler has no item for it
     // when the search's `Documents` job lands: the job holds the hash and
     // embeds it on the spot.
-    let before = visible_hashes(&repo.root).await;
+    let before = visible_hashes(&d.state, &repo.root).await;
     feed.arm();
     repo::append(
         &repo.root,
@@ -318,7 +319,7 @@ async fn query_preempts_indexing() {
     // it, and the retriever sends its `Documents` job only once they are
     // answered, so that chunk's `AneDone` has already noted it committed
     // inside the search's window, and the job skips it.
-    let added: Vec<ContentHash> = visible_hashes(&repo.root)
+    let added: Vec<ContentHash> = visible_hashes(&d.state, &repo.root)
         .await
         .difference(&before)
         .copied()
@@ -1523,7 +1524,7 @@ async fn a_recreated_worktree_gets_a_fresh_index() {
     let worktree = repo::add_worktree(&repo, "linked", "first");
     let events = answer_search(&d, &worktree, MARKER).await;
     assert!(matches!(final_of(&events), Final::Answer(_)));
-    assert!(worktree.join(".repo-search/index.db").exists());
+    assert!(d.state.worktree_index(&worktree).exists());
 
     // The same path again, a different tree: the daemon must not keep
     // writing to the first tree's deleted index.
@@ -1534,7 +1535,7 @@ async fn a_recreated_worktree_gets_a_fresh_index() {
     let events = answer_search(&d, &worktree, MARKER).await;
     assert!(matches!(final_of(&events), Final::Answer(_)));
     assert!(
-        worktree.join(".repo-search/index.db").exists(),
+        d.state.worktree_index(&worktree).exists(),
         "the search indexes the new tree"
     );
     let events = request(&d.socket, &hello(), Request::Status { worktree }).await;
@@ -1572,8 +1573,70 @@ async fn status_does_not_create_an_index() {
     };
     assert!(status.index.is_none(), "no index exists yet");
     assert!(
-        !repo.root.join(".repo-search").exists(),
-        "a Status never creates .repo-search/"
+        repo::clean(&repo.root),
+        "a Status writes nothing under the worktree"
+    );
+    assert!(
+        !d.state.root().exists(),
+        "a Status creates nothing under the state dir"
+    );
+}
+
+/// Two worktrees of one repository share its vector cache but get separate
+/// index files; a second repository shares neither. Nothing is written
+/// under any worktree.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn worktrees_and_repositories_get_separate_index_files() {
+    let repo = fn_repo(5, SMALL_BYTES, 5);
+    let other = fn_repo(5, SMALL_BYTES, 5);
+    let (d, _, _) = start(&repo, Duration::ZERO, Duration::ZERO, &[]).await;
+    let linked = repo::add_worktree(&repo, "linked", "linked");
+
+    for root in [&repo.root, &linked, &other.root] {
+        let events = answer_search(&d, root, MARKER).await;
+        assert!(
+            matches!(final_of(&events), Final::Answer(_)),
+            "the search on {} failed: {events:?}",
+            root.display()
+        );
+        assert!(
+            d.state.worktree_index(root).is_file(),
+            "no index for {}",
+            root.display()
+        );
+        assert!(
+            repo::clean(root),
+            "the daemon wrote under {}",
+            root.display()
+        );
+    }
+    let indexes: HashSet<PathBuf> = [&repo.root, &linked, &other.root]
+        .iter()
+        .map(|root| d.state.worktree_index(root))
+        .collect();
+    assert_eq!(indexes.len(), 3, "every worktree gets its own index file");
+
+    // The linked worktree's common dir is `repo`'s `.git`: one cache dir
+    // for it, a separate one for `other`.
+    assert!(
+        d.state
+            .repo_cache(&repo.common_dir)
+            .join("vectors.v1.db")
+            .is_file()
+    );
+    assert!(
+        d.state
+            .repo_cache(&other.common_dir)
+            .join("vectors.v1.db")
+            .is_file()
+    );
+    assert_ne!(
+        d.state.repo_cache(&repo.common_dir),
+        d.state.repo_cache(&other.common_dir)
+    );
+    assert!(
+        !repo.common_dir.join("repo-search").exists(),
+        "the daemon wrote under the common dir"
     );
 }
 
@@ -1583,6 +1646,7 @@ async fn status_does_not_create_an_index() {
 struct HostConfig {
     socket: PathBuf,
     model_cache: PathBuf,
+    state_dir: PathBuf,
     ane_delay_ms: u64,
     gpu_delay_ms: u64,
 }
@@ -1641,6 +1705,7 @@ async fn daemon_host() {
         idle_exit: Duration::from_secs(3600),
         load_bound: daemon::LOAD_BOUND,
         model_store: store,
+        state: StateDir::new(config.state_dir),
         chip: ChipClass::Wide,
         backend: Arc::new(backend),
         build: support::client::build(),
@@ -1831,6 +1896,7 @@ async fn host_parent() {
 async fn sigterm_answers_in_flight_and_flushes() {
     let repo = fn_repo(400, SMALL_BYTES, 20);
     let tmp = tempfile::tempdir().expect("tmp");
+    let state = StateDir::new(tmp.path().join("state"));
     let model_cache = tmp.path().join("models");
     let spec = ModelSpec {
         url: "http://127.0.0.1:1/unused".into(),
@@ -1843,6 +1909,7 @@ async fn sigterm_answers_in_flight_and_flushes() {
     let mut host = Host::spawn(&HostConfig {
         socket: tmp.path().join("daemon.sock"),
         model_cache,
+        state_dir: tmp.path().join("state"),
         ane_delay_ms: 5,
         gpu_delay_ms: 0,
     });
@@ -1887,9 +1954,9 @@ async fn sigterm_answers_in_flight_and_flushes() {
     assert!(status.success(), "the host exits 0 on SIGTERM: {status}");
 
     let committed = last.unwrap_or(committed);
-    let index = Index::open(&repo.root).await.expect("index opens");
+    let index = Index::open(&state, &repo.root).await.expect("index opens");
     let hashes = index.chunk_hashes(true).await.expect("chunk hashes");
-    let cache = VectorCache::open(&repo.common_dir)
+    let cache = VectorCache::open(&state, &repo.common_dir)
         .await
         .expect("cache opens");
     let cached = cache
@@ -1907,6 +1974,7 @@ async fn sigterm_answers_in_flight_and_flushes() {
 async fn kill_mid_index_resumes() {
     let repo = fn_repo(1200, SMALL_BYTES, 20);
     let tmp = tempfile::tempdir().expect("tmp");
+    let state = StateDir::new(tmp.path().join("state"));
     let model_cache = tmp.path().join("models");
     let spec = ModelSpec {
         url: "http://127.0.0.1:1/unused".into(),
@@ -1918,6 +1986,7 @@ async fn kill_mid_index_resumes() {
     let host_config = |sock: &str| HostConfig {
         socket: tmp.path().join(sock),
         model_cache: model_cache.clone(),
+        state_dir: tmp.path().join("state"),
         ane_delay_ms: 5,
         gpu_delay_ms: 0,
     };
@@ -1950,9 +2019,9 @@ async fn kill_mid_index_resumes() {
 
     // Whatever the writer's close-flush could not reach is simply absent;
     // what coverage reported as committed is not.
-    let index = Index::open(&repo.root).await.expect("index opens");
+    let index = Index::open(&state, &repo.root).await.expect("index opens");
     let hashes = index.chunk_hashes(true).await.expect("chunk hashes");
-    let cache = VectorCache::open(&repo.common_dir)
+    let cache = VectorCache::open(&state, &repo.common_dir)
         .await
         .expect("cache opens");
     let cached = cache
@@ -2068,6 +2137,7 @@ fn host_exits_when_its_parent_is_killed() {
     let mut parent = Intermediate::spawn(&HostConfig {
         socket: tmp.path().join("daemon.sock"),
         model_cache,
+        state_dir: tmp.path().join("state"),
         ane_delay_ms: 0,
         gpu_delay_ms: 0,
     });
@@ -2194,7 +2264,7 @@ async fn background_work_follows_edits_and_deletions() {
     // Every surviving chunk was embedded exactly once; f3's chunks never
     // were. Watcher passes may interleave the searches' barriers — every
     // interleaving must give this result.
-    let final_hashes: HashSet<ContentHash> = Index::open(&repo.root)
+    let final_hashes: HashSet<ContentHash> = Index::open(&d.state, &repo.root)
         .await
         .expect("index opens")
         .chunk_hashes(false)
@@ -2277,7 +2347,9 @@ async fn an_include_ignored_search_and_a_plain_one_resync_the_scope() {
         other => panic!("expected Indexed, got {other:?}"),
     }
 
-    let index = Index::open(&repo.root).await.expect("index opens");
+    let index = Index::open(&d.state, &repo.root)
+        .await
+        .expect("index opens");
     let all: HashSet<ContentHash> = index
         .chunk_hashes(true)
         .await
@@ -2375,8 +2447,8 @@ fn embeds(log: &mut Vec<Record>, records: &mpsc::Receiver<Record>) -> Vec<(Kind,
 }
 
 /// The distinct chunk hashes visible in `worktree`'s index.
-async fn visible_hashes(worktree: &Path) -> HashSet<ContentHash> {
-    Index::open(worktree)
+async fn visible_hashes(state: &StateDir, worktree: &Path) -> HashSet<ContentHash> {
+    Index::open(state, worktree)
         .await
         .expect("index opens")
         .chunk_hashes(false)
@@ -2416,7 +2488,7 @@ async fn a_scope_flip_resync_skips_chunks_finished_while_it_was_held() {
     index_request(&d, &repo.root, false).await;
     wait_feed_held(&hold);
     gate.open();
-    let want = visible_hashes(&repo.root).await;
+    let want = visible_hashes(&d.state, &repo.root).await;
     assert_eq!(want.len(), 21);
     // Every chunk embeds from the first `Replace` while the resync is held.
     tokio::task::block_in_place(|| {
@@ -2483,9 +2555,9 @@ async fn a_second_worktrees_first_resync_skips_chunks_finished_while_it_was_held
     // filtered to nothing, `stage1_left` was 0 and stage 1 completed at
     // once.
     assert_eq!(coverage_frames(&events), 0, "{events:?}");
-    let want = visible_hashes(&repo.root).await;
+    let want = visible_hashes(&d.state, &repo.root).await;
     assert_eq!(want.len(), 21);
-    assert_eq!(visible_hashes(&linked).await, want);
+    assert_eq!(visible_hashes(&d.state, &linked).await, want);
     let indexed: Vec<ContentHash> = embeds(&mut log, &d.records)
         .into_iter()
         .filter(|(kind, _)| *kind == Kind::Index)
@@ -2529,7 +2601,7 @@ async fn a_change_skips_chunks_another_worktree_embedded_while_it_was_held() {
     let (d, _gate, hold) = start_feed_held(Duration::from_millis(10)).await;
     index_request(&d, &repo.root, true).await;
     index_request(&d, &linked, true).await;
-    let before = visible_hashes(&repo.root).await;
+    let before = visible_hashes(&d.state, &repo.root).await;
     let mut log: Vec<Record> = Vec::new();
     // The work from here runs at background QoS.
     let _lift = support::stub::lift_ane(&d.backend, QosClass::UserInitiated);
@@ -2549,8 +2621,8 @@ async fn a_change_skips_chunks_another_worktree_embedded_while_it_was_held() {
     let events = index_request(&d, &linked, true).await;
     assert_eq!(coverage_frames(&events), 0, "{events:?}");
 
-    let want = visible_hashes(&repo.root).await;
-    assert_eq!(visible_hashes(&linked).await, want);
+    let want = visible_hashes(&d.state, &repo.root).await;
+    assert_eq!(visible_hashes(&d.state, &linked).await, want);
     let added: HashSet<ContentHash> = want.difference(&before).copied().collect();
     assert_eq!(added.len(), 1, "{added:?}");
     let new = added.iter().next().expect("one new hash");
@@ -2574,7 +2646,7 @@ async fn a_change_skips_chunks_a_search_embedded_while_it_was_held() {
     let repo = fn_repo(20, SMALL_BYTES, 10);
     let (d, _gate, hold) = start_feed_held(Duration::from_millis(10)).await;
     index_request(&d, &repo.root, true).await;
-    let before = visible_hashes(&repo.root).await;
+    let before = visible_hashes(&d.state, &repo.root).await;
     let mut log: Vec<Record> = Vec::new();
     let _lift = support::stub::lift_ane(&d.backend, QosClass::UserInitiated);
 
@@ -2605,7 +2677,7 @@ async fn a_change_skips_chunks_a_search_embedded_while_it_was_held() {
     let events = index_request(&d, &repo.root, true).await;
     assert_eq!(coverage_frames(&events), 0, "{events:?}");
 
-    let added: HashSet<ContentHash> = visible_hashes(&repo.root)
+    let added: HashSet<ContentHash> = visible_hashes(&d.state, &repo.root)
         .await
         .difference(&before)
         .copied()

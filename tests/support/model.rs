@@ -13,6 +13,7 @@ use std::process::Command;
 use repo_search::client::Responses;
 use repo_search::model_store::{ModelSpec, ModelStore};
 use repo_search::protocol::{Event, Final, Hello, Progress, Request, WirePhase};
+use repo_search_core::StateDir;
 use repo_search_core::store::{Index, VectorCache};
 
 use super::client;
@@ -104,10 +105,22 @@ pub async fn await_coverage(stream: &mut Responses, min: u64) -> u64 {
 
 /// The count of `worktree`'s chunks whose `model_id` vectors are committed
 /// in the vector cache — what `Coverage` reports, read straight from disk.
-pub async fn committed(worktree: &Path, common_dir: &Path, model_id: &str) -> u64 {
-    let index = Index::open(worktree).await.expect("index opens");
+pub async fn committed(
+    state: &StateDir,
+    worktree: &Path,
+    common_dir: &Path,
+    model_id: &str,
+) -> u64 {
+    // The daemon fingerprints the canonical paths it resolved.
+    let worktree = worktree.canonicalize().expect("the worktree canonicalizes");
+    let common_dir = common_dir
+        .canonicalize()
+        .expect("the common dir canonicalizes");
+    let index = Index::open(state, &worktree).await.expect("index opens");
     let hashes = index.chunk_hashes(false).await.expect("chunk hashes");
-    let cache = VectorCache::open(common_dir).await.expect("cache opens");
+    let cache = VectorCache::open(state, &common_dir)
+        .await
+        .expect("cache opens");
     let cached = cache.cached(model_id, &hashes).await.expect("cached reads");
     // Count chunk rows, as coverage does: two chunks with identical content
     // share one cached vector, so the distinct count would fall short.

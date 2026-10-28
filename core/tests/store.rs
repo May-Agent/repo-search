@@ -2,14 +2,14 @@ use numkong::f16;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::ops::RangeInclusive;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use futures_executor::block_on;
-use repo_search_core::UnitVector;
 use repo_search_core::store::{
     self, ChunkRecord, ContentHash, FileChange, FileState, Index, MemberRecord, StoredCalibration,
     VectorCache, fts_body, split_identifiers,
 };
+use repo_search_core::{StateDir, UnitVector};
 
 fn state(path: &str, content: &[u8]) -> FileState {
     FileState {
@@ -38,8 +38,10 @@ fn chunk(lines: RangeInclusive<u32>, title: &str, kind: &str, text: &str) -> Chu
     }
 }
 
-fn index_db(worktree: &Path) -> PathBuf {
-    worktree.join(".repo-search/index.db")
+/// A state root in a tempdir; the TempDir keeps it alive.
+fn dirs() -> (StateDir, tempfile::TempDir) {
+    let tmp = tempfile::tempdir().unwrap();
+    (StateDir::new(tmp.path().to_path_buf()), tmp)
 }
 
 /// FTS rowids matching `query`, read through a second connection to check what
@@ -117,21 +119,73 @@ fn chunk_hash_depends_on_the_title() {
 }
 
 #[test]
-fn fresh_index_reports_empty_and_creates_gitignore() {
+fn a_fresh_index_is_empty_and_writes_nothing_under_the_worktree() {
     let dir = tempfile::tempdir().unwrap();
-    let index = block_on(Index::open(dir.path())).unwrap();
+    let (dirs, _dirs_tmp) = dirs();
+    let index = block_on(Index::open(&dirs, dir.path())).unwrap();
     assert!(block_on(index.file_states()).unwrap().is_empty());
-    assert_eq!(
-        fs::read_to_string(dir.path().join(".repo-search/.gitignore")).unwrap(),
-        "*\n"
+    assert!(
+        dirs.worktree_index(dir.path()).is_file(),
+        "the index lives under the state dir"
     );
+    assert!(
+        fs::read_dir(dir.path()).unwrap().next().is_none(),
+        "nothing was written under the worktree"
+    );
+}
+
+#[test]
+fn worktrees_and_repositories_get_separate_files() {
+    let (dirs, _dirs_tmp) = dirs();
+    let tree_a = tempfile::tempdir().unwrap();
+    let tree_b = tempfile::tempdir().unwrap();
+    let index_a = block_on(Index::open(&dirs, tree_a.path())).unwrap();
+    let index_b = block_on(Index::open(&dirs, tree_b.path())).unwrap();
+    let (db_a, db_b) = (
+        dirs.worktree_index(tree_a.path()),
+        dirs.worktree_index(tree_b.path()),
+    );
+    assert_ne!(db_a, db_b, "two worktrees get separate index files");
+    assert!(db_a.is_file() && db_b.is_file());
+    for tree in [&tree_a, &tree_b] {
+        assert!(
+            fs::read_dir(tree.path()).unwrap().next().is_none(),
+            "nothing under {}",
+            tree.path().display()
+        );
+    }
+    drop(index_a);
+    drop(index_b);
+
+    let repo_a = tempfile::tempdir().unwrap();
+    let repo_b = tempfile::tempdir().unwrap();
+    let _cache_a = block_on(VectorCache::open(&dirs, repo_a.path())).unwrap();
+    let _cache_b = block_on(VectorCache::open(&dirs, repo_b.path())).unwrap();
+    let (dir_a, dir_b) = (
+        dirs.repo_cache(repo_a.path()),
+        dirs.repo_cache(repo_b.path()),
+    );
+    assert_ne!(dir_a, dir_b, "two repositories get separate caches");
+    assert!(dir_a.join("vectors.v1.db").is_file());
+    assert!(dir_b.join("vectors.v1.db").is_file());
+    for repo in [&repo_a, &repo_b] {
+        assert!(
+            fs::read_dir(repo.path()).unwrap().next().is_none(),
+            "nothing under {}",
+            repo.path().display()
+        );
+    }
+    // The fingerprint is stable: reopening names the same paths.
+    assert_eq!(dirs.worktree_index(tree_a.path()), db_a);
+    assert_eq!(dirs.repo_cache(repo_a.path()), dir_a);
 }
 
 #[test]
 fn replace_and_remove_keep_fts_and_rows_in_sync() {
     let dir = tempfile::tempdir().unwrap();
-    let index = block_on(Index::open(dir.path())).unwrap();
-    let db = index_db(dir.path());
+    let (dirs, _dirs_tmp) = dirs();
+    let index = block_on(Index::open(&dirs, dir.path())).unwrap();
+    let db = dirs.worktree_index(dir.path());
 
     let v1 = chunk(
         1..=3,
@@ -164,8 +218,9 @@ fn replace_and_remove_keep_fts_and_rows_in_sync() {
 #[test]
 fn camel_case_identifiers_are_searchable() {
     let dir = tempfile::tempdir().unwrap();
-    let index = block_on(Index::open(dir.path())).unwrap();
-    let db = index_db(dir.path());
+    let (dirs, _dirs_tmp) = dirs();
+    let index = block_on(Index::open(&dirs, dir.path())).unwrap();
+    let db = dirs.worktree_index(dir.path());
 
     let text = "impl HTTPServer { fn parseURL2Value(&self) {} }";
     let c = chunk(10..=14, "impl HTTPServer", "impl", text);
@@ -183,8 +238,9 @@ fn camel_case_identifiers_are_searchable() {
 #[test]
 fn a_batch_applies_atomically() {
     let dir = tempfile::tempdir().unwrap();
-    let index = block_on(Index::open(dir.path())).unwrap();
-    let db = index_db(dir.path());
+    let (dirs, _dirs_tmp) = dirs();
+    let index = block_on(Index::open(&dirs, dir.path())).unwrap();
+    let db = dirs.worktree_index(dir.path());
 
     let good = FileChange::Replace(
         state("src/a.rs", b"a"),
@@ -203,12 +259,13 @@ fn a_batch_applies_atomically() {
 #[test]
 fn vector_cache_is_shared_between_worktrees() {
     let worktree_a = tempfile::tempdir().unwrap();
+    let (dirs, _dirs_tmp) = dirs();
     let worktree_b = tempfile::tempdir().unwrap();
     let common = tempfile::tempdir().unwrap();
-    let index_a = block_on(Index::open(worktree_a.path())).unwrap();
-    let index_b = block_on(Index::open(worktree_b.path())).unwrap();
-    let cache_a = block_on(VectorCache::open(common.path())).unwrap();
-    let cache_b = block_on(VectorCache::open(common.path())).unwrap();
+    let index_a = block_on(Index::open(&dirs, worktree_a.path())).unwrap();
+    let index_b = block_on(Index::open(&dirs, worktree_b.path())).unwrap();
+    let cache_a = block_on(VectorCache::open(&dirs, common.path())).unwrap();
+    let cache_b = block_on(VectorCache::open(&dirs, common.path())).unwrap();
 
     // Both worktrees index a file holding the same chunk; one content hash
     // covers both.
@@ -246,13 +303,14 @@ fn vector_cache_is_shared_between_worktrees() {
 #[test]
 fn cached_reports_membership_without_the_fp16_file() {
     let common = tempfile::tempdir().unwrap();
-    let cache = block_on(VectorCache::open(common.path())).unwrap();
+    let (dirs, _dirs_tmp) = dirs();
+    let cache = block_on(VectorCache::open(&dirs, common.path())).unwrap();
     let hit = ContentHash::of_chunk("fn a", "fn a() {}");
     let miss = ContentHash::of_chunk("fn b", "fn b() {}");
     block_on(cache.put_many("m", vec![(hit, UnitVector::normalize(vec![1.0, 2.0]))])).unwrap();
 
     // Removing the fp16 file proves the query reads only the SQLite index.
-    for entry in fs::read_dir(common.path().join("repo-search")).unwrap() {
+    for entry in fs::read_dir(dirs.repo_cache(common.path())).unwrap() {
         let path = entry.unwrap().path();
         if path.extension().is_some_and(|e| e == "f16") {
             fs::remove_file(path).unwrap();
@@ -266,7 +324,8 @@ fn cached_reports_membership_without_the_fp16_file() {
 #[test]
 fn scan_pages_interleaved_with_writes_return_every_vector_once() {
     let common = tempfile::tempdir().unwrap();
-    let cache = block_on(VectorCache::open(common.path())).unwrap();
+    let (dirs, _dirs_tmp) = dirs();
+    let cache = block_on(VectorCache::open(&dirs, common.path())).unwrap();
 
     let vector = |seed: usize| UnitVector::normalize(vec![seed as f32, 1.0, -1.0]);
     let hash_of = |i: usize| ContentHash::of_chunk("fn v", &format!("fn v{i}() {{}}"));
@@ -319,8 +378,9 @@ fn scan_pages_interleaved_with_writes_return_every_vector_once() {
 #[test]
 fn cache_runs_in_wal_mode() {
     let common = tempfile::tempdir().unwrap();
-    let _cache = block_on(VectorCache::open(common.path())).unwrap();
-    let db = common.path().join("repo-search/vectors.v1.db");
+    let (dirs, _dirs_tmp) = dirs();
+    let _cache = block_on(VectorCache::open(&dirs, common.path())).unwrap();
+    let db = dirs.repo_cache(common.path()).join("vectors.v1.db");
     assert!(db.exists());
     let conn = rusqlite::Connection::open(&db).unwrap();
     let mode: String = conn
@@ -332,7 +392,8 @@ fn cache_runs_in_wal_mode() {
 #[test]
 fn vectors_round_trip_at_fp16_precision() {
     let common = tempfile::tempdir().unwrap();
-    let cache = block_on(VectorCache::open(common.path())).unwrap();
+    let (dirs, _dirs_tmp) = dirs();
+    let cache = block_on(VectorCache::open(&dirs, common.path())).unwrap();
 
     let vector = UnitVector::normalize(vec![1.0, -2.0, 3.0, 0.5]);
     let hash = ContentHash::of_chunk("fn v", "fn v() {}");
@@ -352,7 +413,8 @@ fn vectors_round_trip_at_fp16_precision() {
 #[test]
 fn a_version_mismatch_rebuilds_the_index_and_removes_sidecars() {
     let dir = tempfile::tempdir().unwrap();
-    let index = block_on(Index::open(dir.path())).unwrap();
+    let (dirs, _dirs_tmp) = dirs();
+    let index = block_on(Index::open(&dirs, dir.path())).unwrap();
     block_on(index.replace_file(
         state("src/a.rs", b"a"),
         vec![chunk(1..=1, "fn a", "fn", "fn a() {}")],
@@ -361,7 +423,7 @@ fn a_version_mismatch_rebuilds_the_index_and_removes_sidecars() {
     assert_eq!(block_on(index.file_states()).unwrap().len(), 1);
     drop(index);
 
-    let db = index_db(dir.path());
+    let db = dirs.worktree_index(dir.path());
     let conn = rusqlite::Connection::open(&db).unwrap();
     conn.pragma_update(None, "user_version", 99_i64).unwrap();
     drop(conn);
@@ -370,7 +432,7 @@ fn a_version_mismatch_rebuilds_the_index_and_removes_sidecars() {
         fs::write(db.with_file_name(format!("index.db{suffix}")), b"stale").unwrap();
     }
 
-    let index = block_on(Index::open(dir.path())).unwrap();
+    let index = block_on(Index::open(&dirs, dir.path())).unwrap();
     assert!(block_on(index.file_states()).unwrap().is_empty());
     for suffix in ["-wal", "-shm", "-journal"] {
         assert!(
@@ -383,7 +445,8 @@ fn a_version_mismatch_rebuilds_the_index_and_removes_sidecars() {
 #[test]
 fn a_foreign_version_on_the_shared_cache_is_rejected() {
     let common = tempfile::tempdir().unwrap();
-    let dir = common.path().join("repo-search");
+    let (dirs, _dirs_tmp) = dirs();
+    let dir = dirs.repo_cache(common.path());
     fs::create_dir_all(&dir).unwrap();
     let db = dir.join("vectors.v1.db");
     let conn = rusqlite::Connection::open(&db).unwrap();
@@ -391,7 +454,9 @@ fn a_foreign_version_on_the_shared_cache_is_rejected() {
     conn.pragma_update(None, "user_version", 42_i64).unwrap();
     drop(conn);
 
-    let err = block_on(VectorCache::open(common.path())).err().unwrap();
+    let err = block_on(VectorCache::open(&dirs, common.path()))
+        .err()
+        .unwrap();
     match err {
         store::Error::BadSchemaVersion { path, found, want } => {
             assert_eq!(path, db);
@@ -412,7 +477,8 @@ fn fp16_of(vector: &UnitVector) -> Vec<u8> {
 #[test]
 fn vectors_live_in_a_flat_fp16_file_at_slot_offsets() {
     let common = tempfile::tempdir().unwrap();
-    let cache = block_on(VectorCache::open(common.path())).unwrap();
+    let (dirs, _dirs_tmp) = dirs();
+    let cache = block_on(VectorCache::open(&dirs, common.path())).unwrap();
     assert!(block_on(cache.model("m")).unwrap().is_none());
 
     let vectors: Vec<(ContentHash, UnitVector)> = (0..5)
@@ -434,10 +500,7 @@ fn vectors_live_in_a_flat_fp16_file_at_slot_offsets() {
         .unwrap();
     assert_eq!(id_hash.len(), 16);
     assert!(id_hash.bytes().all(|b| b.is_ascii_hexdigit()));
-    assert_eq!(
-        info.file.parent().unwrap(),
-        common.path().join("repo-search")
-    );
+    assert_eq!(info.file.parent().unwrap(), dirs.repo_cache(common.path()));
 
     let bytes = fs::read(&info.file).unwrap();
     assert_eq!(bytes.len(), 5 * 4 * 2);
@@ -471,7 +534,8 @@ fn vectors_live_in_a_flat_fp16_file_at_slot_offsets() {
 #[test]
 fn a_cached_hash_keeps_its_slot_and_vector() {
     let common = tempfile::tempdir().unwrap();
-    let cache = block_on(VectorCache::open(common.path())).unwrap();
+    let (dirs, _dirs_tmp) = dirs();
+    let cache = block_on(VectorCache::open(&dirs, common.path())).unwrap();
     let hash = ContentHash::of_chunk("fn v", "fn v() {}");
     let first = UnitVector::normalize(vec![1.0, 2.0]);
     block_on(cache.put_many("m", vec![(hash, first.clone())])).unwrap();
@@ -487,7 +551,8 @@ fn a_cached_hash_keeps_its_slot_and_vector() {
 #[test]
 fn a_vector_of_another_dimension_rolls_the_batch_back() {
     let common = tempfile::tempdir().unwrap();
-    let cache = block_on(VectorCache::open(common.path())).unwrap();
+    let (dirs, _dirs_tmp) = dirs();
+    let cache = block_on(VectorCache::open(&dirs, common.path())).unwrap();
     let ok = ContentHash::of_chunk("fn a", "fn a() {}");
     block_on(cache.put_many("m", vec![(ok, UnitVector::normalize(vec![1.0, 2.0]))])).unwrap();
 
@@ -529,8 +594,9 @@ fn a_vector_of_another_dimension_rolls_the_batch_back() {
 #[test]
 fn concurrent_writers_never_overlap_slots() {
     let common = tempfile::tempdir().unwrap();
-    let a = block_on(VectorCache::open(common.path())).unwrap();
-    let b = block_on(VectorCache::open(common.path())).unwrap();
+    let (dirs, _dirs_tmp) = dirs();
+    let a = block_on(VectorCache::open(&dirs, common.path())).unwrap();
+    let b = block_on(VectorCache::open(&dirs, common.path())).unwrap();
     let vector_of =
         |i: usize| UnitVector::normalize(vec![i as f32 + 1.0, (i % 7) as f32 - 3.0, 0.25]);
     let hash_of = |i: usize| ContentHash::of_chunk("fn v", &format!("fn v{i}() {{}}"));
@@ -570,7 +636,8 @@ fn concurrent_writers_never_overlap_slots() {
 #[test]
 fn calibration_is_stored_per_model() {
     let common = tempfile::tempdir().unwrap();
-    let cache = block_on(VectorCache::open(common.path())).unwrap();
+    let (dirs, _dirs_tmp) = dirs();
+    let cache = block_on(VectorCache::open(&dirs, common.path())).unwrap();
     let hash = ContentHash::of_chunk("fn v", "fn v() {}");
     let calibration = || StoredCalibration {
         lo: vec![-1.0, 0.5].into(),
@@ -612,7 +679,8 @@ fn calibration_is_stored_per_model() {
 #[test]
 fn bounds_cover_every_committed_vector_at_fp16_precision() {
     let common = tempfile::tempdir().unwrap();
-    let cache = block_on(VectorCache::open(common.path())).unwrap();
+    let (dirs, _dirs_tmp) = dirs();
+    let cache = block_on(VectorCache::open(&dirs, common.path())).unwrap();
 
     let err = block_on(cache.bounds("m")).unwrap_err();
     assert!(matches!(err, store::Error::UnknownModel(_)), "{err:?}");
@@ -655,7 +723,8 @@ fn bounds_cover_every_committed_vector_at_fp16_precision() {
 #[test]
 fn a_calibration_over_no_vectors_is_rejected() {
     let common = tempfile::tempdir().unwrap();
-    let cache = block_on(VectorCache::open(common.path())).unwrap();
+    let (dirs, _dirs_tmp) = dirs();
+    let cache = block_on(VectorCache::open(&dirs, common.path())).unwrap();
     let hash = ContentHash::of_chunk("fn v", "fn v() {}");
     block_on(cache.put_many("m", vec![(hash, UnitVector::normalize(vec![1.0, 2.0]))])).unwrap();
     let err = block_on(cache.set_calibration("m", StoredCalibration::empty(2))).unwrap_err();
@@ -666,7 +735,8 @@ fn a_calibration_over_no_vectors_is_rejected() {
 #[test]
 fn restamping_an_unstored_path_is_a_named_error() {
     let dir = tempfile::tempdir().unwrap();
-    let index = block_on(Index::open(dir.path())).unwrap();
+    let (dirs, _dirs_tmp) = dirs();
+    let index = block_on(Index::open(&dirs, dir.path())).unwrap();
     let err = block_on(index.apply(vec![FileChange::Restamp(state("nope.rs", b"x"))]))
         .err()
         .unwrap();
@@ -676,7 +746,8 @@ fn restamping_an_unstored_path_is_a_named_error() {
 #[test]
 fn chunks_by_hash_returns_the_first_row_with_member_ranges() {
     let dir = tempfile::tempdir().unwrap();
-    let index = block_on(Index::open(dir.path())).unwrap();
+    let (dirs, _dirs_tmp) = dirs();
+    let index = block_on(Index::open(&dirs, dir.path())).unwrap();
     let text = "fn a() {}";
     block_on(index.replace_file(
         state("src/a.rs", b"a"),
@@ -702,7 +773,8 @@ fn chunks_by_hash_returns_the_first_row_with_member_ranges() {
 #[test]
 fn since_lists_the_vectors_stored_from_a_slot_on() {
     let common = tempfile::tempdir().unwrap();
-    let cache = block_on(VectorCache::open(common.path())).unwrap();
+    let (dirs, _dirs_tmp) = dirs();
+    let cache = block_on(VectorCache::open(&dirs, common.path())).unwrap();
     let batch = |range: std::ops::Range<usize>| -> Vec<(ContentHash, UnitVector)> {
         range
             .map(|i| {
@@ -744,7 +816,8 @@ fn chunk_queries_bind_the_doc_kind_and_expose_filters() {
     use repo_search_core::store::{ChunkFilter, Side};
 
     let tree = tempfile::tempdir().unwrap();
-    let index = block_on(Index::open(tree.path())).unwrap();
+    let (dirs, _dirs_tmp) = dirs();
+    let index = block_on(Index::open(&dirs, tree.path())).unwrap();
     let doc_kind = ChunkKind::Doc.static_name().unwrap();
     let files = [
         ("a.rs", "function_item", "alpha beta"),
@@ -814,7 +887,8 @@ fn the_extension_filter_is_ascii_case_insensitive() {
     use repo_search_core::store::{ChunkFilter, Side};
 
     let tree = tempfile::tempdir().unwrap();
-    let index = block_on(Index::open(tree.path())).unwrap();
+    let (dirs, _dirs_tmp) = dirs();
+    let index = block_on(Index::open(&dirs, tree.path())).unwrap();
     let doc_kind = ChunkKind::Doc.static_name().unwrap();
     for (path, kind, text) in [
         ("README.MD", doc_kind, "alpha docs"),
@@ -848,7 +922,8 @@ fn the_phase_defaults_to_first_index_and_survives_reopen_and_realignment() {
     use repo_search_core::store::Phase;
 
     let dir = tempfile::tempdir().unwrap();
-    let index = block_on(Index::open(dir.path())).unwrap();
+    let (dirs, _dirs_tmp) = dirs();
+    let index = block_on(Index::open(&dirs, dir.path())).unwrap();
     assert_eq!(block_on(index.phase()).unwrap(), Phase::FirstIndex);
     assert!(matches!(
         block_on(index.set_phase(Phase::Maintained)),
@@ -859,7 +934,7 @@ fn the_phase_defaults_to_first_index_and_survives_reopen_and_realignment() {
     block_on(index.set_phase(Phase::Maintained)).unwrap();
     drop(index);
 
-    let index = block_on(Index::open(dir.path())).unwrap();
+    let index = block_on(Index::open(&dirs, dir.path())).unwrap();
     assert_eq!(block_on(index.phase()).unwrap(), Phase::Maintained);
     // A chunker change re-chunks but keeps the phase.
     block_on(index.align_chunker("chunker-b", "model")).unwrap();
@@ -867,9 +942,9 @@ fn the_phase_defaults_to_first_index_and_survives_reopen_and_realignment() {
     drop(index);
 
     // A database at another schema version is rebuilt, phase included.
-    let conn = rusqlite::Connection::open(index_db(dir.path())).unwrap();
+    let conn = rusqlite::Connection::open(dirs.worktree_index(dir.path())).unwrap();
     conn.pragma_update(None, "user_version", 5_i64).unwrap();
     drop(conn);
-    let index = block_on(Index::open(dir.path())).unwrap();
+    let index = block_on(Index::open(&dirs, dir.path())).unwrap();
     assert_eq!(block_on(index.phase()).unwrap(), Phase::FirstIndex);
 }

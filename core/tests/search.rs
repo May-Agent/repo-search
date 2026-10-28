@@ -216,8 +216,9 @@ impl Fixture {
             fs::write(src.join(name), text).unwrap();
         }
 
-        let index = block_on(Index::open(tree.path())).unwrap();
-        let cache = block_on(VectorCache::open(common.path())).unwrap();
+        let state = repo_search_core::StateDir::new(common.path().join("state"));
+        let index = block_on(Index::open(&state, tree.path())).unwrap();
+        let cache = block_on(VectorCache::open(&state, common.path())).unwrap();
         let reconciled = block_on(
             Reconciler::new(index.clone(), cache.clone(), MODEL, tree.path()).reconcile(
                 CHUNKER_FINGERPRINT,
@@ -1025,8 +1026,9 @@ fn alternating_searches_show_ignored_files_only_when_asked() {
         ),
     )
     .unwrap();
-    let index = block_on(Index::open(tree.path())).unwrap();
-    let cache = block_on(VectorCache::open(common.path())).unwrap();
+    let state = repo_search_core::StateDir::new(common.path().join("state"));
+    let index = block_on(Index::open(&state, tree.path())).unwrap();
+    let cache = block_on(VectorCache::open(&state, common.path())).unwrap();
     let reconciler = RefCell::new(Reconciler::new(
         index.clone(),
         cache.clone(),
@@ -1231,8 +1233,9 @@ fn vector_reads(files: usize) -> Scenario {
         )
         .unwrap();
     }
-    let index = block_on(Index::open(tree.path())).unwrap();
-    let cache = block_on(VectorCache::open(common.path())).unwrap();
+    let state = repo_search_core::StateDir::new(common.path().join("state"));
+    let index = block_on(Index::open(&state, tree.path())).unwrap();
+    let cache = block_on(VectorCache::open(&state, common.path())).unwrap();
     let mut reconciler = Reconciler::new(index.clone(), cache.clone(), MODEL, tree.path());
     let embed_missing = || {
         let pending = missing(&index, &cache, tree.path(), false);

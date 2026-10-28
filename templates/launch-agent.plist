@@ -16,6 +16,10 @@
 		<string>--model-cache</string>
 		<string>{{ cache.display() }}</string>
 		{%- endif %}
+		{%- if let Some(state) = state_dir %}
+		<string>--state-dir</string>
+		<string>{{ state.display() }}</string>
+		{%- endif %}
 	</array>
 	<key>Sockets</key>
 	<dict>
