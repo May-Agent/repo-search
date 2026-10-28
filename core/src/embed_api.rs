@@ -12,6 +12,12 @@ use sfv::{
     key_ref, string_ref, token_ref,
 };
 
+/// The cap on the model load; past it the load fails fatally with the
+/// stage it stopped in. It lives with the wire types because it is part
+/// of the daemon-server contract: the daemon derives its own link bound
+/// from it, whichever platform the daemon runs on.
+pub const LOAD_BOUND: Duration = Duration::from_secs(300);
+
 /// `POST /v1/embeddings`. Non-standard body fields are rejected.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

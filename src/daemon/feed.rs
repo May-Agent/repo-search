@@ -8,7 +8,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use repo_search_core::TokenCounter;
-use repo_search_core::qos::performance_cores;
 use repo_search_core::reconcile::{self, Missing, PendingChunk};
 use tokio::sync::{mpsc, oneshot};
 
@@ -204,8 +203,8 @@ pub fn spawn<T: Tokens>(config: FeederConfig<T>) -> mpsc::Sender<FeedMsg> {
     tx
 }
 
-/// Counts each pending chunk's document tokens on a scoped worker pool of
-/// `performance_cores()` threads, off the executor.
+/// Counts each pending chunk's document tokens on a scoped worker pool
+/// sized by [`std::thread::available_parallelism`], off the executor.
 async fn count_pending<T: Tokens>(
     pending: Vec<PendingChunk>,
     counter: Arc<T::Counter>,
@@ -213,8 +212,9 @@ async fn count_pending<T: Tokens>(
     if pending.is_empty() {
         return Ok(Vec::new());
     }
-    let threads = performance_cores()
+    let threads = std::thread::available_parallelism()
         .map_err(|e| e.to_string())?
+        .get()
         .min(pending.len());
     let (tx, rx) = oneshot::channel();
     std::thread::spawn(move || {

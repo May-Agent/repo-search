@@ -7,6 +7,7 @@
 //! every component that opens or stats a stored file; nothing below the
 //! daemon's own startup looks it up.
 
+#[cfg(target_os = "macos")]
 use std::io;
 use std::path::{Path, PathBuf};
 

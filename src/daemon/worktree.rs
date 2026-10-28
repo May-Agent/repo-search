@@ -7,12 +7,10 @@
 //! whose changes its feeder orders into the scheduler. Its spawned
 //! `index --wait` tasks and its feeder read off its books by asking it.
 
-use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use repo_search_core::qos::performance_cores;
 use repo_search_core::reconcile::{self, Counts, PendingChunk, Reconciler, Report};
 use repo_search_core::search::{self, EmbedService, Reconciliation, Retriever};
 use repo_search_core::store::{Index, Phase, VectorCache};
@@ -511,20 +509,12 @@ impl<T: Tokens> Owner<T> {
         let barrier_us = barrier_start.elapsed().as_micros() as u64;
 
         if self.retriever.is_none() {
-            let knn_threads = match performance_cores() {
-                Ok(cores) => NonZeroUsize::new(cores),
+            let knn_threads = match std::thread::available_parallelism() {
+                Ok(threads) => threads,
                 Err(e) => {
                     send(events, error(ErrorKind::Internal, e.to_string())).await;
                     return None;
                 }
-            };
-            let Some(knn_threads) = knn_threads else {
-                send(
-                    events,
-                    error(ErrorKind::Internal, "no performance cores".into()),
-                )
-                .await;
-                return None;
             };
             let handle = AneHandle {
                 worktree: self.id,

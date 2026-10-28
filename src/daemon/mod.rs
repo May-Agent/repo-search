@@ -143,7 +143,8 @@ pub const IDLE_EXIT: Duration = Duration::from_secs(600);
 /// The bound on one link attempt — the tokenizer download plus the wait
 /// for the server to report the model ready: the server's own load bound
 /// plus slack for the tokenizer fetch and the probe round trips.
-pub const LOAD_BOUND: Duration = Duration::from_secs(repo_search_server::LOAD_BOUND.as_secs() + 30);
+pub const LOAD_BOUND: Duration =
+    Duration::from_secs(repo_search_core::embed_api::LOAD_BOUND.as_secs() + 30);
 
 /// A busy-source registration for the idle-exit tracker. Each source owns
 /// its `watch::Sender<bool>` — state, not transitions, so nothing is lost —

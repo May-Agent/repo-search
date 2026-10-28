@@ -1706,7 +1706,7 @@ async fn a_model_id_mismatch_is_fatal() {
             chip: ChipClass::Wide,
             backend: Arc::new(StubBackend::new(mpsc::channel().0)),
             idle_exit: Duration::from_secs(600),
-            load_bound: repo_search_server::LOAD_BOUND,
+            load_bound: repo_search_core::embed_api::LOAD_BOUND,
         },
     );
     let join = support::daemon::spawn_on(
@@ -1937,7 +1937,7 @@ async fn daemon_host() {
         tcp: Vec::new(),
         token: None,
         idle_exit: Duration::from_secs(3600),
-        load_bound: repo_search_server::LOAD_BOUND,
+        load_bound: repo_search_core::embed_api::LOAD_BOUND,
         model: store,
         chip: ChipClass::Wide,
         backend: Arc::new(backend),

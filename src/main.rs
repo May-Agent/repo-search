@@ -460,7 +460,7 @@ fn server_main(
         tcp,
         token,
         idle_exit,
-        load_bound: repo_search_server::LOAD_BOUND,
+        load_bound: repo_search_core::embed_api::LOAD_BOUND,
         model: model_store,
         chip,
         backend: std::sync::Arc::new(repo_search_server::coreml::CoreMlBackend),

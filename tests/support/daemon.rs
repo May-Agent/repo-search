@@ -276,7 +276,7 @@ pub async fn daemon<T: Tokens>(
             // as launchd does, so it keeps the production idle exit,
             // which `server/tests/api.rs` covers.
             idle_exit: repo_search_server::IDLE_EXIT,
-            load_bound: repo_search_server::LOAD_BOUND,
+            load_bound: repo_search_core::embed_api::LOAD_BOUND,
         },
     ))
     .await
