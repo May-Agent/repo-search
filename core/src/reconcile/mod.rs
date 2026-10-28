@@ -85,8 +85,7 @@ pub struct Options {
     /// `.ignore` files would hide (`--include-ignored`), flagged as ignored.
     /// A pass without it keeps the flagged files stored but does not look at
     /// them, and queues none of their chunks for embedding. Hidden files and
-    /// dot-directories are indexed either way; `.git/` and `.repo-search/`
-    /// never are.
+    /// dot-directories are indexed either way; `.git/` never is.
     pub include_ignored: bool,
 }
 

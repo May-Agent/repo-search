@@ -341,7 +341,7 @@ pub enum ErrorKind {
 pub struct StatusReport {
     /// The queried worktree.
     pub worktree: PathBuf,
-    /// `None`: never indexed (no `.repo-search/index.db`).
+    /// `None`: never indexed (no index file under the state dir).
     pub index: Option<IndexStatus>,
     /// Where the model is.
     pub model: ModelStatus,

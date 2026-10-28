@@ -26,6 +26,7 @@ use repo_search::install::{self, AgentConfig, Check, Launchctl, SystemLaunchctl,
 use repo_search::kqueue::ExitWatch;
 use repo_search::launchd::{LABEL, LaunchAgent};
 use repo_search::protocol::{Final, Hello, Request};
+use repo_search_core::StateDir;
 
 /// The `search` binary the test agents run.
 fn program() -> PathBuf {
@@ -66,6 +67,7 @@ fn config(
             socket: dir.join("daemon.sock"),
             idle_exit,
             model_cache: Some(model_cache),
+            state_dir: Some(dir.join("state")),
             stderr: dir.join("daemon.log"),
         },
         timeouts: install::Timeouts {
@@ -215,7 +217,8 @@ async fn kill_resumes_through_launchd() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    let committed = model::committed(&worktree, &worktree.join(".git"), &model_id).await;
+    let state = StateDir::new(agent._tmp.path().join("state"));
+    let committed = model::committed(&state, &worktree, &worktree.join(".git"), &model_id).await;
     assert!(committed >= 500, "{committed} committed vectors");
 
     model::assert_resume(&socket, &hello, &worktree, committed).await;

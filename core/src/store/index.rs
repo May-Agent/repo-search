@@ -1,5 +1,6 @@
-//! The per-worktree index at `.repo-search/index.db`: file state, chunk
-//! metadata and a contentless FTS5 table over chunk titles and bodies.
+//! The per-worktree index under the daemon's [`StateDir`]: file state,
+//! chunk metadata and a contentless FTS5 table over chunk titles and
+//! bodies.
 
 use std::collections::HashSet;
 use std::fs;
@@ -14,6 +15,7 @@ use super::{
     ChunkRecord, ContentHash, Error, FileState, Unchunkable, ensure_version, open_conn,
     remove_db_files, send_and_wait, spawn_actor,
 };
+use crate::StateDir;
 
 /// Schema generation; a database at any other version is deleted and rebuilt.
 const SCHEMA_VERSION: i64 = 7;
@@ -231,21 +233,23 @@ pub struct Index {
 }
 
 impl Index {
-    /// Opens — creating if needed — `<worktree>/.repo-search/index.db`, and
-    /// creates the `.repo-search` directory with a `.gitignore` of `*`. The
-    /// filesystem and SQLite work runs on the actor thread; `open` only awaits
-    /// its outcome.
+    /// Opens — creating if needed — `worktree`'s index under `state`
+    /// ([`StateDir::worktree_index`]); nothing is written under the
+    /// worktree itself. `worktree` is its canonical root. The filesystem
+    /// and SQLite work runs on the actor thread; `open` only awaits its
+    /// outcome.
     ///
     /// A database found at another schema version is deleted and recreated.
     ///
     /// # Errors
     ///
-    /// When `worktree` is not a directory, the store directory or `.gitignore`
-    /// cannot be written, SQLite rejects the file, or the actor thread fails
-    /// to spawn.
-    pub async fn open(worktree: &Path) -> Result<Self, Error> {
+    /// When `worktree` is not a directory, the state directory cannot be
+    /// written, SQLite rejects the file, or the actor thread fails to
+    /// spawn.
+    pub async fn open(state: &StateDir, worktree: &Path) -> Result<Self, Error> {
+        let path = state.worktree_index(worktree);
         let worktree = worktree.to_path_buf();
-        let tx = spawn_actor("repo-search-index", move || init(&worktree), serve).await?;
+        let tx = spawn_actor("repo-search-index", move || init(&worktree, &path), serve).await?;
         Ok(Self { tx })
     }
 
@@ -487,33 +491,27 @@ impl Index {
     }
 }
 
-/// Creates `.repo-search/` when missing and opens the index database. Runs on
-/// the actor thread.
-fn init(worktree: &Path) -> Result<Connection, Error> {
+/// Creates the index's state directory when missing and opens the index
+/// database. Runs on the actor thread.
+fn init(worktree: &Path, path: &Path) -> Result<Connection, Error> {
     if !worktree.is_dir() {
         return Err(Error::NotDirectory(worktree.to_path_buf()));
     }
-    let dir = worktree.join(".repo-search");
-    fs::create_dir_all(&dir)?;
-    let gitignore = dir.join(".gitignore");
-    if !gitignore.exists() {
-        fs::write(&gitignore, "*\n")?;
-    }
-    let path = dir.join("index.db");
-    let mut conn = open_conn(&path)?;
+    fs::create_dir_all(path.parent().expect("worktree_index names index.db"))?;
+    let mut conn = open_conn(path)?;
     match ensure_version(&mut conn, SCHEMA_VERSION, include_str!("index.sql"))? {
         None => Ok(conn),
         // A version-mismatched per-worktree index belongs to this worktree
         // alone; it is deleted — sidecars included — and rebuilt.
         Some(_) => {
             drop(conn);
-            remove_db_files(&path)?;
-            let mut conn = open_conn(&path)?;
+            remove_db_files(path)?;
+            let mut conn = open_conn(path)?;
             if let Some(found) =
                 ensure_version(&mut conn, SCHEMA_VERSION, include_str!("index.sql"))?
             {
                 return Err(Error::BadSchemaVersion {
-                    path,
+                    path: path.to_path_buf(),
                     found,
                     want: SCHEMA_VERSION,
                 });

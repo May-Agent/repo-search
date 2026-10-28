@@ -8,7 +8,10 @@ pub mod model;
 pub mod qos;
 pub mod reconcile;
 pub mod search;
+mod state;
 pub mod store;
+
+pub use state::StateDir;
 
 /// Identifies the chunker that built an index: a hash of the chunker sources
 /// and the resolved tree-sitter grammar versions, computed by `build.rs`.

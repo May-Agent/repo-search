@@ -37,6 +37,9 @@ pub fn repo(files: &[(String, String)]) -> TestRepo {
             "initial",
         ],
     );
+    // The daemon indexes by the canonical root: keep the fixture's paths
+    // canonical so test-side lookups fingerprint the same paths.
+    let root = root.canonicalize().expect("the repo root canonicalizes");
     TestRepo {
         common_dir: root.join(".git"),
         root,
@@ -71,6 +74,23 @@ pub fn rust_fn(name: &str, text_bytes: usize) -> String {
 
 /// Adds a linked worktree named `name` next to `repo` on a new `branch`,
 /// returning its path.
+/// True when `git status --ignored` in `root` reports nothing, ignored files
+/// included: the daemon left nothing under the worktree.
+pub fn clean(root: &Path) -> bool {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["status", "--porcelain", "--ignored"])
+        .output()
+        .expect("git status runs");
+    assert!(
+        out.status.success(),
+        "git status failed in {}",
+        root.display()
+    );
+    out.stdout.is_empty()
+}
+
 pub fn add_worktree(repo: &TestRepo, name: &str, branch: &str) -> PathBuf {
     let path = repo
         .root

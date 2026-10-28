@@ -36,7 +36,7 @@ enum Question {
 
 impl Ask {
     /// Answers from `reconciler`'s books. `None` is an owner whose index is
-    /// not open: a reopen after a recreated `.repo-search/` failed.
+    /// not open: a reopen after a replaced index file failed.
     pub async fn answer(self, reconciler: Option<&mut Reconciler>) {
         let Some(reconciler) = reconciler else {
             let message = "the worktree's index is not open".to_owned();
@@ -211,8 +211,11 @@ mod tests {
         let tree = tempfile::tempdir().expect("tempdir");
         let common = tempfile::tempdir().expect("tempdir");
         write_modules(tree.path(), files);
-        let index = Index::open(tree.path()).await.expect("index");
-        let cache = VectorCache::open(common.path()).await.expect("cache");
+        let state = repo_search_core::StateDir::new(common.path().join("state"));
+        let index = Index::open(&state, tree.path()).await.expect("index");
+        let cache = VectorCache::open(&state, common.path())
+            .await
+            .expect("cache");
         let mut reconciler = Reconciler::new(index.clone(), cache.clone(), MODEL, tree.path());
         reconciler
             .reconcile(CHUNKER_FINGERPRINT, Options::default(), Arc::new(CapOff))
@@ -305,8 +308,11 @@ mod tests {
         let tree = tempfile::tempdir().expect("tempdir");
         let common = tempfile::tempdir().expect("tempdir");
         write_modules(tree.path(), files);
-        let index = Index::open(tree.path()).await.expect("index");
-        let cache = VectorCache::open(common.path()).await.expect("cache");
+        let state = repo_search_core::StateDir::new(common.path().join("state"));
+        let index = Index::open(&state, tree.path()).await.expect("index");
+        let cache = VectorCache::open(&state, common.path())
+            .await
+            .expect("cache");
         let mut reconciler = Reconciler::new(index.clone(), cache.clone(), MODEL, tree.path());
         let pass = async |reconciler: &mut Reconciler| {
             reconciler

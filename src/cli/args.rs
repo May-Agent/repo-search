@@ -71,6 +71,16 @@ struct RawCli {
         value_name = "DIR"
     )]
     model_cache: Option<PathBuf>,
+
+    /// The daemon's state root, defaulting to the per-user state dir.
+    #[arg(
+        long,
+        hide = true,
+        requires = "daemon",
+        conflicts_with = "query",
+        value_name = "DIR"
+    )]
+    state_dir: Option<PathBuf>,
 }
 
 /// The parsed `search` command line.
@@ -226,6 +236,8 @@ pub enum Invocation {
         idle_exit: Duration,
         /// `--model-cache`, when given.
         model_cache: Option<PathBuf>,
+        /// `--state-dir`, when given.
+        state_dir: Option<PathBuf>,
     },
     /// `search <query>`.
     Search {
@@ -258,6 +270,7 @@ impl Cli {
                     .idle_exit_secs
                     .map_or(daemon::IDLE_EXIT, Duration::from_secs),
                 model_cache: raw.model_cache,
+                state_dir: raw.state_dir,
             };
         }
         match raw.command {
@@ -373,9 +386,11 @@ mod tests {
             Invocation::Daemon {
                 idle_exit,
                 model_cache,
+                state_dir,
             } => {
                 assert_eq!(idle_exit, daemon::IDLE_EXIT);
                 assert_eq!(model_cache, None);
+                assert_eq!(state_dir, None);
             }
             other => panic!("expected Daemon, got {other:?}"),
         }

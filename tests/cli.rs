@@ -51,6 +51,7 @@ fn config(tmp: &tempfile::TempDir) -> AgentConfig {
             socket: root.join("support/daemon.sock"),
             idle_exit: Duration::from_secs(600),
             model_cache: None,
+            state_dir: None,
             stderr: root.join("logs/daemon.log"),
         },
         timeouts: Timeouts {

@@ -25,6 +25,7 @@ use repo_search::daemon::coreml::CoreMlBackend;
 use repo_search::daemon::{self, Config};
 use repo_search::model_store::{ModelSpec, ModelStore};
 use repo_search::protocol::{Final, Request};
+use repo_search_core::StateDir;
 use tokio::net::UnixListener;
 
 /// The corpus queries: behaviour descriptions, in the spirit of what a
@@ -58,6 +59,7 @@ async fn stage_1_query_on_the_ane() {
         idle_exit: Duration::from_secs(600),
         load_bound: daemon::LOAD_BOUND,
         model_store: store,
+        state: StateDir::new(tmp.path().join("state")),
         chip: ChipClass::Wide,
         backend: Arc::new(CoreMlBackend),
         build: client::build(),
@@ -103,11 +105,13 @@ async fn kill_and_resume_on_the_model() {
     let tmp = tempfile::tempdir().expect("tmp");
     let worktree = model::clone_corpus(&tmp);
     let model_cache = tmp.path().join("models");
+    let state = StateDir::new(tmp.path().join("state"));
     let store = model::model_store(model_cache.clone());
     let model_id = store.model_id();
     let host_config = |sock: &str| HostConfig {
         socket: tmp.path().join(sock),
         model_cache: model_cache.clone(),
+        state_dir: tmp.path().join("state"),
     };
 
     let mut host = Host::spawn(&host_config("daemon1.sock"));
@@ -134,7 +138,7 @@ async fn kill_and_resume_on_the_model() {
     }
     host.kill();
 
-    let committed = model::committed(&worktree, &worktree.join(".git"), &model_id).await;
+    let committed = model::committed(&state, &worktree, &worktree.join(".git"), &model_id).await;
     tracing::info!(committed, "committed vectors after the flush");
     // The barrier flushed the writer, so the 500 chunks coverage reported
     // are committed on disk.
@@ -156,6 +160,7 @@ async fn kill_and_resume_on_the_model() {
 struct HostConfig {
     socket: PathBuf,
     model_cache: PathBuf,
+    state_dir: PathBuf,
 }
 
 /// The ignored test re-executed as the kill target; prints `READY` once its
@@ -179,6 +184,7 @@ async fn daemon_host_coreml() {
         idle_exit: Duration::from_secs(3600),
         load_bound: daemon::LOAD_BOUND,
         model_store: store,
+        state: StateDir::new(config.state_dir),
         chip: ChipClass::Wide,
         backend: Arc::new(CoreMlBackend),
         build: client::build(),

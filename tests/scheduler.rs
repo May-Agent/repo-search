@@ -136,7 +136,10 @@ async fn rig_gated(
         .expect("ane thread reports")
         .expect("stub open_ane does not fail");
 
-    let cache = VectorCache::open(&git).await.expect("vector cache opens");
+    let state = repo_search_core::StateDir::new(tmp.path().join("state"));
+    let cache = VectorCache::open(&state, &git)
+        .await
+        .expect("vector cache opens");
     let (writer_busy_tx, _writer_busy_rx) = tokio::sync::watch::channel(false);
     let (writer, _writer_task) = writer::spawn(
         cache.clone(),
