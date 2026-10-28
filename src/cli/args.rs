@@ -38,7 +38,7 @@ pub const VERSION_INFO: &str = const_format::concatcp!(
 )]
 struct RawCli {
     /// Free-text query.
-    #[arg(required_unless_present = "daemon",
+    #[arg(required_unless_present_any = ["daemon", "server"],
           value_parser = clap::builder::NonEmptyStringValueParser::new())]
     query: Option<String>,
 
@@ -49,14 +49,39 @@ struct RawCli {
     command: Option<Command>,
 
     /// Run as the launchd socket-activated daemon.
-    #[arg(long, hide = true, conflicts_with = "query")]
+    #[arg(long, hide = true, conflicts_with = "query", group = "agent")]
     daemon: bool,
+
+    /// Run as the launchd socket-activated embedding server.
+    #[arg(long, hide = true, conflicts_with = "query", group = "agent")]
+    server: bool,
+
+    /// The bearer token TCP listeners require, read from this file.
+    #[arg(
+        long,
+        hide = true,
+        requires = "server",
+        conflicts_with = "query",
+        value_name = "FILE"
+    )]
+    token_file: Option<PathBuf>,
+
+    /// The build this agent registered; the server refuses to run any
+    /// other.
+    #[arg(
+        long,
+        hide = true,
+        requires = "server",
+        conflicts_with = "query",
+        value_name = "ID"
+    )]
+    build: Option<String>,
 
     /// Exit after this many seconds with no connections and no work.
     #[arg(
         long,
         hide = true,
-        requires = "daemon",
+        requires = "agent",
         conflicts_with = "query",
         value_name = "SECS"
     )]
@@ -66,7 +91,7 @@ struct RawCli {
     #[arg(
         long,
         hide = true,
-        requires = "daemon",
+        requires = "agent",
         conflicts_with = "query",
         value_name = "DIR"
     )]
@@ -230,6 +255,18 @@ pub enum Command {
 /// What a parsed [`Cli`] dispatches on.
 #[derive(Debug)]
 pub enum Invocation {
+    /// `search --server`: the embedding server's entry point.
+    Server {
+        /// Idle deadline; [`IDLE_EXIT`](repo_search_server::IDLE_EXIT)
+        /// unless `--idle-exit-secs`.
+        idle_exit: Duration,
+        /// `--model-cache`, when given.
+        model_cache: Option<PathBuf>,
+        /// `--token-file`, when given.
+        token_file: Option<PathBuf>,
+        /// `--build`, when given.
+        build: Option<String>,
+    },
     /// `search --daemon`: the launchd job's entry point.
     Daemon {
         /// Idle deadline; [`daemon::IDLE_EXIT`] unless `--idle-exit-secs`.
@@ -264,6 +301,16 @@ impl Cli {
     /// The invocation this parse describes.
     pub fn invocation(self) -> Invocation {
         let raw = self.0;
+        if raw.server {
+            return Invocation::Server {
+                idle_exit: raw
+                    .idle_exit_secs
+                    .map_or(repo_search_server::IDLE_EXIT, Duration::from_secs),
+                model_cache: raw.model_cache,
+                token_file: raw.token_file,
+                build: raw.build,
+            };
+        }
         if raw.daemon {
             return Invocation::Daemon {
                 idle_exit: raw
@@ -378,6 +425,54 @@ mod tests {
         ]));
         assert_eq!(options.lang, ["rust", "python", "go"]);
         assert_eq!(options.kind, ["fn", "struct"]);
+    }
+
+    #[test]
+    fn server_flags_form_the_server_invocation() {
+        match parsed(&["search", "--server"]) {
+            Invocation::Server {
+                idle_exit,
+                model_cache,
+                token_file,
+                build,
+            } => {
+                assert_eq!(idle_exit, repo_search_server::IDLE_EXIT);
+                assert_eq!(model_cache, None);
+                assert_eq!(token_file, None);
+                assert_eq!(build, None);
+            }
+            other => panic!("expected Server, got {other:?}"),
+        }
+        match parsed(&[
+            "search",
+            "--server",
+            "--idle-exit-secs",
+            "30",
+            "--token-file",
+            "/tmp/tok",
+            "--build",
+            "1:2:3:4",
+        ]) {
+            Invocation::Server {
+                idle_exit,
+                token_file,
+                build,
+                ..
+            } => {
+                assert_eq!(idle_exit, Duration::from_secs(30));
+                assert_eq!(token_file, Some(PathBuf::from("/tmp/tok")));
+                assert_eq!(build.as_deref(), Some("1:2:3:4"));
+            }
+            other => panic!("expected Server, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn server_flags_conflict_with_client_arguments() {
+        assert!(Cli::try_parse_from(["search", "--server", "q"]).is_err());
+        assert!(Cli::try_parse_from(["search", "q", "--token-file", "f"]).is_err());
+        assert!(Cli::try_parse_from(["search", "--token-file", "f"]).is_err());
+        assert!(Cli::try_parse_from(["search", "--build", "1:2:3:4"]).is_err());
     }
 
     #[test]

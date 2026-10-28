@@ -17,8 +17,8 @@ use repo_search_coreml::GpuBlocked;
 use tokio::sync::watch;
 
 use crate::backend::{
-    Backend, EncoderLoad, GpuOpen, Headroom, LoadStage, TextEncoder, TokenBatchEmbedder,
-    TokenEmbedder,
+    Backend, EncodeError, EncoderLoad, GpuOpen, Headroom, LoadStage, TextEncoder,
+    TokenBatchEmbedder, TokenEmbedder,
 };
 
 /// Which embedder instance made a call.
@@ -97,13 +97,13 @@ pub struct StubMonitor;
 pub struct StubEncoder;
 
 impl TextEncoder for StubEncoder {
-    fn encode(&self, text: &str) -> Result<Vec<u32>, String> {
+    fn encode(&self, text: &str) -> Result<Vec<u32>, EncodeError> {
         let tokens = text.len() / 4 + 1;
         if tokens > BUCKETS[2] {
-            return Err(format!(
+            return Err(EncodeError::TooLong(format!(
                 "{tokens} tokens exceeds the {}-token cap",
                 BUCKETS[2]
-            ));
+            )));
         }
         Ok(vec![0; tokens])
     }
@@ -264,6 +264,11 @@ impl StubBackend {
             index_gates: BTreeMap::new(),
             dim: 64,
         }
+    }
+
+    /// The stub vector's width; 64 by default.
+    pub fn set_dim(&mut self, dim: usize) {
+        self.dim = dim;
     }
 
     /// The sleep for calls of `instance` in every bucket.

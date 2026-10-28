@@ -19,6 +19,12 @@ fn main() -> ExitCode {
             model_cache,
             state_dir,
         } => daemon_main(idle_exit, model_cache, state_dir),
+        Invocation::Server {
+            idle_exit,
+            model_cache,
+            token_file,
+            build,
+        } => server_main(idle_exit, model_cache, token_file, build),
         client => client_main(client),
     }
 }
@@ -210,5 +216,249 @@ fn startup(
     match tokio::net::UnixListener::from_std(std_listener) {
         Ok(listener) => Ok((listener, model_store, state, chip, build)),
         Err(error) => Err((StartupError::Adopt(error), vec![spare])),
+    }
+}
+
+/// Answers queued launchd connections with the 503 refusal, then exits 1.
+fn fail_all(
+    listeners: Vec<repo_search_server::Listener>,
+    message: &str,
+    runtime: &tokio::runtime::Runtime,
+) -> ExitCode {
+    tracing::error!(%message, "the server failed to start");
+    runtime.block_on(repo_search_server::refuse_http(listeners, message));
+    ExitCode::FAILURE
+}
+
+/// One listener adopted into the runtime.
+enum Adopted {
+    Unix(tokio::net::UnixListener),
+    Tcp(tokio::net::TcpListener),
+}
+
+/// Adopts `listener`: `from_std` consumes the std listener either way,
+/// so a `try_clone` spare rides along for the refusal path when the
+/// adoption fails.
+fn adopt(
+    listener: repo_search_server::Listener,
+) -> Result<Adopted, (std::io::Error, repo_search_server::Listener)> {
+    use repo_search_server::Listener;
+    match listener {
+        Listener::Unix(listener) => match listener.try_clone() {
+            Ok(spare) => tokio::net::UnixListener::from_std(listener)
+                .map(Adopted::Unix)
+                .map_err(|error| (error, Listener::Unix(spare))),
+            Err(error) => Err((error, Listener::Unix(listener))),
+        },
+        Listener::Tcp(listener) => match listener.try_clone() {
+            Ok(spare) => tokio::net::TcpListener::from_std(listener)
+                .map(Adopted::Tcp)
+                .map_err(|error| (error, Listener::Tcp(spare))),
+            Err(error) => Err((error, Listener::Tcp(listener))),
+        },
+    }
+}
+
+/// The `search --server` entry point.
+///
+/// Mirrors [`daemon_main`]: launchd hands over `"Unix"` (exactly one) and
+/// `"Tcp"` (zero or more) sockets; `--build` is checked against the running
+/// binary before `repo_search_server::run` starts — a mismatch means the
+/// agent wants another build, so the server fails fast after answering
+/// every queued connection 503.
+fn server_main(
+    idle_exit: Duration,
+    model_cache: Option<PathBuf>,
+    token_file: Option<PathBuf>,
+    build: Option<String>,
+) -> ExitCode {
+    use repo_search::launchd;
+    use repo_search::model_store::{ModelSpec, ModelStore};
+    use repo_search::protocol::BuildId;
+
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_max_level(tracing::Level::INFO)
+        .init();
+
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            tracing::error!(%error, "could not build the tokio runtime");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let mut listeners = Vec::new();
+    for name in ["Unix", "Tcp"] {
+        match launchd::activate_socket(name) {
+            Ok(fds) => {
+                // Every fd of the batch that accepts `set_nonblocking`
+                // is refused on a failure — one bad fd must not drop
+                // its siblings' queued connections.
+                let mut failed = None;
+                for fd in fds {
+                    let listener = match name {
+                        "Unix" => repo_search_server::Listener::Unix(
+                            std::os::unix::net::UnixListener::from(fd),
+                        ),
+                        _ => repo_search_server::Listener::Tcp(std::net::TcpListener::from(fd)),
+                    };
+                    match match &listener {
+                        repo_search_server::Listener::Unix(l) => l.set_nonblocking(true),
+                        repo_search_server::Listener::Tcp(l) => l.set_nonblocking(true),
+                    } {
+                        Ok(()) => listeners.push((name, listener)),
+                        Err(error) => {
+                            tracing::error!(%error, %name, "could not set a socket nonblocking");
+                            failed.get_or_insert(error);
+                        }
+                    }
+                }
+                if let Some(error) = failed {
+                    return fail_all(
+                        listeners.into_iter().map(|(_, l)| l).collect(),
+                        &format!("could not set a {name} fd nonblocking: {error}"),
+                        &runtime,
+                    );
+                }
+            }
+            // No socket of this name is registered: zero `Tcp` listeners
+            // is a valid configuration; a missing `Unix` is caught by the
+            // count check below.
+            Err(launchd::ActivateError::Launchd { source, .. })
+                if source.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                tracing::error!(%error, %name, "launchd socket activation failed");
+                return fail_all(
+                    listeners.into_iter().map(|(_, l)| l).collect(),
+                    &format!("launchd socket activation failed for {name}: {error}"),
+                    &runtime,
+                );
+            }
+        }
+    }
+    let unix = listeners.iter().filter(|(n, _)| *n == "Unix").count();
+    let mut refused = listeners.into_iter().map(|(_, l)| l).collect::<Vec<_>>();
+    if unix != 1 {
+        return fail_all(
+            refused,
+            &format!("launchd returned {unix} Unix fds, expected exactly 1"),
+            &runtime,
+        );
+    }
+    if let Some(expected) = &build {
+        match BuildId::of_current_exe() {
+            Ok(actual) if actual.to_string() == *expected => {}
+            Ok(actual) => {
+                return fail_all(
+                    refused,
+                    &format!("--build {expected} does not match this binary {actual}"),
+                    &runtime,
+                );
+            }
+            Err(error) => {
+                return fail_all(
+                    refused,
+                    &format!("could not identify the running binary: {error}"),
+                    &runtime,
+                );
+            }
+        }
+    }
+    let model_store = match &model_cache {
+        Some(root) => ModelStore::new(root.clone(), ModelSpec::embedding_gemma_2()),
+        None => ModelStore::user_cache(),
+    };
+    let model_store = match model_store {
+        Ok(store) => store,
+        Err(error) => {
+            return fail_all(
+                refused,
+                &format!("could not open the model cache: {error}"),
+                &runtime,
+            );
+        }
+    };
+    let chip = match repo_search_server::chip::host() {
+        Ok(chip) => chip,
+        Err(error) => {
+            return fail_all(
+                refused,
+                &format!("could not determine the host's chip class: {error}"),
+                &runtime,
+            );
+        }
+    };
+    let token = match &token_file {
+        Some(path) => match std::fs::read_to_string(path) {
+            Ok(token) => Some(token.trim_end_matches(['\n', '\r']).to_owned()),
+            Err(error) => {
+                return fail_all(
+                    refused,
+                    &format!("could not read the token file {}: {error}", path.display()),
+                    &runtime,
+                );
+            }
+        },
+        None => None,
+    };
+    // Adopt the listeners into the runtime after every check that can
+    // fail: `from_std` needs the runtime's driver.
+    let _guard = runtime.enter();
+    let mut unix_listener = None;
+    let mut tcp = Vec::new();
+    while let Some(listener) = refused.pop() {
+        match adopt(listener) {
+            Ok(Adopted::Unix(l)) => unix_listener = Some(l),
+            Ok(Adopted::Tcp(l)) => tcp.push(l),
+            Err((error, failed)) => {
+                refused.push(failed);
+                // The listeners already adopted go back to std handles,
+                // so their queues get the same 503 as the ones never
+                // drained.
+                if let Some(l) = unix_listener {
+                    match l.into_std() {
+                        Ok(l) => refused.push(repo_search_server::Listener::Unix(l)),
+                        Err(error) => {
+                            tracing::error!(%error, "could not un-adopt the unix listener");
+                        }
+                    }
+                }
+                for l in tcp {
+                    match l.into_std() {
+                        Ok(l) => refused.push(repo_search_server::Listener::Tcp(l)),
+                        Err(error) => {
+                            tracing::error!(%error, "could not un-adopt a tcp listener");
+                        }
+                    }
+                }
+                return fail_all(
+                    refused,
+                    &format!("could not adopt a listener fd: {error}"),
+                    &runtime,
+                );
+            }
+        }
+    }
+    match runtime.block_on(repo_search_server::run(repo_search_server::Config {
+        unix: unix_listener.expect("the count check left one listener"),
+        tcp,
+        token,
+        idle_exit,
+        load_bound: repo_search_server::LOAD_BOUND,
+        model: model_store,
+        chip,
+        backend: std::sync::Arc::new(repo_search_server::coreml::CoreMlBackend),
+    })) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            tracing::error!(%error, "the server stopped on a fatal error");
+            ExitCode::FAILURE
+        }
     }
 }

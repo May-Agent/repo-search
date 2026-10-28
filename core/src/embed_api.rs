@@ -164,6 +164,79 @@ pub struct ErrorDetail {
     pub code: Option<String>,
 }
 
+/// `GET /status`: the server's own report — model state (with archive
+/// download progress and load stage) and GPU state, in the shapes the
+/// daemon's `status` already knows.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StatusBody {
+    /// The model's state.
+    pub model: ModelStatus,
+    /// The GPU embedding instance's state.
+    pub gpu: GpuStatus,
+}
+
+/// The model's state on `GET /status`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ModelStatus {
+    /// `ensure` has not produced a directory yet.
+    Absent,
+    /// The archive is downloading.
+    Downloading {
+        /// Bytes received so far.
+        received: u64,
+        /// The server's declared length, when known.
+        total: Option<u64>,
+    },
+    /// The archive is verified; the encoder and the ANE instance load.
+    Loading {
+        /// The `open_ane` pipeline stage.
+        stage: LoadStage,
+    },
+    /// Ready to embed.
+    Ready {
+        /// The model id.
+        id: String,
+    },
+    /// Download or load failed; a request retries.
+    Failed {
+        /// The failure's message.
+        message: String,
+    },
+    /// The load failed fatally; the server is shutting down.
+    Fatal {
+        /// The failure's message.
+        message: String,
+    },
+}
+
+/// The model load's stage while `model.type` is `loading`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LoadStage {
+    /// Reading the tokenizer and the manifest.
+    Encoder,
+    /// Inside the compiled-model open.
+    Open,
+    /// The per-bucket warm-up embeds.
+    WarmUp,
+}
+
+/// The GPU embedding instance's state — the daemon's `GpuStatus` shape.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum GpuStatus {
+    /// No GPU instance exists.
+    Absent {
+        /// Why it cannot be created, when the check has run.
+        blocked: Option<String>,
+    },
+    /// Being created (a multi-second cold start).
+    Loading,
+    /// Embedding normal-urgency work.
+    Running,
+}
+
 /// An RFC 9218 `Priority` urgency: 0 is most urgent, 7 least.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Urgency(u8);

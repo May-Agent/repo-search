@@ -169,65 +169,14 @@ impl ModelStore {
         &self,
         progress: &tokio::sync::watch::Sender<Fetch>,
     ) -> Result<NamedTempFile, Error> {
-        let mut response = self.client.get(&self.spec.url).send().await?;
-        if !response.status().is_success() {
-            return Err(Error::Status {
-                url: self.spec.url.clone(),
-                status: response.status(),
-            });
-        }
-        let total = response.content_length();
-        if let Some(size) = total
-            && size > MAX_ARCHIVE_BYTES
-        {
-            return Err(Error::TooLarge {
-                size,
-                limit: MAX_ARCHIVE_BYTES,
-            });
-        }
-        let root = self.root.clone();
-        let (temp, writer) = tokio::task::spawn_blocking(move || {
-            let temp = NamedTempFile::new_in(&root)?;
-            let writer = temp.reopen()?;
-            io::Result::Ok((temp, writer))
-        })
-        .await??;
-        let mut writer = tokio::fs::File::from_std(writer);
-        let mut hasher = Sha256::new();
-        let mut received = 0u64;
-        tracing::info!(url = %self.spec.url, "downloading model archive");
-        let streamed: Result<(), Error> = async {
-            while let Some(chunk) = response.chunk().await? {
-                received += chunk.len() as u64;
-                if received > MAX_ARCHIVE_BYTES {
-                    return Err(Error::TooLarge {
-                        size: received,
-                        limit: MAX_ARCHIVE_BYTES,
-                    });
-                }
-                hasher.update(&chunk);
-                writer.write_all(&chunk).await?;
-                progress.send_replace(Fetch { received, total });
-            }
-            writer.flush().await?;
-            Ok(())
-        }
-        .await;
-        let digest = match streamed {
-            Ok(()) => Sha256Digest(hasher.finalize().into()),
-            Err(e) => {
-                discard(temp).await;
-                return Err(e);
-            }
-        };
-        if digest != self.spec.sha256 {
-            discard(temp).await;
-            return Err(Error::HashMismatch {
-                expected: self.spec.sha256,
-                actual: digest,
-            });
-        }
-        Ok(temp)
+        fetch_verified(
+            &self.client,
+            &self.spec.url,
+            self.spec.sha256,
+            &self.root,
+            progress,
+        )
+        .await
     }
 
     /// Unpack a verified archive into `dir` via a sibling staging directory.
@@ -245,6 +194,92 @@ impl ModelStore {
         .await??;
         tracing::info!(dir = %dir.display(), "model archive unpacked");
         Ok(())
+    }
+}
+
+/// Stream `url` into a temp file inside `root`, returning it only once its
+/// sha256 matches `sha256`. The temp file deletes itself on drop; error
+/// paths run that drop on the blocking pool. Shared by [`ModelStore`] and
+/// the server's [`repo_search_server::ModelSource`].
+pub async fn fetch_verified(
+    client: &reqwest::Client,
+    url: &str,
+    sha256: Sha256Digest,
+    root: &Path,
+    progress: &tokio::sync::watch::Sender<Fetch>,
+) -> Result<NamedTempFile, Error> {
+    let mut response = client.get(url).send().await?;
+    if !response.status().is_success() {
+        return Err(Error::Status {
+            url: url.to_owned(),
+            status: response.status(),
+        });
+    }
+    let total = response.content_length();
+    if let Some(size) = total
+        && size > MAX_ARCHIVE_BYTES
+    {
+        return Err(Error::TooLarge {
+            size,
+            limit: MAX_ARCHIVE_BYTES,
+        });
+    }
+    let root = root.to_path_buf();
+    let (temp, writer) = tokio::task::spawn_blocking(move || {
+        let temp = NamedTempFile::new_in(&root)?;
+        let writer = temp.reopen()?;
+        io::Result::Ok((temp, writer))
+    })
+    .await??;
+    let mut writer = tokio::fs::File::from_std(writer);
+    let mut hasher = Sha256::new();
+    let mut received = 0u64;
+    tracing::info!(url, "downloading model archive");
+    let streamed: Result<(), Error> = async {
+        while let Some(chunk) = response.chunk().await? {
+            received += chunk.len() as u64;
+            if received > MAX_ARCHIVE_BYTES {
+                return Err(Error::TooLarge {
+                    size: received,
+                    limit: MAX_ARCHIVE_BYTES,
+                });
+            }
+            hasher.update(&chunk);
+            writer.write_all(&chunk).await?;
+            progress.send_replace(Fetch { received, total });
+        }
+        writer.flush().await?;
+        Ok(())
+    }
+    .await;
+    let digest = match streamed {
+        Ok(()) => Sha256Digest(hasher.finalize().into()),
+        Err(e) => {
+            discard(temp).await;
+            return Err(e);
+        }
+    };
+    if digest != sha256 {
+        discard(temp).await;
+        return Err(Error::HashMismatch {
+            expected: sha256,
+            actual: digest,
+        });
+    }
+    Ok(temp)
+}
+
+#[cfg(target_os = "macos")]
+impl repo_search_server::ModelSource for ModelStore {
+    fn model_id(&self) -> String {
+        self.model_id()
+    }
+
+    async fn ensure(
+        &self,
+        progress: &tokio::sync::watch::Sender<Fetch>,
+    ) -> Result<PathBuf, String> {
+        self.ensure(progress).await.map_err(|e| e.to_string())
     }
 }
 

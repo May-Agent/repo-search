@@ -223,6 +223,8 @@ pub struct SchedulerHandle {
     /// A3: the GPU instance's state for `GET /status`, pushed on every
     /// transition.
     gpu: watch::Receiver<GpuState>,
+    /// Items waiting in a queue, pushed on every turn of the actor.
+    queued: watch::Receiver<u64>,
 }
 
 impl SchedulerHandle {
@@ -236,6 +238,12 @@ impl SchedulerHandle {
     /// reads it through `borrow`.
     pub fn gpu_state(&self) -> watch::Receiver<GpuState> {
         self.gpu.clone()
+    }
+
+    /// The count of items waiting in a queue, pushed on every turn of
+    /// the actor: a `submit`'s inputs land here before any dispatch.
+    pub fn queued(&self) -> watch::Receiver<u64> {
+        self.queued.clone()
     }
 
     /// Sends a request to embed.
@@ -339,6 +347,8 @@ struct Scheduler<B: Backend> {
     last_low_end: Option<Instant>,
     /// The GPU state `/status` reads, pushed on every transition.
     gpu_state: watch::Sender<GpuState>,
+    /// Queued items, pushed on every turn for the `queued` receiver.
+    queued: watch::Sender<u64>,
     /// The idle-exit tracker: every queued or in-flight unit of work
     /// reports busy through it.
     busy: watch::Sender<bool>,
@@ -392,9 +402,11 @@ pub fn spawn<B: Backend>(
     } = config;
     let (tx, rx) = mpsc::channel(INBOX);
     let (exit_tx, exited) = oneshot::channel();
+    let (queued_tx, queued_rx) = watch::channel(0u64);
     let handle = SchedulerHandle {
         tx: tx.clone(),
         gpu: gpu_state.subscribe(),
+        queued: queued_rx,
     };
     let scheduler = Scheduler {
         tx: tx.downgrade(),
@@ -424,6 +436,7 @@ pub fn spawn<B: Backend>(
         dispatched_low: 0,
         last_low_end: None,
         gpu_state,
+        queued: queued_tx,
         busy,
         last_busy: false,
         stopping: false,
@@ -914,6 +927,8 @@ impl<B: Backend> Scheduler<B> {
     /// queued items live in their requests, and the ANE/GPU each track the
     /// items already handed out.
     fn update_busy(&mut self) {
+        let queued = (self.interactive.len() + self.normal.len() + self.background.len()) as u64;
+        self.queued.send_replace(queued);
         let busy =
             !self.requests.is_empty() || self.ane_in_flight.is_some() || self.gpu_in_flight > 0;
         if busy != self.last_busy {

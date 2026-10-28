@@ -27,8 +27,12 @@ impl TokenBatchEmbedder for CoreMlEmbedder {
 }
 
 impl TextEncoder for Encoder {
-    fn encode(&self, text: &str) -> Result<Vec<u32>, String> {
-        Encoder::encode(self, text).map_err(|error| error.to_string())
+    fn encode(&self, text: &str) -> Result<Vec<u32>, crate::backend::EncodeError> {
+        use crate::backend::EncodeError;
+        Encoder::encode(self, text).map_err(|error| match error {
+            repo_search_coreml::Error::TooLong { .. } => EncodeError::TooLong(error.to_string()),
+            error => EncodeError::Failed(error.to_string()),
+        })
     }
 }
 

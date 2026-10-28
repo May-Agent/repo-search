@@ -292,7 +292,7 @@ where
             worktree: worktree.clone(),
             wait: *wait,
         },
-        Invocation::Daemon { .. } => unreachable!("checked above"),
+        Invocation::Daemon { .. } | Invocation::Server { .. } => unreachable!("checked above"),
     };
     let mut responses = match client.request(request).await {
         Ok(responses) => responses,
@@ -310,7 +310,7 @@ where
         Invocation::Search { options, .. } => ("search", options.json),
         Invocation::Status { json } => ("status", *json),
         Invocation::Index { json, .. } => ("index", *json),
-        Invocation::Daemon { .. } => unreachable!("checked above"),
+        Invocation::Daemon { .. } | Invocation::Server { .. } => unreachable!("checked above"),
     };
     let mut progress = ProgressLine::new(term.stderr_tty);
     while let Some(item) = responses.next().await {

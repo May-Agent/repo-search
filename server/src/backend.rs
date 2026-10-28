@@ -41,14 +41,26 @@ pub trait TokenBatchEmbedder: TokenEmbedder {
 
 /// Turns request text into token ids.
 pub trait TextEncoder: Send + Sync {
-    /// Encodes `text` with special tokens; the error is the message a
-    /// `context_length_exceeded` or `invalid_request` reply carries.
+    /// Encodes `text` with special tokens.
     ///
     /// # Errors
     ///
-    /// When `text` encodes past the model's largest bucket, or encoding
-    /// fails.
-    fn encode(&self, text: &str) -> Result<Vec<u32>, String>;
+    /// [`EncodeError::TooLong`] when `text` encodes past the model's
+    /// largest bucket; [`EncodeError::Failed`] on any other failure.
+    fn encode(&self, text: &str) -> Result<Vec<u32>, EncodeError>;
+}
+
+/// A [`TextEncoder::encode`] failure, typed so the HTTP layer can tell a
+/// client's over-cap input (400 `context_length_exceeded`) from an
+/// encode failure (500).
+#[derive(Debug, thiserror::Error)]
+pub enum EncodeError {
+    /// The input encodes past the model's largest bucket.
+    #[error("{0}")]
+    TooLong(String),
+    /// Encoding failed.
+    #[error("{0}")]
+    Failed(String),
 }
 
 /// The model backend: the text encoder plus the ANE and GPU instances.
