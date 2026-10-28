@@ -4,6 +4,7 @@
 
 use std::collections::HashSet;
 use std::fs;
+use std::io;
 use std::ops::{Range, RangeInclusive};
 use std::path::Path;
 
@@ -13,7 +14,7 @@ use tokio::sync::{mpsc, oneshot};
 use super::query::{self, ChunkFilter, ChunkId, ChunkRow, Side};
 use super::{
     ChunkRecord, ContentHash, Error, FileState, Unchunkable, ensure_version, open_conn,
-    remove_db_files, send_and_wait, spawn_actor,
+    open_read_only, remove_db_files, send_and_wait, spawn_actor,
 };
 use crate::StateDir;
 
@@ -123,6 +124,67 @@ impl StoredMemberKind {
             Ok(Self::Text)
         }
     }
+}
+
+/// What an index file's `meta` row records, read without an actor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredMeta {
+    /// The chunker fingerprint the rows were built under.
+    pub chunker: String,
+    /// The model id whose token counter capped every chunk.
+    pub model_id: String,
+    /// The stored phase.
+    pub phase: Phase,
+}
+
+/// The `meta` row of the index at `path` on a read-only connection: `None`
+/// when the file is at another schema version, which [`Index::open`] would
+/// discard, or recorded no identity yet. A writer on the file serializes the
+/// read behind its commit under the busy timeout.
+///
+/// # Errors
+///
+/// When `path` is missing or not a database, or SQLite rejects the read.
+pub fn stored_meta(path: &Path) -> Result<Option<StoredMeta>, Error> {
+    let conn = open_read_only(path)?;
+    let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if version != SCHEMA_VERSION {
+        return Ok(None);
+    }
+    match conn.query_row(
+        "SELECT chunker, model_id, phase FROM meta WHERE id = 1",
+        [],
+        |row| {
+            Ok(StoredMeta {
+                chunker: row.get(0)?,
+                model_id: row.get(1)?,
+                phase: Phase::from_column(row.get(2)?)?,
+            })
+        },
+    ) {
+        Ok(meta) => Ok(Some(meta)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Copies the database at `src` to `dst` with `VACUUM INTO` over a
+/// read-only connection, one consistent transaction against the source: a
+/// writer on `src` serializes the copy behind its commit under the busy
+/// timeout. `dst` must not exist; on error a partial destination may be
+/// left for the caller to remove.
+///
+/// # Errors
+///
+/// When `src` cannot be read, `dst` exists or cannot be written, or `dst`
+/// is not UTF-8.
+pub fn vacuum_into(src: &Path, dst: &Path) -> Result<(), Error> {
+    let conn = open_read_only(src)?;
+    let dst = dst
+        .to_str()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path is not UTF-8"))?;
+    conn.execute("VACUUM INTO ?1", params![dst])?;
+    Ok(())
 }
 
 /// How far the index has come: whether indexing has ever caught up with the

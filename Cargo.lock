@@ -1530,6 +1530,7 @@ dependencies = [
  "repo-search-coreml",
  "repo-search-server",
  "reqwest",
+ "rusqlite",
  "serde",
  "serde_json",
  "sha2",
