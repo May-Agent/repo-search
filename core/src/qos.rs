@@ -247,19 +247,33 @@ mod tests {
     #[test]
     fn an_override_raises_and_releases_the_target() {
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<ThreadId>();
+        let (demoted_tx, demoted_rx) = std::sync::mpsc::channel::<()>();
         let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
         let worker = std::thread::spawn(move || {
-            set_current_thread(QosClass::Background);
             ready_tx.send(ThreadId::current()).unwrap();
+            set_current_thread(QosClass::Background);
+            demoted_tx.send(()).unwrap();
             go_rx.recv().unwrap();
         });
         let thread = ready_rx.recv().unwrap();
+        // On a loaded host a thread already at Background can starve inside
+        // the demotion itself; the Utility override keeps the worker
+        // scheduled until it acknowledges. It cannot stay held for the
+        // assertions below: `pth_curpri` reads the same lifted band under
+        // any override while the thread waits, so a second override on top
+        // of it is indistinguishable (see the scheduler tests).
+        let hold = Override::start(thread, QosClass::Utility);
+        demoted_rx.recv().unwrap();
+        // The held override does not mask the class the worker requested.
         assert_eq!(read_thread(thread), QosClass::Background);
+        drop(hold);
         let base = scheduling_priority(thread);
         let over = Override::start(thread, QosClass::UserInteractive);
         let lifted = scheduling_priority(thread);
-        eprintln!("base {base}, lifted {lifted}");
-        assert!(lifted > base, "the override lifts the effective priority");
+        assert!(
+            lifted > base,
+            "the override lifts the effective priority: base {base}, lifted {lifted}"
+        );
         drop(over);
         assert_eq!(
             scheduling_priority(thread),
