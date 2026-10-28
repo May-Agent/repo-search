@@ -20,12 +20,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use repo_search::daemon::chip::ChipClass;
-use repo_search::daemon::coreml::CoreMlBackend;
+use repo_search::daemon::server::Endpoint;
 use repo_search::daemon::{self, Config};
 use repo_search::model_store::{ModelSpec, ModelStore};
 use repo_search::protocol::{Final, Request};
 use repo_search_core::StateDir;
+use repo_search_server::chip::ChipClass;
+use repo_search_server::coreml::CoreMlBackend;
 use tokio::net::UnixListener;
 
 /// The corpus queries: behaviour descriptions, in the spirit of what a
@@ -52,16 +53,29 @@ async fn stage_1_query_on_the_ane() {
     let tmp = tempfile::tempdir().expect("tmp");
     let worktree = model::clone_corpus(&tmp);
     let socket = tmp.path().join("daemon.sock");
+    let server_socket = tmp.path().join("server.sock");
     let listener = UnixListener::bind(&socket).expect("socket binds");
+    let server_listener = UnixListener::bind(&server_socket).expect("server socket binds");
     let store = model::model_store(tmp.path().join("models"));
+    let model_id = repo_search_core::model::MODEL_ID.to_owned();
+    let server = tokio::spawn(repo_search_server::run(repo_search_server::Config {
+        unix: server_listener,
+        tcp: Vec::new(),
+        token: None,
+        idle_exit: Duration::from_secs(600),
+        load_bound: repo_search_server::LOAD_BOUND,
+        model: store,
+        chip: ChipClass::Wide,
+        backend: Arc::new(CoreMlBackend),
+    }));
     let daemon = tokio::spawn(daemon::run(Config {
         listener,
         idle_exit: Duration::from_secs(600),
         load_bound: daemon::LOAD_BOUND,
-        model_store: store,
+        tokens: model::tokenizer_store(tmp.path().join("models")),
+        server: Endpoint::Unix(server_socket),
+        model_id,
         state: StateDir::new(tmp.path().join("state")),
-        chip: ChipClass::Wide,
-        backend: Arc::new(CoreMlBackend),
         build: client::build(),
     }));
 
@@ -90,6 +104,7 @@ async fn stage_1_query_on_the_ane() {
     }
 
     daemon.abort();
+    server.abort();
 }
 
 /// The real-kill sequence of `kill_mid_index_resumes`, with the host
@@ -110,6 +125,7 @@ async fn kill_and_resume_on_the_model() {
     let model_id = store.model_id();
     let host_config = |sock: &str| HostConfig {
         socket: tmp.path().join(sock),
+        server_socket: tmp.path().join(format!("{sock}-server.sock")),
         model_cache: model_cache.clone(),
         state_dir: tmp.path().join("state"),
     };
@@ -159,6 +175,8 @@ async fn kill_and_resume_on_the_model() {
 #[derive(serde::Serialize, serde::Deserialize)]
 struct HostConfig {
     socket: PathBuf,
+    /// The socket the host's server binds and the daemon probes.
+    server_socket: PathBuf,
     model_cache: PathBuf,
     state_dir: PathBuf,
 }
@@ -174,19 +192,31 @@ async fn daemon_host_coreml() {
         .expect("REPO_SEARCH_TEST_HOST is set by kill_and_resume_on_the_model");
     let config: HostConfig = serde_json::from_str(&raw).expect("HostConfig json");
     host::watch_stdin();
-    let store =
-        ModelStore::new(config.model_cache, ModelSpec::embedding_gemma_2()).expect("model store");
+    let store = ModelStore::new(config.model_cache.clone(), ModelSpec::embedding_gemma_2())
+        .expect("model store");
+    let model_id = repo_search_core::model::MODEL_ID.to_owned();
     let listener = UnixListener::bind(&config.socket).expect("socket binds");
+    let server_listener = UnixListener::bind(&config.server_socket).expect("server socket binds");
+    tokio::spawn(repo_search_server::run(repo_search_server::Config {
+        unix: server_listener,
+        tcp: Vec::new(),
+        token: None,
+        idle_exit: Duration::from_secs(3600),
+        load_bound: repo_search_server::LOAD_BOUND,
+        model: store,
+        chip: ChipClass::Wide,
+        backend: Arc::new(CoreMlBackend),
+    }));
     // The harness left its `test ... ` prefix unterminated on this line.
     println!("\nREADY");
     daemon::run(Config {
         listener,
         idle_exit: Duration::from_secs(3600),
         load_bound: daemon::LOAD_BOUND,
-        model_store: store,
+        tokens: model::tokenizer_store(config.model_cache.join("tokenizer")),
+        server: Endpoint::Unix(config.server_socket),
+        model_id,
         state: StateDir::new(config.state_dir),
-        chip: ChipClass::Wide,
-        backend: Arc::new(CoreMlBackend),
         build: client::build(),
     })
     .await

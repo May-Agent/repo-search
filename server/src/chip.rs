@@ -1,9 +1,9 @@
 //! The host chip's class, read once at daemon startup.
 //!
-//! `machdep.cpu.brand_string` names the Apple silicon the daemon runs on:
+//! `machdep.cpu.brand_string` names the Apple silicon the server runs on:
 //! `Apple M<n>` is the base class and `Apple M<n> Pro`, `Max` and `Ultra`
 //! the wide one. On a base chip a GPU instance executing alongside the ANE
-//! makes stage 1 finish later — shared memory bandwidth is the leading
+//! makes the normal queue finish later — shared memory bandwidth is the leading
 //! explanation — so the scheduler keeps stage-1 work off it there. A brand
 //! the parse does not recognise is a startup error, not a guess: falling
 //! back would schedule on a measurement that was never made.

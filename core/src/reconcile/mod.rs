@@ -94,7 +94,8 @@ pub struct Options {
 pub struct PendingChunk {
     /// Worktree-relative path of the file.
     pub path: String,
-    /// Embed under this title: `Embedder::embed_document(title, text)`.
+    /// Embed the document `crate::model::DOCUMENT` formats for this title
+    /// and `text`.
     pub title: String,
     /// The chunk text.
     pub text: String,

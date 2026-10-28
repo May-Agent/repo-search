@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["core", "coreml"]
+members = ["core", "coreml", "server"]
 
 [workspace.package]
 edition = "2024"
@@ -11,6 +11,7 @@ repository = "https://github.com/May-Agent/repo-search"
 [workspace.dependencies]
 repo-search-core = { path = "core", version = "0.0.2" }
 repo-search-coreml = { path = "coreml", version = "0.0.2" }
+repo-search-server = { path = "server", version = "0.0.2" }
 clap = { version = "4.6.7", default-features = false, features = [
     "std",
     "derive",
@@ -46,6 +47,7 @@ futures-util = { version = "0.3.34", default-features = false, features = [
 ] }
 hex = { version = "0.4.3", default-features = false, features = ["alloc"] }
 reqwest = { version = "0.13.5", default-features = false, features = [
+    "json",
     "native-tls",
 ] }
 serde = { version = "1.0.229", default-features = false, features = [
@@ -81,18 +83,32 @@ tracing-subscriber = { version = "0.3.23", default-features = false, features = 
 zstd = { version = "0.14.3", default-features = false }
 
 [dev-dependencies]
+bytes = { version = "1.11.0", default-features = false }
+http-body-util = { version = "0.1.5", default-features = false }
+hyper = { version = "1.12.0", default-features = false, features = [
+    "http1",
+    "server",
+] }
+hyper-util = { version = "0.1.21", default-features = false, features = [
+    "http1",
+    "tokio",
+] }
 tokio = { version = "1.54.0", default-features = false, features = ["test-util"] }
 
 [target.'cfg(target_os = "macos")'.dev-dependencies]
 libc = { version = "0.2.191", default-features = false, features = ["std"] }
+repo-search-coreml.workspace = true
+repo-search-server = { workspace = true, features = ["stub"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-repo-search-coreml.workspace = true
+repo-search-server.workspace = true
 kqueue = { version = "1.2.1", default-features = false }
 libc = { version = "0.2.191", default-features = false, features = ["std"] }
 notify = { version = "8.2.0", default-features = false, features = [
     "macos_fsevent",
 ] }
+tokenizers = { version = "0.23.2", default-features = false, features = ["fancy-regex"] }
+toml_edit = { version = "0.25.17", default-features = false, features = ["parse"] }
 
 [workspace.metadata.dist]
 cargo-dist-version = "0.33.0"

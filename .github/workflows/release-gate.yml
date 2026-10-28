@@ -36,7 +36,7 @@ jobs:
         id: model
         run: |
           set -euo pipefail
-          spec=src/model_store.rs
+          spec=core/src/model.rs
           url=$(sed -nE 's/^ *url: "([^"]+)".*/\1/p' "$spec" | head -1)
           sha256=$(sed -nE 's/^ *"([0-9a-f]{64})",? *$/\1/p' "$spec" | head -1)
           if [[ -z "$url" || -z "$sha256" ]]; then
@@ -132,7 +132,7 @@ jobs:
         id: model
         run: |
           set -euo pipefail
-          spec=src/model_store.rs
+          spec=core/src/model.rs
           url=$(sed -nE 's/^ *url: "([^"]+)".*/\1/p' "$spec" | head -1)
           sha256=$(sed -nE 's/^ *"([0-9a-f]{64})",? *$/\1/p' "$spec" | head -1)
           if [[ -z "$url" || -z "$sha256" ]]; then
@@ -178,7 +178,7 @@ jobs:
         env:
           REPO_SEARCH_CORPUS: ${{ runner.temp }}/corpora/waterui:${{ runner.temp }}/corpora/book
           REPO_SEARCH_MODEL_DIR: ${{ runner.temp }}/model
-        run: cargo test --locked --release -p repo-search-coreml --test cap -- --ignored
+        run: cargo test --locked --release -p repo-search --test cap -- --ignored
 
   daemon-model-tests:
     name: daemon model tests
@@ -198,7 +198,7 @@ jobs:
         id: model
         run: |
           set -euo pipefail
-          spec=src/model_store.rs
+          spec=core/src/model.rs
           url=$(sed -nE 's/^ *url: "([^"]+)".*/\1/p' "$spec" | head -1)
           sha256=$(sed -nE 's/^ *"([0-9a-f]{64})",? *$/\1/p' "$spec" | head -1)
           if [[ -z "$url" || -z "$sha256" ]]; then

@@ -16,3 +16,7 @@ git_tag_name = "core/v{{ version }}"
 [[package]]
 name = "repo-search-coreml"
 git_tag_name = "coreml/v{{ version }}"
+
+[[package]]
+name = "repo-search-server"
+git_tag_name = "server/v{{ version }}"

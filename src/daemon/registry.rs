@@ -10,17 +10,20 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Instant;
 
 use repo_search_core::StateDir;
 use repo_search_core::store::VectorCache;
 use tokio::sync::{mpsc, oneshot, watch};
 
-use super::model::ModelState;
+use super::counter::Tokens;
+use super::link::EmbeddingState;
 use super::scheduler::{RepoId, WorktreeId};
+use super::server::ServerClient;
 use super::worktree::{self, OwnerConfig, OwnerMsg};
 use super::writer::{self, WriterHandle};
-use super::{Backend, BusySource, Error};
+use super::{BusySource, Error};
 
 /// A repository's shared state: the vector cache and its writer task,
 /// opened lazily on the first `Search` or `Index` — a `Status` never
@@ -221,13 +224,13 @@ impl RegistryHandle {
 }
 
 /// What the registry needs to build owners and writers.
-pub struct RegistryConfig<B: Backend> {
+pub struct RegistryConfig<T: Tokens> {
     /// The daemon's state root, handed to every owner and shared cache.
     pub state: StateDir,
     /// The model-id vectors are stored under.
     pub model_id: String,
     /// The model readiness watch, handed to every owner.
-    pub model: watch::Receiver<ModelState<B>>,
+    pub model: watch::Receiver<EmbeddingState<T>>,
     /// Daemon start, handed to every owner.
     pub started: Instant,
     /// The shutdown watch, handed to every owner.
@@ -236,12 +239,15 @@ pub struct RegistryConfig<B: Backend> {
     pub busy: mpsc::Sender<BusySource>,
     /// The fatal channel, handed to every writer.
     pub fatal: mpsc::Sender<Error>,
-    /// Marker tying the config to `B`.
-    pub marker: std::marker::PhantomData<B>,
+    /// The embedding server's client; owners read `GET /status` through
+    /// it for the GPU report.
+    pub server: Arc<ServerClient>,
+    /// Marker tying the config to `T`.
+    pub marker: std::marker::PhantomData<T>,
 }
 
 /// Spawns the registry task and returns its handle.
-pub fn spawn<B: Backend>(config: RegistryConfig<B>) -> RegistryHandle {
+pub fn spawn<T: Tokens>(config: RegistryConfig<T>) -> RegistryHandle {
     let (tx, rx) = mpsc::channel(64);
     tokio::spawn(
         Registry {
@@ -258,7 +264,7 @@ pub fn spawn<B: Backend>(config: RegistryConfig<B>) -> RegistryHandle {
     RegistryHandle { tx }
 }
 
-struct Registry<B: Backend> {
+struct Registry<T: Tokens> {
     /// Owner entries by canonical worktree root.
     owners: HashMap<PathBuf, OwnerEntry>,
     /// Shared repository state by canonical git common dir.
@@ -268,11 +274,11 @@ struct Registry<B: Backend> {
     /// A self-handle, handed to owners for `DaemonStatus::worktrees` and
     /// `Forget`.
     handle: RegistryHandle,
-    config: RegistryConfig<B>,
+    config: RegistryConfig<T>,
     rx: mpsc::Receiver<RegistryMsg>,
 }
 
-impl<B: Backend> Registry<B> {
+impl<T: Tokens> Registry<T> {
     async fn run(mut self) {
         while let Some(msg) = self.rx.recv().await {
             match msg {
@@ -337,6 +343,7 @@ impl<B: Backend> Registry<B> {
                 registry: self.handle.clone(),
                 started: self.config.started,
                 stopping: self.config.stopping.clone(),
+                server: self.config.server.clone(),
             });
             self.owners.insert(
                 w.toplevel.clone(),

@@ -22,15 +22,25 @@ use std::time::Duration;
 
 use clap::Parser;
 use repo_search::cli::{self, Cli, Exit, Terminal};
+use repo_search::install::Plist;
 use repo_search::install::{self, AgentConfig, Check, Launchctl, SystemLaunchctl, ensure_agent};
 use repo_search::kqueue::ExitWatch;
-use repo_search::launchd::{LABEL, LaunchAgent};
+use repo_search::launchd::{LABEL, LaunchAgent, SERVER_LABEL, ServerAgent};
 use repo_search::protocol::{Final, Hello, Request};
 use repo_search_core::StateDir;
 
 /// The `search` binary the test agents run.
 fn program() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_search"))
+}
+
+/// A free TCP port for a test server agent, bound and released.
+fn server_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("a probe bind")
+        .local_addr()
+        .unwrap()
+        .port()
 }
 
 /// The handshake matching a daemon running `program` — the `search`
@@ -61,15 +71,16 @@ fn config(
         domain: repo_search::launchd::domain(),
         plist: dir.join("agent.plist"),
         lock: dir.join("install.lock"),
-        agent: LaunchAgent {
+        agent: Plist::Daemon(LaunchAgent {
             label: format!("{LABEL}.test-{}-{name}", std::process::id()),
             program,
             socket: dir.join("daemon.sock"),
+            server_socket: dir.join("server.sock"),
             idle_exit,
             model_cache: Some(model_cache),
             state_dir: Some(dir.join("state")),
             stderr: dir.join("daemon.log"),
-        },
+        }),
         timeouts: install::Timeouts {
             teardown: install::TEARDOWN_TIMEOUT,
             socket: install::SOCKET_TIMEOUT,
@@ -95,8 +106,8 @@ impl Agent {
 /// path — and returns once its socket is bound.
 fn agent(name: &str, tmp: tempfile::TempDir, model_cache: PathBuf, idle_exit: Duration) -> Agent {
     let config = config(name, tmp.path(), program(), model_cache, idle_exit);
-    let socket = config.agent.socket.clone();
-    let label = config.agent.label.clone();
+    let socket = config.agent.socket().to_path_buf();
+    let label = config.agent.label().to_owned();
     tokio::task::block_in_place(|| ensure_agent(&config, &mut SystemLaunchctl, Check::Fast))
         .expect("the agent installs");
     Agent {
@@ -243,9 +254,9 @@ async fn reinstall_waits_for_a_running_daemon() {
         model_cache,
         Duration::from_secs(600),
     );
-    let socket = config.agent.socket.clone();
+    let socket = config.agent.socket().to_path_buf();
     let agent = Agent {
-        label: config.agent.label.clone(),
+        label: config.agent.label().to_owned(),
         socket: socket.clone(),
         _tmp: tmp,
     };
@@ -272,7 +283,10 @@ async fn reinstall_waits_for_a_running_daemon() {
     // install replaces the agent.
     let copy = agent._tmp.path().join("search-copy");
     std::fs::copy(program(), &copy).expect("the binary copies");
-    config.agent.program = copy.clone();
+    let Plist::Daemon(daemon_agent) = &mut config.agent else {
+        unreachable!("the test config is a daemon agent")
+    };
+    daemon_agent.program = copy.clone();
     let outcome =
         tokio::task::block_in_place(|| ensure_agent(&config, &mut launchctl, Check::Fast))
             .expect("the reinstall succeeds without `Bootstrap failed: 5`");
@@ -309,8 +323,8 @@ async fn reinstall_of_an_idle_agent() {
         Duration::from_secs(600),
     );
     let agent = Agent {
-        label: config.agent.label.clone(),
-        socket: config.agent.socket.clone(),
+        label: config.agent.label().to_owned(),
+        socket: config.agent.socket().to_path_buf(),
         _tmp: tmp,
     };
     let mut launchctl = SystemLaunchctl;
@@ -321,7 +335,10 @@ async fn reinstall_of_an_idle_agent() {
 
     let copy = agent._tmp.path().join("search-copy");
     std::fs::copy(program(), &copy).expect("the binary copies");
-    config.agent.program = copy;
+    let Plist::Daemon(daemon_agent) = &mut config.agent else {
+        unreachable!("the test config is a daemon agent")
+    };
+    daemon_agent.program = copy;
     let outcome =
         tokio::task::block_in_place(|| ensure_agent(&config, &mut launchctl, Check::Fast))
             .expect("the reinstall of an idle agent succeeds without `Bootstrap failed: 5`");
@@ -347,8 +364,8 @@ async fn concurrent_installs_bootstrap_once() {
         Duration::from_secs(600),
     );
     let agent = Agent {
-        label: config.agent.label.clone(),
-        socket: config.agent.socket.clone(),
+        label: config.agent.label().to_owned(),
+        socket: config.agent.socket().to_path_buf(),
         _tmp: tmp,
     };
     let barrier = Arc::new(Barrier::new(2));
@@ -392,8 +409,36 @@ fn invocation(args: &[&str]) -> cli::Invocation {
 /// names — computed when the `Env` is built, so a replaced program yields
 /// a new `BuildId`.
 fn cli_env(cwd: &Path, config: AgentConfig, program: &Path) -> cli::Env<SystemLaunchctl> {
+    // The server agent installs for real beside the daemon's: a per-test
+    /// label and paths inside the config's own dir, `--build` naming the
+    /// test binary so a started server accepts it.
+    fn server_config(dir: &Path, program: &Path) -> AgentConfig {
+        AgentConfig {
+            domain: repo_search::launchd::domain(),
+            plist: dir.join("server-agent.plist"),
+            lock: dir.join("install.lock"),
+            agent: Plist::Server(ServerAgent {
+                label: format!("{SERVER_LABEL}.test-{}-cli", std::process::id()),
+                program: program.to_path_buf(),
+                socket: dir.join("server.sock"),
+                idle_exit: Duration::from_secs(600),
+                build: client::hello_for(program).build.to_string(),
+                model_cache: None,
+                token_file: None,
+                bind: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                port: server_port(),
+                stderr: dir.join("server.log"),
+            }),
+            timeouts: install::Timeouts {
+                teardown: install::TEARDOWN_TIMEOUT,
+                socket: install::SOCKET_TIMEOUT,
+            },
+        }
+    }
+    let dir = config.plist.parent().unwrap().parent().unwrap();
     cli::Env {
         cwd: cwd.to_path_buf(),
+        server_agent: server_config(dir, program),
         agent: config,
         launchctl: SystemLaunchctl,
         hello: hello(program),
@@ -428,8 +473,8 @@ async fn install_answers_through_cli_run() {
         Duration::from_secs(600),
     );
     let _agent = Agent {
-        label: config.agent.label.clone(),
-        socket: config.agent.socket.clone(),
+        label: config.agent.label().to_owned(),
+        socket: config.agent.socket().to_path_buf(),
         _tmp: tmp,
     };
 
@@ -475,9 +520,9 @@ async fn replaced_binary_restarts_the_daemon() {
             Duration::from_secs(600),
         )
     };
-    let socket = make_config().agent.socket;
+    let socket = make_config().agent.socket().to_path_buf();
     let agent = Agent {
-        label: make_config().agent.label,
+        label: make_config().agent.label().to_owned(),
         socket: socket.clone(),
         _tmp: tmp,
     };
@@ -546,19 +591,19 @@ async fn startup_failure_reaches_the_client() {
         tmp.path().join("models"),
         Duration::from_secs(600),
     );
-    let socket = config.agent.socket.clone();
+    let socket = config.agent.socket().to_path_buf();
     let agent_plist = askama::Template::render(&ListenerAgent {
-        label: config.agent.label.clone(),
+        label: config.agent.label().to_owned(),
         program: program(),
         sockets: vec![socket.clone(), tmp.path().join("second.sock")],
-        stderr: config.agent.stderr.clone(),
+        stderr: config.agent.stderr().to_path_buf(),
     })
     .expect("the template renders");
     std::fs::write(&config.plist, agent_plist).expect("the plist writes");
 
     let watch = DirWatch::register(tmp.path()).expect("the dir registers");
     let agent = Agent {
-        label: config.agent.label.clone(),
+        label: config.agent.label().to_owned(),
         socket: socket.clone(),
         _tmp: tmp,
     };
@@ -584,4 +629,110 @@ async fn startup_failure_reaches_the_client() {
         Err(other) => panic!("expected a Startup refusal, got {other:?}"),
         Ok(_) => panic!("expected a Startup refusal, the handshake succeeded"),
     }
+}
+
+/// The server agent's lifecycle: `ensure_agent` installs it, a unix
+/// connect makes launchd run `search --server`, the 3 s idle exit takes
+/// it down, the next connect relaunches a new pid, and a `--build`
+/// change replaces the agent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "real launchd; runs only where a developer opts in"]
+async fn server_agent_lifecycle() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let dir = tmp.path().to_path_buf();
+    let program = program();
+    let build = client::hello_for(&program).build.to_string();
+    let make_config = |label: &str, idle_exit: Duration| AgentConfig {
+        domain: repo_search::launchd::domain(),
+        plist: dir.join(format!("{label}.plist")),
+        lock: dir.join("install.lock"),
+        agent: Plist::Server(ServerAgent {
+            label: label.to_owned(),
+            program: program.clone(),
+            socket: dir.join("server.sock"),
+            idle_exit,
+            build: build.clone(),
+            model_cache: Some(dir.join("models")),
+            token_file: None,
+            bind: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            port: server_port(),
+            stderr: dir.join("server.log"),
+        }),
+        timeouts: install::Timeouts {
+            teardown: install::TEARDOWN_TIMEOUT,
+            socket: install::SOCKET_TIMEOUT,
+        },
+    };
+    let label = format!("{SERVER_LABEL}.test-{}", std::process::id());
+    let config = make_config(&label, Duration::from_secs(3));
+    let socket = config.agent.socket().to_path_buf();
+    let _agent = Agent {
+        label: label.clone(),
+        socket: socket.clone(),
+        _tmp: tmp,
+    };
+    let mut launchctl = SystemLaunchctl;
+    let outcome =
+        tokio::task::block_in_place(|| ensure_agent(&config, &mut launchctl, Check::Fast))
+            .expect("the server agent installs");
+    assert_eq!(outcome, install::Agent::Installed);
+
+    // A unix connect makes launchd start `search --server`.
+    let service = format!("{}/{}", repo_search::launchd::domain(), label);
+    let server_pid = |launchctl: &mut SystemLaunchctl| {
+        launchctl
+            .service(&service)
+            .ok()
+            .flatten()
+            .and_then(|s| s.pid)
+    };
+    std::os::unix::net::UnixStream::connect(&socket).expect("the unix connect lands");
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let first = loop {
+        if let Some(pid) = server_pid(&mut launchctl) {
+            break pid;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "launchd did not start the server"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+
+    // The idle exit takes it down; the next connect relaunches it.
+    let exited = tokio::task::block_in_place(|| {
+        ExitWatch::register(first)
+            .expect("the server's exit registers")
+            .wait(Duration::from_secs(30))
+    });
+    assert!(exited, "the server did not exit within 30 s of going idle");
+    std::os::unix::net::UnixStream::connect(&socket).expect("the reconnect lands");
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let second = loop {
+        if let Some(pid) = server_pid(&mut launchctl)
+            && pid != first
+        {
+            break pid;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "launchd did not relaunch the server"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert_ne!(first, second, "launchd did not start a replacement server");
+
+    // A `--build` change is a plist change: the agent is replaced.
+    let mut rebuilt = make_config(&label, Duration::from_secs(3));
+    let Plist::Server(server_agent) = &mut rebuilt.agent else {
+        unreachable!()
+    };
+    server_agent.build = "other-build".to_owned();
+    let outcome =
+        tokio::task::block_in_place(|| ensure_agent(&rebuilt, &mut launchctl, Check::Fast))
+            .expect("the rebuild replaces the agent");
+    assert_eq!(
+        outcome,
+        install::Agent::Replaced(install::Reason::PlistChanged)
+    );
 }

@@ -13,7 +13,6 @@ use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
-use repo_search::daemon::chip::ChipClass;
 use repo_search::daemon::{self, Config, Error};
 use repo_search::model_store::{ModelSpec, ModelStore};
 use repo_search::protocol::{self, ErrorKind, Event, Final, Request, WirePhase};
@@ -21,10 +20,12 @@ use repo_search_core::StateDir;
 use repo_search_core::qos::QosClass;
 use repo_search_core::store::{ContentHash, Index, VectorCache};
 use repo_search_coreml::GpuBlocked;
+use repo_search_server::chip::ChipClass;
+use repo_search_server::stub::{IndexGate, Instance, Kind, Record, StubBackend};
 use support::client::{final_event, final_of, hello, next_event, request, search, stream_request};
-use support::daemon::{Daemon, Model, daemon, digest_of, sha_7};
+use support::daemon::{Daemon, Model, daemon, digest_of, model_store, sha_7};
 use support::repo::{self, TestRepo};
-use support::stub::{HoldHandle, IndexGate, Instance, Kind, Record, StubBackend};
+use support::tokens::{HoldHandle, StubTokens};
 use tokio::net::UnixListener;
 
 const TIMEOUT: Duration = Duration::from_secs(60);
@@ -118,6 +119,7 @@ async fn start(
         tmp,
         backend,
         Model::Cached,
+        StubTokens::default(),
         Duration::from_secs(600),
         daemon::LOAD_BOUND,
     )
@@ -142,6 +144,7 @@ async fn start_index_gated(ane: Duration) -> (Daemon, Arc<IndexGate>) {
         tmp,
         backend,
         Model::Cached,
+        StubTokens::default(),
         Duration::from_secs(600),
         daemon::LOAD_BOUND,
     )
@@ -202,17 +205,19 @@ async fn query_preempts_indexing() {
     // simulation, not a wait for a signal.
     backend.set_delay(
         Instance::Ane,
-        support::stub::BUCKETS[2],
+        repo_search_server::stub::BUCKETS[2],
         Duration::from_secs(5),
     );
     let gate = backend.gate_first_index(Instance::Ane);
     // Once armed, holds the feeder's next token count: a feed found by the
     // search's barrier never reaches the scheduler while the search runs.
-    let feed = backend.hold_document_tokens();
+    let mut tokens = StubTokens::default();
+    let feed = tokens.hold_document_tokens();
     let d = daemon(
         tmp,
         backend,
         Model::Cached,
+        tokens,
         Duration::from_secs(600),
         daemon::LOAD_BOUND,
     )
@@ -236,7 +241,7 @@ async fn query_preempts_indexing() {
     // effective priority, but only to Utility — below the scheduler's own
     // lift, which the scheduler-level test asserts. The recorded (requested)
     // class stays Background.
-    let _lift = support::stub::lift_ane(&d.backend, QosClass::Utility);
+    let _lift = repo_search_server::stub::lift_ane(&d.backend, QosClass::Utility);
 
     // A new file with a new long function needs a vector: the one chunk
     // lands in the 512-token bucket the test slowed down, and the gate
@@ -299,7 +304,12 @@ async fn query_preempts_indexing() {
     log.extend(d.records.try_iter());
     let query = log
         .iter()
-        .find(|r| r.instance == Instance::Ane && r.kind == Kind::Query && r.start >= sent)
+        .find(|r| {
+            r.instance == Instance::Ane
+                && r.kind == Kind::Interactive
+                && r.hash.is_none()
+                && r.start >= sent
+        })
         .expect("the search's query embedding ran on the ANE");
     // The held call is the only index job in flight when the query arrives,
     // and nothing else can start before the query does: at most that call
@@ -327,7 +337,7 @@ async fn query_preempts_indexing() {
     assert_eq!(added.len(), 1, "the search's barrier added one chunk");
     let docs: Vec<&Record> = log
         .iter()
-        .filter(|r| r.kind == Kind::QueryDocument && r.start >= sent)
+        .filter(|r| r.kind == Kind::Interactive && r.hash.is_some() && r.start >= sent)
         .collect();
     assert_eq!(
         docs.iter().map(|r| r.hash).collect::<Vec<_>>(),
@@ -366,7 +376,9 @@ async fn gpu_takes_the_long_end_in_same_bucket_batches() {
         )
     }));
     let repo = repo::repo(&files);
-    // The ANE gate holds stage 1 open while the headroom lands.
+    // The ANE gate holds stage 1 open while the headroom lands. Its call
+    // is a filler of the test's own: the window's requests race each other
+    // to the server, so the GPU opens only once all of them are queued.
     let (d, ane_gate, _) = start(
         &repo,
         Duration::from_millis(20),
@@ -374,16 +386,19 @@ async fn gpu_takes_the_long_end_in_same_bucket_batches() {
         &[Instance::Ane],
     )
     .await;
+    let filler = d.filler(0).await;
+    let mut log: Vec<Record> = Vec::new();
+    wait_for(&mut log, &d.records, |r| r.kind == Kind::Started);
     let socket = d.socket.clone();
     let root = repo.root.clone();
     let query =
         tokio::spawn(async move { request(&socket, &hello(), search(&root, "long_0")).await });
-    // A Started record proves the daemon is up — its headroom callback is
-    // registered — so the push below lands.
-    let mut log: Vec<Record> = Vec::new();
-    wait_for(&mut log, &d.records, |r| r.kind == Kind::Started);
+    // The full window — 8 short and 24 long flights — and the query
+    // embedding are queued behind the filler.
+    d.await_server_queued(33).await;
     d.backend.push_headroom(Ok(()));
     open(&ane_gate);
+    filler.await.expect("the filler task does not panic");
     query.await.expect("the search task answers");
 
     // The GPU drops once stage-1 items are drained.
@@ -411,7 +426,12 @@ async fn gpu_takes_the_long_end_in_same_bucket_batches() {
         }
     }
     for batch in &batches {
-        let bucket = |t: usize| support::stub::BUCKETS.iter().find(|&&b| t <= b).unwrap();
+        let bucket = |t: usize| {
+            repo_search_server::stub::BUCKETS
+                .iter()
+                .find(|&&b| t <= b)
+                .unwrap()
+        };
         assert!(
             batch
                 .iter()
@@ -436,8 +456,7 @@ async fn gpu_takes_the_long_end_in_same_bucket_batches() {
     );
 
     assert!(
-        !gpu.iter()
-            .any(|r| matches!(r.kind, Kind::Query | Kind::QueryDocument)),
+        !gpu.iter().any(|r| r.kind == Kind::Interactive),
         "no query record ever comes from the GPU"
     );
 }
@@ -463,9 +482,7 @@ async fn no_gpu_on_battery() {
     let mut log: Vec<Record> = Vec::new();
     while log
         .iter()
-        .filter(|r| {
-            r.instance == Instance::Ane && matches!(r.kind, Kind::Index | Kind::QueryDocument)
-        })
+        .filter(|r| r.instance == Instance::Ane && r.hash.is_some())
         .count()
         < 101
     {
@@ -501,16 +518,21 @@ async fn gpu_released_on_power_loss() {
         &[Instance::Ane, Instance::Gpu],
     )
     .await;
-    // Drive the first barrier; the ANE Started record proves the daemon's
-    // headroom callback is registered before we push.
-    let socket = d.socket.clone();
-    let root = repo.root.clone();
-    let query =
-        tokio::spawn(async move { request(&socket, &hello(), search(&root, "long_0")).await });
+    // The gated ANE call is a filler of the test's own: the window's
+    // requests race each other to the server, so the GPU opens only once
+    // all of them are queued and its first batch is 8 of the longs.
+    let filler = d.filler(0).await;
     let mut log = Vec::new();
     wait_for(&mut log, &d.records, |r| {
         r.instance == Instance::Ane && r.kind == Kind::Started
     });
+    // Drive the first barrier.
+    let socket = d.socket.clone();
+    let root = repo.root.clone();
+    let query =
+        tokio::spawn(async move { request(&socket, &hello(), search(&root, "long_0")).await });
+    // The full window and the query embedding are queued behind it.
+    d.await_server_queued(33).await;
     d.backend.push_headroom(Ok(()));
     wait_for(&mut log, &d.records, |r| {
         r.instance == Instance::Gpu && r.kind == Kind::Started
@@ -532,6 +554,7 @@ async fn gpu_released_on_power_loss() {
 
     // Indexing continues on the ANE.
     open(&ane_gate);
+    filler.await.expect("the filler task does not panic");
     query.await.expect("the search task answers");
     let dropped_start = log[dropped].start;
     wait_for(&mut log, &d.records, |r| {
@@ -556,7 +579,10 @@ async fn stage_2_runs_at_background_qos() {
             repo::rust_fn(&format!("longitem{i}"), LONG_BYTES),
         ));
     }
-    files.extend((0..30).map(|i| {
+    // 31 chunks: the daemon's whole in-flight window, so the server holds
+    // all of stage 1 at once and its normal queue empties only when stage
+    // 1 has nothing left — no refill can wake the GPU after its drop.
+    files.extend((0..23).map(|i| {
         (
             format!("src/s{i}.rs"),
             repo::rust_fn(&format!("smallitem{i}"), SMALL_BYTES),
@@ -564,22 +590,19 @@ async fn stage_2_runs_at_background_qos() {
     }));
     let repo = repo::repo(&files);
     // The GPU's first call is gated: it takes exactly one batch while the
-    // ANE works the 30 small items through stage-1 completion.
-    let (d, _, gpu_gate) = start(
+    // ANE works the 23 small items through stage-1 completion. The ANE's
+    // first call is gated too, and taken by a filler of the test's own:
+    // the window's requests race each other to the server, so the GPU
+    // opens only once all of them are queued.
+    let (d, ane_gate, gpu_gate) = start(
         &repo,
         Duration::from_millis(10),
         Duration::ZERO,
-        &[Instance::Gpu],
+        &[Instance::Ane, Instance::Gpu],
     )
     .await;
-    let socket = d.socket.clone();
-    let root = repo.root.clone();
-    // The query matches nothing, so no chunk is embedded on the spot.
-    let query =
-        tokio::spawn(async move { request(&socket, &hello(), search(&root, "nomatchterm")).await });
+    let filler = d.filler(0).await;
     let mut log: Vec<Record> = Vec::new();
-    // The daemon is up once the ANE's first record lands; the headroom push
-    // after it reaches a registered callback.
     wait_for(&mut log, &d.records, |r| {
         r.instance == Instance::Ane && r.kind == Kind::Started
     });
@@ -587,11 +610,21 @@ async fn stage_2_runs_at_background_qos() {
     // Background work, which a loaded host can starve: lift the thread's
     // effective priority for the run — its requested class stays
     // Background.
-    let _lift = support::stub::lift_ane(&d.backend, QosClass::UserInitiated);
+    let _lift = repo_search_server::stub::lift_ane(&d.backend, QosClass::UserInitiated);
+    let socket = d.socket.clone();
+    let root = repo.root.clone();
+    // The query matches nothing, so no chunk is embedded on the spot.
+    let query =
+        tokio::spawn(async move { request(&socket, &hello(), search(&root, "nomatchterm")).await });
+    // Every chunk and the query embedding are queued behind the filler.
+    d.await_server_queued(32).await;
+    // The GPU's first pull takes the long end: the 8 longs.
     d.backend.push_headroom(Ok(()));
     wait_for(&mut log, &d.records, |r| {
         r.instance == Instance::Gpu && r.kind == Kind::Started
     });
+    open(&ane_gate);
+    filler.await.expect("the filler task does not panic");
     query.await.expect("the search task answers");
     open(&gpu_gate);
 
@@ -680,6 +713,7 @@ async fn search_answers_during_index_wait() {
         tmp,
         backend,
         Model::Cached,
+        StubTokens::default(),
         Duration::from_secs(600),
         daemon::LOAD_BOUND,
     )
@@ -910,7 +944,7 @@ async fn fsevents_change_is_embedded_in_background() {
     // Background QoS, which a loaded host can starve: lift the thread's
     // effective priority for the run — its requested class stays
     // Background.
-    let _lift = support::stub::lift_ane(&d.backend, QosClass::UserInitiated);
+    let _lift = repo_search_server::stub::lift_ane(&d.backend, QosClass::UserInitiated);
     // Every pending chunk is stage-1 class while the phase is first-index,
     // so `index --wait` waits only on UserInitiated work — never starved —
     // and the phase flips to maintained before it answers.
@@ -979,6 +1013,7 @@ async fn idle_exit() {
         tmp,
         backend,
         Model::Cached,
+        StubTokens::default(),
         Duration::from_secs(2),
         daemon::LOAD_BOUND,
     )
@@ -1013,6 +1048,7 @@ async fn idle_exit() {
         tmp,
         backend,
         Model::Cached,
+        StubTokens::default(),
         Duration::from_secs(2),
         daemon::LOAD_BOUND,
     )
@@ -1071,6 +1107,7 @@ async fn protocol_mismatch_shuts_down() {
         tmp,
         StubBackend::new(mpsc::channel().0),
         Model::Cached,
+        StubTokens::default(),
         Duration::from_secs(600),
         daemon::LOAD_BOUND,
     )
@@ -1099,6 +1136,7 @@ async fn build_mismatch_shuts_down() {
         tmp,
         StubBackend::new(mpsc::channel().0),
         Model::Cached,
+        StubTokens::default(),
         Duration::from_secs(600),
         daemon::LOAD_BOUND,
     )
@@ -1137,38 +1175,34 @@ async fn shutdown_during_open_ane_joins_the_thread() {
         tmp,
         backend,
         Model::Cached,
+        StubTokens::default(),
         Duration::from_secs(600),
         daemon::LOAD_BOUND,
     )
     .await;
 
-    // The ANE thread is inside `open_ane` when the shutdown begins.
+    // The server's ANE thread is inside `open_ane` when the shutdown
+    // begins; the daemon is mid-probe, so the cancel cuts its wait — the
+    // daemon does not join the server's threads.
     tokio::task::block_in_place(|| {
         hold.entered
             .recv_timeout(TIMEOUT)
             .expect("open_ane is entered")
     });
     mismatched_hello(&d.socket, &next_protocol());
-    tokio::task::block_in_place(|| hold.open());
-
-    // `open_ane` returns a live embedder; the pipeline stop pulls `Stop`
-    // on it, so its `Drop` record precedes the loader's shutdown reply,
-    // which precedes `run` returning.
-    let mut log: Vec<Record> = Vec::new();
-    wait_for(&mut log, &d.records, |r| {
-        r.instance == Instance::Ane && r.kind == Kind::Dropped
-    });
     tokio::time::timeout(TIMEOUT, d.join)
         .await
-        .expect("run returns once the ANE thread is joined")
+        .expect("run returns while the server is still loading")
         .expect("run task does not panic")
         .expect("a mismatch shutdown is clean");
+    tokio::task::block_in_place(|| hold.open());
 }
 
-/// A shutdown during a gated download cancels `ensure`: `run` returns and
-/// no `<sha>/` model directory is left behind.
+/// A shutdown while the server downloads answers the waiting request
+/// `ShuttingDown`: the daemon's probe wait is cancelled and `run`
+/// returns, leaving the download to the server.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn shutdown_during_download_leaves_no_model_dir() {
+async fn shutdown_during_server_download_answers_shutting_down() {
     let body = support::http::archive(&[("manifest.json", b"{}")]);
     let (release_tx, release) = mpsc::channel();
     let (url, server) = support::http::serve_gated(body.len() as u64, body.clone(), release);
@@ -1180,6 +1214,7 @@ async fn shutdown_during_download_leaves_no_model_dir() {
             url,
             sha: digest_of(&body),
         },
+        StubTokens::default(),
         Duration::from_secs(600),
         daemon::LOAD_BOUND,
     )
@@ -1215,13 +1250,9 @@ async fn shutdown_during_download_leaves_no_model_dir() {
     server.join().expect("the gated server exits");
     tokio::time::timeout(TIMEOUT, d.join)
         .await
-        .expect("run returns after cancelling the download")
+        .expect("run returns after cancelling the probe wait")
         .expect("run task does not panic")
         .expect("a mismatch shutdown is clean");
-    assert!(
-        !d.model_dir.exists(),
-        "a cancelled download leaves no model directory"
-    );
 }
 
 /// A client that hangs up mid-barrier does not leak it: the barrier still
@@ -1231,13 +1262,15 @@ async fn shutdown_during_download_leaves_no_model_dir() {
 async fn dropped_client_still_completes_the_barrier() {
     let repo = fn_repo(20, SMALL_BYTES, 10);
     let tmp = tempfile::tempdir().expect("tempdir");
-    let mut backend = StubBackend::new(mpsc::channel().0);
+    let backend = StubBackend::new(mpsc::channel().0);
     // The counter is called inside `reconcile`, which the barrier awaits.
-    let hold = backend.hold_counter();
+    let mut tokens = StubTokens::default();
+    let hold = tokens.hold_counter();
     let d = daemon(
         tmp,
         backend,
         Model::Cached,
+        tokens,
         Duration::from_secs(1),
         daemon::LOAD_BOUND,
     )
@@ -1276,6 +1309,7 @@ async fn silent_client_dropped_at_hello_deadline() {
         tmp,
         StubBackend::new(mpsc::channel().0),
         Model::Cached,
+        StubTokens::default(),
         Duration::from_secs(1),
         daemon::LOAD_BOUND,
     )
@@ -1299,7 +1333,8 @@ async fn silent_client_dropped_at_hello_deadline() {
 }
 
 /// An `open_ane` failure on a verified archive is fatal: the request is
-/// answered `Model`, `run` returns the error and nothing is retried.
+/// answered `Model`, the server's `run` returns the error and nothing is
+/// retried.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fatal_open_ane_fails_the_request() {
     let repo = fn_repo(5, SMALL_BYTES, 10);
@@ -1314,6 +1349,7 @@ async fn fatal_open_ane_fails_the_request() {
         tmp,
         backend,
         Model::Cached,
+        StubTokens::default(),
         Duration::from_secs(600),
         daemon::LOAD_BOUND,
     )
@@ -1345,18 +1381,20 @@ async fn fatal_open_ane_fails_the_request() {
             _ => {}
         }
     }
-    let outcome = tokio::time::timeout(TIMEOUT, d.join)
+    // The model load is the server's: the fatal failure is its run's
+    // error, and its `Fatal` state honors no `Retry`.
+    let outcome = tokio::time::timeout(TIMEOUT, d.server)
         .await
-        .expect("run returns after the fatal load failure")
-        .expect("run task does not panic");
+        .expect("the server's run returns after the fatal load failure")
+        .expect("the server task does not panic");
     assert!(
-        matches!(outcome, Err(Error::Embedder(_))),
-        "the fatal failure is run's error: {outcome:?}"
+        matches!(outcome, Err(repo_search_server::Error::Embedder(_))),
+        "the fatal failure is the server's run error: {outcome:?}"
     );
     assert_eq!(backend.ane_opens(), 1, "a fatal open_ane is never retried");
 }
 
-/// An `open_ane` that outlives the load bound is answered `Model` with the
+/// An `open_ane` that outlives the load bound is answered `Fatal` and the
 /// stage it stopped in — a final error frame, not a silent timeout — and
 /// shuts the daemon down without a retry.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1372,6 +1410,7 @@ async fn load_past_the_bound_fails_with_the_stage() {
         tmp,
         backend,
         Model::Cached,
+        StubTokens::default(),
         Duration::from_secs(600),
         Duration::from_secs(2),
     )
@@ -1386,8 +1425,8 @@ async fn load_past_the_bound_fails_with_the_stage() {
             _ => {}
         }
     }
-    // `entered` proves the thread is inside `open_ane`, so the stage is
-    // the model open, not the warm-up.
+    // `entered` proves the server is inside `open_ane`, so the daemon is
+    // probing a not-ready model and the bound is what ends the wait.
     tokio::task::block_in_place(|| {
         hold.entered
             .recv_timeout(TIMEOUT)
@@ -1397,28 +1436,29 @@ async fn load_past_the_bound_fails_with_the_stage() {
         Final::Error(report) => {
             assert_eq!(report.kind, ErrorKind::Model);
             assert!(
-                report.message.contains("model open"),
-                "the timeout names the stage it stopped in: {}",
+                report.message.contains("bound"),
+                "the timeout names the bound it stopped at: {}",
                 report.message
             );
         }
         other => panic!("expected a Model error, got {other:?}"),
     }
     // The fatal failure takes the daemon down; releasing the parked call
-    // lets the ANE thread exit instead of leaking into the test runtime.
+    // lets the server's ANE thread exit instead of leaking into the test
+    // runtime.
     tokio::task::block_in_place(|| hold.open());
     let outcome = tokio::time::timeout(TIMEOUT, d.join)
         .await
         .expect("run returns after the load timed out")
         .expect("run task does not panic");
     assert!(
-        matches!(outcome, Err(Error::Embedder(_))),
-        "the timed-out load is run's fatal error: {outcome:?}"
+        matches!(outcome, Err(Error::Server(_))),
+        "the timed-out link is run's fatal error: {outcome:?}"
     );
     assert_eq!(
         backend.ane_opens(),
         1,
-        "a load past the bound is never retried"
+        "a link past the bound never probes again"
     );
 }
 
@@ -1437,6 +1477,7 @@ async fn model_download_streams_progress() {
             url,
             sha: digest_of(&body),
         },
+        StubTokens::default(),
         Duration::from_secs(600),
         daemon::LOAD_BOUND,
     )
@@ -1471,6 +1512,10 @@ async fn model_download_streams_progress() {
 async fn corrupt_model_download_is_rejected() {
     let good = support::http::archive(&[("manifest.json", b"{}")]);
     let corrupt = support::http::archive(&[("manifest.json", b"corrupted")]);
+    // Three bodies: the first two fail the sha, so the `Failed` the
+    // probe answers after them is still standing when the request
+    // re-probes; the server's retry on that probe fetches the third,
+    // correct one.
     let (url, server) = support::http::serve_sequence(vec![
         ("200 OK", corrupt.len() as u64, corrupt.clone()),
         ("200 OK", corrupt.len() as u64, corrupt.clone()),
@@ -1485,6 +1530,7 @@ async fn corrupt_model_download_is_rejected() {
             url,
             sha: digest_of(&good),
         },
+        StubTokens::default(),
         Duration::from_secs(600),
         daemon::LOAD_BOUND,
     )
@@ -1515,6 +1561,189 @@ async fn corrupt_model_download_is_rejected() {
         "the retry is answered"
     );
     server.join().unwrap();
+}
+
+/// `search status` while the server loads: the daemon's `ModelStatus`
+/// carries the server's `GET /status` download and load detail — first
+/// `Downloading` with the received bytes, then `Loading` once the
+/// archive is verified and the model open is underway.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_status_reports_server_loading_detail() {
+    let body = support::http::archive(&[("manifest.json", b"{}")]);
+    let (release_tx, release) = mpsc::channel();
+    let (url, server) = support::http::serve_gated(body.len() as u64, body.clone(), release);
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let mut backend = StubBackend::new(mpsc::channel().0);
+    // `open_ane` is held once the download finishes, so the Loading stage
+    // is observable rather than racing by.
+    let hold = backend.hold_open_ane();
+    let d = daemon(
+        tmp,
+        backend,
+        Model::Served {
+            url,
+            sha: digest_of(&body),
+        },
+        StubTokens::default(),
+        Duration::from_secs(600),
+        daemon::LOAD_BOUND,
+    )
+    .await;
+    let repo = fn_repo(5, SMALL_BYTES, 10);
+
+    // The gated body is half-written when the server stalls: the probe's
+    // `/status` poll publishes `Downloading` within a couple of rounds.
+    let status = loop {
+        let events = request(
+            &d.socket,
+            &hello(),
+            Request::Status {
+                worktree: repo.root.clone(),
+            },
+        )
+        .await;
+        match final_of(&events).clone() {
+            Final::Status(status) => match status.model {
+                protocol::ModelStatus::Downloading { received, total } if received > 0 => {
+                    assert_eq!(total, Some(body.len() as u64));
+                    break status;
+                }
+                _ => {}
+            },
+            other => panic!("expected a Status, got {other:?}"),
+        }
+    };
+    assert!(
+        matches!(
+            status.daemon.gpu,
+            protocol::GpuStatus::Absent { .. } | protocol::GpuStatus::Loading
+        ),
+        "the server reports its GPU state through the link: {:?}",
+        status.daemon.gpu
+    );
+
+    let _ = release_tx.send(());
+    tokio::task::block_in_place(|| {
+        hold.entered
+            .recv_timeout(TIMEOUT)
+            .expect("open_ane is entered")
+    });
+    loop {
+        let events = request(
+            &d.socket,
+            &hello(),
+            Request::Status {
+                worktree: repo.root.clone(),
+            },
+        )
+        .await;
+        match final_of(&events) {
+            Final::Status(status) if matches!(status.model, protocol::ModelStatus::Loading) => {
+                break;
+            }
+            Final::Status(_) => {}
+            other => panic!("expected a Status, got {other:?}"),
+        }
+    }
+    tokio::task::block_in_place(|| hold.open());
+    server.join().expect("the gated server exits");
+}
+
+/// A daemon whose server socket answers nothing fails the request `Model`
+/// once the link gives up: the connect error is the failure, not a hang.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_daemon_with_an_unreachable_server_fails_the_request_with_model() {
+    let repo = fn_repo(5, SMALL_BYTES, 10);
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let socket = tmp.path().join("daemon.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket).expect("socket binds");
+    let join = support::daemon::spawn_on(
+        &tokio::runtime::Handle::current(),
+        listener,
+        support::daemon::Setup {
+            tokens: StubTokens::default(),
+            server: repo_search::daemon::server::Endpoint::Unix(tmp.path().join("no-server.sock")),
+            model_id: sha_7().hex(),
+            state: StateDir::new(tmp.path().join("state")),
+            idle_exit: Duration::from_secs(600),
+            load_bound: daemon::LOAD_BOUND,
+            build: support::client::build(),
+        },
+    );
+
+    let events = request(&socket, &hello(), search(&repo.root, MARKER)).await;
+    match final_of(&events) {
+        Final::Error(report) => {
+            assert_eq!(report.kind, ErrorKind::Model);
+            assert!(
+                !report.message.is_empty(),
+                "the error names the transport failure"
+            );
+        }
+        other => panic!("expected a Model error, got {other:?}"),
+    }
+    join.abort();
+}
+
+/// A server that answers `/v1/models` with a different model than the
+/// daemon expects is fatal: the request is answered `Model` naming the
+/// mismatch and `run` returns the error.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_model_id_mismatch_is_fatal() {
+    let repo = fn_repo(5, SMALL_BYTES, 10);
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let socket = tmp.path().join("daemon.sock");
+    let server_socket = tmp.path().join("server.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket).expect("socket binds");
+    let server_listener =
+        std::os::unix::net::UnixListener::bind(&server_socket).expect("server socket binds");
+    let runtime = tokio::runtime::Handle::current();
+    let _server = support::daemon::spawn_server_on(
+        &runtime,
+        server_listener,
+        support::daemon::ServerSetup {
+            model_store: model_store(tmp.path().join("models"), &Model::Cached),
+            chip: ChipClass::Wide,
+            backend: Arc::new(StubBackend::new(mpsc::channel().0)),
+            idle_exit: Duration::from_secs(600),
+            load_bound: repo_search_server::LOAD_BOUND,
+        },
+    );
+    let join = support::daemon::spawn_on(
+        &runtime,
+        listener,
+        support::daemon::Setup {
+            tokens: StubTokens::default(),
+            server: repo_search::daemon::server::Endpoint::Unix(server_socket),
+            // Not the stub server's id: the probe's list cannot contain it.
+            model_id: "ff".repeat(64),
+            state: StateDir::new(tmp.path().join("state")),
+            idle_exit: Duration::from_secs(600),
+            load_bound: daemon::LOAD_BOUND,
+            build: support::client::build(),
+        },
+    );
+
+    let events = request(&socket, &hello(), search(&repo.root, MARKER)).await;
+    match final_of(&events) {
+        Final::Error(report) => {
+            assert_eq!(report.kind, ErrorKind::Model);
+            assert!(
+                report.message.contains("expects"),
+                "the error names the id the daemon expects: {}",
+                report.message
+            );
+        }
+        other => panic!("expected a Model error, got {other:?}"),
+    }
+    let outcome = tokio::time::timeout(TIMEOUT, join)
+        .await
+        .expect("run returns on the mismatch")
+        .expect("run task does not panic");
+    assert!(
+        matches!(outcome, Err(Error::Server(_))),
+        "the mismatch is run's fatal error: {outcome:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1554,6 +1783,7 @@ async fn status_does_not_create_an_index() {
         tmp,
         StubBackend::new(mpsc::channel().0),
         Model::Cached,
+        StubTokens::default(),
         Duration::from_secs(600),
         daemon::LOAD_BOUND,
     )
@@ -1645,6 +1875,8 @@ async fn worktrees_and_repositories_get_separate_index_files() {
 #[derive(serde::Serialize, serde::Deserialize)]
 struct HostConfig {
     socket: PathBuf,
+    /// The socket the host's stub server binds and the daemon probes.
+    server_socket: PathBuf,
     model_cache: PathBuf,
     state_dir: PathBuf,
     ane_delay_ms: u64,
@@ -1697,17 +1929,29 @@ async fn daemon_host() {
         sha256: sha_7(),
     };
     let store = ModelStore::new(config.model_cache, spec).expect("model store");
+    std::fs::create_dir_all(store.dir()).expect("the host's model dir");
     let listener = UnixListener::bind(&config.socket).expect("socket binds");
+    let server_listener = UnixListener::bind(&config.server_socket).expect("server socket binds");
+    tokio::spawn(repo_search_server::run(repo_search_server::Config {
+        unix: server_listener,
+        tcp: Vec::new(),
+        token: None,
+        idle_exit: Duration::from_secs(3600),
+        load_bound: repo_search_server::LOAD_BOUND,
+        model: store,
+        chip: ChipClass::Wide,
+        backend: Arc::new(backend),
+    }));
     // The harness left its `test ... ` prefix unterminated on this line.
     println!("\nREADY");
     daemon::run(Config {
         listener,
         idle_exit: Duration::from_secs(3600),
         load_bound: daemon::LOAD_BOUND,
-        model_store: store,
+        tokens: StubTokens::default(),
+        server: repo_search::daemon::server::Endpoint::Unix(config.server_socket),
+        model_id: repo_search_core::model::MODEL_ID.to_owned(),
         state: StateDir::new(config.state_dir),
-        chip: ChipClass::Wide,
-        backend: Arc::new(backend),
         build: support::client::build(),
     })
     .await
@@ -1904,10 +2148,11 @@ async fn sigterm_answers_in_flight_and_flushes() {
     };
     let store = ModelStore::new(model_cache.clone(), spec).expect("model store");
     std::fs::create_dir_all(store.dir()).expect("cached model dir");
-    let model_id = store.model_id();
+    let model_id = repo_search_core::model::MODEL_ID.to_owned();
 
     let mut host = Host::spawn(&HostConfig {
         socket: tmp.path().join("daemon.sock"),
+        server_socket: tmp.path().join("server.sock"),
         model_cache,
         state_dir: tmp.path().join("state"),
         ane_delay_ms: 5,
@@ -1982,9 +2227,10 @@ async fn kill_mid_index_resumes() {
     };
     let store = ModelStore::new(model_cache.clone(), spec).expect("model store");
     std::fs::create_dir_all(store.dir()).expect("cached model dir");
-    let model_id = store.model_id();
+    let model_id = repo_search_core::model::MODEL_ID.to_owned();
     let host_config = |sock: &str| HostConfig {
         socket: tmp.path().join(sock),
+        server_socket: tmp.path().join(format!("{sock}-server.sock")),
         model_cache: model_cache.clone(),
         state_dir: tmp.path().join("state"),
         ane_delay_ms: 5,
@@ -2136,6 +2382,7 @@ fn host_exits_when_its_parent_is_killed() {
     std::fs::create_dir_all(store.dir()).expect("cached model dir");
     let mut parent = Intermediate::spawn(&HostConfig {
         socket: tmp.path().join("daemon.sock"),
+        server_socket: tmp.path().join("server.sock"),
         model_cache,
         state_dir: tmp.path().join("state"),
         ane_delay_ms: 0,
@@ -2215,53 +2462,64 @@ async fn a_no_change_search_reads_no_pending_file() {
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn background_work_follows_edits_and_deletions() {
-    let repo = fn_repo(40, SMALL_BYTES, 10);
+    // 31 chunks: the daemon's whole in-flight window, so every one is
+    // queued on the server and the queue depth below tells the deletion's
+    // cancels apart from refills.
+    let repo = fn_repo(30, SMALL_BYTES, 10);
     let (d, gate) = start_index_gated(Duration::from_millis(10)).await;
     gate.arm();
-
-    let events = request(&d.socket, &hello(), lexical(&repo.root, MARKER)).await;
-    assert!(
-        matches!(final_of(&events), Final::Answer(a) if a.has_results),
-        "{events:?}"
-    );
-    // The held item is the first in index order, a chunk of f0.
+    // The window's requests race each other to the server, and the idle
+    // ANE takes whichever lands first, so a filler of the test's own takes
+    // the gated call: the gate then holds no chunk of the window.
+    let filler = d.filler(3).await;
     let mut log: Vec<Record> = Vec::new();
     wait_held(&mut log, &d.records);
     // The edit's chunks embed at background QoS once the phase flips, which
     // a loaded host can starve: lift the thread's effective priority for
     // the run — its requested class stays Background. The Held record
     // proves `open_ane` has published the thread.
-    let _lift = support::stub::lift_ane(&d.backend, QosClass::UserInitiated);
+    let _lift = repo_search_server::stub::lift_ane(&d.backend, QosClass::UserInitiated);
+
+    let events = request(&d.socket, &hello(), lexical(&repo.root, MARKER)).await;
+    assert!(
+        matches!(final_of(&events), Final::Answer(a) if a.has_results),
+        "{events:?}"
+    );
+    d.await_server_queued(31).await;
 
     repo::append(
         &repo.root,
         "src/f1.rs",
         &repo::rust_fn("added_while_held", SMALL_BYTES),
     );
-    std::fs::remove_file(repo.root.join("src/f3.rs")).unwrap();
+    std::fs::remove_file(repo.root.join("src/f2.rs")).unwrap();
 
     let events = request(&d.socket, &hello(), lexical(&repo.root, "added_while_held")).await;
     assert!(
         matches!(final_of(&events), Final::Answer(a) if a.has_results),
         "{events:?}"
     );
+    // f2's requests were aborted while queued on the server and the
+    // appended chunk's was sent: 31 - 10 + 1.
+    d.await_server_queued(22).await;
 
     // The wait's first `Coverage` is sent only once its own `Enqueue` is
     // in the scheduler's inbox — and the feeder applies feeds in order, so
-    // the search's `Change` is in by then. The held item keeps `remaining`
-    // above 0, so the first loop iteration reports right away.
+    // the search's `Change` is in by then. The queued items keep
+    // `remaining` above 0, so the first loop iteration reports right away.
     let mut wait = support::model::index_wait(&d.socket, &hello(), &repo.root).await;
     support::model::await_coverage(&mut wait, 0).await;
     gate.open();
+    filler.await.expect("the filler task does not panic");
     match final_event(&mut wait).await {
         Final::Indexed { with_vector, total } => {
             assert_eq!(with_vector, total, "every chunk has a vector");
-            assert_eq!(total, 32, "41 chunks - f3's 10 + the appended fn");
+            assert_eq!(total, 22, "31 chunks - f2's 10 + the appended fn");
         }
         other => panic!("expected Indexed, got {other:?}"),
     }
 
-    // Every surviving chunk was embedded exactly once; f3's chunks never
+    // Every surviving chunk was embedded exactly once; f2's chunks never
     // were. Watcher passes may interleave the searches' barriers — every
     // interleaving must give this result.
     let final_hashes: HashSet<ContentHash> = Index::open(&d.state, &repo.root)
@@ -2272,11 +2530,19 @@ async fn background_work_follows_edits_and_deletions() {
         .expect("chunk hashes")
         .into_iter()
         .collect();
-    let embedded: Vec<ContentHash> = d
+    let (documents, fillers): (Vec<Record>, Vec<Record>) = d
         .records
         .try_iter()
         .filter(|r| r.kind == Kind::Index)
-        .map(|r| r.hash.expect("an Index record carries a hash"))
+        .partition(|r| r.hash.is_some());
+    assert_eq!(
+        fillers.len(),
+        1,
+        "the filler is the one Index record without a hash"
+    );
+    let embedded: Vec<ContentHash> = documents
+        .iter()
+        .map(|r| r.hash.expect("partitioned on the hash"))
         .collect();
     let embedded_set: HashSet<ContentHash> = embedded.iter().copied().collect();
     assert_eq!(embedded.len(), embedded_set.len(), "no hash embedded twice");
@@ -2287,7 +2553,7 @@ async fn background_work_follows_edits_and_deletions() {
 async fn an_include_ignored_search_and_a_plain_one_resync_the_scope() {
     // The vendored functions' longer names give their chunks more
     // `StubCounter` tokens than the `fn_NNNN` chunks, so shortest-first
-    // dispatch holds a `src` chunk at the gate.
+    // dispatch reaches them last.
     let mut files = Vec::new();
     for f in 0..2 {
         let mut body = String::new();
@@ -2312,6 +2578,12 @@ async fn an_include_ignored_search_and_a_plain_one_resync_the_scope() {
 
     let (d, gate) = start_index_gated(Duration::from_millis(10)).await;
     gate.arm();
+    // The window's requests race each other to the server, and the idle
+    // ANE takes whichever lands first, so a filler of the test's own takes
+    // the gated call: the gate then holds no chunk of the window.
+    let filler = d.filler(3).await;
+    let mut log: Vec<Record> = Vec::new();
+    wait_held(&mut log, &d.records);
 
     let mut ignored = lexical(&repo.root, MARKER);
     let Request::Search(inner) = &mut ignored else {
@@ -2323,16 +2595,18 @@ async fn an_include_ignored_search_and_a_plain_one_resync_the_scope() {
         matches!(final_of(&events), Final::Answer(a) if a.has_results),
         "{events:?}"
     );
-    let mut log: Vec<Record> = Vec::new();
-    wait_held(&mut log, &d.records);
+    // Every chunk — 21 of src, 10 vendored — is queued behind the filler.
+    d.await_server_queued(31).await;
 
-    // The scope flip resyncs: the vendored chunks leave the interest before
-    // any dispatch, the held item being a src chunk.
+    // The scope flip resyncs: the vendored chunks leave the interest, and
+    // their requests are aborted while queued on the server.
     let events = request(&d.socket, &hello(), lexical(&repo.root, MARKER)).await;
     assert!(
         matches!(final_of(&events), Final::Answer(a) if a.has_results),
         "{events:?}"
     );
+    // The cancels landed: only the src chunks are left queued.
+    d.await_server_queued(21).await;
 
     // Same ordering: the first `Coverage` puts the wait's feed — and so,
     // FIFO, the scope-false `Resync` — into the scheduler before the gate
@@ -2340,6 +2614,7 @@ async fn an_include_ignored_search_and_a_plain_one_resync_the_scope() {
     let mut wait = support::model::index_wait(&d.socket, &hello(), &repo.root).await;
     support::model::await_coverage(&mut wait, 0).await;
     gate.open();
+    filler.await.expect("the filler task does not panic");
     match final_event(&mut wait).await {
         Final::Indexed { with_vector, total } => {
             assert_eq!(with_vector, total, "every chunk has a vector")
@@ -2383,11 +2658,13 @@ async fn start_feed_held(ane: Duration) -> (Daemon, Arc<IndexGate>, HoldHandle) 
     let mut backend = StubBackend::new(mpsc::channel().0);
     backend.set_instance_delay(Instance::Ane, ane);
     let gate = backend.gate_first_index(Instance::Ane);
-    let hold = backend.hold_document_tokens();
+    let mut tokens = StubTokens::default();
+    let hold = tokens.hold_document_tokens();
     let d = daemon(
         tmp,
         backend,
         Model::Cached,
+        tokens,
         Duration::from_secs(600),
         daemon::LOAD_BOUND,
     )
@@ -2441,7 +2718,7 @@ fn coverage_frames(events: &[Event]) -> usize {
 fn embeds(log: &mut Vec<Record>, records: &mpsc::Receiver<Record>) -> Vec<(Kind, ContentHash)> {
     log.extend(records.try_iter());
     log.iter()
-        .filter(|r| matches!(r.kind, Kind::Index | Kind::QueryDocument))
+        .filter(|r| r.hash.is_some())
         .map(|r| (r.kind, r.hash.expect("a document record carries a hash")))
         .collect()
 }
@@ -2478,7 +2755,7 @@ async fn a_scope_flip_resync_skips_chunks_finished_while_it_was_held() {
     // Its `Replace` is in and the ANE holds the first item.
     let mut log: Vec<Record> = Vec::new();
     wait_held(&mut log, &d.records);
-    let _lift = support::stub::lift_ane(&d.backend, QosClass::UserInitiated);
+    let _lift = repo_search_server::stub::lift_ane(&d.backend, QosClass::UserInitiated);
 
     // The plain `index` flips the scope back: a `Resync`, held after its
     // `missing` read saw nothing cached. The flips are ordered this way so
@@ -2538,7 +2815,7 @@ async fn a_second_worktrees_first_resync_skips_chunks_finished_while_it_was_held
     // The main worktree's `Replace` is in, its first item held.
     let mut log: Vec<Record> = Vec::new();
     wait_held(&mut log, &d.records);
-    let _lift = support::stub::lift_ane(&d.backend, QosClass::UserInitiated);
+    let _lift = repo_search_server::stub::lift_ane(&d.backend, QosClass::UserInitiated);
 
     // The linked worktree's first barrier is a `Resync`, held after its
     // `missing` read saw nothing cached.
@@ -2604,7 +2881,7 @@ async fn a_change_skips_chunks_another_worktree_embedded_while_it_was_held() {
     let before = visible_hashes(&d.state, &repo.root).await;
     let mut log: Vec<Record> = Vec::new();
     // The work from here runs at background QoS.
-    let _lift = support::stub::lift_ane(&d.backend, QosClass::UserInitiated);
+    let _lift = repo_search_server::stub::lift_ane(&d.backend, QosClass::UserInitiated);
 
     // The linked worktree's `Change` is held after its reconcile read saw
     // the new chunk uncached.
@@ -2648,7 +2925,7 @@ async fn a_change_skips_chunks_a_search_embedded_while_it_was_held() {
     index_request(&d, &repo.root, true).await;
     let before = visible_hashes(&d.state, &repo.root).await;
     let mut log: Vec<Record> = Vec::new();
-    let _lift = support::stub::lift_ane(&d.backend, QosClass::UserInitiated);
+    let _lift = repo_search_server::stub::lift_ane(&d.backend, QosClass::UserInitiated);
 
     // The edit's `Change` is held after its reconcile read saw the new
     // chunk uncached.
@@ -2694,7 +2971,7 @@ async fn a_change_skips_chunks_a_search_embedded_while_it_was_held() {
     assert_eq!(
         embedded
             .iter()
-            .filter(|(kind, hash)| *kind == Kind::QueryDocument && hash == new)
+            .filter(|(kind, hash)| *kind == Kind::Interactive && hash == new)
             .count(),
         1,
         "the new chunk embedded exactly once, on the spot: {embedded:?}"

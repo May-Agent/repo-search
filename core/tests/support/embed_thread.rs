@@ -1,4 +1,4 @@
-//! A blocking [`Embedder`] on a thread of its own, as an [`EmbedService`].
+//! A blocking encoder on a thread of its own, as an [`EmbedService`].
 
 use std::io;
 use std::thread;
@@ -9,13 +9,37 @@ use repo_search_core::qos::{QosClass, set_current_thread};
 use repo_search_core::reconcile::PendingChunk;
 use repo_search_core::search::EmbedService;
 use repo_search_core::store::{ContentHash, VectorCache};
-use repo_search_core::{Embedder, QueryTask, UnitVector};
+use repo_search_core::{QueryTask, UnitVector};
 
 /// A test embedder thread that exits early is a test bug.
 const GONE: &str = "the embedder thread exited";
 
 /// Bound on the request queue.
 const QUEUE: usize = 16;
+
+/// The blocking encoder the thread runs: calls block, so the thread owns
+/// them and sets its QoS.
+pub trait BlockingEmbed: Send + 'static {
+    /// The encoder's failure.
+    type Error: std::error::Error + Send + Sync + 'static;
+
+    /// Identifies the model build; vectors with different ids never mix.
+    fn model_id(&self) -> &str;
+
+    /// Embeds the document `text` under `title`.
+    ///
+    /// # Errors
+    ///
+    /// When the encoder fails.
+    fn document(&mut self, title: &str, text: &str) -> Result<UnitVector, Self::Error>;
+
+    /// Embeds `text` as a `task` query.
+    ///
+    /// # Errors
+    ///
+    /// When the encoder fails.
+    fn query(&mut self, task: QueryTask, text: &str) -> Result<UnitVector, Self::Error>;
+}
 
 enum Request<Err> {
     Query {
@@ -31,14 +55,14 @@ enum Request<Err> {
 
 /// Handle to the embedder thread. Requests queue in order; a request whose
 /// future is dropped is still run, and its answer discarded.
-pub struct EmbedThread<E: Embedder> {
+pub struct EmbedThread<E: BlockingEmbed> {
     tx: mpsc::Sender<Request<E::Error>>,
     model: String,
     /// Where `documents` commits its vectors.
     cache: VectorCache,
 }
 
-impl<E: Embedder + Send + 'static> EmbedThread<E> {
+impl<E: BlockingEmbed> EmbedThread<E> {
     /// Moves `embedder` onto a new thread, which exits when the handle
     /// drops; `documents` commits into `cache`.
     pub fn spawn(mut embedder: E, cache: VectorCache) -> io::Result<Self> {
@@ -51,13 +75,13 @@ impl<E: Embedder + Send + 'static> EmbedThread<E> {
                 while let Some(request) = rx.blocking_recv() {
                     match request {
                         Request::Query { task, text, reply } => {
-                            let _ = reply.send(embedder.embed_query(task, &text));
+                            let _ = reply.send(embedder.query(task, &text));
                         }
                         Request::Documents { chunks, reply } => {
                             let _ = reply.send(
                                 chunks
                                     .iter()
-                                    .map(|c| embedder.embed_document(&c.title, &c.text))
+                                    .map(|c| embedder.document(&c.title, &c.text))
                                     .collect(),
                             );
                         }
@@ -68,7 +92,7 @@ impl<E: Embedder + Send + 'static> EmbedThread<E> {
     }
 }
 
-impl<E: Embedder + Send + 'static> EmbedService for EmbedThread<E> {
+impl<E: BlockingEmbed> EmbedService for EmbedThread<E> {
     type Error = E::Error;
 
     fn model_id(&self) -> &str {

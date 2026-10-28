@@ -1,15 +1,13 @@
 //! The `search` daemon: the embedding pipeline and, behind it, the model
 //! loader, the worktree registry and the socket server.
 
-pub mod ane;
-pub mod chip;
-pub mod coreml;
+pub mod counter;
 pub mod coverage;
 pub mod feed;
-pub mod gpu;
-pub mod model;
+pub mod link;
 pub mod registry;
 pub mod scheduler;
+pub mod server;
 pub mod watch;
 pub mod worktree;
 pub mod writer;
@@ -22,104 +20,29 @@ use std::time::{Duration, Instant};
 
 use futures_util::SinkExt;
 use futures_util::stream::StreamExt;
-use repo_search_core::{BatchEmbedder, Embedder, StateDir, TokenCounter};
-use repo_search_coreml::GpuBlocked;
+use repo_search_core::StateDir;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::codec::LinesCodecError;
 
-use crate::model_store::ModelStore;
 use crate::protocol::{
     self, BuildId, ErrorKind, ErrorReport, Event, Final, Hello, PROTOCOL, Progress, Request, framed,
 };
 
-use chip::ChipClass;
-use model::{LoaderMsg, ModelState};
+use counter::Tokens;
+use link::{EmbeddingState, LoaderMsg};
 use registry::{GetError, RegistryHandle};
+use server::{Endpoint, ServerClient};
 use worktree::OwnerMsg;
-
-/// Host headroom for the GPU embedder: `Ok(())` when the GPU instance may run.
-pub type Headroom = Result<(), GpuBlocked>;
-
-/// The counter for chunking and queue ordering, with the model's bucket
-/// lengths in ascending order.
-pub type CounterLoad<C, E> = Result<(C, Box<[usize]>), E>;
-
-/// The model backend behind the daemon's embedding pipeline.
-///
-/// The seam that lets the scheduler-level tests run every component against a
-/// stub embedder. Production is [`coreml::CoreMlBackend`].
-pub trait Backend: Send + Sync + 'static {
-    /// The single-chunk instance on the ANE thread, shared by queries and
-    /// indexing.
-    type Ane: Embedder + Send + 'static;
-    /// The batch instance on the GPU thread; serves indexing only — stage
-    /// 1 on a wide-class chip, the background queue on a base one.
-    type Gpu: BatchEmbedder + Send + 'static;
-    /// Counts the model's tokens for chunking and queue ordering.
-    type Counter: TokenCounter + 'static;
-    /// The backend's model-load failure.
-    type LoadError: std::error::Error + Send + Sync + 'static;
-    /// The headroom monitor's guard; dropping it stops the monitor.
-    type Monitor: Send + 'static;
-
-    /// The counter for chunking and queue ordering, and the model's bucket
-    /// lengths, ascending.
-    ///
-    /// # Errors
-    ///
-    /// When the model directory cannot be read.
-    fn load_counter(&self, dir: &Path) -> CounterLoad<Self::Counter, Self::LoadError>;
-
-    /// Opens the ANE instance; called on the ANE thread, which owns the
-    /// returned embedder. Implementations warm every bucket before returning
-    /// so the first query does not pay a compile. `stage` is already `Open`
-    /// on entry; an implementation sends [`LoadStage::WarmUp`] once the
-    /// model is open and the warm-up embeds begin, so a load that outlives
-    /// the bound names the stage it stopped in.
-    ///
-    /// # Errors
-    ///
-    /// When the model cannot be loaded.
-    fn open_ane(
-        &self,
-        dir: &Path,
-        model_id: &str,
-        stage: &tokio::sync::watch::Sender<LoadStage>,
-    ) -> Result<Self::Ane, Self::LoadError>;
-
-    /// Opens the GPU instance; called on the GPU thread, which owns the
-    /// returned embedder.
-    ///
-    /// # Errors
-    ///
-    /// [`GpuOpen::Blocked`] when the host has no GPU headroom — the headroom
-    /// may have changed between the check and the open — and
-    /// [`GpuOpen::Failed`] for every other load failure, which is fatal.
-    fn open_gpu(&self, dir: &Path, model_id: &str) -> Result<Self::Gpu, GpuOpen<Self::LoadError>>;
-
-    /// Calls `on_change` once with the current headroom, then on every
-    /// power-source or thermal change.
-    fn watch_headroom(&self, on_change: Box<dyn Fn(Headroom) + Send + Sync>) -> Self::Monitor;
-}
-
-/// The outcome of opening the GPU instance.
-#[derive(Debug)]
-pub enum GpuOpen<E> {
-    /// The host refuses the GPU instance right now: not fatal, retry later.
-    Blocked(GpuBlocked),
-    /// The model could not be loaded: fatal.
-    Failed(E),
-}
 
 /// A failure that shuts the daemon down. Delivered to `run` over the fatal
 /// channel every component shares.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    /// An [`Embedder`] or [`BatchEmbedder`] call, or an `open_gpu`, failed.
-    /// There is no retry and no fallback to the other instance.
-    #[error("embedder failed: {0}")]
-    Embedder(String),
+    /// An embed request to the embedding server failed past its retry,
+    /// or the server answered a non-2xx status.
+    #[error("embedding server failed: {0}")]
+    Server(String),
     /// A writer's `put_many` failed.
     #[error("vector writer failed: {0}")]
     Writer(String),
@@ -141,12 +64,12 @@ pub enum StartupError {
     /// The running binary could not be identified.
     #[error("could not identify the running binary: {0}")]
     Build(#[source] io::Error),
-    /// The model cache could not be opened.
+    /// The tokenizer cache could not be opened.
     #[error("could not open the model cache: {0}")]
     ModelStore(#[source] crate::model_store::Error),
-    /// The host's chip class could not be decided.
-    #[error("could not determine the host's chip class: {0}")]
-    Chip(#[source] chip::Error),
+    /// The server client could not be built.
+    #[error("could not build the embedding server client: {0}")]
+    ServerClient(#[source] reqwest::Error),
     /// The state directory could not be resolved.
     #[error("could not resolve the state directory: {0}")]
     StateDir(#[source] io::Error),
@@ -217,36 +140,10 @@ const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 /// The daemon exits after this long with no connections and no work.
 pub const IDLE_EXIT: Duration = Duration::from_secs(600);
 
-/// The model load — counter, open and warm-up — must report within this
-/// long. A cache-hit open takes seconds; a miss pays the system's ANE
-/// compile, which is unbounded under contention and was observed past
-/// 180 s. The bound is generous enough for a cold compile on a slow host
-/// while still failing a wedged load instead of waiting on it forever.
-pub const LOAD_BOUND: Duration = Duration::from_secs(300);
-
-/// Where the ANE thread's load is, reported over `AneThread`'s `stage`
-/// watch so a load that outlives [`LOAD_BOUND`] names the stage it stopped
-/// in.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LoadStage {
-    /// `load_counter` is reading the tokenizer and the manifest.
-    Counter,
-    /// `open_ane` is inside the compiled-model open — the ANE compile when
-    /// the system's compiled-model cache misses.
-    Open,
-    /// The model is open; the per-bucket warm-up embeds are running.
-    WarmUp,
-}
-
-impl std::fmt::Display for LoadStage {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Self::Counter => "the counter load",
-            Self::Open => "the model open",
-            Self::WarmUp => "the bucket warm-up",
-        })
-    }
-}
+/// The bound on one link attempt — the tokenizer download plus the wait
+/// for the server to report the model ready: the server's own load bound
+/// plus slack for the tokenizer fetch and the probe round trips.
+pub const LOAD_BOUND: Duration = Duration::from_secs(repo_search_server::LOAD_BOUND.as_secs() + 30);
 
 /// A busy-source registration for the idle-exit tracker. Each source owns
 /// its `watch::Sender<bool>` — state, not transitions, so nothing is lost —
@@ -257,26 +154,27 @@ pub struct BusySource {
 }
 
 /// The daemon's configuration.
-pub struct Config<B: Backend> {
+pub struct Config<T: Tokens> {
     /// The socket to accept on; launchd's in production, a bound one in
     /// tests.
     pub listener: UnixListener,
     /// Exit after this long with no connections and no work.
     pub idle_exit: Duration,
-    /// Fail the model load past this bound, naming the stage it stopped
-    /// in; [`LOAD_BOUND`] in production.
+    /// Fail the link — tokenizer download plus the server-readiness wait
+    /// — past this bound; [`LOAD_BOUND`] in production.
     pub load_bound: Duration,
-    /// The model cache; the loader starts `ensure` at once.
-    pub model_store: ModelStore,
+    /// The tokenizer source the link's `load` starts on at once.
+    pub tokens: T,
+    /// Where the embedding server listens; `--server-socket` in
+    /// production.
+    pub server: Endpoint,
+    /// The model-id vectors are stored under and the server is expected
+    /// to list; `MODEL_ID` in production, the stub server's in tests.
+    pub model_id: String,
     /// The daemon's state root: the per-worktree indexes and the
     /// per-repository vector caches live under it, never under a
     /// worktree.
     pub state: StateDir,
-    /// The host's chip class, read once at startup: on a base chip the GPU
-    /// instance takes no stage-1 work.
-    pub chip: ChipClass,
-    /// The embedding backend.
-    pub backend: Arc<B>,
     /// The identity of the executable file this process runs; a `Hello`
     /// naming another build is a `ProtocolMismatch`.
     pub build: BuildId,
@@ -299,7 +197,7 @@ enum ConnMsg {
 /// the embedding threads' pulls with `Stop`), then awaits the writer
 /// tasks: with every `WriterHandle` dropped, each writer's close-flush
 /// commits the buffered vectors. The connection tasks are awaited last.
-pub async fn run<B: Backend>(config: Config<B>) -> Result<(), Error> {
+pub async fn run<T: Tokens>(config: Config<T>) -> Result<(), Error> {
     // The signal stream exists before anything is spawned: a failure here
     // leaves nothing to shut down.
     let mut signal = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
@@ -316,16 +214,16 @@ pub async fn run<B: Backend>(config: Config<B>) -> Result<(), Error> {
     let (busy_tx, mut busy_rx) = busy_channel();
     let (stopping_tx, stopping_rx) = tokio::sync::watch::channel(false);
     let (conn_tx, mut conn_rx) = mpsc::channel::<ConnMsg>(64);
-    let backend = config.backend;
     let build = config.build;
-    let model_id = config.model_store.model_id();
 
-    // Headroom monitor: the callback may run on any thread.
-    let (headroom_tx, headroom_rx) =
-        tokio::sync::watch::channel(Err(GpuBlocked::PowerSourceUnknown));
-    let _monitor = backend.watch_headroom(Box::new(move |h| {
-        let _ = headroom_tx.send_replace(h);
-    }));
+    let server = match ServerClient::new(&config.server) {
+        Ok(client) => Arc::new(client),
+        Err(error) => {
+            let error = StartupError::ServerClient(error);
+            refuse(config.listener.into_std()?, &error).await;
+            return Err(error.into());
+        }
+    };
 
     let (loader_busy_tx, loader_busy_rx) = tokio::sync::watch::channel(false);
     busy_tx
@@ -334,24 +232,24 @@ pub async fn run<B: Backend>(config: Config<B>) -> Result<(), Error> {
         })
         .await
         .expect("the busy aggregator outlives run");
-    let loader = model::spawn(model::LoaderConfig {
-        backend,
-        store: Arc::new(config.model_store),
+    let loader = link::spawn(link::LinkConfig {
+        tokens: config.tokens,
+        server: server.clone(),
+        model_id: config.model_id.clone(),
         bound: config.load_bound,
-        chip: config.chip,
-        headroom: headroom_rx,
         busy: loader_busy_tx,
         busy_reg: busy_tx.clone(),
         fatal: fatal_tx.clone(),
     });
     let registry = registry::spawn(registry::RegistryConfig {
         state: config.state,
-        model_id,
+        model_id: config.model_id,
         model: loader.state.clone(),
         started,
         stopping: stopping_rx.clone(),
         busy: busy_tx.clone(),
         fatal: fatal_tx.clone(),
+        server,
         marker: std::marker::PhantomData,
     });
 
@@ -517,9 +415,9 @@ fn busy_channel() -> (mpsc::Sender<BusySource>, tokio::sync::watch::Receiver<boo
 
 /// One connection: the handshake, the one request, then events until the
 /// `Final` frame.
-async fn connection<B: Backend>(
+async fn connection<T: Tokens>(
     stream: UnixStream,
-    model: tokio::sync::watch::Receiver<ModelState<B>>,
+    model: tokio::sync::watch::Receiver<EmbeddingState<T>>,
     loader: mpsc::Sender<LoaderMsg>,
     registry: RegistryHandle,
     stopping: tokio::sync::watch::Receiver<bool>,
@@ -531,9 +429,9 @@ async fn connection<B: Backend>(
     let _ = conn.send(end).await;
 }
 
-async fn serve<B: Backend>(
+async fn serve<T: Tokens>(
     framed: &mut protocol::Connection,
-    model: &tokio::sync::watch::Receiver<ModelState<B>>,
+    model: &tokio::sync::watch::Receiver<EmbeddingState<T>>,
     loader: &mpsc::Sender<LoaderMsg>,
     registry: &RegistryHandle,
     stopping: &tokio::sync::watch::Receiver<bool>,
@@ -692,9 +590,9 @@ enum ModelWait {
 
 /// Waits out the model load, streaming progress, sending the loader a
 /// `Retry` once on the first `Failed`.
-async fn await_model<B: Backend>(
+async fn await_model<T: Tokens>(
     framed: &mut protocol::Connection,
-    model: &tokio::sync::watch::Receiver<ModelState<B>>,
+    model: &tokio::sync::watch::Receiver<EmbeddingState<T>>,
     loader: &mpsc::Sender<LoaderMsg>,
     stopping: &tokio::sync::watch::Receiver<bool>,
 ) -> ModelWait {
@@ -709,14 +607,16 @@ async fn await_model<B: Backend>(
             Fatal(String),
         }
         let snap = match &*model.borrow_and_update() {
-            ModelState::Ready(_) => Snap::Ready,
-            ModelState::Absent | ModelState::Loading => Snap::Send(Progress::ModelLoading),
-            ModelState::Downloading { received, total } => Snap::Send(Progress::ModelDownload {
-                received: *received,
-                total: *total,
-            }),
-            ModelState::Failed(message) => Snap::Failed(message.clone()),
-            ModelState::Fatal(message) => Snap::Fatal(message.clone()),
+            EmbeddingState::Ready(_) => Snap::Ready,
+            EmbeddingState::Absent | EmbeddingState::Loading => Snap::Send(Progress::ModelLoading),
+            EmbeddingState::Downloading { received, total } => {
+                Snap::Send(Progress::ModelDownload {
+                    received: *received,
+                    total: *total,
+                })
+            }
+            EmbeddingState::Failed(message) => Snap::Failed(message.clone()),
+            EmbeddingState::Fatal(message) => Snap::Fatal(message.clone()),
         };
         match snap {
             Snap::Ready => return ModelWait::Ready,
@@ -748,7 +648,7 @@ async fn await_model<B: Backend>(
                 // error: `Fatal` precedes the fatal channel, which precedes
                 // `stopping`, so it is always already there.
                 let message = match &*model.borrow() {
-                    ModelState::Fatal(message) => Some(message.clone()),
+                    EmbeddingState::Fatal(message) => Some(message.clone()),
                     _ => None,
                 };
                 match message {

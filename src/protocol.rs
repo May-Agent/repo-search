@@ -17,7 +17,7 @@ use tokio::net::UnixStream;
 use tokio_util::codec::{Framed, LinesCodec};
 
 /// Wire format version, bumped whenever a wire type changes.
-pub const PROTOCOL: u32 = 3;
+pub const PROTOCOL: u32 = 4;
 
 /// The largest frame a peer may send, in bytes.
 pub const MAX_FRAME: usize = 64 << 20;
@@ -408,20 +408,9 @@ pub struct DaemonStatus {
     pub gpu: GpuStatus,
 }
 
-/// The GPU embedding instance's state.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum GpuStatus {
-    /// No GPU instance exists.
-    Absent {
-        /// Why it cannot be created, when the check has run.
-        blocked: Option<String>,
-    },
-    /// Being created (a multi-second cold start).
-    Loading,
-    /// Embedding stage-1 index work.
-    Running,
-}
+/// The GPU embedding instance's state: core's `embed_api` carries the
+/// same type for the embedding server's `/status`.
+pub use repo_search_core::embed_api::GpuStatus;
 
 #[cfg(test)]
 mod tests {

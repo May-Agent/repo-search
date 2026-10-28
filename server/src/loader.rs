@@ -1,7 +1,7 @@
 //! The model loader: download, load, and the readiness watch.
 //!
 //! One task owns `watch::Sender<ModelState>` and runs the load sequence:
-//! [`ModelStore::ensure`], then the ANE thread — which loads the counter
+//! [`ModelSource::ensure`], then the ANE thread — which loads the encoder
 //! and opens the model off the executor — and the scheduler, publishing
 //! [`ModelState::Ready`] once the thread reports its embedder open. A
 //! failure publishes [`ModelState::Failed`]; a request that finds it sends
@@ -21,12 +21,28 @@ use std::time::Duration;
 
 use tokio::sync::{mpsc, oneshot, watch};
 
-use crate::model_store::{Fetch, ModelStore};
+use repo_search_core::model::Fetch;
 
-use super::ane;
-use super::chip::ChipClass;
-use super::scheduler::{self, STAGE1_MAX_TOKENS, SchedulerHandle};
-use super::{Backend, BusySource, Error, Headroom, LoadStage};
+use crate::BusySource;
+use crate::ane;
+use crate::backend::{Backend, Headroom, LoadStage};
+use crate::chip::ChipClass;
+use crate::scheduler::{self, SchedulerHandle};
+
+/// A model cache the loader downloads from. `ModelStore` in the main
+/// crate implements it; tests hand a directory back directly.
+pub trait ModelSource: Send + Sync + 'static {
+    /// The model build's identity: the archive sha256, `MODEL_ID` on the
+    /// wire.
+    fn model_id(&self) -> String;
+
+    /// The unpacked model directory, downloading it on first use.
+    /// `progress` receives a [`Fetch`] after each downloaded chunk.
+    fn ensure(
+        &self,
+        progress: &watch::Sender<Fetch>,
+    ) -> impl Future<Output = Result<PathBuf, String>> + Send;
+}
 
 /// Where the model is on its way to readiness.
 pub enum ModelState<B: Backend> {
@@ -39,26 +55,28 @@ pub enum ModelState<B: Backend> {
         /// The server's declared length, when known.
         total: Option<u64>,
     },
-    /// The archive is verified; the counter and the ANE instance are loading.
+    /// The archive is verified; the encoder and the ANE instance are
+    /// loading. The stage `/status` reports rides the loader's `stage`
+    /// watch.
     Loading,
     /// Ready to embed.
     Ready(Arc<Model<B>>),
     /// Download or load failed; a request finding it sends
     /// [`LoaderMsg::Retry`].
     Failed(String),
-    /// The load failed fatally — `open_ane` on a verified archive — and the
-    /// daemon is shutting down. No `Retry` is honored after this.
+    /// The load failed fatally — `open_ane` on a verified archive — and
+    /// the server is shutting down. No `Retry` is honored after this.
     Fatal(String),
 }
 
 /// The loaded model and the pipeline built on it.
 pub struct Model<B: Backend> {
-    /// The archive sha256; names vectors in the cache.
+    /// The archive sha256; `MODEL_ID` on the wire.
     pub id: String,
     /// The unpacked model directory.
     pub dir: PathBuf,
-    /// The model's token counter, shared with the barrier and the budget.
-    pub counter: Arc<B::Counter>,
+    /// The model's text encoder, shared by every request task.
+    pub encoder: Arc<B::Encoder>,
     /// The model's bucket lengths, ascending.
     pub buckets: Box<[usize]>,
     /// The embedding scheduler the model's pipeline runs on.
@@ -77,10 +95,14 @@ pub enum LoaderMsg {
     },
 }
 
-/// The loader's handle: the readiness watch and the inbox.
+/// The loader's handle: the readiness watch, the load-stage watch and the
+/// inbox.
 pub struct Loader<B: Backend> {
     /// The model's current state.
     pub state: watch::Receiver<ModelState<B>>,
+    /// The ANE pipeline's `open_ane` stage while `state` is `Loading` —
+    /// `/status` reports it verbatim.
+    pub stage: watch::Receiver<LoadStage>,
     /// The loader's inbox sender.
     pub tx: mpsc::Sender<LoaderMsg>,
 }
@@ -109,8 +131,8 @@ type Attempt<B> = Result<(Arc<Model<B>>, Pipeline), LoadFail>;
 enum LoadFail {
     /// The download was cancelled by a shutdown; no thread ever existed.
     Cancelled,
-    /// A download, verification, counter or bucket failure: `Failed`, and a
-    /// request may retry.
+    /// A download, verification, encoder or bucket failure: `Failed`, and
+    /// a request may retry.
     Retryable {
         /// The error text.
         message: String,
@@ -138,16 +160,16 @@ impl LoadFail {
 }
 
 /// What the loader is built from.
-pub struct LoaderConfig<B: Backend> {
+pub struct LoaderConfig<B: Backend, M: ModelSource> {
     /// The embedding backend.
     pub backend: Arc<B>,
-    /// The model cache; `ensure` starts at once.
-    pub store: Arc<ModelStore>,
-    /// The cap on the wait for the ANE thread's `counted` and `loaded`
+    /// The model source; `ensure` starts at once.
+    pub model: Arc<M>,
+    /// The cap on the wait for the ANE thread's `encoded` and `loaded`
     /// reports: a load past it fails fatally with the stage it stopped in.
     pub bound: Duration,
     /// The host's chip class, handed to the scheduler: a base chip keeps
-    /// the GPU off stage-1 work.
+    /// the GPU off normal work.
     pub chip: ChipClass,
     /// Host headroom for the GPU instance.
     pub headroom: watch::Receiver<Headroom>,
@@ -156,22 +178,26 @@ pub struct LoaderConfig<B: Backend> {
     /// Where busy sources register with the idle-exit tracker.
     pub busy_reg: mpsc::Sender<BusySource>,
     /// Fatal errors go to `run` here.
-    pub fatal: mpsc::Sender<Error>,
+    pub fatal: mpsc::Sender<String>,
+    /// The GPU state `/status` reports, handed to the scheduler.
+    pub gpu_state: watch::Sender<crate::scheduler::GpuState>,
 }
 
 /// Spawns the loader task; it starts the load sequence at once.
-pub fn spawn<B: Backend>(config: LoaderConfig<B>) -> Loader<B> {
+pub fn spawn<B: Backend, M: ModelSource>(config: LoaderConfig<B, M>) -> Loader<B> {
     let LoaderConfig {
         backend,
-        store,
+        model,
         bound,
         chip,
         headroom,
         busy,
         busy_reg,
         fatal,
+        gpu_state,
     } = config;
     let (state_tx, state) = watch::channel(ModelState::Absent);
+    let (stage_tx, stage) = watch::channel(LoadStage::Encoder);
     let (tx, mut rx) = mpsc::channel::<LoaderMsg>(64);
     tokio::spawn(async move {
         let mut join: Option<tokio::task::JoinHandle<Attempt<B>>>;
@@ -190,14 +216,16 @@ pub fn spawn<B: Backend>(config: LoaderConfig<B>) -> Loader<B> {
                 join = Some(tokio::spawn(load(
                     LoadParts {
                         backend: backend.clone(),
-                        store: store.clone(),
+                        model: model.clone(),
                         bound,
                         chip,
                         fetch: fetch_tx.clone(),
                         headroom: headroom.clone(),
                         busy_reg: busy_reg.clone(),
                         fatal: fatal.clone(),
+                        gpu_state: gpu_state.clone(),
                         state: state_tx.clone(),
+                        stage: stage_tx.clone(),
                     },
                     cancel_rx,
                 )));
@@ -254,11 +282,21 @@ pub fn spawn<B: Backend>(config: LoaderConfig<B>) -> Loader<B> {
                     }
                 },
                 changed = fetch_rx.changed(), if join.is_some() => {
+                    // The state moves forward only: a `Fetch` landing
+                    // after the attempt sent `Loading` must not push it
+                    // back to `Downloading`.
                     if changed.is_ok() {
                         let fetch = *fetch_rx.borrow();
-                        let _ = state_tx.send(ModelState::Downloading {
-                            received: fetch.received,
-                            total: fetch.total,
+                        state_tx.send_if_modified(|state| {
+                            let ModelState::Downloading { received, total } = state else {
+                                return false;
+                            };
+                            if *received == fetch.received && *total == fetch.total {
+                                return false;
+                            }
+                            *received = fetch.received;
+                            *total = fetch.total;
+                            true
                         });
                     }
                 }
@@ -292,13 +330,13 @@ pub fn spawn<B: Backend>(config: LoaderConfig<B>) -> Loader<B> {
                     busy.send_replace(false);
                     let _ = state_tx.send(state);
                     if let Some(message) = fatal_message {
-                        let _ = fatal.send(Error::Embedder(message)).await;
+                        let _ = fatal.send(message).await;
                     }
                 }
             }
         }
     });
-    Loader { state, tx }
+    Loader { state, stage, tx }
 }
 
 /// Stops an attempt's scheduler — whose `Stop` answers the embedding
@@ -320,15 +358,11 @@ fn retryable(message: String, pipeline: Option<Pipeline>) -> LoadFail {
     LoadFail::Retryable { message, pipeline }
 }
 
-/// One load attempt: `ensure`, then the ANE thread — which loads the
-/// counter and opens the model — then the scheduler, whose inbox the
-/// thread is handed. Returns the model with the threads' exit signals, or
-/// the failure with the half-built pipeline for the caller to stop.
 /// What one load attempt is built from: the pieces shared across retries.
-struct LoadParts<B: Backend> {
+struct LoadParts<B: Backend, M: ModelSource> {
     backend: Arc<B>,
-    store: Arc<ModelStore>,
-    /// The cap on the wait for the ANE thread's `counted` and `loaded`
+    model: Arc<M>,
+    /// The cap on the wait for the ANE thread's `encoded` and `loaded`
     /// reports.
     bound: Duration,
     /// The host's chip class, handed to the scheduler.
@@ -336,43 +370,82 @@ struct LoadParts<B: Backend> {
     fetch: watch::Sender<Fetch>,
     headroom: watch::Receiver<Headroom>,
     busy_reg: mpsc::Sender<BusySource>,
-    fatal: mpsc::Sender<Error>,
+    fatal: mpsc::Sender<String>,
+    gpu_state: watch::Sender<crate::scheduler::GpuState>,
     state: watch::Sender<ModelState<B>>,
+    /// The `open_ane` stage `/status` reports; the attempt forwards the
+    /// ANE thread's own watch into it.
+    stage: watch::Sender<LoadStage>,
 }
 
-async fn load<B: Backend>(parts: LoadParts<B>, mut cancel: oneshot::Receiver<()>) -> Attempt<B> {
+/// One load attempt: `ensure`, then the ANE thread — which loads the
+/// encoder and opens the model — then the scheduler, whose inbox the
+/// thread is handed. Returns the model with the threads' exit signals, or
+/// the failure with the half-built pipeline for the caller to stop.
+async fn load<B: Backend, M: ModelSource>(
+    parts: LoadParts<B, M>,
+    mut cancel: oneshot::Receiver<()>,
+) -> Attempt<B> {
     let LoadParts {
         backend,
-        store,
+        model,
         bound,
         chip,
         fetch,
         headroom,
         busy_reg,
         fatal,
+        gpu_state,
         state,
+        stage,
     } = parts;
+    // Every attempt starts the state machine over: a retry's `Failed`
+    // becomes a fresh `Downloading` — absent progress — and the fetch
+    // arm only ever advances a `Downloading` state, never a later one
+    // backwards. The progress channel is reset first so a stale `Fetch`
+    // of the last attempt cannot arrive after it.
+    fetch.send_replace(Fetch {
+        received: 0,
+        total: None,
+    });
+    let _ = state.send(ModelState::Downloading {
+        received: 0,
+        total: None,
+    });
     // Only the download observes the cancel signal: it is the one phase
     // that has spawned no thread, so a cancelled attempt returns with no
     // pipeline to stop. Everything past `ensure` runs to completion.
     let dir = tokio::select! {
-        dir = store.ensure(&fetch) => dir.map_err(|e| retryable(e.to_string(), None))?,
+        dir = model.ensure(&fetch) => dir.map_err(|e| retryable(e, None))?,
         _ = &mut cancel => return Err(LoadFail::Cancelled),
     };
     let _ = state.send(ModelState::Loading);
-    let model_id = store.model_id();
+    let model_id = model.model_id();
     let ane::AneThread {
-        counted,
+        encoded,
         sched: ane_sched,
-        stage,
+        stage: ane_stage,
         loaded,
         exited: ane_exited,
-    } = ane::spawn(backend.clone(), dir.clone(), model_id.clone());
+    } = ane::spawn(backend.clone(), dir.clone());
+    // Forward the thread's stage into the loader's watch so `/status`
+    // reports where an `open_ane` call is; a second receiver serves the
+    // attempt's own timeout reads.
+    let stage_read = ane_stage.clone();
+    let mut stage_fwd = ane_stage;
+    tokio::spawn(async move {
+        loop {
+            let _ = stage.send_replace(*stage_fwd.borrow_and_update());
+            if stage_fwd.changed().await.is_err() {
+                return;
+            }
+        }
+    });
     // One deadline covers every wait on the thread's reports: a load past
     // `bound` fails with the stage `stage` last reported.
     let deadline = tokio::time::Instant::now() + bound;
-    let (counter, buckets) = match tokio::time::timeout_at(deadline, counted).await {
-        Err(_) => return Err(timed_out(bound, *stage.borrow())),
+    let (encoder, buckets) = match tokio::time::timeout_at(deadline, encoded).await {
+        Err(_) => return Err(timed_out(bound, *stage_read.borrow())),
         Ok(Ok(Ok(out))) => out,
         Ok(Ok(Err(message))) => {
             return Err(retryable(message, Some(Pipeline::just_ane(ane_exited))));
@@ -384,14 +457,6 @@ async fn load<B: Backend>(parts: LoadParts<B>, mut cancel: oneshot::Receiver<()>
             ));
         }
     };
-    if !buckets.contains(&STAGE1_MAX_TOKENS) {
-        return Err(retryable(
-            format!(
-                "the model's buckets {buckets:?} do not cover the stage-1 cap {STAGE1_MAX_TOKENS}"
-            ),
-            Some(Pipeline::just_ane(ane_exited)),
-        ));
-    }
     let (sched_busy_tx, sched_busy_rx) = watch::channel(false);
     if busy_reg
         .send(BusySource {
@@ -408,13 +473,13 @@ async fn load<B: Backend>(parts: LoadParts<B>, mut cancel: oneshot::Receiver<()>
     let (sched, sched_exited) = scheduler::spawn(scheduler::SchedulerConfig {
         backend,
         dir: dir.clone(),
-        model_id: model_id.clone(),
         buckets: buckets.clone(),
         headroom,
         chip,
-        fatal,
+        fatal: fatal.clone(),
         busy: sched_busy_tx,
         ane_exited: ane_exited.clone(),
+        gpu_state,
     });
     let make = |handle: SchedulerHandle,
                 exited: oneshot::Receiver<Vec<oneshot::Receiver<()>>>,
@@ -429,8 +494,8 @@ async fn load<B: Backend>(parts: LoadParts<B>, mut cancel: oneshot::Receiver<()>
         // attempt reports `pipeline: None` rather than a pipeline it
         // cannot stop: `sched` and the unsent `ane_sched` drop here, which
         // ends the scheduler and makes a late return exit the thread; a
-        // permanently wedged call dies with the daemon's fatal exit.
-        Err(_) => Err(timed_out(bound, *stage.borrow())),
+        // permanently wedged call dies with the server's fatal exit.
+        Err(_) => Err(timed_out(bound, *stage_read.borrow())),
         Ok(Err(_)) => Err(retryable(
             "the ANE thread went away".to_owned(),
             Some(make(sched, sched_exited, ane_exited)),
@@ -447,7 +512,7 @@ async fn load<B: Backend>(parts: LoadParts<B>, mut cancel: oneshot::Receiver<()>
                 Arc::new(Model {
                     id: model_id,
                     dir,
-                    counter: Arc::new(counter),
+                    encoder: Arc::new(encoder),
                     buckets,
                     scheduler: sched.clone(),
                 }),
@@ -460,10 +525,14 @@ async fn load<B: Backend>(parts: LoadParts<B>, mut cancel: oneshot::Receiver<()>
 /// The load outlived `bound` while in `stage`: fatal — the client gets the
 /// error and no `Retry` restarts the attempt.
 fn timed_out(bound: Duration, stage: LoadStage) -> LoadFail {
-    tracing::error!(%stage, bound_s = bound.as_secs(), "the model load timed out");
+    tracing::error!(
+        ?stage,
+        bound_s = bound.as_secs(),
+        "the model load timed out"
+    );
     LoadFail::Fatal {
         message: format!(
-            "the model load exceeded the {}s bound during {stage}",
+            "the model load exceeded the {}s bound during {stage:?}",
             bound.as_secs()
         ),
         pipeline: None,

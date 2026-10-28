@@ -14,8 +14,6 @@ pub(crate) struct Manifest {
     pub functions: BTreeMap<String, usize>,
     /// Width of the `embedding` output.
     pub embedding_dim: usize,
-    /// Prompt templates the model was converted for.
-    pub prompts: Prompts,
     /// Declared inputs; `input_ids` must be int32, `attention_mask` float16.
     pub inputs: BTreeMap<String, Io>,
     /// Declared outputs; exactly one, the embedding.
@@ -29,13 +27,6 @@ pub(crate) struct Io {
     pub dtype: String,
     /// Tensor shape; the sequence dimension is the string `length`.
     pub shape: Vec<serde_json::Value>,
-}
-
-/// The prompt templates.
-#[derive(Debug, Deserialize)]
-pub(crate) struct Prompts {
-    /// `title: {title} | text: {text}`.
-    pub document: String,
 }
 
 impl Manifest {
@@ -79,14 +70,6 @@ impl Manifest {
                     });
                 }
             }
-        }
-        let doc = &manifest.prompts.document;
-        let valid = doc.find("{title}").zip(doc.find("{text}"));
-        if !valid.is_some_and(|(t, x)| t < x) {
-            return Err(Error::ManifestContent {
-                path,
-                reason: "document prompt lacks {title} before {text}",
-            });
         }
         Ok(manifest)
     }
