@@ -20,7 +20,7 @@ use tokio::sync::{mpsc, oneshot};
 
 pub use index::{
     Applied, FileChange, Index, Phase, RowHash, StoredChunk, StoredMember, StoredMemberKind,
-    StoredMeta, stored_meta, vacuum_into,
+    StoredMeta, set_stored_phase, stored_meta, vacuum_into,
 };
 pub use query::{ChunkFilter, ChunkId, ChunkRow, MemberRow, Side};
 pub use records::{

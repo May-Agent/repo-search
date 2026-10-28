@@ -232,17 +232,19 @@ async fn counts_of(rig: &Rig, worktree: WorktreeId) -> Counts {
         .expect("counts answered")
 }
 
-/// Waits until `worktree`'s counts are `want`, watching them change.
+/// Waits until `worktree`'s counts are `want`, polling them: holding a
+/// `watch_counts` would attach an `index --wait` to the worktree and
+/// lift its background work to stage-1 urgency.
 async fn await_counts(rig: &Rig, worktree: WorktreeId, want: Counts) {
-    let mut watch = rig
-        .sched
-        .watch_counts(worktree)
-        .await
-        .expect("watch answered");
-    tokio::time::timeout(TIMEOUT, watch.wait_for(|counts| *counts == want))
-        .await
-        .expect("counts reach the expected value within the timeout")
-        .expect("watch stays open");
+    tokio::time::timeout(TIMEOUT, async {
+        loop {
+            if counts_of(rig, worktree).await == want {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("counts reach the expected value within the timeout");
 }
 
 /// Waits for the next `Stage1Done` on `done`.
@@ -1561,6 +1563,72 @@ async fn a_background_to_stage1_flip_cancels_and_requeues() {
             embeds_of(&mut log, &records, hash(seq, 100)),
             vec![(Kind::Index, 3)],
             "only the u=3 flight embeds"
+        );
+    }
+}
+
+/// An attached `index --wait` lifts its worktree's background work to
+/// stage-1 urgency: the queued items move to the stage-1 queue and the
+/// in-flight `u=7` requests are aborted and requeued at `u=3`. The last
+/// waiter's detach drops the remaining queued items back to background;
+/// another worktree's background items never move.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_waiter_lifts_background_work_until_it_detaches() {
+    let (tx, records) = mpsc::channel();
+    let mut fake = FakeEmbeddings::new(tx);
+    let index_gate = fake.gate_index();
+    let rig = fake_rig(fake).await;
+    let mut log = Vec::new();
+    // WORKTREE fills the window — 0..=7 and 16..=39 in flight at `u=7`,
+    // 8..=15 queued — and OTHER's ten stay queued behind it.
+    let _done = enqueue(&rig, small(0..40), IndexClass::Background).await;
+    let _other_done = enqueue_for(&rig, OTHER, small(40..50), IndexClass::Background).await;
+    assert_eq!(counts_of(&rig, WORKTREE).await, counts(0, 8, 32, false));
+    assert_eq!(counts_of(&rig, OTHER).await, counts(0, 10, 0, false));
+    wait_started(&mut log, &records, 32);
+
+    // The wait attaches: the queued items flip to stage 1, and the
+    // in-flight `u=7` requests are aborted and requeued at `u=3`.
+    let watch = rig
+        .sched
+        .watch_counts(WORKTREE)
+        .await
+        .expect("watch answered");
+    assert_eq!(counts_of(&rig, WORKTREE).await, counts(8, 0, 32, false));
+    assert_eq!(counts_of(&rig, OTHER).await, counts(0, 10, 0, false));
+    wait_started(&mut log, &records, 64);
+    for seq in (0..8).chain(16..40) {
+        let hash = hash(seq, 100);
+        assert_eq!(
+            starts_of(&mut log, &records, hash),
+            vec![7, 3],
+            "the attached wait requeued the flight at stage-1 urgency"
+        );
+        wait_cancelled(&mut log, &records, hash, 7);
+    }
+
+    // Detaching drops the queued items back to background; the `u=3`
+    // flights out already fly on. The detach lands on the next handled
+    // message: the second `CountsFor` sees it.
+    drop(watch);
+    counts_of(&rig, WORKTREE).await;
+    assert_eq!(counts_of(&rig, WORKTREE).await, counts(0, 8, 32, false));
+    assert_eq!(counts_of(&rig, OTHER).await, counts(0, 10, 0, false));
+
+    index_gate.open();
+    await_idle(&rig).await;
+    for seq in (0..8).chain(16..40) {
+        assert_eq!(
+            embeds_of(&mut log, &records, hash(seq, 100)),
+            vec![(Kind::Index, 3)],
+            "the lifted item embedded once, at stage-1 urgency"
+        );
+    }
+    for seq in (8..16).chain(40..50) {
+        assert_eq!(
+            embeds_of(&mut log, &records, hash(seq, 100)),
+            vec![(Kind::Index, 7)],
+            "a queued item went back to background urgency"
         );
     }
 }
