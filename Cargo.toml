@@ -86,6 +86,7 @@ tokio = { version = "1.54.0", default-features = false, features = ["test-util"]
 
 [target.'cfg(target_os = "macos")'.dev-dependencies]
 libc = { version = "0.2.191", default-features = false, features = ["std"] }
+repo-search-coreml.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 repo-search-coreml.workspace = true
@@ -95,6 +96,7 @@ libc = { version = "0.2.191", default-features = false, features = ["std"] }
 notify = { version = "8.2.0", default-features = false, features = [
     "macos_fsevent",
 ] }
+tokenizers = { version = "0.23.2", default-features = false, features = ["fancy-regex"] }
 
 [workspace.metadata.dist]
 cargo-dist-version = "0.33.0"

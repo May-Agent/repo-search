@@ -1532,6 +1532,7 @@ dependencies = [
  "tar",
  "tempfile",
  "thiserror",
+ "tokenizers",
  "tokio",
  "tokio-util",
  "tracing",

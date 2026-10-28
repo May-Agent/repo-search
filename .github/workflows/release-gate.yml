@@ -178,7 +178,7 @@ jobs:
         env:
           REPO_SEARCH_CORPUS: ${{ runner.temp }}/corpora/waterui:${{ runner.temp }}/corpora/book
           REPO_SEARCH_MODEL_DIR: ${{ runner.temp }}/model
-        run: cargo test --locked --release -p repo-search-coreml --test cap -- --ignored
+        run: cargo test --locked --release -p repo-search --test cap -- --ignored
 
   daemon-model-tests:
     name: daemon model tests

@@ -4,6 +4,7 @@
 pub mod ane;
 pub mod chip;
 pub mod coreml;
+pub mod counter;
 pub mod coverage;
 pub mod feed;
 pub mod gpu;

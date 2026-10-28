@@ -10,7 +10,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use repo_search_core::model::{ARCHIVE, Fetch};
+use repo_search_core::model::{ARCHIVE, Fetch, TOKENIZER};
 use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 use thiserror::Error;
@@ -39,6 +39,11 @@ impl Sha256Digest {
         Some(Self(digest))
     }
 
+    /// The sha256 of `bytes`.
+    pub fn of(bytes: &[u8]) -> Self {
+        Self(Sha256::digest(bytes).into())
+    }
+
     /// Lowercase hex, e.g. for a directory name.
     pub fn hex(&self) -> String {
         hex::encode(self.0)
@@ -49,6 +54,13 @@ impl fmt::Display for Sha256Digest {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.hex())
     }
+}
+
+/// The per-user cache root the model archive and the tokenizer share:
+/// `~/Library/Caches/repo-search/models`.
+fn user_cache_root() -> Result<PathBuf, Error> {
+    let home = std::env::home_dir().ok_or(Error::NoHomeDir)?;
+    Ok(home.join("Library/Caches/repo-search/models"))
 }
 
 /// A model archive to fetch and the digest that verifies it.
@@ -102,11 +114,7 @@ impl ModelStore {
 
     /// The per-user store: `~/Library/Caches/repo-search/models`.
     pub fn user_cache() -> Result<Self, Error> {
-        let home = std::env::home_dir().ok_or(Error::NoHomeDir)?;
-        Self::new(
-            home.join("Library/Caches/repo-search/models"),
-            ModelSpec::embedding_gemma_2(),
-        )
+        Self::new(user_cache_root()?, ModelSpec::embedding_gemma_2())
     }
 
     /// Directory the archive unpacks to.
@@ -197,10 +205,95 @@ impl ModelStore {
     }
 }
 
+/// A tokenizer file to fetch and the digest that verifies it.
+#[derive(Debug, Clone)]
+pub struct TokenizerSpec {
+    /// Download URL, pinned to an immutable upstream revision.
+    pub url: String,
+    /// Expected sha256 of the file bytes.
+    pub sha256: Sha256Digest,
+}
+
+impl TokenizerSpec {
+    /// The tokenizer from [`repo_search_core::model`]'s model card: the
+    /// upstream revision the archive ships the same bytes under.
+    pub fn embedding_gemma_2() -> Self {
+        Self {
+            url: TOKENIZER.url.to_owned(),
+            sha256: Sha256Digest::from_hex(TOKENIZER.sha256)
+                .expect("pinned tokenizer digest is valid hex"),
+        }
+    }
+}
+
+/// A cache of the pinned `tokenizer.json` for the daemon's counter.
+///
+/// The file lands at `<root>/tokenizer/<sha256>.json`, written by an
+/// atomic rename of the verified temp file — a present path is always a
+/// complete, verified download, so an existing file is a cache hit.
+pub struct TokenizerStore {
+    /// Cache root, shared with the model archive cache.
+    root: PathBuf,
+    spec: TokenizerSpec,
+    /// The store's own client, built through [`client_builder`].
+    client: reqwest::Client,
+}
+
+impl TokenizerStore {
+    /// A store under `root` serving `spec`.
+    pub fn new(root: PathBuf, spec: TokenizerSpec) -> Result<Self, Error> {
+        Ok(Self {
+            root,
+            spec,
+            client: client_builder().build()?,
+        })
+    }
+
+    /// The per-user store, in the same cache root as the model archive.
+    pub fn user_cache() -> Result<Self, Error> {
+        Self::new(user_cache_root()?, TokenizerSpec::embedding_gemma_2())
+    }
+
+    /// The cached tokenizer's path.
+    pub fn path(&self) -> PathBuf {
+        self.root
+            .join("tokenizer")
+            .join(format!("{}.json", self.spec.sha256.hex()))
+    }
+
+    /// Path to the cached tokenizer, downloading it on first use.
+    ///
+    /// `progress` receives a [`Fetch`] after each downloaded chunk.
+    pub async fn ensure(
+        &self,
+        progress: &tokio::sync::watch::Sender<Fetch>,
+    ) -> Result<PathBuf, Error> {
+        let path = self.path();
+        if tokio::fs::try_exists(&path).await? {
+            return Ok(path);
+        }
+        // `fetch_verified` stages its temp file in `root`.
+        let dir = path.parent().expect("path has a parent").to_path_buf();
+        tokio::fs::create_dir_all(dir).await?;
+        let temp = fetch_verified(
+            &self.client,
+            &self.spec.url,
+            self.spec.sha256,
+            &self.root,
+            progress,
+        )
+        .await?;
+        // The verified bytes are moved into place with one rename; a
+        // racing install writes the identical bytes.
+        tokio::task::spawn_blocking(move || temp.persist(path).map_err(|e| e.error)).await??;
+        Ok(self.path())
+    }
+}
+
 /// Stream `url` into a temp file inside `root`, returning it only once its
 /// sha256 matches `sha256`. The temp file deletes itself on drop; error
-/// paths run that drop on the blocking pool. Shared by [`ModelStore`] and
-/// the server's [`repo_search_server::ModelSource`].
+/// paths run that drop on the blocking pool. Shared by [`ModelStore`],
+/// [`TokenizerStore`] and the server's [`repo_search_server::ModelSource`].
 pub async fn fetch_verified(
     client: &reqwest::Client,
     url: &str,
@@ -598,6 +691,70 @@ mod tests {
             std::fs::read(store.dir().join("manifest.json")).unwrap(),
             b"{}"
         );
+        server.join().unwrap();
+    }
+    fn tokenizer_store(root: PathBuf, url: String, sha256: Sha256Digest) -> TokenizerStore {
+        TokenizerStore {
+            root,
+            spec: TokenizerSpec { url, sha256 },
+            client: client_builder().no_proxy().build().unwrap(),
+        }
+    }
+
+    #[tokio::test]
+    async fn tokenizer_downloads_verifies_and_caches() {
+        let body = b"{\"tokenizer\": true}".to_vec();
+        let (url, server) = serve_once("200 OK", body.len() as u64, body.clone());
+        let root = tempfile::tempdir().unwrap();
+        let store = tokenizer_store(root.path().join("models"), url, digest_of(&body));
+        let (progress, mut received) = sink();
+
+        let path = store.ensure(&progress).await.unwrap();
+
+        assert_eq!(path, store.path());
+        assert_eq!(
+            path,
+            root.path()
+                .join("models/tokenizer")
+                .join(format!("{}.json", digest_of(&body).hex()))
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), body);
+        received.borrow_and_update();
+        assert_eq!(
+            *received.borrow(),
+            Fetch {
+                received: body.len() as u64,
+                total: Some(body.len() as u64)
+            }
+        );
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn tokenizer_cache_hit_never_touches_the_server() {
+        let body = b"{}".to_vec();
+        let (url, server) = serve_once("200 OK", body.len() as u64, body.clone());
+        let root = tempfile::tempdir().unwrap();
+        let store = tokenizer_store(root.path().join("models"), url, digest_of(&body));
+        let (progress, _) = sink();
+        let path = store.ensure(&progress).await.unwrap();
+        server.join().unwrap();
+        // The one-shot server is spent; a second ensure must be a hit.
+        assert_eq!(store.ensure(&progress).await.unwrap(), path);
+    }
+
+    #[tokio::test]
+    async fn a_tokenizer_mismatch_is_rejected_and_leaves_nothing() {
+        let corrupt = b"corrupted".to_vec();
+        let (url, server) = serve_once("200 OK", corrupt.len() as u64, corrupt.clone());
+        let root = tempfile::tempdir().unwrap();
+        let store = tokenizer_store(root.path().join("models"), url, digest_of(b"{}"));
+        let (progress, _) = sink();
+
+        let Err(Error::HashMismatch { .. }) = store.ensure(&progress).await else {
+            panic!("a corrupt tokenizer is rejected");
+        };
+        assert!(!store.path().exists());
         server.join().unwrap();
     }
 }
