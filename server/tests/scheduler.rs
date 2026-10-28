@@ -620,6 +620,12 @@ async fn wait_and_overtaken_are_reported_per_request() {
     let (_, first) = submit(&mut rig, 7, vec![ids(1, 100)]).await;
     wait_for(&rig, "the held call", |r| r.kind == Kind::Held);
     let (_, urgent) = submit(&mut rig, 0, vec![ids(2, 100)]).await;
+    // The held item is on the ANE, so the urgent one is the only queued item.
+    let mut queued = rig.handle.queued();
+    tokio::time::timeout(TIMEOUT, queued.wait_for(|&n| n == 1))
+        .await
+        .expect("the urgent item queues")
+        .expect("the scheduler runs");
     gate.open();
     first.await.expect("answered").expect("ok");
     let answered = urgent.await.expect("answered").expect("ok");
