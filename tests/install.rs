@@ -33,6 +33,7 @@ fn test_config(tmp: &tempfile::TempDir, program: &Path) -> AgentConfig {
             socket: root.join("support/daemon.sock"),
             idle_exit: Duration::from_secs(600),
             model_cache: None,
+            server_socket: root.join("support/server.sock"),
             state_dir: None,
             stderr: root.join("logs/daemon.log"),
         }),
@@ -48,12 +49,20 @@ fn program() -> PathBuf {
 }
 
 /// The fake for `config`, with the daemon identity the test binary gives.
+/// A daemon agent's job brings a stub server of its own, on a socket
+/// apart from the server agent's, which a second fake may bind.
 fn launchd(config: &AgentConfig) -> FakeLaunchd {
-    FakeLaunchd::new(
-        config.agent.socket().to_path_buf(),
-        tokio::runtime::Handle::current(),
-        client::build(),
-    )
+    let socket = config.agent.socket().to_path_buf();
+    let runtime = tokio::runtime::Handle::current();
+    match &config.agent {
+        Plist::Daemon(_) => FakeLaunchd::new(
+            socket.clone(),
+            socket.with_file_name("daemon-job-server.sock"),
+            runtime,
+            client::build(),
+        ),
+        Plist::Server(_) => FakeLaunchd::server(socket, runtime, client::build()),
+    }
 }
 
 /// The plist file written for `config`: an agent previously installed for

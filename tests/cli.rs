@@ -21,18 +21,19 @@ use repo_search::cli::{Cli, Env, Exit, Invocation, Terminal};
 use repo_search::install::{AgentConfig, Plist, Timeouts};
 use repo_search::launchd::{LaunchAgent, ServerAgent};
 use repo_search::protocol::BuildId;
+use repo_search_server::stub::{Instance, StubBackend};
 use std::net::{IpAddr, Ipv4Addr};
 use support::client;
 use support::daemon::Model;
 use support::launchd::{FakeLaunchctl, FakeLaunchd};
 use support::repo;
-use support::stub::{Instance, StubBackend};
 
 /// The test binary's `BuildId`, given to the fake's daemons and to the
 /// `Hello` the test sends — they must match for the handshake to pass.
 fn launchd(config: &AgentConfig) -> FakeLaunchd {
     FakeLaunchd::new(
         config.agent.socket().to_path_buf(),
+        config.agent.socket().parent().unwrap().join("server.sock"),
         tokio::runtime::Handle::current(),
         client::build(),
     )
@@ -68,7 +69,11 @@ fn server_config(tmp: &Path) -> AgentConfig {
     std::fs::create_dir_all(config.plist.parent().unwrap()).unwrap();
     std::fs::write(&config.plist, config.agent.render().unwrap()).unwrap();
     std::fs::create_dir_all(config.agent.socket().parent().unwrap()).unwrap();
-    std::fs::write(config.agent.socket(), b"").unwrap();
+    // Once the fake's server has bound the path, it is a socket, not a
+    // file — the `Check::Fast` marker is needed only before that.
+    if !config.agent.socket().exists() {
+        std::fs::write(config.agent.socket(), b"").unwrap();
+    }
     config
 }
 
@@ -84,6 +89,7 @@ fn config(tmp: &tempfile::TempDir) -> AgentConfig {
             socket: root.join("support/daemon.sock"),
             idle_exit: Duration::from_secs(600),
             model_cache: None,
+            server_socket: root.join("support/server.sock"),
             state_dir: None,
             stderr: root.join("logs/daemon.log"),
         }),
@@ -322,6 +328,7 @@ async fn index_wait_reaches_full_coverage() {
     let config = config(&tmp);
     let launchd = FakeLaunchd::with_daemon(
         config.agent.socket().to_path_buf(),
+        config.agent.socket().parent().unwrap().join("server.sock"),
         tokio::runtime::Handle::current(),
         client::build(),
         Model::Cached,
@@ -378,6 +385,7 @@ async fn stale_build_shuts_the_daemon_down() {
     };
     let launchd = FakeLaunchd::new(
         config.agent.socket().to_path_buf(),
+        config.agent.socket().parent().unwrap().join("server.sock"),
         tokio::runtime::Handle::current(),
         stale,
     );
@@ -407,6 +415,7 @@ async fn install_failure_exits_2() {
     let config = config(&tmp);
     let launchd = FakeLaunchd::new(
         config.agent.socket().to_path_buf(),
+        config.agent.socket().parent().unwrap().join("server.sock"),
         tokio::runtime::Handle::current(),
         client::build(),
     );
@@ -455,8 +464,8 @@ async fn daemon_startup_failure_exits_2() {
     let stderr = text(&term.stderr);
     assert!(
         stderr.contains(
-            "the daemon failed to start: could not determine the host's chip class: \
-             unrecognised chip brand \"Apple Z1\""
+            "the daemon failed to start: could not resolve the state directory: \
+             simulated startup failure on Apple Z1"
         ),
         "stderr: {stderr}"
     );
@@ -509,6 +518,7 @@ async fn non_tty_shows_only_announcements() {
     let config = config(&tmp);
     let launchd = FakeLaunchd::with_daemon(
         config.agent.socket().to_path_buf(),
+        config.agent.socket().parent().unwrap().join("server.sock"),
         tokio::runtime::Handle::current(),
         client::build(),
         Model::Served {

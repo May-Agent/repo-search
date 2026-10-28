@@ -167,6 +167,8 @@ pub struct LaunchAgent {
     pub model_cache: Option<PathBuf>,
     /// The `--state-dir` argument, when a non-default state dir is used.
     pub state_dir: Option<PathBuf>,
+    /// The `--server-socket` argument: where the embedding server listens.
+    pub server_socket: PathBuf,
     /// The `StandardErrorPath` log file.
     pub stderr: PathBuf,
 }
@@ -375,6 +377,7 @@ mod tests {
             idle_exit: Duration::from_secs(600),
             model_cache: None,
             state_dir: None,
+            server_socket: PathBuf::from("/tmp/server.sock"),
             stderr: PathBuf::from("/tmp/daemon.log"),
         }
     }
@@ -387,6 +390,7 @@ mod tests {
             "<key>LimitLoadToSessionType</key>\n\t<string>Background</string>",
             "<string>/usr/local/bin/search</string>",
             "<string>--idle-exit-secs</string>\n\t\t<string>600</string>",
+            "<string>--server-socket</string>\n\t\t<string>/tmp/server.sock</string>",
             "<key>SockPathName</key>\n\t\t\t<string>/tmp/daemon.sock</string>",
             "<key>SockPathMode</key>\n\t\t\t<integer>384</integer>",
             "<key>StandardErrorPath</key>\n\t<string>/tmp/daemon.log</string>",

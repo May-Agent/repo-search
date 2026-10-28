@@ -12,6 +12,8 @@
 		<string>--daemon</string>
 		<string>--idle-exit-secs</string>
 		<string>{{ idle_exit.as_secs() }}</string>
+		<string>--server-socket</string>
+		<string>{{ server_socket.display() }}</string>
 		{%- if let Some(cache) = model_cache %}
 		<string>--model-cache</string>
 		<string>{{ cache.display() }}</string>

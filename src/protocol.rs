@@ -17,7 +17,7 @@ use tokio::net::UnixStream;
 use tokio_util::codec::{Framed, LinesCodec};
 
 /// Wire format version, bumped whenever a wire type changes.
-pub const PROTOCOL: u32 = 3;
+pub const PROTOCOL: u32 = 4;
 
 /// The largest frame a peer may send, in bytes.
 pub const MAX_FRAME: usize = 64 << 20;

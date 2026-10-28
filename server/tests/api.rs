@@ -241,15 +241,16 @@ async fn embeddings_float_base64_and_dimensions() {
 
     // dimensions = 256 truncates and renormalizes; the input's stub
     // vector must have its nonzero element inside the first 256 dims, so
-    // pick a token count whose `bag_of_ids` lands there.
-    let tokens = (1..16)
-        .find(|n| {
-            repo_search_server::stub::bag_of_ids(&vec![0; *n], 768).as_slice()[..256]
+    // pick an input whose encoded ids' `bag_of_ids` lands there.
+    let input = (1..64)
+        .map(|n| "x".repeat(n))
+        .find(|input| {
+            let ids = repo_search_server::stub::encode_ids(input);
+            repo_search_server::stub::bag_of_ids(&ids, 768).as_slice()[..256]
                 .iter()
                 .any(|x| *x != 0.0)
         })
         .expect("a short input lands inside 256 dims");
-    let input = "x".repeat(4 * (tokens - 1) + 1);
     let response = client
         .post("http://localhost/v1/embeddings")
         .body(
@@ -829,12 +830,14 @@ async fn a_closed_connection_embeds_nothing() {
         .await
         .expect("response");
     assert_eq!(response.status(), 200);
+    let last = repo_search_server::stub::encode_ids("cccccccccccc");
+    let closed = repo_search_server::stub::encode_ids("aaaa");
     let log = wait_until(&records, |r| {
-        matches!(r.kind, Kind::Index | Kind::Interactive) && r.ids == [0u32; 4]
+        matches!(r.kind, Kind::Index | Kind::Interactive) && r.ids == last
     });
     assert!(
         log.iter()
-            .all(|r| !(matches!(r.kind, Kind::Index | Kind::Interactive) && r.ids == [0u32; 2])),
+            .all(|r| !(matches!(r.kind, Kind::Index | Kind::Interactive) && r.ids == closed)),
         "the closed request's item never embedded: {log:?}"
     );
     accepts.shutdown().await;

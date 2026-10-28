@@ -98,9 +98,9 @@ tokio = { version = "1.54.0", default-features = false, features = ["test-util"]
 [target.'cfg(target_os = "macos")'.dev-dependencies]
 libc = { version = "0.2.191", default-features = false, features = ["std"] }
 repo-search-coreml.workspace = true
+repo-search-server = { workspace = true, features = ["stub"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-repo-search-coreml.workspace = true
 repo-search-server.workspace = true
 kqueue = { version = "1.2.1", default-features = false }
 libc = { version = "0.2.191", default-features = false, features = ["std"] }

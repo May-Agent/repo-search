@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use repo_search::client::Responses;
-use repo_search::model_store::{ModelSpec, ModelStore};
+use repo_search::model_store::{ModelSpec, ModelStore, TokenizerSpec, TokenizerStore};
 use repo_search::protocol::{Event, Final, Hello, Progress, Request, WirePhase};
 use repo_search_core::StateDir;
 use repo_search_core::store::{Index, VectorCache};
@@ -72,6 +72,17 @@ pub fn model_store(root: PathBuf) -> ModelStore {
     std::os::unix::fs::symlink(model_dir(), root.join(spec.sha256.hex()))
         .expect("the model dir symlink");
     ModelStore::new(root, spec).expect("model store")
+}
+
+/// A `TokenizerStore` rooted at `root` whose cached path is a copy of the
+/// archive's `tokenizer.json`, so `load` returns at once.
+pub fn tokenizer_store(root: PathBuf) -> TokenizerStore {
+    let spec = TokenizerSpec::embedding_gemma_2();
+    let store = TokenizerStore::new(root, spec).expect("tokenizer store");
+    let path = store.path();
+    std::fs::create_dir_all(path.parent().unwrap()).expect("the tokenizer dir");
+    std::fs::copy(model_dir().join("tokenizer.json"), &path).expect("the tokenizer copy lands");
+    store
 }
 
 /// Opens an `index --wait` stream for `worktree` on `socket`.

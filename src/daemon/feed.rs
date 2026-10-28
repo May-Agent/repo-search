@@ -12,7 +12,7 @@ use repo_search_core::qos::performance_cores;
 use repo_search_core::reconcile::{self, Missing, PendingChunk};
 use tokio::sync::{mpsc, oneshot};
 
-use super::Backend;
+use super::counter::Tokens;
 use super::coverage::Asker;
 use super::scheduler::{
     Enqueue, IndexClass, Interest, PendingItem, RepoId, SchedulerHandle, Stage1Done, WorktreeId,
@@ -66,7 +66,7 @@ pub struct FeedMsg {
 }
 
 /// What a feeder is built from.
-pub struct FeederConfig<B: Backend> {
+pub struct FeederConfig<T: Tokens> {
     /// The scheduler's worktree id.
     pub worktree: WorktreeId,
     /// The repository the worktree lives in.
@@ -78,7 +78,7 @@ pub struct FeederConfig<B: Backend> {
     /// The repository's vector writer, handed to every `Enqueue`.
     pub writer: WriterHandle,
     /// The model's token counter.
-    pub counter: Arc<B::Counter>,
+    pub counter: Arc<T::Counter>,
     /// The embedding scheduler.
     pub sched: SchedulerHandle,
     /// Where stage-1 completion for `worktree` is announced.
@@ -87,7 +87,7 @@ pub struct FeederConfig<B: Backend> {
 
 /// Spawns the feeder; it exits once the returned sender is dropped and its
 /// inbox is drained.
-pub fn spawn<B: Backend>(config: FeederConfig<B>) -> mpsc::Sender<FeedMsg> {
+pub fn spawn<T: Tokens>(config: FeederConfig<T>) -> mpsc::Sender<FeedMsg> {
     let FeederConfig {
         worktree,
         repo,
@@ -159,14 +159,14 @@ pub fn spawn<B: Backend>(config: FeederConfig<B>) -> mpsc::Sender<FeedMsg> {
                     }
                     .await;
                     match pending {
-                        Ok(pending) => count_pending::<B>(pending, counter.clone())
+                        Ok(pending) => count_pending::<T>(pending, counter.clone())
                             .await
                             .map(Interest::Replace),
                         Err(message) => Err(message),
                     }
                 }
                 Work::Change(reconcile::Changes { added, dropped }) => {
-                    count_pending::<B>(added, counter.clone())
+                    count_pending::<T>(added, counter.clone())
                         .await
                         .map(|added| Interest::Change { added, dropped })
                 }
@@ -206,9 +206,9 @@ pub fn spawn<B: Backend>(config: FeederConfig<B>) -> mpsc::Sender<FeedMsg> {
 
 /// Counts each pending chunk's document tokens on a scoped worker pool of
 /// `performance_cores()` threads, off the executor.
-async fn count_pending<B: Backend>(
+async fn count_pending<T: Tokens>(
     pending: Vec<PendingChunk>,
-    counter: Arc<B::Counter>,
+    counter: Arc<T::Counter>,
 ) -> Result<Vec<PendingItem>, String> {
     if pending.is_empty() {
         return Ok(Vec::new());

@@ -11,8 +11,12 @@ use std::sync::mpsc;
 use std::sync::{Arc, Barrier, OnceLock};
 use std::time::{Duration, Instant};
 
+use std::collections::HashMap;
+use std::sync::Mutex;
+
 use repo_search_core::UnitVector;
 use repo_search_core::qos::{self, QosClass};
+use repo_search_core::store::ContentHash;
 use repo_search_coreml::GpuBlocked;
 use tokio::sync::watch;
 
@@ -53,8 +57,11 @@ pub struct Record {
     pub instance: Instance,
     /// What the call was, derived from the thread's QoS.
     pub kind: Kind,
-    /// The input's token ids; `None` for `Started`/`Held`/`Dropped`.
+    /// The input's token ids; empty for `Started`/`Held`/`Dropped`.
     pub ids: Vec<u32>,
+    /// The document's content hash, recovered by the encoder from the
+    /// `DOCUMENT` prompt; `None` for queries and non-embedding records.
+    pub hash: Option<ContentHash>,
     /// The input's token count: `ids.len()`.
     pub tokens: usize,
     /// The inputs in the call: 1 for single embeds, up to 8 for batches.
@@ -91,21 +98,59 @@ type OnChange = Box<dyn Fn(Headroom) + Send + Sync>;
 /// The headroom monitor's guard; dropping it stops nothing in the stub.
 pub struct StubMonitor;
 
+/// The ids→document map the encoder and embedders share: `encode`
+/// registers a `DOCUMENT` input's hash under the ids it produced, so the
+/// embedder's [`Record`] names the chunk it embedded.
+type Hashes = Arc<Mutex<HashMap<Vec<u32>, ContentHash>>>;
+
 /// The stub's text encoder: `len / 4 + 1` ids, today's `StubCounter`
-/// arithmetic, capped at the largest bucket.
+/// arithmetic, capped at the largest bucket. The ids are seeded by the
+/// text, so two different inputs embed to different vectors; a `DOCUMENT`
+/// prompt additionally registers its content hash.
 #[derive(Debug)]
-pub struct StubEncoder;
+pub struct StubEncoder {
+    hashes: Hashes,
+}
+
+/// Recovers a `DOCUMENT` prompt's content hash: `title: t | text: b`
+/// parses back into the chunk `of_chunk` hashed.
+fn document_hash(text: &str) -> Option<ContentHash> {
+    let rest = text.strip_prefix("title: ")?;
+    let (title, body) = rest.split_once(" | text: ")?;
+    Some(ContentHash::of_chunk(title, body))
+}
+
+/// The ids [`StubEncoder`] gives `text`, cap aside: `len / 4 + 1` of them,
+/// counting up from the text's FNV-1a, so two different inputs embed to
+/// different vectors. Tests name an input's records by them.
+pub fn encode_ids(text: &str) -> Vec<u32> {
+    let mut seed = 0x811c_9dc5u32;
+    for byte in text.as_bytes() {
+        seed ^= u32::from(*byte);
+        seed = seed.wrapping_mul(0x0100_0193);
+    }
+    (0..text.len() / 4 + 1)
+        .map(|i| seed.wrapping_add(i as u32))
+        .collect()
+}
 
 impl TextEncoder for StubEncoder {
     fn encode(&self, text: &str) -> Result<Vec<u32>, EncodeError> {
-        let tokens = text.len() / 4 + 1;
-        if tokens > BUCKETS[2] {
+        let ids = encode_ids(text);
+        if ids.len() > BUCKETS[2] {
             return Err(EncodeError::TooLong(format!(
-                "{tokens} tokens exceeds the {}-token cap",
+                "{} tokens exceeds the {}-token cap",
+                ids.len(),
                 BUCKETS[2]
             )));
         }
-        Ok(vec![0; tokens])
+        if let Some(hash) = document_hash(text) {
+            self.hashes
+                .lock()
+                .expect("the hashes map")
+                .insert(ids.clone(), hash);
+        }
+        Ok(ids)
     }
 }
 
@@ -207,6 +252,7 @@ fn held_record(instance: Instance, now: Instant) -> Record {
         instance,
         kind: Kind::Held,
         ids: Vec::new(),
+        hash: None,
         tokens: 0,
         batch_len: 0,
         qos: qos::current_thread(),
@@ -237,6 +283,7 @@ pub struct StubBackend {
     gates: BTreeMap<Instance, BTreeMap<usize, Arc<Barrier>>>,
     index_gates: BTreeMap<Instance, Arc<IndexGate>>,
     dim: usize,
+    hashes: Hashes,
 }
 
 impl StubBackend {
@@ -263,6 +310,7 @@ impl StubBackend {
             gates: BTreeMap::new(),
             index_gates: BTreeMap::new(),
             dim: 64,
+            hashes: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -371,6 +419,7 @@ impl StubBackend {
             calls: 0,
             index_gate: self.index_gates.get(&instance).cloned(),
             dim: self.dim,
+            hashes: self.hashes.clone(),
         }
     }
 }
@@ -383,7 +432,12 @@ impl Backend for StubBackend {
     type Monitor = StubMonitor;
 
     fn load_encoder(&self, _: &Path) -> EncoderLoad<Self::Encoder, Self::LoadError> {
-        Ok((StubEncoder, BUCKETS.into()))
+        Ok((
+            StubEncoder {
+                hashes: self.hashes.clone(),
+            },
+            BUCKETS.into(),
+        ))
     }
 
     fn open_ane(
@@ -437,6 +491,7 @@ pub struct StubEmbedder {
     calls: usize,
     index_gate: Option<Arc<IndexGate>>,
     dim: usize,
+    hashes: Hashes,
 }
 
 impl StubEmbedder {
@@ -506,10 +561,17 @@ impl StubEmbedder {
         start: Instant,
         end: Instant,
     ) {
+        let hash = self
+            .hashes
+            .lock()
+            .expect("the hashes map")
+            .get(&ids)
+            .copied();
         let _ = self.records.send(Record {
             instance: self.instance,
             kind,
             ids,
+            hash,
             tokens,
             batch_len,
             qos: qos::current_thread(),

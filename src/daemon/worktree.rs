@@ -24,15 +24,16 @@ use crate::protocol::{
     QueryStats, SearchRequest, StatusReport, WirePhase,
 };
 
-use super::Backend;
+use super::counter::Tokens;
 use super::coverage::{self, Ask, AskError, Asker};
 use super::feed::{self, Feed, FeedMsg, FeederConfig};
-use super::model::{Model, ModelState};
+use super::link::{Embedding, EmbeddingState};
 use super::registry::RegistryHandle;
 use super::scheduler::{
-    DocumentsJob, EmbedError, GpuState, IndexClass, QueryJob, RepoId, SchedulerHandle,
-    SchedulerMsg, Stage1Done, WorktreeId,
+    DocumentsJob, EmbedError, IndexClass, QueryJob, RepoId, SchedulerHandle, SchedulerMsg,
+    Stage1Done, WorktreeId,
 };
+use super::server::ServerClient;
 use super::watch::{WatchMsg, Watcher};
 use super::writer::WriterHandle;
 
@@ -74,7 +75,7 @@ impl OwnerMsg {
 }
 
 /// Everything the registry hands a new owner.
-pub struct OwnerConfig<B: Backend> {
+pub struct OwnerConfig<T: Tokens> {
     /// The daemon's state root: the worktree's index lives under it.
     pub state: StateDir,
     /// The scheduler's worktree id.
@@ -90,7 +91,7 @@ pub struct OwnerConfig<B: Backend> {
     /// The model-id vectors are stored under; known before the model loads.
     pub model_id: String,
     /// The model readiness watch.
-    pub model: watch::Receiver<ModelState<B>>,
+    pub model: watch::Receiver<EmbeddingState<T>>,
     /// The registry, for the shared cache and writer, `DaemonStatus`'s
     /// worktree count, and `Forget`.
     pub registry: RegistryHandle,
@@ -98,16 +99,19 @@ pub struct OwnerConfig<B: Backend> {
     pub started: Instant,
     /// Set when the daemon begins shutdown.
     pub stopping: watch::Receiver<bool>,
+    /// The embedding server's client: `GET /status` carries its GPU
+    /// report, before and after the link reaches Ready.
+    pub server: Arc<ServerClient>,
 }
 
 /// Spawns the owner task; the returned sender is its inbox.
-pub fn spawn<B: Backend>(config: OwnerConfig<B>) -> mpsc::Sender<OwnerMsg> {
+pub fn spawn<T: Tokens>(config: OwnerConfig<T>) -> mpsc::Sender<OwnerMsg> {
     let (tx, rx) = mpsc::channel(64);
     tokio::spawn(Owner::new(config, rx).run());
     tx
 }
 
-struct Owner<B: Backend> {
+struct Owner<T: Tokens> {
     state: StateDir,
     id: WorktreeId,
     root: PathBuf,
@@ -117,7 +121,7 @@ struct Owner<B: Backend> {
     cache: Option<VectorCache>,
     writer: Option<WriterHandle>,
     model_id: String,
-    model: watch::Receiver<ModelState<B>>,
+    model: watch::Receiver<EmbeddingState<T>>,
     registry: RegistryHandle,
     started: Instant,
     stopping: watch::Receiver<bool>,
@@ -150,6 +154,8 @@ struct Owner<B: Backend> {
     /// The applied phase, published to `index --wait` tasks spawned off
     /// the owner.
     phase_tx: watch::Sender<Phase>,
+    /// The embedding server's client; `Status` reads its GPU report.
+    server: Arc<ServerClient>,
     /// The spawned `index --wait` tasks the owner has not yet seen finish.
     waits: tokio::task::JoinSet<()>,
     /// Handed to each `index --wait` task; kept so `asks` never closes.
@@ -159,8 +165,8 @@ struct Owner<B: Backend> {
     asks: mpsc::Receiver<Ask>,
 }
 
-impl<B: Backend> Owner<B> {
-    fn new(config: OwnerConfig<B>, rx: mpsc::Receiver<OwnerMsg>) -> Self {
+impl<T: Tokens> Owner<T> {
+    fn new(config: OwnerConfig<T>, rx: mpsc::Receiver<OwnerMsg>) -> Self {
         let (stage1_tx, stage1_rx) = mpsc::channel(8);
         let (phase_tx, _) = watch::channel(Phase::FirstIndex);
         let (asker, asks) = coverage::channel();
@@ -178,6 +184,7 @@ impl<B: Backend> Owner<B> {
             registry: config.registry,
             started: config.started,
             stopping: config.stopping,
+            server: config.server,
             rx,
             index: None,
             index_id: None,
@@ -288,9 +295,9 @@ impl<B: Backend> Owner<B> {
     }
 
     /// The `Ready` model, or `None` while it is still on its way.
-    fn ready(&self) -> Option<Arc<Model<B>>> {
+    fn ready(&self) -> Option<Arc<Embedding<T>>> {
         match &*self.model.borrow() {
-            ModelState::Ready(model) => Some(model.clone()),
+            EmbeddingState::Ready(model) => Some(model.clone()),
             _ => None,
         }
     }
@@ -489,7 +496,7 @@ impl<B: Backend> Owner<B> {
     /// already sent.
     async fn barrier_and_retrieve(
         &mut self,
-        model: &Arc<Model<B>>,
+        model: &Arc<Embedding<T>>,
         request: &search::Request,
         events: &mpsc::Sender<Event>,
     ) -> Option<Retrieved> {
@@ -558,7 +565,7 @@ impl<B: Backend> Owner<B> {
             .await;
             return None;
         }
-        let counter = BudgetCounter::<B>(model.counter.clone());
+        let counter = BudgetCounter::<T>(model.counter.clone());
         // Only the retrieval cancels on a hang-up: the barrier above always
         // runs to completion.
         let result = tokio::select! {
@@ -578,7 +585,7 @@ impl<B: Backend> Owner<B> {
 
     /// Drops this worktree's accumulated query stats; `Err` when the
     /// scheduler is gone.
-    async fn reset_stats(&self, model: &Arc<Model<B>>) -> Result<(), ()> {
+    async fn reset_stats(&self, model: &Arc<Embedding<T>>) -> Result<(), ()> {
         model
             .scheduler
             .take_stats(self.id)
@@ -589,7 +596,10 @@ impl<B: Backend> Owner<B> {
 
     /// Takes this worktree's accumulated query stats; `Err` when the
     /// scheduler is gone.
-    async fn take_stats(&self, model: &Arc<Model<B>>) -> Result<super::scheduler::AneStats, ()> {
+    async fn take_stats(
+        &self,
+        model: &Arc<Embedding<T>>,
+    ) -> Result<super::scheduler::AneStats, ()> {
         model.scheduler.take_stats(self.id).await.map_err(|_| ())
     }
 
@@ -686,10 +696,14 @@ impl<B: Backend> Owner<B> {
             }
         };
         let gpu = async {
-            match &sched {
-                Some(sched) => sched.gpu_status().await,
-                None => Ok(GpuState::Absent { blocked: None }),
-            }
+            // The GPU instance lives in the server now; `GET /status`
+            // reports it. A server that cannot be reached reports like a
+            // not-ready one, as before.
+            self.server
+                .status()
+                .await
+                .map(|body| body.gpu)
+                .unwrap_or(crate::protocol::GpuStatus::Absent { blocked: None })
         };
         let index = if index_exists {
             self.index.clone()
@@ -706,7 +720,7 @@ impl<B: Backend> Owner<B> {
         // stage-1 completion below.
         let (phase, counts, gpu, worktrees) =
             tokio::join!(phase, counts, gpu, self.registry.count());
-        let (Ok(counts), Ok(gpu), Some(worktrees)) = (counts, gpu, worktrees) else {
+        let (Ok(counts), gpu, Some(worktrees)) = (counts, gpu, worktrees) else {
             send(events, shutting_down()).await;
             return;
         };
@@ -760,26 +774,23 @@ impl<B: Backend> Owner<B> {
             }
         };
         let model = match &*self.model.borrow() {
-            ModelState::Absent => ModelStatus::Downloading {
+            EmbeddingState::Absent => ModelStatus::Downloading {
                 received: 0,
                 total: None,
             },
-            ModelState::Downloading { received, total } => ModelStatus::Downloading {
+            EmbeddingState::Downloading { received, total } => ModelStatus::Downloading {
                 received: *received,
                 total: *total,
             },
-            ModelState::Loading => ModelStatus::Loading,
-            ModelState::Ready(model) => ModelStatus::Ready {
+            EmbeddingState::Loading => ModelStatus::Loading,
+            EmbeddingState::Ready(model) => ModelStatus::Ready {
                 model_id: model.id.clone(),
             },
-            ModelState::Failed(message) | ModelState::Fatal(message) => ModelStatus::Failed {
-                message: message.clone(),
-            },
-        };
-        let gpu = match gpu {
-            GpuState::Absent { blocked } => crate::protocol::GpuStatus::Absent { blocked },
-            GpuState::Loading => crate::protocol::GpuStatus::Loading,
-            GpuState::Running => crate::protocol::GpuStatus::Running,
+            EmbeddingState::Failed(message) | EmbeddingState::Fatal(message) => {
+                ModelStatus::Failed {
+                    message: message.clone(),
+                }
+            }
         };
         let report = StatusReport {
             worktree: self.root.clone(),
@@ -806,7 +817,7 @@ impl<B: Backend> Owner<B> {
     /// barrier's `Enqueue` if the read missed it.
     async fn barrier(
         &mut self,
-        model: &Arc<Model<B>>,
+        model: &Arc<Embedding<T>>,
         include_ignored: bool,
         ack: Option<oneshot::Sender<Result<(), String>>>,
     ) -> Result<(Report, String), String> {
@@ -844,7 +855,7 @@ impl<B: Backend> Owner<B> {
     /// failed feed asks the books before it takes the next feed, so asks
     /// are answered while the feeder's inbox is full: the owner never waits
     /// on a feeder that waits on it.
-    async fn feed(&mut self, model: &Arc<Model<B>>, msg: FeedMsg) {
+    async fn feed(&mut self, model: &Arc<Embedding<T>>, msg: FeedMsg) {
         let feeder = self.feeder(model);
         let permit = loop {
             tokio::select! {
@@ -860,9 +871,9 @@ impl<B: Backend> Owner<B> {
 
     /// The feeder, spawned on first use; the writer is open by then (every
     /// barrier caller ran `shared` first).
-    fn feeder(&mut self, model: &Arc<Model<B>>) -> mpsc::Sender<feed::FeedMsg> {
+    fn feeder(&mut self, model: &Arc<Embedding<T>>) -> mpsc::Sender<feed::FeedMsg> {
         if self.feeder.is_none() {
-            self.feeder = Some(feed::spawn(FeederConfig::<B> {
+            self.feeder = Some(feed::spawn(FeederConfig::<T> {
                 worktree: self.id,
                 repo: self.repo,
                 root: self.root.clone(),
@@ -902,7 +913,7 @@ impl<B: Backend> Owner<B> {
     /// the pass leaves for the feeder.
     async fn barrier_steps(
         &mut self,
-        model: &Arc<Model<B>>,
+        model: &Arc<Embedding<T>>,
         include_ignored: bool,
     ) -> Result<(Report, String, Feed), String> {
         self.writer
@@ -1232,9 +1243,9 @@ struct Retrieved {
 }
 
 /// The output-budget counter over the model's tokenizer.
-struct BudgetCounter<B: Backend>(Arc<B::Counter>);
+struct BudgetCounter<T: Tokens>(Arc<T::Counter>);
 
-impl<B: Backend> search::TokenCounter for BudgetCounter<B> {
+impl<T: Tokens> search::TokenCounter for BudgetCounter<T> {
     fn count(&self, text: &str) -> usize {
         self.0.count(text)
     }

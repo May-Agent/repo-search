@@ -75,6 +75,7 @@ fn config(
             label: format!("{LABEL}.test-{}-{name}", std::process::id()),
             program,
             socket: dir.join("daemon.sock"),
+            server_socket: dir.join("server.sock"),
             idle_exit,
             model_cache: Some(model_cache),
             state_dir: Some(dir.join("state")),

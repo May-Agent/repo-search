@@ -27,7 +27,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use fake_embeddings::{FakeEmbeddings, Gate, Kind, Record, StubQueries};
-use repo_search::daemon::scheduler_http::{
+use repo_search::daemon::scheduler::{
     self, Counts, DocumentsJob, EmbedError, Enqueue, IndexClass, Interest, QueryJob, RepoId,
     SchedulerHandle, SchedulerMsg, Stage1Done, WorktreeId,
 };
@@ -62,7 +62,7 @@ async fn rig<E: Embeddings>(embeddings: Arc<E>) -> Rig {
     std::fs::create_dir_all(&git).expect("git dir");
     let (fatal_tx, fatal) = tokio::sync::mpsc::channel(8);
     let (busy_tx, busy) = tokio::sync::watch::channel(false);
-    let sched = scheduler_http::spawn(scheduler_http::SchedulerConfig {
+    let sched = scheduler::spawn(scheduler::SchedulerConfig {
         embeddings,
         query_input: Arc::new(StubQueries),
         fatal: fatal_tx.clone(),
@@ -97,11 +97,11 @@ async fn fake_rig(fake: FakeEmbeddings) -> Rig {
 }
 
 /// A pending chunk whose stub token count is exactly `tokens`.
-fn pending(seq: u64, tokens: u32) -> scheduler_http::PendingItem {
+fn pending(seq: u64, tokens: u32) -> scheduler::PendingItem {
     let title = format!("t{seq}");
     let width = 4 * (tokens as usize - 1) - title.len();
     let text = format!("{seq:0>width$}");
-    scheduler_http::PendingItem {
+    scheduler::PendingItem {
         chunk: PendingChunk {
             path: format!("src/f{seq}.rs"),
             content_hash: ContentHash::of_chunk(&title, &text),
@@ -119,7 +119,7 @@ fn hash(seq: u64, tokens: u32) -> ContentHash {
 }
 
 /// `seqs` as 100-token pending chunks.
-fn small(seqs: impl IntoIterator<Item = u64>) -> Vec<scheduler_http::PendingItem> {
+fn small(seqs: impl IntoIterator<Item = u64>) -> Vec<scheduler::PendingItem> {
     seqs.into_iter().map(|seq| pending(seq, 100)).collect()
 }
 
@@ -135,7 +135,7 @@ fn gates(fake: &mut FakeEmbeddings, seqs: impl IntoIterator<Item = u64>) -> Vec<
 async fn send_replace(
     rig: &Rig,
     worktree: WorktreeId,
-    items: Vec<scheduler_http::PendingItem>,
+    items: Vec<scheduler::PendingItem>,
     class: IndexClass,
 ) -> tokio::sync::mpsc::Receiver<Stage1Done> {
     let (done_tx, done_rx) = tokio::sync::mpsc::channel(8);
@@ -158,7 +158,7 @@ async fn send_replace(
 async fn enqueue_for(
     rig: &Rig,
     worktree: WorktreeId,
-    items: Vec<scheduler_http::PendingItem>,
+    items: Vec<scheduler::PendingItem>,
     class: IndexClass,
 ) -> tokio::sync::mpsc::Receiver<Stage1Done> {
     rig.sched.barrier(REPO, true).await;
@@ -170,7 +170,7 @@ async fn enqueue_for(
 /// Sends `items` to the scheduler as `class`, replacing its interest.
 async fn enqueue(
     rig: &Rig,
-    items: Vec<scheduler_http::PendingItem>,
+    items: Vec<scheduler::PendingItem>,
     class: IndexClass,
 ) -> tokio::sync::mpsc::Receiver<Stage1Done> {
     enqueue_for(rig, WORKTREE, items, class).await
@@ -182,7 +182,7 @@ async fn enqueue(
 async fn send_change(
     rig: &Rig,
     worktree: WorktreeId,
-    added: Vec<scheduler_http::PendingItem>,
+    added: Vec<scheduler::PendingItem>,
     dropped: Vec<ContentHash>,
     class: IndexClass,
 ) {
@@ -205,7 +205,7 @@ async fn send_change(
 async fn change_for(
     rig: &Rig,
     worktree: WorktreeId,
-    added: Vec<scheduler_http::PendingItem>,
+    added: Vec<scheduler::PendingItem>,
     dropped: Vec<ContentHash>,
     class: IndexClass,
 ) {
@@ -512,9 +512,10 @@ async fn counts_track_a_window_of_flights() {
     assert_eq!(counts_of(&rig, WORKTREE).await, counts(0, 0, 0, true));
 }
 
-/// A `Replace` that drops in-flight items uncounts them at once; their
-/// flights run to the end — the vectors are still worth having — and
-/// their late completions change nothing for the worktree.
+/// A `Replace` that drops in-flight items uncounts them at once and
+/// aborts their requests — most of the window waits queued on the
+/// server, where the closed request cancels it — so nothing embeds them
+/// and the worktree's counts never see them again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn counts_drop_a_re_enqueued_in_flight_item() {
     let (tx, records) = mpsc::channel();
@@ -524,27 +525,37 @@ async fn counts_drop_a_re_enqueued_in_flight_item() {
     let mut log = Vec::new();
     let _old_done = enqueue(&rig, small(0..2), IndexClass::Stage1).await;
     assert_eq!(counts_of(&rig, WORKTREE).await, counts(0, 0, 2, false));
+    // Both requests are parked at their gates.
+    wait_started(&mut log, &records, 2);
 
-    // The replacement lists only item 2: both in-flight items drop.
+    // The replacement lists only item 2: both in-flight items drop and
+    // their requests are aborted.
     let mut done = enqueue(&rig, small([2]), IndexClass::Stage1).await;
     assert_eq!(counts_of(&rig, WORKTREE).await, counts(0, 0, 1, false));
+    wait_cancelled(&mut log, &records, hash(0, 100), 3);
+    wait_cancelled(&mut log, &records, hash(1, 100), 3);
     wait_started(&mut log, &records, 3);
 
-    // Item 2 closes stage 1 while the dropped items still fly.
+    // Item 2 closes stage 1.
     gates[2].open();
     stage1(&mut done).await;
     assert_eq!(counts_of(&rig, WORKTREE).await, counts(0, 0, 0, true));
 
-    // The dropped items' completions land after it: the scheduler goes
-    // idle once both are handled, and the worktree's counts never moved.
+    // Opening the dropped items' gates reaches no request: the scheduler
+    // is idle and the worktree's counts never moved.
     gates[0].open();
     gates[1].open();
     await_idle(&rig).await;
     assert_eq!(counts_of(&rig, WORKTREE).await, counts(0, 0, 0, true));
-    for seq in 0..3 {
+    assert_eq!(
+        embeds_of(&mut log, &records, hash(2, 100)),
+        vec![(Kind::Index, 3)]
+    );
+    for seq in 0..2 {
         assert_eq!(
             embeds_of(&mut log, &records, hash(seq, 100)),
-            vec![(Kind::Index, 3)]
+            vec![],
+            "the dropped item {seq} is never embedded"
         );
     }
 }
@@ -639,7 +650,7 @@ async fn counts_move_to_background_at_stage1_completion() {
 
 /// A `Change` edits on top of a `Replace`: the added item flies and the
 /// dropped one leaves the worktree's interest. The dropped item was in
-/// flight, so its request runs to its end.
+/// flight, so its request is aborted and nothing embeds it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_change_adds_and_drops_on_top_of_a_replace() {
     let (tx, records) = mpsc::channel();
@@ -649,6 +660,8 @@ async fn a_change_adds_and_drops_on_top_of_a_replace() {
     let mut log = Vec::new();
     let mut done = enqueue(&rig, small(0..3), IndexClass::Stage1).await;
     assert_eq!(counts_of(&rig, WORKTREE).await, counts(0, 0, 3, false));
+    // Every request is parked at its gate.
+    wait_started(&mut log, &records, 3);
 
     let dropped = hash(1, 100);
     change_for(
@@ -660,6 +673,7 @@ async fn a_change_adds_and_drops_on_top_of_a_replace() {
     )
     .await;
     assert_eq!(counts_of(&rig, WORKTREE).await, counts(0, 0, 3, false));
+    wait_cancelled(&mut log, &records, dropped, 3);
 
     change_for(&rig, WORKTREE, vec![], vec![], IndexClass::Stage1).await;
     assert_eq!(counts_of(&rig, WORKTREE).await, counts(0, 0, 3, false));
@@ -674,8 +688,8 @@ async fn a_change_adds_and_drops_on_top_of_a_replace() {
     assert_each_once(&embedded);
     assert_eq!(
         embedded.iter().copied().collect::<HashSet<_>>(),
-        hash_set(0..4),
-        "the wanted items and the dropped in-flight one embed once each"
+        hash_set([0, 2, 3]),
+        "the wanted items embed once each and the dropped in-flight one never"
     );
 }
 

@@ -106,6 +106,16 @@ struct RawCli {
         value_name = "DIR"
     )]
     state_dir: Option<PathBuf>,
+
+    /// The embedding server's unix socket, defaulting to the agent's.
+    #[arg(
+        long,
+        hide = true,
+        requires = "daemon",
+        conflicts_with = "query",
+        value_name = "PATH"
+    )]
+    server_socket: Option<PathBuf>,
 }
 
 /// The parsed `search` command line.
@@ -275,6 +285,8 @@ pub enum Invocation {
         model_cache: Option<PathBuf>,
         /// `--state-dir`, when given.
         state_dir: Option<PathBuf>,
+        /// `--server-socket`, when given.
+        server_socket: Option<PathBuf>,
     },
     /// `search <query>`.
     Search {
@@ -318,6 +330,7 @@ impl Cli {
                     .map_or(daemon::IDLE_EXIT, Duration::from_secs),
                 model_cache: raw.model_cache,
                 state_dir: raw.state_dir,
+                server_socket: raw.server_socket,
             };
         }
         match raw.command {
@@ -482,10 +495,18 @@ mod tests {
                 idle_exit,
                 model_cache,
                 state_dir,
+                server_socket,
             } => {
                 assert_eq!(idle_exit, daemon::IDLE_EXIT);
                 assert_eq!(model_cache, None);
                 assert_eq!(state_dir, None);
+                assert_eq!(server_socket, None);
+            }
+            other => panic!("expected Daemon, got {other:?}"),
+        }
+        match parsed(&["search", "--daemon", "--server-socket", "/tmp/s.sock"]) {
+            Invocation::Daemon { server_socket, .. } => {
+                assert_eq!(server_socket, Some(PathBuf::from("/tmp/s.sock")));
             }
             other => panic!("expected Daemon, got {other:?}"),
         }

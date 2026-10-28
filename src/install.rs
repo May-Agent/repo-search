@@ -117,6 +117,7 @@ impl AgentConfig {
                 idle_exit: IDLE_EXIT,
                 model_cache: None,
                 state_dir: None,
+                server_socket: server_socket_path()?,
                 stderr: log_path()?,
             }),
             timeouts: Timeouts {

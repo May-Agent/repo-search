@@ -15,8 +15,8 @@ use std::time::Duration;
 
 use repo_search_core::UnitVector;
 use repo_search_core::embed_api::{
-    EmbeddingData, EmbeddingRequest, EncodingFormat, ErrorBody, Input, ServerTiming, Urgency,
-    decode_vector,
+    EmbeddingData, EmbeddingRequest, EncodingFormat, ErrorBody, Input, ModelsResponse,
+    ServerTiming, StatusBody, Urgency, decode_vector,
 };
 use repo_search_core::model::MODEL_ID;
 
@@ -185,6 +185,89 @@ impl ServerClient {
             vectors.push(UnitVector::normalize(floats));
         }
         Ok(Answered { vectors, timing })
+    }
+}
+
+/// A `GET /v1/models` readiness probe's answer.
+#[derive(Debug)]
+pub enum Probe {
+    /// The server is ready and lists these model ids.
+    Listed(Vec<String>),
+    /// `model_not_ready`; probe again after `retry_after`.
+    NotReady {
+        /// The server's `Retry-After`, 1 s when absent or unparsable.
+        retry_after: Duration,
+    },
+    /// `model_load_failed`; the probe itself already fired the server
+    /// loader's `Retry`, as any `/v1/` request on a `Failed` model does.
+    Failed(String),
+}
+
+impl ServerClient {
+    fn get(&self, path: &str) -> reqwest::RequestBuilder {
+        let request = self.client.get(format!("{}{path}", self.url));
+        match &self.token {
+            Some(token) => request.bearer_auth(token),
+            None => request,
+        }
+    }
+
+    /// `GET /v1/models` as a readiness probe: the listed ids, the
+    /// not-ready delay or the load failure's message. Other statuses and
+    /// transport failures come back as [`Error`].
+    pub async fn probe(&self) -> Result<Probe, Error> {
+        let response = self
+            .get("/v1/models")
+            .send()
+            .await
+            .map_err(Error::Transport)?;
+        let status = response.status();
+        let retry_after = response
+            .headers()
+            .get("retry-after")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<f64>().ok())
+            .map(Duration::from_secs_f64)
+            .unwrap_or(Duration::from_secs(1));
+        let body = response.bytes().await.map_err(Error::Transport)?;
+        if status.is_success() {
+            let body: ModelsResponse =
+                serde_json::from_slice(&body).map_err(|e| Error::Response(e.to_string()))?;
+            return Ok(Probe::Listed(
+                body.data.into_iter().map(|entry| entry.id).collect(),
+            ));
+        }
+        let envelope = serde_json::from_slice::<ErrorBody>(&body).ok();
+        let message = envelope
+            .as_ref()
+            .map(|body| body.error.message.clone())
+            .unwrap_or_else(|| String::from_utf8_lossy(&body).into_owned());
+        match envelope.and_then(|body| body.error.code).as_deref() {
+            Some("model_not_ready") => Ok(Probe::NotReady { retry_after }),
+            Some("model_load_failed") => Ok(Probe::Failed(message)),
+            _ => Err(Error::Status {
+                status: status.as_u16(),
+                message,
+            }),
+        }
+    }
+
+    /// `GET /status`: the server's own model and GPU report, for
+    /// `search status`.
+    pub async fn status(&self) -> Result<StatusBody, Error> {
+        let response = self.get("/status").send().await.map_err(Error::Transport)?;
+        let status = response.status();
+        let body = response.bytes().await.map_err(Error::Transport)?;
+        if !status.is_success() {
+            let message = serde_json::from_slice::<ErrorBody>(&body)
+                .map(|body| body.error.message)
+                .unwrap_or_else(|_| String::from_utf8_lossy(&body).into_owned());
+            return Err(Error::Status {
+                status: status.as_u16(),
+                message,
+            });
+        }
+        serde_json::from_slice(&body).map_err(|e| Error::Response(e.to_string()))
     }
 }
 

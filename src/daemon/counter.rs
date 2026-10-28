@@ -5,8 +5,44 @@
 use std::path::Path;
 
 use repo_search_core::TokenCounter;
-use repo_search_core::model::{BUCKETS, DOCUMENT, MAX_TOKENS, QueryTask};
+use repo_search_core::model::{BUCKETS, DOCUMENT, Fetch, MAX_TOKENS, QueryTask};
 use tokenizers::Tokenizer;
+
+use super::scheduler::QueryInput;
+
+/// What the daemon needs of the model's tokenizer: a counter for
+/// chunking, output budgets, queue ordering and the query `input`. The
+/// link's first step is `load` — the download and the tokenizer open —
+/// which reports [`Fetch`] progress to `progress`. Production is
+/// [`crate::model_store::TokenizerStore`]; the scheduler-level tests use
+/// a stub.
+pub trait Tokens: Send + Sync + 'static {
+    /// The loaded counter.
+    type Counter: TokenCounter + QueryInput;
+
+    /// Downloads and loads the counter.
+    ///
+    /// # Errors
+    ///
+    /// When the download or the tokenizer load fails; the error text is
+    /// published as the link's `Failed`.
+    fn load(
+        &self,
+        progress: &tokio::sync::watch::Sender<Fetch>,
+    ) -> impl Future<Output = Result<Self::Counter, String>> + Send;
+}
+
+impl Tokens for crate::model_store::TokenizerStore {
+    type Counter = PromptCounter;
+
+    async fn load(
+        &self,
+        progress: &tokio::sync::watch::Sender<Fetch>,
+    ) -> Result<Self::Counter, String> {
+        let path = self.ensure(progress).await.map_err(|e| e.to_string())?;
+        PromptCounter::open(path).map_err(|e| e.to_string())
+    }
+}
 
 /// Counts the model's tokens for the chunker's cap and for query
 /// truncation. The tokenizer file is the pinned `tokenizer.json` the

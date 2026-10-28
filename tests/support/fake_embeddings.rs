@@ -16,7 +16,7 @@
 use std::collections::HashMap;
 use std::sync::mpsc;
 
-use repo_search::daemon::scheduler_http::QueryInput;
+use repo_search::daemon::scheduler::QueryInput;
 use repo_search::daemon::server::{Answered, Embeddings};
 use repo_search_core::UnitVector;
 use repo_search_core::embed_api::{ServerTiming, Urgency};

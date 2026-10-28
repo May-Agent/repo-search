@@ -18,7 +18,8 @@ fn main() -> ExitCode {
             idle_exit,
             model_cache,
             state_dir,
-        } => daemon_main(idle_exit, model_cache, state_dir),
+            server_socket,
+        } => daemon_main(idle_exit, model_cache, state_dir, server_socket),
         Invocation::Server {
             idle_exit,
             model_cache,
@@ -68,10 +69,12 @@ fn daemon_main(
     idle_exit: Duration,
     model_cache: Option<PathBuf>,
     state_dir: Option<PathBuf>,
+    server_socket: Option<PathBuf>,
 ) -> ExitCode {
     use futures_util::future::join_all;
     use repo_search::daemon::{self, Config};
     use repo_search::launchd;
+    use repo_search_core::model::MODEL_ID;
     use std::os::unix::net::UnixListener;
 
     tracing_subscriber::fmt()
@@ -125,16 +128,16 @@ fn daemon_main(
     // `from_std` registers the fd with this runtime's driver, so `startup`
     // runs inside the runtime's context.
     let _guard = runtime.enter();
-    match startup(listeners, model_cache, state_dir) {
-        Ok((listener, model_store, state, chip, build)) => {
+    match startup(listeners, model_cache, state_dir, server_socket) {
+        Ok((listener, tokens, server, state, build)) => {
             match runtime.block_on(daemon::run(Config {
                 listener,
                 idle_exit,
                 load_bound: daemon::LOAD_BOUND,
-                model_store,
+                tokens,
+                server,
+                model_id: MODEL_ID.to_owned(),
                 state,
-                chip,
-                backend: std::sync::Arc::new(daemon::coreml::CoreMlBackend),
                 build,
             })) {
                 Ok(()) => ExitCode::SUCCESS,
@@ -159,9 +162,9 @@ fn daemon_main(
 /// What a successful `startup` hands to `daemon::run`.
 type Started = (
     tokio::net::UnixListener,
-    repo_search::model_store::ModelStore,
+    repo_search::model_store::TokenizerStore,
+    repo_search::daemon::server::Endpoint,
     repo_search_core::StateDir,
-    repo_search::daemon::chip::ChipClass,
     repo_search::protocol::BuildId,
 );
 
@@ -171,6 +174,7 @@ fn startup(
     mut listeners: Vec<std::os::unix::net::UnixListener>,
     model_cache: Option<PathBuf>,
     state_dir: Option<PathBuf>,
+    server_socket: Option<PathBuf>,
 ) -> Result<
     Started,
     (
@@ -178,8 +182,9 @@ fn startup(
         Vec<std::os::unix::net::UnixListener>,
     ),
 > {
-    use repo_search::daemon::{StartupError, chip};
-    use repo_search::model_store::{ModelSpec, ModelStore};
+    use repo_search::daemon::StartupError;
+    use repo_search::daemon::server::Endpoint;
+    use repo_search::model_store::TokenizerStore;
     use repo_search::protocol::BuildId;
     use repo_search_core::StateDir;
 
@@ -188,22 +193,27 @@ fn startup(
             return Err(StartupError::ListenerCount(listeners.len()));
         }
         let build = BuildId::of_current_exe().map_err(StartupError::Build)?;
-        let model_store = match &model_cache {
-            Some(root) => ModelStore::new(root.clone(), ModelSpec::embedding_gemma_2()),
-            None => ModelStore::user_cache(),
+        let tokens = match &model_cache {
+            Some(root) => TokenizerStore::new(
+                root.clone(),
+                repo_search::model_store::TokenizerSpec::embedding_gemma_2(),
+            ),
+            None => TokenizerStore::user_cache(),
         }
         .map_err(StartupError::ModelStore)?;
         let state = match &state_dir {
             Some(root) => StateDir::new(root.clone()),
             None => StateDir::user().map_err(StartupError::StateDir)?,
         };
-        // The chip's class decides which indexing queue the GPU serves; a
-        // brand the parse does not recognise is fatal — no fallback is
-        // guessed.
-        let chip = chip::host().map_err(StartupError::Chip)?;
-        Ok((model_store, state, chip, build))
+        let server = match server_socket {
+            Some(path) => Endpoint::Unix(path),
+            None => Endpoint::Unix(
+                repo_search::launchd::server_socket_path().map_err(StartupError::StateDir)?,
+            ),
+        };
+        Ok((tokens, server, state, build))
     };
-    let (model_store, state, chip, build) = match checks() {
+    let (tokens, server, state, build) = match checks() {
         Ok(checked) => checked,
         Err(error) => return Err((error, listeners)),
     };
@@ -214,7 +224,7 @@ fn startup(
         Err(error) => return Err((StartupError::Adopt(error), vec![std_listener])),
     };
     match tokio::net::UnixListener::from_std(std_listener) {
-        Ok(listener) => Ok((listener, model_store, state, chip, build)),
+        Ok(listener) => Ok((listener, tokens, server, state, build)),
         Err(error) => Err((StartupError::Adopt(error), vec![spare])),
     }
 }
