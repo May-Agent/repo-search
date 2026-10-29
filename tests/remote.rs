@@ -16,43 +16,19 @@ use std::time::Duration;
 use futures_util::{SinkExt, StreamExt};
 use repo_search::daemon::listen::{Bound, Listener as _};
 use repo_search::daemon::server::Endpoint;
-use repo_search::daemon::{self, Config, Error};
 use repo_search::protocol::{ErrorKind, Event, Final, GpuStatus, ModelStatus, Request, framed};
 use repo_search_core::StateDir;
 use repo_search_core::model::MODEL_ID;
+use support::bound::spawn;
 use support::client::{final_of, hello, request, search};
 use support::embed_server::{FakeConfig, FakeServer};
 use support::repo::{self, TestRepo};
 use support::tokens::StubTokens;
-use tokio::task::JoinHandle;
 
 const TIMEOUT: Duration = Duration::from_secs(60);
 
 /// The marker an edit lands in the index, then the answer.
 const MARKER: &str = "xylophonemarker";
-
-/// `daemon::run` with `StubTokens` on a `Bound` listener at `socket`.
-/// The acquire is awaited before the handle is returned, so the socket
-/// exists when the test goes on.
-async fn spawn(
-    socket: &Path,
-    state: StateDir,
-    endpoint: Endpoint,
-    tokens: StubTokens,
-    idle_exit: Duration,
-) -> JoinHandle<Result<(), Error>> {
-    let listener = Bound::acquire(socket).await.expect("the daemon binds");
-    tokio::spawn(daemon::run(Config {
-        listener,
-        idle_exit,
-        load_bound: daemon::LOAD_BOUND,
-        tokens,
-        server: endpoint,
-        model_id: MODEL_ID.to_owned(),
-        state,
-        build: support::client::build(),
-    }))
-}
 
 /// `index --wait` answers `Indexed` with every chunk vectored.
 async fn index_wait(socket: &Path, repo: &TestRepo) {

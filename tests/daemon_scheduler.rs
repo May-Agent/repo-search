@@ -15,8 +15,6 @@
 //! wait runs on gates, records, scheduler state or the busy report —
 //! never a sleep.
 
-#![cfg(target_os = "macos")]
-
 #[path = "support/embed_server.rs"]
 mod embed_server;
 #[path = "support/fake_embeddings.rs"]

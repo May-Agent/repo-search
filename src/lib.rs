@@ -22,3 +22,5 @@ pub mod model_store;
 pub mod paths;
 /// The daemon's wire types and JSON-lines framing.
 pub mod protocol;
+/// Spawn-on-demand: the client's launcher without launchd.
+pub mod spawn;

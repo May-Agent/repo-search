@@ -1,8 +1,8 @@
 //! The `search` binary: a thin dispatcher — `search --daemon` runs the
 //! launchd daemon, everything else is the client over the daemon socket.
 
-#[cfg(not(target_os = "macos"))]
-compile_error!("the search binary runs on macOS only");
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+compile_error!("the search binary runs on macOS and Linux only");
 
 use std::io::Write as _;
 use std::path::PathBuf;
@@ -35,12 +35,18 @@ fn main() -> ExitCode {
                 token_file: server_token_file,
             },
         ),
+        #[cfg(target_os = "macos")]
         Invocation::Server {
             idle_exit,
             model_cache,
             token_file,
             build,
         } => server_main(idle_exit, model_cache, token_file, build),
+        #[cfg(not(target_os = "macos"))]
+        Invocation::Server { .. } => {
+            let _ = std::io::stderr().write_all(b"search: --server runs on macOS only\n");
+            ExitCode::from(2)
+        }
         client => client_main(client),
     }
 }
@@ -80,6 +86,9 @@ fn client_main(invocation: Invocation) -> ExitCode {
 /// Only the failures that precede the socket — the runtime and the
 /// activation itself — are logged alone. Exit is 0 on idle exit or SIGTERM
 /// and 1 on a fatal error.
+///
+/// Off macOS there is no launchd: `--listen` is required, and its absence
+/// is a startup error reported on the ready fd.
 fn daemon_main(
     idle_exit: Duration,
     model_cache: Option<PathBuf>,
@@ -88,13 +97,6 @@ fn daemon_main(
     ready_fd: Option<std::os::fd::RawFd>,
     server: ServerArgs,
 ) -> ExitCode {
-    use futures_util::future::join_all;
-    use repo_search::daemon::listen::Activated;
-    use repo_search::daemon::{self, Config};
-    use repo_search::launchd;
-    use repo_search_core::model::MODEL_ID;
-    use std::os::unix::net::UnixListener;
-
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_max_level(tracing::Level::INFO)
@@ -133,6 +135,36 @@ fn daemon_main(
             path,
         );
     }
+
+    #[cfg(target_os = "macos")]
+    {
+        activated_main(runtime, idle_exit, model_cache, state_dir, ready_fd, server)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        tracing::error!("--daemon needs --listen off macOS");
+        fail_ready(ready_fd, "--daemon needs --listen off macOS")
+    }
+}
+
+/// The launchd entry point: the `Listener` socket comes from socket
+/// activation, and the startup failures answer the connections already
+/// queued on it.
+#[cfg(target_os = "macos")]
+fn activated_main(
+    runtime: tokio::runtime::Runtime,
+    idle_exit: Duration,
+    model_cache: Option<PathBuf>,
+    state_dir: Option<PathBuf>,
+    ready_fd: Option<std::os::fd::RawFd>,
+    server: ServerArgs,
+) -> ExitCode {
+    use futures_util::future::join_all;
+    use repo_search::daemon::listen::Activated;
+    use repo_search::daemon::{self, Config};
+    use repo_search::launchd;
+    use repo_search_core::model::MODEL_ID;
+    use std::os::unix::net::UnixListener;
 
     let fds = match launchd::activate_socket("Listener") {
         Ok(fds) if fds.is_empty() => {
@@ -287,6 +319,7 @@ fn fail_ready(ready_fd: Option<std::os::fd::RawFd>, message: &str) -> ExitCode {
 }
 
 /// What a successful `startup` hands to `daemon::run`.
+#[cfg(target_os = "macos")]
 type Started = (
     tokio::net::UnixListener,
     repo_search::model_store::TokenizerStore,
@@ -297,6 +330,7 @@ type Started = (
 
 /// The reportable startup checks, in order. On failure the std listeners
 /// come back so the caller can answer their queues.
+#[cfg(target_os = "macos")]
 fn startup(
     mut listeners: Vec<std::os::unix::net::UnixListener>,
     model_cache: Option<PathBuf>,
@@ -416,6 +450,7 @@ fn endpoint(
 }
 
 /// Answers queued launchd connections with the 503 refusal, then exits 1.
+#[cfg(target_os = "macos")]
 fn fail_all(
     listeners: Vec<repo_search_server::Listener>,
     message: &str,
@@ -427,6 +462,7 @@ fn fail_all(
 }
 
 /// One listener adopted into the runtime.
+#[cfg(target_os = "macos")]
 enum Adopted {
     Unix(tokio::net::UnixListener),
     Tcp(tokio::net::TcpListener),
@@ -435,6 +471,7 @@ enum Adopted {
 /// Adopts `listener`: `from_std` consumes the std listener either way,
 /// so a `try_clone` spare rides along for the refusal path when the
 /// adoption fails.
+#[cfg(target_os = "macos")]
 fn adopt(
     listener: repo_search_server::Listener,
 ) -> Result<Adopted, (std::io::Error, repo_search_server::Listener)> {
@@ -462,6 +499,7 @@ fn adopt(
 /// binary before `repo_search_server::run` starts — a mismatch means the
 /// agent wants another build, so the server fails fast after answering
 /// every queued connection 503.
+#[cfg(target_os = "macos")]
 fn server_main(
     idle_exit: Option<Duration>,
     model_cache: Option<PathBuf>,

@@ -3,6 +3,7 @@
 
 #![cfg(target_os = "macos")]
 
+#[allow(dead_code)] // each test file uses its own slice of the fixtures
 mod support;
 
 use std::collections::HashSet;

@@ -16,7 +16,7 @@ pub use launcher::LaunchdAgents;
 pub use launcher::{Launcher, Report};
 pub use render::{IndexedOutput, StatusOutput};
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -28,9 +28,11 @@ use tokio::io::{AsyncWrite, AsyncWriteExt};
 use crate::client::Client;
 #[cfg(target_os = "macos")]
 use crate::install::{AgentConfig, SystemLaunchctl};
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use crate::protocol::BuildId;
 use crate::protocol::{Event, Final, Format, Hello, Request, SearchRequest};
+#[cfg(target_os = "linux")]
+use crate::spawn::OnDemand;
 
 /// The process's own environment: the working directory, the launcher
 /// that keeps the daemon reachable and the handshake to send. Production
@@ -46,7 +48,7 @@ pub struct Env<A: Launcher> {
 
 /// A failure of `Env::user`: one of the process's own paths did not
 /// resolve.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[derive(Debug, thiserror::Error)]
 #[error("{what}: {source}")]
 pub struct EnvError {
@@ -54,31 +56,39 @@ pub struct EnvError {
     source: io::Error,
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 impl EnvError {
     fn new(what: &'static str, source: io::Error) -> Self {
         Self { what, source }
+    }
+
+    /// The working directory, the canonical current executable and its
+    /// handshake: the part of the real user's [`Env`] both platforms
+    /// share. Runs synchronously before any runtime exists; every step
+    /// is a cheap filesystem call.
+    fn process() -> Result<(PathBuf, PathBuf, Hello), Self> {
+        let cwd = std::env::current_dir()
+            .map_err(|e| Self::new("cannot read the working directory", e))?;
+        let program = std::env::current_exe()
+            .and_then(|exe| exe.canonicalize())
+            .map_err(|e| Self::new("cannot identify the running executable", e))?;
+        // Canonical, so that a symlink repointed at a new install (a
+        // versioned directory, a package manager's shim) changes the
+        // launcher's command and replaces the daemon.
+        let hello = Hello::new(
+            BuildId::of_file(&program)
+                .map_err(|e| Self::new("cannot stat the running executable", e))?,
+        );
+        Ok((cwd, program, hello))
     }
 }
 
 #[cfg(target_os = "macos")]
 impl Env<LaunchdAgents<SystemLaunchctl>> {
     /// The real user: `cwd`, the canonical current executable, its
-    /// [`BuildId`], and [`AgentConfig::user`]. Runs synchronously before
-    /// any runtime exists; every step is a cheap filesystem call.
+    /// [`BuildId`], and [`AgentConfig::user`].
     pub fn user() -> Result<Self, EnvError> {
-        let cwd = std::env::current_dir()
-            .map_err(|e| EnvError::new("cannot read the working directory", e))?;
-        let program = std::env::current_exe()
-            .and_then(|exe| exe.canonicalize())
-            .map_err(|e| EnvError::new("cannot identify the running executable", e))?;
-        // Canonical, so that a symlink repointed at a new install (a
-        // versioned directory, a package manager's shim) changes the plist
-        // and reinstalls.
-        let hello = Hello::new(
-            BuildId::of_file(&program)
-                .map_err(|e| EnvError::new("cannot stat the running executable", e))?,
-        );
+        let (cwd, program, hello) = EnvError::process()?;
         let server_agent = AgentConfig::server(program.clone())
             .map_err(|e| EnvError::new("cannot resolve the server agent's paths", e))?;
         let agent = AgentConfig::user(program)
@@ -86,6 +96,23 @@ impl Env<LaunchdAgents<SystemLaunchctl>> {
         Ok(Self {
             cwd,
             launcher: LaunchdAgents::new(server_agent, agent, SystemLaunchctl),
+            hello,
+        })
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Env<OnDemand> {
+    /// The real user: `cwd`, the canonical current executable, its
+    /// [`BuildId`], and the daemon [`OnDemand`] spawns from the XDG
+    /// paths and `daemon.toml`.
+    pub fn user() -> Result<Self, EnvError> {
+        let (cwd, program, hello) = EnvError::process()?;
+        let launcher = OnDemand::user(program)
+            .map_err(|e| EnvError::new("cannot resolve the daemon's paths", e))?;
+        Ok(Self {
+            cwd,
+            launcher,
             hello,
         })
     }

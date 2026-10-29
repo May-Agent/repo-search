@@ -157,6 +157,16 @@ const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 /// The daemon exits after this long with no connections and no work.
 pub const IDLE_EXIT: Duration = Duration::from_secs(600);
 
+/// `launchctl bootout` returns before launchd finishes the teardown; the
+/// agent's process exit is awaited this long before `bootstrap`. On Linux
+/// it is the old daemon's shutdown tail a replacement waits out.
+pub const TEARDOWN_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// `launchctl bootstrap` returns once the job is loaded; launchd binds the
+/// `SockPathName` a moment later, awaited this long. On Linux it is the
+/// new daemon's startup after the old one is gone.
+pub const SOCKET_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// The bound on one link attempt — the tokenizer download plus the wait
 /// for the server to report the model ready: the server's own load bound
 /// plus slack for the tokenizer fetch and the probe round trips.
