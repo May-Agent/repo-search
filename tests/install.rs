@@ -11,10 +11,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Barrier;
 use std::time::Duration;
 
-use repo_search::install::{
+use repo_search_client::launcher::install::{
     Agent, AgentConfig, Check, InstallError, Plist, Reason, Timeouts, ensure_agent,
 };
-use repo_search::launchd::{DEFAULT_PORT, LaunchAgent, ServerAgent};
+use repo_search_client::launcher::launchd::{DEFAULT_PORT, LaunchAgent, ServerAgent};
 use std::net::{IpAddr, Ipv4Addr};
 use support::client;
 use support::launchd::{Call, FakeLaunchd};
@@ -24,7 +24,7 @@ use support::launchd::{Call, FakeLaunchd};
 fn test_config(tmp: &tempfile::TempDir, program: &Path) -> AgentConfig {
     let root = tmp.path();
     AgentConfig {
-        domain: repo_search::launchd::domain(),
+        domain: repo_search_client::launcher::launchd::domain(),
         plist: root.join("LaunchAgents/com.github.may-agent.repo-search.test.plist"),
         lock: root.join("support/install.lock"),
         agent: Plist::Daemon(LaunchAgent {
@@ -307,7 +307,7 @@ async fn socket_wait_times_out() {
 fn server_test_config(tmp: &tempfile::TempDir, program: &Path) -> AgentConfig {
     let root = tmp.path();
     AgentConfig {
-        domain: repo_search::launchd::domain(),
+        domain: repo_search_client::launcher::launchd::domain(),
         plist: root.join("LaunchAgents/com.github.may-agent.repo-search.server.test.plist"),
         lock: root.join("support/install.lock"),
         agent: Plist::Server(ServerAgent {

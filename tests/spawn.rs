@@ -20,13 +20,12 @@ use std::time::Duration;
 
 use clap::Parser as _;
 use futures_util::future::join_all;
-use repo_search::cli::{Cli, Env, Exit, Invocation, Launcher as _, Terminal};
+use repo_search::cli::{Cli, Env, Exit, Invocation, Terminal};
 use repo_search::daemon::listen::{Bound, LifetimeLock, Listener};
 use repo_search::daemon::server::Endpoint;
 use repo_search::daemon::{self, Config, StartupError};
-use repo_search::spawn::{DaemonCommand, DaemonConfig, OnDemand, ServerTarget};
-use repo_search_client::client::ClientError;
-use repo_search_client::protocol::{ErrorKind, ErrorReport};
+use repo_search_client::launcher::Launcher as _;
+use repo_search_client::launcher::spawn::{DaemonCommand, DaemonConfig, OnDemand, ServerTarget};
 use repo_search_core::StateDir;
 use repo_search_core::model::MODEL_ID;
 use serde::{Deserialize, Serialize};
@@ -589,42 +588,4 @@ async fn an_unreadable_token_file_shows_the_daemons_failure() {
     // The host reports `failed:` before it exits, so the client can
     // print the error while the host still holds its lifetime lock.
     world.exited().await;
-}
-
-/// Which connect failures a fresh daemon can cure.
-#[test]
-fn recoverable_connect_failures() {
-    let launcher = OnDemand::new(
-        DaemonCommand::new(
-            PathBuf::from("search"),
-            Path::new("/run/daemon.sock"),
-            &ServerTarget::Socket(PathBuf::from("/run/server.sock")),
-        ),
-        PathBuf::from("/run/daemon.sock"),
-        PathBuf::from("/log"),
-    );
-    let refused = |kind| {
-        ClientError::Refused(ErrorReport {
-            kind,
-            message: String::new(),
-        })
-    };
-    let connect = |kind| ClientError::Connect(std::io::Error::from(kind));
-    for cure in [
-        connect(std::io::ErrorKind::NotFound),
-        connect(std::io::ErrorKind::ConnectionRefused),
-        ClientError::Io(std::io::Error::from(std::io::ErrorKind::ConnectionReset)),
-        ClientError::Closed,
-        refused(ErrorKind::ShuttingDown),
-        refused(ErrorKind::ProtocolMismatch),
-    ] {
-        assert!(launcher.recoverable(&cure), "{cure:?} is recoverable");
-    }
-    for fatal in [
-        ClientError::TooLarge,
-        refused(ErrorKind::Startup),
-        refused(ErrorKind::Model),
-    ] {
-        assert!(!launcher.recoverable(&fatal), "{fatal:?} is final");
-    }
 }

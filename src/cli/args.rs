@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use clap::{ArgMatches, Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 
-use crate::daemon;
+use repo_search_client::launcher::DAEMON_IDLE_EXIT;
 use repo_search_client::protocol::WireMode;
 
 /// `--version` output: the binary version, the chunker fingerprint and the
@@ -322,7 +322,7 @@ pub enum Invocation {
     /// `search --daemon`: the agent's entry point, socket-activated on
     /// macOS and self-bound under spawn on Linux.
     Daemon {
-        /// Idle deadline; [`daemon::IDLE_EXIT`] unless `--idle-exit-secs`.
+        /// Idle deadline; [`DAEMON_IDLE_EXIT`] unless `--idle-exit-secs`.
         idle_exit: Duration,
         /// `--model-cache`, when given.
         model_cache: Option<PathBuf>,
@@ -376,7 +376,7 @@ impl Cli {
             return Invocation::Daemon {
                 idle_exit: raw
                     .idle_exit_secs
-                    .map_or(daemon::IDLE_EXIT, Duration::from_secs),
+                    .map_or(DAEMON_IDLE_EXIT, Duration::from_secs),
                 model_cache: raw.model_cache,
                 state_dir: raw.state_dir,
                 server_socket: raw.server_socket,
@@ -554,7 +554,7 @@ mod tests {
                 server_addr,
                 server_token_file,
             } => {
-                assert_eq!(idle_exit, daemon::IDLE_EXIT);
+                assert_eq!(idle_exit, DAEMON_IDLE_EXIT);
                 assert_eq!(model_cache, None);
                 assert_eq!(state_dir, None);
                 assert_eq!(server_socket, None);

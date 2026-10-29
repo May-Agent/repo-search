@@ -1,5 +1,5 @@
-//! Spawn-on-demand: the client's [`Launcher`] for a machine without
-//! launchd. A client that cannot reach the daemon takes `spawn.lock`,
+//! Spawn-on-demand: the [`Launcher`] for a machine without launchd. A
+//! client that cannot reach the daemon takes `spawn.lock`,
 //! starts a detached `search --daemon --listen` and reads its readiness
 //! line off a pipe before it lets any other client spawn.
 //!
@@ -7,7 +7,7 @@
 //! runtime dir:
 //!
 //! - `daemon.lock`: the daemon's lifetime lock, held by the daemon until
-//!   its process exits ([`Bound`](crate::daemon::listen::Bound)); its
+//!   its process exits (`Bound`); its
 //!   contents are the daemon's pid.
 //! - `spawn.lock`: the clients' spawn lock, held from the liveness probe
 //!   until the new daemon reported ready, so concurrent clients spawn
@@ -32,11 +32,10 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt as _, BufReader};
 use tokio::net::unix::pipe;
 
-use crate::cli::{Launcher, Report};
-use crate::daemon::{SOCKET_TIMEOUT, TEARDOWN_TIMEOUT};
-use crate::paths::UserPaths;
-use repo_search_client::client::ClientError;
-use repo_search_client::protocol::ErrorKind;
+use super::paths::UserPaths;
+use super::{Launcher, Report, SOCKET_TIMEOUT, TEARDOWN_TIMEOUT};
+use crate::client::ClientError;
+use crate::protocol::ErrorKind;
 
 /// How long a client waits for the spawned daemon's readiness line: the
 /// previous daemon's shutdown tail plus the new daemon's startup — the
@@ -359,7 +358,7 @@ impl OnDemand {
     }
 
     /// The daemon's lifetime lock, next to its socket as
-    /// [`Bound`](crate::daemon::listen::Bound) names it.
+    /// `Bound` names it.
     fn daemon_lock(&self) -> PathBuf {
         self.socket.with_extension("lock")
     }
@@ -629,6 +628,7 @@ impl Launcher for OnDemand {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::ErrorReport;
 
     fn parse(text: &str) -> Result<DaemonConfig, DaemonConfigError> {
         DaemonConfig::parse(Path::new("daemon.toml"), text)
@@ -748,5 +748,43 @@ mod tests {
             "/bin/search\n--daemon\n--listen\n/run/daemon.sock\n--ready-fd\n3\n--server-addr\n127.0.0.1:41827\n--server-token-file\n/etc/token\n"
         );
         assert_ne!(unix.render(), tcp.render());
+    }
+
+    /// Which connect failures a fresh daemon can cure.
+    #[test]
+    fn recoverable_connect_failures() {
+        let launcher = OnDemand::new(
+            DaemonCommand::new(
+                PathBuf::from("search"),
+                Path::new("/run/daemon.sock"),
+                &ServerTarget::Socket(PathBuf::from("/run/server.sock")),
+            ),
+            PathBuf::from("/run/daemon.sock"),
+            PathBuf::from("/log"),
+        );
+        let refused = |kind| {
+            ClientError::Refused(ErrorReport {
+                kind,
+                message: String::new(),
+            })
+        };
+        let connect = |kind| ClientError::Connect(std::io::Error::from(kind));
+        for cure in [
+            connect(std::io::ErrorKind::NotFound),
+            connect(std::io::ErrorKind::ConnectionRefused),
+            ClientError::Io(std::io::Error::from(std::io::ErrorKind::ConnectionReset)),
+            ClientError::Closed,
+            refused(ErrorKind::ShuttingDown),
+            refused(ErrorKind::ProtocolMismatch),
+        ] {
+            assert!(launcher.recoverable(&cure), "{cure:?} is recoverable");
+        }
+        for fatal in [
+            ClientError::TooLarge,
+            refused(ErrorKind::Startup),
+            refused(ErrorKind::Model),
+        ] {
+            assert!(!launcher.recoverable(&fatal), "{fatal:?} is final");
+        }
     }
 }

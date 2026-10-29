@@ -11,7 +11,7 @@ use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
 use repo_search::daemon::server::Endpoint;
-use repo_search::install::{Launchctl, LaunchctlError, Service};
+use repo_search_client::launcher::install::{Launchctl, LaunchctlError, Service};
 use repo_search_client::protocol::BuildId;
 use repo_search_core::StateDir;
 use repo_search_server::stub::StubBackend;

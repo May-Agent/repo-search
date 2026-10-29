@@ -423,7 +423,7 @@ fn checks(
     let state = match &state_dir {
         Some(root) => StateDir::new(root.clone()),
         None => StateDir::new(
-            repo_search::paths::UserPaths::user()
+            repo_search_client::launcher::paths::UserPaths::user()
                 .map_err(StartupError::StateDir)?
                 .state,
         ),
@@ -468,7 +468,8 @@ fn endpoint(
         (Some(path), None) => Ok(Endpoint::Unix(path)),
         (None, Some(addr)) => Ok(Endpoint::Tcp { addr, token }),
         (None, None) => Ok(Endpoint::Unix(
-            repo_search::paths::server_socket_path().map_err(StartupError::StateDir)?,
+            repo_search_client::launcher::paths::server_socket_path()
+                .map_err(StartupError::StateDir)?,
         )),
         (Some(_), Some(_)) => unreachable!("clap marks the flags conflicting"),
     }
@@ -708,7 +709,7 @@ fn server_main(
         unix: unix_listener.expect("the count check left one listener"),
         tcp,
         token,
-        idle_exit: idle_exit.unwrap_or(repo_search_server::IDLE_EXIT),
+        idle_exit: idle_exit.unwrap_or(repo_search_client::launcher::SERVER_IDLE_EXIT),
         load_bound: repo_search_core::embed_api::LOAD_BOUND,
         model: model_store,
         chip,

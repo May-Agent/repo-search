@@ -26,10 +26,6 @@ pub mod stub;
 pub use loader::{Loader, LoaderConfig, LoaderMsg, Model, ModelSource, ModelState};
 pub use scheduler::{GpuState, SchedulerHandle};
 
-/// Exit after this long with no request in flight, nothing queued and the
-/// loader not busy.
-pub const IDLE_EXIT: Duration = Duration::from_secs(600);
-
 /// The request body cap: 32 MiB.
 pub const BODY_LIMIT: usize = 32 << 20;
 

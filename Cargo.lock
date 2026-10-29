@@ -1768,13 +1768,11 @@ dependencies = [
  "bytes",
  "clap",
  "const_format",
- "etcetera",
  "futures-util",
  "hex",
  "http-body-util",
  "hyper",
  "hyper-util",
- "kqueue",
  "libc",
  "notify",
  "repo-search-client",
@@ -1792,7 +1790,6 @@ dependencies = [
  "tokenizers",
  "tokio",
  "tokio-util",
- "toml_edit",
  "tracing",
  "tracing-subscriber",
  "zstd",
@@ -1802,13 +1799,18 @@ dependencies = [
 name = "repo-search-client"
 version = "0.0.3"
 dependencies = [
+ "askama",
+ "etcetera",
  "futures-util",
+ "kqueue",
+ "libc",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror",
  "tokio",
  "tokio-util",
+ "toml_edit",
 ]
 
 [[package]]
