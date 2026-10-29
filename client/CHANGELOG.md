@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.4](https://github.com/May-Agent/repo-search/compare/client/v0.0.3...client/v0.0.4) - 2026-10-29
+
+### Added
+
+- *(client)* move the daemon launcher into the client crate
+
 ## [0.0.3](https://github.com/May-Agent/repo-search/releases/tag/client/v0.0.3) - 2026-10-29
 
 ### Added
