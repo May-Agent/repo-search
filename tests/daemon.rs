@@ -1968,6 +1968,76 @@ async fn worktrees_and_repositories_get_separate_index_files() {
     );
 }
 
+/// Two case spellings of one worktree root reach one owner and one index:
+/// on a case-insensitive volume a mis-spelled path names the same
+/// directory, so the daemon's key must be the on-disk spelling, not the
+/// spelling it was handed. Case-insensitivity is detected on the tempdir
+/// itself — only there can two spellings resolve to one directory at all,
+/// so only there can the aliasing arise.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn case_spellings_of_one_worktree_share_an_owner_and_index() {
+    let repo = fn_repo(5, SMALL_BYTES, 5);
+    let (d, _, _) = start(&repo, Duration::ZERO, Duration::ZERO, &[]).await;
+    let wrong = PathBuf::from(
+        repo.root
+            .to_str()
+            .expect("the test root is UTF-8")
+            .to_uppercase(),
+    );
+    assert_ne!(wrong, repo.root, "the two spellings differ");
+    if !wrong.exists() {
+        // A case-sensitive volume names a directory by one spelling only:
+        // no second spelling can reach it, so no aliasing can arise.
+        eprintln!(
+            "skipping: {} is on a case-sensitive volume",
+            repo.root.display()
+        );
+        return;
+    }
+
+    for root in [&wrong, &repo.root] {
+        let events = answer_search(&d, root, MARKER).await;
+        assert!(
+            matches!(final_of(&events), Final::Answer(_)),
+            "the search on {} failed: {events:?}",
+            root.display()
+        );
+    }
+
+    // One owner served both spellings, keyed by the on-disk spelling, and
+    // one index file holds the tree.
+    let events = request(
+        &d.socket,
+        &hello(),
+        Request::Status {
+            worktree: repo.root.clone(),
+        },
+    )
+    .await;
+    let status = match final_of(&events) {
+        Final::Status(status) => status,
+        other => panic!("expected a Status, got {other:?}"),
+    };
+    assert_eq!(
+        status.daemon.worktrees, 1,
+        "both spellings reach one worktree"
+    );
+    assert_eq!(
+        status.worktree, repo.root,
+        "the owner's root is the on-disk spelling"
+    );
+    let indexes: Vec<PathBuf> = std::fs::read_dir(d.state.root().join("worktrees"))
+        .expect("the state dir lists")
+        .map(|entry| entry.expect("the entry reads").path())
+        .collect();
+    assert_eq!(indexes.len(), 1, "both spellings share one index");
+    assert!(indexes[0].join("index.db").is_file());
+    assert!(
+        repo::clean(&repo.root),
+        "the daemon wrote under the worktree"
+    );
+}
+
 /// A worktree added next to an indexed sibling copies the sibling's index
 /// instead of rebuilding: its first barrier re-chunks only the edited
 /// files and restamps the rest, and the seeded index searches as a freshly
@@ -2050,35 +2120,17 @@ async fn a_new_worktree_seeds_its_index_from_a_sibling() {
     assert!(fresh.has_results, "{events:?}");
     let fresh_output: serde_json::Value =
         serde_json::from_str(&fresh.output).expect("the answer is JSON");
-    // A hybrid answer's fused scores and its order within a file are no
-    // function of the index: the vector channel breaks equal scores by the
-    // row a vector holds in the in-memory index, the order vectors were
-    // adopted in (a `HashSet`'s, then the cache's slots'), and the stub's
-    // one-hot vectors make nearly every score equal. Two fresh builds of
-    // one tree differ the same way. The selection — same files, same
-    // chunks, found by the same channels — is identical.
-    let selection = |output: &serde_json::Value| {
-        let mut files = Vec::new();
-        for list in ["code", "docs"] {
-            for file in output[list].as_array().into_iter().flatten() {
-                let mut chunks: Vec<String> = file["chunks"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .map(serde_json::Value::to_string)
-                    .collect();
-                chunks.sort_unstable();
-                files.push(format!("{list}:{}:{chunks:?}", file["path"]));
-            }
-        }
-        files.sort_unstable();
-        files
-    };
-    assert_eq!(selection(&output), selection(&fresh_output), "{output}");
-    // The lexical channel alone ranks by the index's rows: BM25 over its
-    // FTS statistics, equal scores by chunk id. The seeded index answers
-    // exactly as `scratch`'s, which reconciled the same edits — `usize`
-    // matches every chunk at one score, so its order is the ids'.
+    // Every ranking stage breaks a score tie by the chunk's content hash,
+    // never by the row a vector was loaded into — the order vectors were
+    // adopted in differs between the seeded store and `scratch`'s — so the
+    // stub's one-hot scores (nearly all equal) still give the identical
+    // hybrid answer.
+    assert_eq!(output["code"], fresh_output["code"], "{output}");
+    assert_eq!(output["docs"], fresh_output["docs"], "{output}");
+    // The lexical channel alone ranks by BM25 over the index's FTS
+    // statistics, equal scores by content hash then path. The seeded index
+    // answers exactly as `scratch`'s, which reconciled the same edits —
+    // `usize` matches every chunk at one score, so its order is the hashes'.
     for query in [MARKER, "usize"] {
         let mut answers = Vec::new();
         for worktree in [&linked, &scratch] {
@@ -2101,6 +2153,50 @@ async fn a_new_worktree_seeds_its_index_from_a_sibling() {
     );
 
     index_request(&d, &linked, true).await;
+}
+
+/// Two daemons over the same index return identical hybrid results under
+/// tied scores: the stub's one-hot vectors tie nearly every cosine, and
+/// each daemon's vector store loads the index's rows in its own `HashSet`
+/// order, so only a tie-break on the chunk's content hash — never a row
+/// number — makes the answers equal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_daemons_over_one_index_agree_on_tied_results() {
+    let repo = fn_repo(20, SMALL_BYTES, 5);
+    let (d, _, _) = start(&repo, Duration::ZERO, Duration::ZERO, &[]).await;
+    index_request(&d, &repo.root, true).await;
+
+    // A second daemon over the same state dir: it opens the same index and
+    // vector cache and loads its rows in its own order.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let socket = tmp.path().join("daemon.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket).expect("socket binds");
+    let join = support::daemon::spawn_on(
+        &tokio::runtime::Handle::current(),
+        listener,
+        support::daemon::Setup {
+            tokens: StubTokens::default(),
+            server: repo_search::daemon::server::Endpoint::Unix(d.server_socket.clone()),
+            model_id: repo_search_core::model::MODEL_ID.to_owned(),
+            state: d.state.clone(),
+            idle_exit: Duration::from_secs(600),
+            load_bound: daemon::LOAD_BOUND,
+            build: support::client::build(),
+        },
+    );
+
+    let mut outputs = Vec::new();
+    for socket in [&d.socket, &socket] {
+        let events = request(socket, &hello(), search(&repo.root, MARKER)).await;
+        let answer = match final_of(&events) {
+            Final::Answer(answer) => answer,
+            other => panic!("expected an Answer, got {other:?}"),
+        };
+        assert!(answer.has_results, "{events:?}");
+        outputs.push(answer.output.clone());
+    }
+    assert_eq!(outputs[0], outputs[1]);
+    join.abort();
 }
 
 /// A seeded index starts first-index: the files a seeded worktree

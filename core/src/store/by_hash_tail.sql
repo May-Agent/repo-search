@@ -1,1 +1,1 @@
-ORDER BY c.id
+ORDER BY c.path, c.start_line, c.id
