@@ -13,8 +13,8 @@ use serde::Serialize;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 use super::{Exit, Terminal, mb, tell};
-use crate::client::ClientError;
-use crate::protocol::{
+use repo_search_client::client::ClientError;
+use repo_search_client::protocol::{
     Answer, ErrorKind, ErrorReport, GpuStatus, IndexStatus, ModelStatus, StatusReport, WirePhase,
 };
 
@@ -443,7 +443,7 @@ pub fn client_error(error: &ClientError, socket: &Path, log: &Path) -> String {
 mod tests {
     use super::*;
 
-    use crate::protocol::{DaemonStatus, IndexStatus};
+    use repo_search_client::protocol::{DaemonStatus, IndexStatus};
 
     fn report(model: ModelStatus, gpu: GpuStatus, index: Option<IndexStatus>) -> StatusReport {
         StatusReport {

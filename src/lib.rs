@@ -3,8 +3,6 @@
 /// The `search` client: argument parsing, the agent check, progress and
 /// output rendering.
 pub mod cli;
-/// The library client of the `search` daemon.
-pub mod client;
 /// The `search` daemon.
 pub mod daemon;
 /// Installing and replacing the per-user LaunchAgent.
@@ -20,7 +18,7 @@ pub mod launchd;
 pub mod model_store;
 /// The per-user paths: `~/Library` on macOS, XDG on Linux.
 pub mod paths;
-/// The daemon's wire types and JSON-lines framing.
-pub mod protocol;
 /// Spawn-on-demand: the client's launcher without launchd.
 pub mod spawn;
+/// Conversions between core's types and the client crate's wire types.
+pub mod wire;

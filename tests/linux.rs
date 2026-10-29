@@ -21,7 +21,7 @@ use std::time::Duration;
 
 use repo_search::daemon::server::Endpoint;
 use repo_search::daemon::watch::{self, WatchMsg, Watcher};
-use repo_search::protocol::{Final, Request};
+use repo_search_client::protocol::{Final, Request};
 use repo_search_core::StateDir;
 use repo_search_core::model::MODEL_ID;
 use support::bound::spawn;

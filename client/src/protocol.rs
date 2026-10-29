@@ -10,8 +10,6 @@ use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use repo_search_core::search::Mode;
-use repo_search_core::store::Phase;
 use serde::{Deserialize, Serialize};
 use tokio::net::UnixStream;
 use tokio_util::codec::{Framed, LinesCodec};
@@ -191,7 +189,7 @@ pub struct SearchRequest {
     pub format: Format,
 }
 
-/// `search::Mode` on the wire; core types carry no serde derives.
+/// The search mode on the wire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum WireMode {
@@ -203,27 +201,7 @@ pub enum WireMode {
     Semantic,
 }
 
-impl From<Mode> for WireMode {
-    fn from(mode: Mode) -> Self {
-        match mode {
-            Mode::Hybrid => Self::Hybrid,
-            Mode::Lexical => Self::Lexical,
-            Mode::Semantic => Self::Semantic,
-        }
-    }
-}
-
-impl From<WireMode> for Mode {
-    fn from(mode: WireMode) -> Self {
-        match mode {
-            WireMode::Hybrid => Self::Hybrid,
-            WireMode::Lexical => Self::Lexical,
-            WireMode::Semantic => Self::Semantic,
-        }
-    }
-}
-
-/// `store::Phase` on the wire.
+/// The index phase on the wire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum WirePhase {
@@ -231,24 +209,6 @@ pub enum WirePhase {
     FirstIndex,
     /// The index has been complete once and is kept up to date.
     Maintained,
-}
-
-impl From<Phase> for WirePhase {
-    fn from(phase: Phase) -> Self {
-        match phase {
-            Phase::FirstIndex => Self::FirstIndex,
-            Phase::Maintained => Self::Maintained,
-        }
-    }
-}
-
-impl From<WirePhase> for Phase {
-    fn from(phase: WirePhase) -> Self {
-        match phase {
-            WirePhase::FirstIndex => Self::FirstIndex,
-            WirePhase::Maintained => Self::Maintained,
-        }
-    }
 }
 
 /// How the daemon renders `Answer::output`.
@@ -478,9 +438,20 @@ pub struct DaemonStatus {
     pub gpu: GpuStatus,
 }
 
-/// The GPU embedding instance's state: core's `embed_api` carries the
-/// same type for the embedding server's `/status`.
-pub use repo_search_core::embed_api::GpuStatus;
+/// The GPU embedding instance's state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum GpuStatus {
+    /// No GPU instance exists.
+    Absent {
+        /// Why it cannot be created, when the check has run.
+        blocked: Option<String>,
+    },
+    /// Being created (a multi-second cold start).
+    Loading,
+    /// Embedding normal-urgency work.
+    Running,
+}
 
 #[cfg(test)]
 mod tests {
@@ -715,16 +686,6 @@ mod tests {
             BuildId::of_file(&path).expect("the replacement stats"),
             "a same-size rename replacement is a different build"
         );
-    }
-
-    #[test]
-    fn wire_mirrors_convert_both_ways() {
-        for mode in [Mode::Hybrid, Mode::Lexical, Mode::Semantic] {
-            assert_eq!(Mode::from(WireMode::from(mode)), mode);
-        }
-        for phase in [Phase::FirstIndex, Phase::Maintained] {
-            assert_eq!(Phase::from(WirePhase::from(phase)), phase);
-        }
     }
 
     #[tokio::test]

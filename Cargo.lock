@@ -1777,6 +1777,7 @@ dependencies = [
  "kqueue",
  "libc",
  "notify",
+ "repo-search-client",
  "repo-search-core",
  "repo-search-coreml",
  "repo-search-server",
@@ -1795,6 +1796,19 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "zstd",
+]
+
+[[package]]
+name = "repo-search-client"
+version = "0.0.3"
+dependencies = [
+ "futures-util",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tokio-util",
 ]
 
 [[package]]

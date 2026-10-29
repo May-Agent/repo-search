@@ -28,7 +28,7 @@ use repo_search::install::Plist;
 use repo_search::install::{self, AgentConfig, Check, Launchctl, SystemLaunchctl, ensure_agent};
 use repo_search::kqueue::ExitWatch;
 use repo_search::launchd::{LABEL, LaunchAgent, SERVER_LABEL, ServerAgent};
-use repo_search::protocol::{Final, Hello, Request};
+use repo_search_client::protocol::{Final, Hello, Request};
 use repo_search_core::StateDir;
 
 /// The `search` binary the test agents run.
@@ -692,9 +692,9 @@ struct ListenerAgent {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "real launchd and model; the release gate runs it"]
 async fn startup_failure_reaches_the_client() {
-    use repo_search::client::{Client, ClientError};
     use repo_search::kqueue::DirWatch;
-    use repo_search::protocol::{ErrorKind, ErrorReport};
+    use repo_search_client::client::{Client, ClientError};
+    use repo_search_client::protocol::{ErrorKind, ErrorReport};
 
     let tmp = tempfile::tempdir().expect("tmp");
     let config = config(
