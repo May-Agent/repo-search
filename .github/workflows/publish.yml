@@ -46,7 +46,7 @@ jobs:
           }
           # Publish crates in dependency order, skipping versions already on
           # crates.io so a release that bumps only some crates still succeeds.
-          for crate in repo-search-core repo-search-coreml repo-search; do
+          for crate in repo-search-core repo-search-coreml repo-search-server repo-search; do
             version=$(cargo metadata --no-deps --format-version 1 \
               | jq -r --arg crate "$crate" '.packages[] | select(.name == $crate) | .version')
             if curl -sf "https://index.crates.io/$(index_path "$crate")" \
