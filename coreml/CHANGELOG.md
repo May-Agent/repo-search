@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.3](https://github.com/May-Agent/repo-search/compare/coreml/v0.0.2...coreml/v0.0.3) - 2026-10-29
+
+### Added
+
+- *(daemon)* tokenizer store and prompt-aware token counter
+- *(server)* embedding server crate with the hardware scheduler
+- *(core)* model card, prompt template and embeddings wire types
+
+### Other
+
+- drop the in-process embedder API
+
 ## [0.0.2](https://github.com/May-Agent/repo-search/compare/coreml/v0.0.1...coreml/v0.0.2) - 2026-10-21
 
 ### Other
