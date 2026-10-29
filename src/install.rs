@@ -18,17 +18,58 @@ use std::time::Duration;
 
 use askama::Template;
 
-use crate::daemon::IDLE_EXIT;
+use crate::daemon::{IDLE_EXIT, SOCKET_TIMEOUT, TEARDOWN_TIMEOUT};
 use crate::kqueue::{DirWatch, ExitWatch};
-use crate::launchd::{LABEL, LaunchAgent, domain, lock_path, log_path, plist_path, socket_path};
+use crate::launchd::{LABEL, LaunchAgent, SERVER_LABEL, ServerAgent, ServerConfig, domain};
+use crate::paths::{
+    lock_path, log_path, plist_path, server_config_path, server_log_path, server_socket_path,
+    socket_path,
+};
+use crate::protocol::BuildId;
 
-/// `launchctl bootout` returns before launchd finishes the teardown; the
-/// agent's process exit is awaited this long before `bootstrap`.
-pub const TEARDOWN_TIMEOUT: Duration = Duration::from_secs(30);
+/// One of the two LaunchAgents the client keeps current: the search
+/// daemon or the embedding server.
+pub enum Plist {
+    /// The daemon's agent.
+    Daemon(LaunchAgent),
+    /// The embedding server's agent.
+    Server(ServerAgent),
+}
 
-/// `launchctl bootstrap` returns once the job is loaded; launchd binds the
-/// `SockPathName` a moment later, awaited this long.
-pub const SOCKET_TIMEOUT: Duration = Duration::from_secs(10);
+impl Plist {
+    /// The rendered plist document.
+    pub fn render(&self) -> Result<String, askama::Error> {
+        match self {
+            Self::Daemon(agent) => agent.render(),
+            Self::Server(agent) => agent.render(),
+        }
+    }
+
+    /// The launchd label.
+    pub fn label(&self) -> &str {
+        match self {
+            Self::Daemon(agent) => &agent.label,
+            Self::Server(agent) => &agent.label,
+        }
+    }
+
+    /// The socket whose file presence fast-checks and the post-bootstrap
+    /// wait verify.
+    pub fn socket(&self) -> &Path {
+        match self {
+            Self::Daemon(agent) => &agent.socket,
+            Self::Server(agent) => &agent.socket,
+        }
+    }
+
+    /// The `StandardErrorPath` log file.
+    pub fn stderr(&self) -> &Path {
+        match self {
+            Self::Daemon(agent) => &agent.stderr,
+            Self::Server(agent) => &agent.stderr,
+        }
+    }
+}
 
 /// Everything the install flow touches; production values come from
 /// [`AgentConfig::user`], test values from the tests.
@@ -39,9 +80,9 @@ pub struct AgentConfig {
     pub plist: PathBuf,
     /// The `flock(2)` file serializing installs.
     pub lock: PathBuf,
-    /// The rendered agent: label, program, socket, idle exit, model cache,
-    /// stderr log.
-    pub agent: LaunchAgent,
+    /// The rendered agent: label, program, socket, idle exit and stderr
+    /// log.
+    pub agent: Plist,
     /// How long the bootout teardown and the socket wait may take.
     pub timeouts: Timeouts,
 }
@@ -62,14 +103,44 @@ impl AgentConfig {
             domain: domain(),
             plist: plist_path(LABEL)?,
             lock: lock_path()?,
-            agent: LaunchAgent {
+            agent: Plist::Daemon(LaunchAgent {
                 label: LABEL.to_owned(),
                 program,
                 socket: socket_path()?,
                 idle_exit: IDLE_EXIT,
                 model_cache: None,
+                state_dir: None,
+                server_socket: server_socket_path()?,
                 stderr: log_path()?,
+            }),
+            timeouts: Timeouts {
+                teardown: TEARDOWN_TIMEOUT,
+                socket: SOCKET_TIMEOUT,
             },
+        })
+    }
+
+    /// The real per-user embedding-server agent: [`SERVER_LABEL`], the
+    /// `search` binary at `program`, `server.toml`'s bind, port and
+    /// token file, and the build identity the `--build` self-heal checks.
+    pub fn server(program: PathBuf) -> io::Result<Self> {
+        let config = ServerConfig::load(&server_config_path()?).map_err(io::Error::other)?;
+        Ok(Self {
+            domain: domain(),
+            plist: plist_path(SERVER_LABEL)?,
+            lock: lock_path()?,
+            agent: Plist::Server(ServerAgent {
+                label: SERVER_LABEL.to_owned(),
+                build: BuildId::of_file(&program)?.to_string(),
+                program,
+                socket: server_socket_path()?,
+                idle_exit: repo_search_server::IDLE_EXIT,
+                model_cache: None,
+                token_file: config.token_file,
+                bind: config.bind,
+                port: config.port,
+                stderr: server_log_path()?,
+            }),
             timeouts: Timeouts {
                 teardown: TEARDOWN_TIMEOUT,
                 socket: SOCKET_TIMEOUT,
@@ -79,7 +150,7 @@ impl AgentConfig {
 
     /// `<domain>/<label>`, the `launchctl` service target.
     pub fn service(&self) -> String {
-        format!("{}/{}", self.domain, self.agent.label)
+        format!("{}/{}", self.domain, self.agent.label())
     }
 }
 
@@ -325,7 +396,7 @@ pub fn ensure_agent<L: Launchctl>(
     // warm search spawns no `launchctl` at all.
     if matches!(check, Check::Fast)
         && read_plist(&config.plist)?.as_deref() == Some(desired.as_bytes())
-        && config.agent.socket.exists()
+        && config.agent.socket().exists()
     {
         return Ok(Agent::Current);
     }
@@ -349,7 +420,7 @@ pub fn ensure_agent<L: Launchctl>(
     let on_disk = read_plist(&config.plist)?;
     if on_disk.as_deref() == Some(desired.as_bytes())
         && state.is_some()
-        && config.agent.socket.exists()
+        && config.agent.socket().exists()
     {
         return Ok(Agent::Current);
     }
@@ -388,27 +459,29 @@ pub fn ensure_agent<L: Launchctl>(
     let plist_dir = config.plist.parent().expect("the plist path has a parent");
     let socket_dir = config
         .agent
-        .socket
+        .socket()
         .parent()
-        .expect("the socket path has a parent");
+        .expect("the socket path has a parent")
+        .to_path_buf();
     let log_dir = config
         .agent
-        .stderr
+        .stderr()
         .parent()
-        .expect("the log path has a parent");
+        .expect("the log path has a parent")
+        .to_path_buf();
     // `~/Library/LaunchAgents` may not exist on a fresh account, and
     // launchd does not create the `StandardErrorPath` directory — without
     // it the daemon starts with no log.
     create_dir(plist_dir)?;
-    create_dir(socket_dir)?;
-    create_dir(log_dir)?;
+    create_dir(&socket_dir)?;
+    create_dir(&log_dir)?;
 
     // With the agent unloaded under the lock nothing owns the socket; a
     // stale file would satisfy the wait below before launchd binds.
-    match std::fs::remove_file(&config.agent.socket) {
+    match std::fs::remove_file(config.agent.socket()) {
         Ok(()) => {}
         Err(source) if source.kind() == io::ErrorKind::NotFound => {}
-        Err(source) => return Err(io_err("cannot remove", &config.agent.socket, source)),
+        Err(source) => return Err(io_err("cannot remove", config.agent.socket(), source)),
     }
 
     // Atomic: `NamedTempFile` lands the plist at its path only once fully
@@ -424,11 +497,11 @@ pub fn ensure_agent<L: Launchctl>(
     // Registered before `bootstrap` so the socket's creation — which
     // launchd performs asynchronously — cannot be missed.
     let watch =
-        DirWatch::register(socket_dir).map_err(|e| io_err("cannot watch", socket_dir, e))?;
+        DirWatch::register(&socket_dir).map_err(|e| io_err("cannot watch", &socket_dir, e))?;
     launchctl.bootstrap(&config.domain, &config.plist)?;
-    if !watch.wait_for(&config.agent.socket, config.timeouts.socket) {
+    if !watch.wait_for(config.agent.socket(), config.timeouts.socket) {
         return Err(InstallError::Socket {
-            path: config.agent.socket.clone(),
+            path: config.agent.socket().to_path_buf(),
             after: config.timeouts.socket,
         });
     }

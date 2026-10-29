@@ -23,7 +23,8 @@ fn put(cache: &VectorCache, range: std::ops::Range<usize>) {
 #[test]
 fn calibration_is_reused_until_the_cache_doubles() {
     let common = tempfile::tempdir().unwrap();
-    let cache = block_on(VectorCache::open(common.path())).unwrap();
+    let state = repo_search_core::StateDir::new(common.path().join("state"));
+    let cache = block_on(VectorCache::open(&state, common.path())).unwrap();
     assert!(block_on(calibration_for(&cache, "m")).is_err());
 
     put(&cache, 0..10);
@@ -48,7 +49,8 @@ fn calibration_is_reused_until_the_cache_doubles() {
 #[test]
 fn an_index_built_from_the_cache_finds_the_stored_vectors() {
     let common = tempfile::tempdir().unwrap();
-    let cache = block_on(VectorCache::open(common.path())).unwrap();
+    let state = repo_search_core::StateDir::new(common.path().join("state"));
+    let cache = block_on(VectorCache::open(&state, common.path())).unwrap();
     put(&cache, 0..50);
 
     let calibration = block_on(calibration_for(&cache, "m")).unwrap();

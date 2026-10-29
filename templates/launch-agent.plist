@@ -12,9 +12,15 @@
 		<string>--daemon</string>
 		<string>--idle-exit-secs</string>
 		<string>{{ idle_exit.as_secs() }}</string>
+		<string>--server-socket</string>
+		<string>{{ server_socket.display() }}</string>
 		{%- if let Some(cache) = model_cache %}
 		<string>--model-cache</string>
 		<string>{{ cache.display() }}</string>
+		{%- endif %}
+		{%- if let Some(state) = state_dir %}
+		<string>--state-dir</string>
+		<string>{{ state.display() }}</string>
 		{%- endif %}
 	</array>
 	<key>Sockets</key>

@@ -10,12 +10,15 @@ use std::process::ExitStatus;
 use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
+use repo_search::daemon::server::Endpoint;
 use repo_search::install::{Launchctl, LaunchctlError, Service};
 use repo_search::protocol::BuildId;
+use repo_search_core::StateDir;
+use repo_search_server::stub::StubBackend;
 use tokio::task::JoinHandle;
 
 use super::daemon::{self, Model};
-use super::stub::StubBackend;
+use super::tokens::StubTokens;
 
 /// One `launchctl` call, reported to the test for sequence assertions.
 #[derive(Debug, PartialEq, Eq)]
@@ -37,9 +40,19 @@ enum Process {
     /// `bootout` drops the stdin and the exit lands asynchronously, like a
     /// real daemon's SIGTERM shutdown.
     StandIn(std::process::Child),
-    /// A stub daemon task started by `bootstrap`; the fake does not boot
-    /// it out.
-    Daemon(JoinHandle<Result<(), repo_search::daemon::Error>>),
+    /// A stub daemon-and-server task pair started by `bootstrap`; the
+    /// fake does not boot it out.
+    Daemon {
+        daemon: JoinHandle<Result<(), repo_search::daemon::Error>>,
+        server: JoinHandle<Result<(), repo_search_server::Error>>,
+    },
+    /// The server agent's job: a stub server task on the job's socket,
+    /// started by `bootstrap`; the fake does not boot it out.
+    Server(JoinHandle<Result<(), repo_search_server::Error>>),
+    /// A task standing in for a daemon that fails after socket activation:
+    /// on the first queued connection it answers every pending one with the
+    /// startup error, as the demand-launched daemon would.
+    Failing(JoinHandle<()>),
 }
 
 struct Loaded {
@@ -58,6 +71,9 @@ enum Control {
     FailNextBootstrap(String),
     /// Make `bootstrap` succeed without binding the socket.
     BootstrapWithoutSocket,
+    /// Make the next `bootstrap` start a daemon that fails the chip check
+    /// on this brand string.
+    BootstrapFailingDaemon(String),
     /// Move the loaded daemon task's join handle to the caller.
     TakeDaemonJoin(mpsc::Sender<Option<JoinHandle<Result<(), repo_search::daemon::Error>>>>),
     /// End the owner thread.
@@ -103,12 +119,19 @@ struct Owner {
     tearing_down: Option<std::process::Child>,
     fail_next_bootstrap: Option<String>,
     bootstrap_without_socket: bool,
+    failing_daemon: Option<String>,
     socket: PathBuf,
+    /// `Some` for a daemon agent's job: the socket its own stub server
+    /// binds and its daemon probes. `None` for the server agent's job,
+    /// whose stub server binds `socket`.
+    server_socket: Option<PathBuf>,
     runtime: tokio::runtime::Handle,
     models: tempfile::TempDir,
-    /// The model layout the bootstrapped daemon's store gets.
+    /// The state root every bootstrapped daemon gets.
+    state: tempfile::TempDir,
+    /// The model layout the bootstrapped server's store gets.
     model: Model,
-    /// The backend every bootstrapped daemon runs.
+    /// The backend every bootstrapped server runs.
     backend: Arc<StubBackend>,
     build: BuildId,
 }
@@ -140,8 +163,15 @@ impl Owner {
                 self.tearing_down = Some(child);
                 Ok(())
             }
-            Process::Daemon(_) => {
+            Process::Daemon { .. } => {
                 panic!("the fake does not boot out an in-process daemon")
+            }
+            Process::Server(_) => {
+                panic!("the fake does not boot out an in-process server")
+            }
+            Process::Failing(task) => {
+                task.abort();
+                Ok(())
             }
         }
     }
@@ -163,27 +193,87 @@ impl Owner {
         }
         let process = if self.bootstrap_without_socket {
             Process::None
-        } else {
-            // launchd binds the declared socket when the job loads; the
-            // stub daemon then accepts on it.
+        } else if let Some(brand) = self.failing_daemon.take() {
+            // launchd binds the socket; a connection in its queue makes it
+            // launch the daemon, which fails and refuses the queue.
             let listener = std::os::unix::net::UnixListener::bind(&self.socket)
                 .expect("the fake binds the socket");
-            let store = daemon::model_store(self.models.path().join("models"), &self.model);
-            Process::Daemon(daemon::spawn_on(
-                &self.runtime,
-                listener,
-                store,
-                self.backend.clone(),
-                Duration::from_secs(600),
-                repo_search::daemon::LOAD_BOUND,
-                self.build,
-            ))
+            listener
+                .set_nonblocking(true)
+                .expect("the listener is nonblocking");
+            Process::Failing(self.runtime.spawn(async move {
+                // SAFETY: the std listener owns its fd, open until
+                // `into_inner`.
+                let listener = unsafe { tokio::io::unix::AsyncFd::register(listener) }
+                    .expect("the listener registers");
+                listener
+                    .readable()
+                    .await
+                    .expect("the listener becomes readable")
+                    .retain_ready();
+                let error = repo_search::daemon::StartupError::StateDir(std::io::Error::other(
+                    format!("simulated startup failure on {brand}"),
+                ));
+                repo_search::daemon::refuse(listener.into_inner(), &error).await;
+            }))
+        } else {
+            // launchd binds the declared socket when the job loads; the
+            // job's stub process then accepts on it.
+            let listener = std::os::unix::net::UnixListener::bind(&self.socket)
+                .expect("the fake binds the socket");
+            match self.server_socket.clone() {
+                // The server agent's job: the stub server alone.
+                None => Process::Server(daemon::spawn_server_on(
+                    &self.runtime,
+                    listener,
+                    self.server_setup(),
+                )),
+                // A daemon agent's job: the stub daemon, against a stub
+                // server of its own. A path pre-created as the "socket
+                // exists" marker is replaced.
+                Some(server_socket) => {
+                    let _ = std::fs::remove_file(&server_socket);
+                    let server_listener = std::os::unix::net::UnixListener::bind(&server_socket)
+                        .expect("the fake binds the server socket");
+                    let server = daemon::spawn_server_on(
+                        &self.runtime,
+                        server_listener,
+                        self.server_setup(),
+                    );
+                    let daemon = daemon::spawn_on(
+                        &self.runtime,
+                        listener,
+                        daemon::Setup {
+                            tokens: StubTokens::default(),
+                            server: Endpoint::Unix(server_socket),
+                            model_id: repo_search_core::model::MODEL_ID.to_owned(),
+                            state: StateDir::new(self.state.path().to_path_buf()),
+                            idle_exit: Duration::from_secs(600),
+                            load_bound: repo_search::daemon::LOAD_BOUND,
+                            build: self.build,
+                        },
+                    );
+                    Process::Daemon { daemon, server }
+                }
+            }
         };
         self.loaded = Some(Loaded {
             plist: plist_contents,
             process,
         });
         Ok(())
+    }
+
+    /// The stub server every bootstrapped job runs: the fake's model
+    /// layout and backend, on a wide chip.
+    fn server_setup(&self) -> daemon::ServerSetup {
+        daemon::ServerSetup {
+            model_store: daemon::model_store(self.models.path().join("models"), &self.model),
+            chip: repo_search_server::chip::ChipClass::Wide,
+            backend: self.backend.clone(),
+            idle_exit: Duration::from_secs(600),
+            load_bound: repo_search_core::embed_api::LOAD_BOUND,
+        }
     }
 
     /// Leaves nothing running: an unexited stand-in is killed and a loaded
@@ -199,7 +289,12 @@ impl Owner {
                     let _ = child.kill();
                     let _ = child.wait();
                 }
-                Process::Daemon(task) => task.abort(),
+                Process::Daemon { daemon, server } => {
+                    daemon.abort();
+                    server.abort();
+                }
+                Process::Server(server) => server.abort(),
+                Process::Failing(task) => task.abort(),
                 Process::None => {}
             }
         }
@@ -237,7 +332,7 @@ impl Owner {
                         let handle =
                             self.loaded.as_mut().and_then(|loaded| {
                                 match std::mem::replace(&mut loaded.process, Process::None) {
-                                    Process::Daemon(join) => Some(join),
+                                    Process::Daemon { daemon, .. } => Some(daemon),
                                     other => {
                                         loaded.process = other;
                                         None
@@ -268,6 +363,9 @@ impl Owner {
                     Control::BootstrapWithoutSocket => {
                         self.bootstrap_without_socket = true;
                     }
+                    Control::BootstrapFailingDaemon(brand) => {
+                        self.failing_daemon = Some(brand);
+                    }
                     Control::Shutdown => break,
                 },
             }
@@ -286,9 +384,42 @@ pub struct FakeLaunchd {
 
 impl FakeLaunchd {
     /// A fake launchd for a service whose socket lives at `socket`; jobs
-    /// it bootstraps run the stub daemon on `runtime` with `build`.
-    pub fn new(socket: PathBuf, runtime: tokio::runtime::Handle, build: BuildId) -> Self {
+    /// it bootstraps run the stub server on `server_socket` and the stub
+    /// daemon against it, on `runtime` with `build`.
+    pub fn new(
+        socket: PathBuf,
+        server_socket: PathBuf,
+        runtime: tokio::runtime::Handle,
+        build: BuildId,
+    ) -> Self {
         Self::with_daemon(
+            socket,
+            server_socket,
+            runtime,
+            build,
+            Model::Cached,
+            StubBackend::new(mpsc::channel().0),
+        )
+    }
+
+    /// A fake whose bootstrapped pair runs `model` on `backend` — the
+    /// tests that drive progress output need both knobs.
+    pub fn with_daemon(
+        socket: PathBuf,
+        server_socket: PathBuf,
+        runtime: tokio::runtime::Handle,
+        build: BuildId,
+        model: Model,
+        backend: StubBackend,
+    ) -> Self {
+        Self::spawn(Some(server_socket), socket, runtime, build, model, backend)
+    }
+
+    /// A fake launchd for the server agent, whose socket lives at
+    /// `socket`: jobs it bootstraps run the stub server alone on it.
+    pub fn server(socket: PathBuf, runtime: tokio::runtime::Handle, build: BuildId) -> Self {
+        Self::spawn(
+            None,
             socket,
             runtime,
             build,
@@ -297,9 +428,10 @@ impl FakeLaunchd {
         )
     }
 
-    /// A fake whose bootstrapped daemon runs `model` on `backend` — the
-    /// tests that drive progress output need both knobs.
-    pub fn with_daemon(
+    /// Starts the owner thread; `server_socket` picks the job kind as
+    /// [`Owner::server_socket`] describes.
+    fn spawn(
+        server_socket: Option<PathBuf>,
         socket: PathBuf,
         runtime: tokio::runtime::Handle,
         build: BuildId,
@@ -313,9 +445,12 @@ impl FakeLaunchd {
             tearing_down: None,
             fail_next_bootstrap: None,
             bootstrap_without_socket: false,
+            failing_daemon: None,
             socket,
+            server_socket,
             runtime,
             models: tempfile::tempdir().expect("the fake's model cache"),
+            state: tempfile::tempdir().expect("the fake's state dir"),
             model,
             backend: Arc::new(backend),
             build,
@@ -368,6 +503,17 @@ impl FakeLaunchd {
     pub fn bootstrap_without_socket(&self) {
         self.tx
             .send(Request::Control(Control::BootstrapWithoutSocket))
+            .expect("the launchd thread lives");
+    }
+
+    /// The next `bootstrap` loads a daemon that fails to start with an
+    /// unrecognised chip `brand`: it answers the queued connections with
+    /// the startup error and runs no further.
+    pub fn bootstrap_failing_daemon(&self, brand: &str) {
+        self.tx
+            .send(Request::Control(Control::BootstrapFailingDaemon(
+                brand.to_owned(),
+            )))
             .expect("the launchd thread lives");
     }
 

@@ -2,18 +2,24 @@
 
 pub mod chunk;
 mod embed;
+pub mod embed_api;
 pub mod knn;
+pub mod model;
 pub mod qos;
 pub mod reconcile;
 pub mod search;
+mod state;
 pub mod store;
+
+pub use state::StateDir;
 
 /// Identifies the chunker that built an index: a hash of the chunker sources
 /// and the resolved tree-sitter grammar versions, computed by `build.rs`.
 /// Lowercase hex, 32 characters.
 pub const CHUNKER_FINGERPRINT: &str = env!("REPO_SEARCH_CHUNKER_FINGERPRINT");
 
-pub use embed::{BatchEmbedder, Embedder, QueryTask, TokenCounter, UnitVector};
+pub use embed::{TokenCounter, UnitVector};
+pub use model::QueryTask;
 
 // Lets the shared test counters (included from `tests/counters`) name the
 // crate the same way the integration tests do.

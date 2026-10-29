@@ -10,6 +10,7 @@ mod counters;
 
 use counters::CapOff;
 use futures_executor::block_on;
+use repo_search_core::StateDir;
 use repo_search_core::reconcile::{
     Books, Changes, Counts, Options, PendingChunk, Presence, Reads, Reconciled, Reconciler, Report,
     SkipReason,
@@ -32,6 +33,7 @@ struct Pass {
 struct Fixture {
     tree: TempDir,
     _common: TempDir,
+    dirs: StateDir,
     index: Index,
     cache: VectorCache,
     /// The reconciler of `index`, kept across passes as the daemon keeps it.
@@ -45,8 +47,9 @@ impl Fixture {
     fn new() -> Self {
         let tree = tempfile::tempdir().unwrap();
         let common = tempfile::tempdir().unwrap();
-        let index = block_on(Index::open(tree.path())).unwrap();
-        let cache = block_on(VectorCache::open(common.path())).unwrap();
+        let dirs = StateDir::new(common.path().join("state"));
+        let index = block_on(Index::open(&dirs, tree.path())).unwrap();
+        let cache = block_on(VectorCache::open(&dirs, common.path())).unwrap();
         let reconciler = RefCell::new(Reconciler::new(
             index.clone(),
             cache.clone(),
@@ -56,6 +59,7 @@ impl Fixture {
         Self {
             tree,
             _common: common,
+            dirs,
             index,
             cache,
             reconciler,
@@ -67,6 +71,17 @@ impl Fixture {
         let path = self.tree.path().join(rel);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, text).unwrap();
+    }
+
+    /// Rewrites `rel` with its own bytes the way an editor's atomic save
+    /// does — a sibling written, then renamed over it — so the file keeps
+    /// its bytes but gets a new mtime and an inode that differs: the new
+    /// one is allocated while the old still exists.
+    fn atomic_save(&self, rel: &str) {
+        let path = self.tree.path().join(rel);
+        let staged = path.with_extension("atomic-save");
+        fs::write(&staged, fs::read(&path).unwrap()).unwrap();
+        fs::rename(&staged, &path).unwrap();
     }
 
     fn run(&self, options: Options) -> Pass {
@@ -289,7 +304,7 @@ impl Fixture {
     }
 
     fn db(&self) -> std::path::PathBuf {
-        self.tree.path().join(".repo-search/index.db")
+        self.dirs.worktree_index(self.tree.path())
     }
 
     fn query<T: rusqlite::types::FromSql>(&self, sql: &str) -> T {
@@ -416,10 +431,7 @@ fn a_touched_file_with_the_same_bytes_is_not_rechunked() {
     let chunk_ids: String = fx.query("SELECT group_concat(id) FROM chunks");
 
     // Same bytes, new inode and mtime, as an editor's atomic save leaves.
-    let path = fx.tree.path().join("a.rs");
-    let bytes = fs::read(&path).unwrap();
-    fs::remove_file(&path).unwrap();
-    fs::write(&path, bytes).unwrap();
+    fx.atomic_save("a.rs");
 
     let r = fx.pass();
     assert_eq!(r.report.files_restamped, 1);
@@ -881,10 +893,7 @@ fn a_malformed_file_with_moved_stat_is_restamped_not_parsed() {
     let before: i64 = fx.query("SELECT inode FROM unchunkable");
 
     // Same bytes, new inode and mtime.
-    let path = fx.tree.path().join("c.json");
-    let bytes = fs::read(&path).unwrap();
-    fs::remove_file(&path).unwrap();
-    fs::write(&path, bytes).unwrap();
+    fx.atomic_save("c.json");
 
     let r = fx.pass();
     assert_eq!(r.report.files_chunked, 0);
@@ -946,7 +955,7 @@ fn another_chunker_rechunks_and_reuses_cached_vectors() {
         .unwrap();
     let total = first.report.chunks_total;
 
-    let mut reopened = fx.reconciler_for(&block_on(Index::open(fx.tree.path())).unwrap());
+    let mut reopened = fx.reconciler_for(&block_on(Index::open(&fx.dirs, fx.tree.path())).unwrap());
     let second = fx.run_with(&mut reopened, "chunker-b", Options::default());
     assert!(second.changes.is_none(), "a rechunk reports no changes");
     let r = &second.report;
@@ -975,7 +984,7 @@ fn the_same_chunker_reopens_without_rechunking() {
     let fx = Fixture::new();
     fx.write("a.rs", "fn alpha() { 1; }\n");
     fx.run_chunker("chunker-a", Options::default());
-    let mut reopened = fx.reconciler_for(&block_on(Index::open(fx.tree.path())).unwrap());
+    let mut reopened = fx.reconciler_for(&block_on(Index::open(&fx.dirs, fx.tree.path())).unwrap());
     let again = fx.run_with(&mut reopened, "chunker-a", Options::default());
     assert!(!again.report.rechunked);
     assert_eq!(again.report.chunks_added, 0);
@@ -1135,10 +1144,7 @@ fn a_restamped_file_offers_its_uncached_chunks_again() {
     assert!(!a0.is_empty());
 
     // Same bytes, new inode and mtime, as an editor's atomic save leaves.
-    let path = fx.tree.path().join("a.rs");
-    let bytes = fs::read(&path).unwrap();
-    fs::remove_file(&path).unwrap();
-    fs::write(&path, bytes).unwrap();
+    fx.atomic_save("a.rs");
 
     let r = fx.reconcile_only(Options::default());
     assert_eq!(r.report.files_restamped, 1);
@@ -1284,10 +1290,7 @@ fn a_restamped_file_reads_only_its_own_rows() {
     let rows: i64 = fx.query("SELECT count(*) FROM chunks WHERE path = 'm5.rs'");
 
     // Same bytes, new inode and mtime, as an editor's atomic save leaves.
-    let path = fx.tree.path().join("m5.rs");
-    let bytes = fs::read(&path).unwrap();
-    fs::remove_file(&path).unwrap();
-    fs::write(&path, bytes).unwrap();
+    fx.atomic_save("m5.rs");
 
     let r = fx.reconcile_only(Options::default());
     assert_eq!(r.report.files_restamped, 1);

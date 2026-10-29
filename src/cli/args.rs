@@ -3,6 +3,8 @@
 //! are subcommands only as a bare first argument — every other first
 //! argument is the free-text query.
 
+use std::net::SocketAddr;
+use std::os::fd::RawFd;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -11,13 +13,25 @@ use clap::{ArgMatches, Args, CommandFactory, FromArgMatches, Parser, Subcommand,
 use crate::daemon;
 use crate::protocol::WireMode;
 
+/// `--version` output: the binary version, the chunker fingerprint and the
+/// model's identity from [`repo_search_core::model`]'s card.
+pub const VERSION_INFO: &str = const_format::concatcp!(
+    env!("CARGO_PKG_VERSION"),
+    "\nchunker: ",
+    repo_search_core::CHUNKER_FINGERPRINT,
+    "\nmodel: ",
+    repo_search_core::model::MODEL_NAME,
+    "\nlicense: ",
+    repo_search_core::model::MODEL_LICENSE
+);
+
 /// Search a repository for code you can describe but cannot name.
 ///
 /// Exit codes follow grep: 0 results, 1 none, 2 error.
 #[derive(Debug, Parser)]
 #[command(
     name = "search",
-    version = crate::model_store::VERSION_INFO,
+    version = VERSION_INFO,
     subcommand_precedence_over_arg = true,
     subcommand_negates_reqs = true,
     args_conflicts_with_subcommands = true,
@@ -26,7 +40,7 @@ use crate::protocol::WireMode;
 )]
 struct RawCli {
     /// Free-text query.
-    #[arg(required_unless_present = "daemon",
+    #[arg(required_unless_present_any = ["daemon", "server"],
           value_parser = clap::builder::NonEmptyStringValueParser::new())]
     query: Option<String>,
 
@@ -37,14 +51,39 @@ struct RawCli {
     command: Option<Command>,
 
     /// Run as the launchd socket-activated daemon.
-    #[arg(long, hide = true, conflicts_with = "query")]
+    #[arg(long, hide = true, conflicts_with = "query", group = "agent")]
     daemon: bool,
+
+    /// Run as the launchd socket-activated embedding server.
+    #[arg(long, hide = true, conflicts_with = "query", group = "agent")]
+    server: bool,
+
+    /// The bearer token TCP listeners require, read from this file.
+    #[arg(
+        long,
+        hide = true,
+        requires = "server",
+        conflicts_with = "query",
+        value_name = "FILE"
+    )]
+    token_file: Option<PathBuf>,
+
+    /// The build this agent registered; the server refuses to run any
+    /// other.
+    #[arg(
+        long,
+        hide = true,
+        requires = "server",
+        conflicts_with = "query",
+        value_name = "ID"
+    )]
+    build: Option<String>,
 
     /// Exit after this many seconds with no connections and no work.
     #[arg(
         long,
         hide = true,
-        requires = "daemon",
+        requires = "agent",
         conflicts_with = "query",
         value_name = "SECS"
     )]
@@ -54,11 +93,71 @@ struct RawCli {
     #[arg(
         long,
         hide = true,
-        requires = "daemon",
+        requires = "agent",
         conflicts_with = "query",
         value_name = "DIR"
     )]
     model_cache: Option<PathBuf>,
+
+    /// The daemon's state root, defaulting to the per-user state dir.
+    #[arg(
+        long,
+        hide = true,
+        requires = "daemon",
+        conflicts_with = "query",
+        value_name = "DIR"
+    )]
+    state_dir: Option<PathBuf>,
+
+    /// The embedding server's unix socket, defaulting to the agent's.
+    #[arg(
+        long,
+        hide = true,
+        requires = "daemon",
+        conflicts_with = "query",
+        value_name = "PATH"
+    )]
+    server_socket: Option<PathBuf>,
+
+    /// Bind this socket instead of taking launchd's.
+    #[arg(
+        long,
+        hide = true,
+        requires = "daemon",
+        conflicts_with = "query",
+        value_name = "PATH"
+    )]
+    listen: Option<PathBuf>,
+
+    /// The fd the daemon reports `ready` or `failed: <message>` on.
+    #[arg(
+        long,
+        hide = true,
+        requires = "daemon",
+        conflicts_with = "query",
+        value_name = "FD"
+    )]
+    ready_fd: Option<RawFd>,
+
+    /// The embedding server's TCP address, an IP literal.
+    #[arg(
+        long,
+        hide = true,
+        requires = "daemon",
+        conflicts_with_all = ["query", "server_socket"],
+        value_name = "IP:PORT"
+    )]
+    server_addr: Option<SocketAddr>,
+
+    /// The bearer token `--server-addr` sends, read from this file.
+    #[arg(
+        long,
+        hide = true,
+        requires = "server_addr",
+        conflicts_with = "query",
+        value_name = "FILE"
+    )]
+    server_token_file: Option<PathBuf>,
 }
 
 /// The parsed `search` command line.
@@ -208,12 +307,37 @@ pub enum Command {
 /// What a parsed [`Cli`] dispatches on.
 #[derive(Debug)]
 pub enum Invocation {
-    /// `search --daemon`: the launchd job's entry point.
+    /// `search --server`: the embedding server's entry point.
+    Server {
+        /// `--idle-exit-secs`, when given; the server's own default
+        /// applies otherwise.
+        idle_exit: Option<Duration>,
+        /// `--model-cache`, when given.
+        model_cache: Option<PathBuf>,
+        /// `--token-file`, when given.
+        token_file: Option<PathBuf>,
+        /// `--build`, when given.
+        build: Option<String>,
+    },
+    /// `search --daemon`: the agent's entry point, socket-activated on
+    /// macOS and self-bound under spawn on Linux.
     Daemon {
         /// Idle deadline; [`daemon::IDLE_EXIT`] unless `--idle-exit-secs`.
         idle_exit: Duration,
         /// `--model-cache`, when given.
         model_cache: Option<PathBuf>,
+        /// `--state-dir`, when given.
+        state_dir: Option<PathBuf>,
+        /// `--server-socket`, when given.
+        server_socket: Option<PathBuf>,
+        /// `--listen`: bind this socket instead of activating.
+        listen: Option<PathBuf>,
+        /// `--ready-fd`, when given.
+        ready_fd: Option<RawFd>,
+        /// `--server-addr`, when given.
+        server_addr: Option<SocketAddr>,
+        /// `--server-token-file`, when given.
+        server_token_file: Option<PathBuf>,
     },
     /// `search <query>`.
     Search {
@@ -240,12 +364,26 @@ impl Cli {
     /// The invocation this parse describes.
     pub fn invocation(self) -> Invocation {
         let raw = self.0;
+        if raw.server {
+            return Invocation::Server {
+                idle_exit: raw.idle_exit_secs.map(Duration::from_secs),
+                model_cache: raw.model_cache,
+                token_file: raw.token_file,
+                build: raw.build,
+            };
+        }
         if raw.daemon {
             return Invocation::Daemon {
                 idle_exit: raw
                     .idle_exit_secs
                     .map_or(daemon::IDLE_EXIT, Duration::from_secs),
                 model_cache: raw.model_cache,
+                state_dir: raw.state_dir,
+                server_socket: raw.server_socket,
+                listen: raw.listen,
+                ready_fd: raw.ready_fd,
+                server_addr: raw.server_addr,
+                server_token_file: raw.server_token_file,
             };
         }
         match raw.command {
@@ -265,8 +403,7 @@ mod tests {
 
     use clap::CommandFactory;
     use repo_search_core::CHUNKER_FINGERPRINT;
-
-    use crate::model_store::{MODEL_LICENSE, MODEL_NAME, VERSION_INFO};
+    use repo_search_core::model::{MODEL_LICENSE, MODEL_NAME};
 
     fn parsed(args: &[&str]) -> Invocation {
         Cli::try_parse_from(args)
@@ -357,16 +494,146 @@ mod tests {
     }
 
     #[test]
+    fn server_flags_form_the_server_invocation() {
+        match parsed(&["search", "--server"]) {
+            Invocation::Server {
+                idle_exit,
+                model_cache,
+                token_file,
+                build,
+            } => {
+                assert_eq!(idle_exit, None);
+                assert_eq!(model_cache, None);
+                assert_eq!(token_file, None);
+                assert_eq!(build, None);
+            }
+            other => panic!("expected Server, got {other:?}"),
+        }
+        match parsed(&[
+            "search",
+            "--server",
+            "--idle-exit-secs",
+            "30",
+            "--token-file",
+            "/tmp/tok",
+            "--build",
+            "1:2:3:4",
+        ]) {
+            Invocation::Server {
+                idle_exit,
+                token_file,
+                build,
+                ..
+            } => {
+                assert_eq!(idle_exit, Some(Duration::from_secs(30)));
+                assert_eq!(token_file, Some(PathBuf::from("/tmp/tok")));
+                assert_eq!(build.as_deref(), Some("1:2:3:4"));
+            }
+            other => panic!("expected Server, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn server_flags_conflict_with_client_arguments() {
+        assert!(Cli::try_parse_from(["search", "--server", "q"]).is_err());
+        assert!(Cli::try_parse_from(["search", "q", "--token-file", "f"]).is_err());
+        assert!(Cli::try_parse_from(["search", "--token-file", "f"]).is_err());
+        assert!(Cli::try_parse_from(["search", "--build", "1:2:3:4"]).is_err());
+    }
+
+    #[test]
     fn daemon_flags_form_the_daemon_invocation() {
         match parsed(&["search", "--daemon"]) {
             Invocation::Daemon {
                 idle_exit,
                 model_cache,
+                state_dir,
+                server_socket,
+                listen,
+                ready_fd,
+                server_addr,
+                server_token_file,
             } => {
                 assert_eq!(idle_exit, daemon::IDLE_EXIT);
                 assert_eq!(model_cache, None);
+                assert_eq!(state_dir, None);
+                assert_eq!(server_socket, None);
+                assert_eq!(listen, None);
+                assert_eq!(ready_fd, None);
+                assert_eq!(server_addr, None);
+                assert_eq!(server_token_file, None);
             }
             other => panic!("expected Daemon, got {other:?}"),
+        }
+        match parsed(&["search", "--daemon", "--server-socket", "/tmp/s.sock"]) {
+            Invocation::Daemon { server_socket, .. } => {
+                assert_eq!(server_socket, Some(PathBuf::from("/tmp/s.sock")));
+            }
+            other => panic!("expected Daemon, got {other:?}"),
+        }
+        match parsed(&[
+            "search",
+            "--daemon",
+            "--listen",
+            "/tmp/d.sock",
+            "--ready-fd",
+            "3",
+            "--server-addr",
+            "127.0.0.1:41827",
+            "--server-token-file",
+            "/tmp/tok",
+        ]) {
+            Invocation::Daemon {
+                listen,
+                ready_fd,
+                server_addr,
+                server_token_file,
+                ..
+            } => {
+                assert_eq!(listen, Some(PathBuf::from("/tmp/d.sock")));
+                assert_eq!(ready_fd, Some(3));
+                assert_eq!(server_addr, Some(SocketAddr::from(([127, 0, 0, 1], 41827))));
+                assert_eq!(server_token_file, Some(PathBuf::from("/tmp/tok")));
+            }
+            other => panic!("expected Daemon, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn daemon_remote_flags_conflict() {
+        // `--server-addr` and `--server-socket` exclude each other.
+        assert!(
+            Cli::try_parse_from([
+                "search",
+                "--daemon",
+                "--server-addr",
+                "127.0.0.1:1",
+                "--server-socket",
+                "/tmp/s.sock",
+            ])
+            .is_err()
+        );
+        // `--server-token-file` needs `--server-addr`.
+        assert!(
+            Cli::try_parse_from(["search", "--daemon", "--server-token-file", "/tmp/t"]).is_err()
+        );
+        // Every daemon flag needs `--daemon`.
+        for args in [
+            &["--listen", "/tmp/d.sock"][..],
+            &["--ready-fd", "3"][..],
+            &["--server-addr", "127.0.0.1:1"][..],
+            &[
+                "--server-addr",
+                "127.0.0.1:1",
+                "--server-token-file",
+                "/tmp/t",
+            ][..],
+        ] {
+            assert!(
+                Cli::try_parse_from(["search"].iter().chain(args).copied().collect::<Vec<_>>())
+                    .is_err(),
+                "{args:?} without --daemon parses"
+            );
         }
     }
 

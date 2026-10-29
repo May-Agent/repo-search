@@ -11,8 +11,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use repo_search::client::Responses;
-use repo_search::model_store::{ModelSpec, ModelStore};
+use repo_search::model_store::{ModelSpec, ModelStore, TokenizerSpec, TokenizerStore};
 use repo_search::protocol::{Event, Final, Hello, Progress, Request, WirePhase};
+use repo_search_core::StateDir;
 use repo_search_core::store::{Index, VectorCache};
 
 use super::client;
@@ -73,6 +74,17 @@ pub fn model_store(root: PathBuf) -> ModelStore {
     ModelStore::new(root, spec).expect("model store")
 }
 
+/// A `TokenizerStore` rooted at `root` whose cached path is a copy of the
+/// archive's `tokenizer.json`, so `load` returns at once.
+pub fn tokenizer_store(root: PathBuf) -> TokenizerStore {
+    let spec = TokenizerSpec::embedding_gemma_2();
+    let store = TokenizerStore::new(root, spec).expect("tokenizer store");
+    let path = store.path();
+    std::fs::create_dir_all(path.parent().unwrap()).expect("the tokenizer dir");
+    std::fs::copy(model_dir().join("tokenizer.json"), &path).expect("the tokenizer copy lands");
+    store
+}
+
 /// Opens an `index --wait` stream for `worktree` on `socket`.
 pub async fn index_wait(socket: &Path, hello: &Hello, worktree: &Path) -> Responses {
     client::stream_request(
@@ -104,10 +116,22 @@ pub async fn await_coverage(stream: &mut Responses, min: u64) -> u64 {
 
 /// The count of `worktree`'s chunks whose `model_id` vectors are committed
 /// in the vector cache — what `Coverage` reports, read straight from disk.
-pub async fn committed(worktree: &Path, common_dir: &Path, model_id: &str) -> u64 {
-    let index = Index::open(worktree).await.expect("index opens");
+pub async fn committed(
+    state: &StateDir,
+    worktree: &Path,
+    common_dir: &Path,
+    model_id: &str,
+) -> u64 {
+    // The daemon fingerprints the canonical paths it resolved.
+    let worktree = worktree.canonicalize().expect("the worktree canonicalizes");
+    let common_dir = common_dir
+        .canonicalize()
+        .expect("the common dir canonicalizes");
+    let index = Index::open(state, &worktree).await.expect("index opens");
     let hashes = index.chunk_hashes(false).await.expect("chunk hashes");
-    let cache = VectorCache::open(common_dir).await.expect("cache opens");
+    let cache = VectorCache::open(state, &common_dir)
+        .await
+        .expect("cache opens");
     let cached = cache.cached(model_id, &hashes).await.expect("cached reads");
     // Count chunk rows, as coverage does: two chunks with identical content
     // share one cached vector, so the distinct count would fall short.

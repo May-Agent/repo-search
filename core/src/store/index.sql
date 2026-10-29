@@ -67,3 +67,15 @@ CREATE VIRTUAL TABLE fts USING fts5 (
     contentless_delete = 1,
     tokenize = 'unicode61'
 );
+
+-- Exact BM25 statistics of `fts`: its row count and each column's token
+-- total. The table's own averages record keeps deleted rows, so every write
+-- to `fts` adjusts this row in the same transaction and `exact_bm25` ranks by
+-- it. Exactly one row.
+CREATE TABLE bm25_stats (
+    id           INTEGER PRIMARY KEY CHECK (id = 1),
+    rows         INTEGER NOT NULL,
+    title_tokens INTEGER NOT NULL,
+    body_tokens  INTEGER NOT NULL
+);
+INSERT INTO bm25_stats (id, rows, title_tokens, body_tokens) VALUES (1, 0, 0, 0);

@@ -21,7 +21,8 @@ use crate::qos::{QosClass, set_current_thread};
 ///
 /// Rows are numbered densely; [`remove`](Self::remove) swaps the last row into
 /// the hole, so row order is not stable across updates. Equal scores resolve to
-/// the lower row.
+/// the lower content hash: a result is a function of the index's contents, not
+/// of the order its rows were loaded in.
 pub struct KnnIndex {
     calibration: Calibration,
     /// `rows * dim` codes.
@@ -149,8 +150,8 @@ impl KnnIndex {
     /// The query is quantized and every admitted code scanned on `threads`
     /// threads (the calling thread when 1), each keeping its [`FIRST_PASS`]
     /// best; the merged candidates are re-ranked with the fp16 rows. Equal
-    /// scores resolve to the lower row, so the result does not depend on
-    /// `threads`.
+    /// scores resolve to the lower content hash, so the result depends
+    /// neither on `threads` nor on the order rows were loaded in.
     ///
     /// # Panics
     ///
@@ -177,7 +178,11 @@ impl KnnIndex {
         let mut best = TopK::new(RESULTS);
         for (row, _) in first_pass.into_best_first() {
             let fp16 = self.file.row(self.slots[row as usize]);
-            best.push(f16::dot(fp16, &query16).expect("same dimension"), row);
+            best.push(
+                f16::dot(fp16, &query16).expect("same dimension"),
+                row,
+                &self.hashes,
+            );
         }
         best.into_best_first()
             .into_iter()
@@ -217,7 +222,7 @@ impl KnnIndex {
             }
             let codes = &self.codes[row * dim..(row + 1) * dim];
             let score = i8::dot(codes, weights).expect("same dimension");
-            top.push(score as f32, row as u32);
+            top.push(score as f32, row as u32, &self.hashes);
         }
         top
     }

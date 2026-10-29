@@ -24,6 +24,8 @@ mod books;
 mod scan;
 
 pub use books::Books;
+#[cfg(all(test, feature = "lang-rust"))]
+pub(crate) use scan::chunk_with;
 
 use std::collections::{HashMap, HashSet};
 use std::ops::RangeInclusive;
@@ -85,8 +87,7 @@ pub struct Options {
     /// `.ignore` files would hide (`--include-ignored`), flagged as ignored.
     /// A pass without it keeps the flagged files stored but does not look at
     /// them, and queues none of their chunks for embedding. Hidden files and
-    /// dot-directories are indexed either way; `.git/` and `.repo-search/`
-    /// never are.
+    /// dot-directories are indexed either way; `.git/` never is.
     pub include_ignored: bool,
 }
 
@@ -95,7 +96,8 @@ pub struct Options {
 pub struct PendingChunk {
     /// Worktree-relative path of the file.
     pub path: String,
-    /// Embed under this title: `Embedder::embed_document(title, text)`.
+    /// Embed the document `crate::model::DOCUMENT` formats for this title
+    /// and `text`.
     pub title: String,
     /// The chunk text.
     pub text: String,

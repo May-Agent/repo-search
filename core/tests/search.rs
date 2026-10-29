@@ -24,8 +24,8 @@ use repo_search_core::store::{
     ChunkFilter, ChunkRecord, ContentHash, FileState, Index, MemberRecord, Side, VectorCache,
     fts_body,
 };
-use repo_search_core::{CHUNKER_FINGERPRINT, Embedder, QueryTask, UnitVector};
-use support::EmbedThread;
+use repo_search_core::{CHUNKER_FINGERPRINT, QueryTask, UnitVector};
+use support::{BlockingEmbed, EmbedThread};
 use tempfile::TempDir;
 
 const MODEL: &str = "fake-bag-of-words";
@@ -74,19 +74,19 @@ struct FakeEmbedder {
     seen: Arc<Seen>,
 }
 
-impl Embedder for FakeEmbedder {
+impl BlockingEmbed for FakeEmbedder {
     type Error = FakeError;
 
     fn model_id(&self) -> &str {
         MODEL
     }
 
-    fn embed_document(&mut self, title: &str, text: &str) -> Result<UnitVector, FakeError> {
+    fn document(&mut self, title: &str, text: &str) -> Result<UnitVector, FakeError> {
         self.seen.documents.fetch_add(1, Ordering::SeqCst);
         Ok(bag_of_words(&format!("{title} {text}")))
     }
 
-    fn embed_query(&mut self, task: QueryTask, query: &str) -> Result<UnitVector, FakeError> {
+    fn query(&mut self, task: QueryTask, query: &str) -> Result<UnitVector, FakeError> {
         self.seen.queries.lock().unwrap().push(task);
         Ok(bag_of_words(query))
     }
@@ -95,7 +95,7 @@ impl Embedder for FakeEmbedder {
 /// The vector the fake embedder gives a pending chunk.
 fn document_vector(chunk: &PendingChunk) -> UnitVector {
     FakeEmbedder::default()
-        .embed_document(&chunk.title, &chunk.text)
+        .document(&chunk.title, &chunk.text)
         .unwrap()
 }
 
@@ -216,8 +216,9 @@ impl Fixture {
             fs::write(src.join(name), text).unwrap();
         }
 
-        let index = block_on(Index::open(tree.path())).unwrap();
-        let cache = block_on(VectorCache::open(common.path())).unwrap();
+        let state = repo_search_core::StateDir::new(common.path().join("state"));
+        let index = block_on(Index::open(&state, tree.path())).unwrap();
+        let cache = block_on(VectorCache::open(&state, common.path())).unwrap();
         let reconciled = block_on(
             Reconciler::new(index.clone(), cache.clone(), MODEL, tree.path()).reconcile(
                 CHUNKER_FINGERPRINT,
@@ -1025,8 +1026,9 @@ fn alternating_searches_show_ignored_files_only_when_asked() {
         ),
     )
     .unwrap();
-    let index = block_on(Index::open(tree.path())).unwrap();
-    let cache = block_on(VectorCache::open(common.path())).unwrap();
+    let state = repo_search_core::StateDir::new(common.path().join("state"));
+    let index = block_on(Index::open(&state, tree.path())).unwrap();
+    let cache = block_on(VectorCache::open(&state, common.path())).unwrap();
     let reconciler = RefCell::new(Reconciler::new(
         index.clone(),
         cache.clone(),
@@ -1231,8 +1233,9 @@ fn vector_reads(files: usize) -> Scenario {
         )
         .unwrap();
     }
-    let index = block_on(Index::open(tree.path())).unwrap();
-    let cache = block_on(VectorCache::open(common.path())).unwrap();
+    let state = repo_search_core::StateDir::new(common.path().join("state"));
+    let index = block_on(Index::open(&state, tree.path())).unwrap();
+    let cache = block_on(VectorCache::open(&state, common.path())).unwrap();
     let mut reconciler = Reconciler::new(index.clone(), cache.clone(), MODEL, tree.path());
     let embed_missing = || {
         let pending = missing(&index, &cache, tree.path(), false);

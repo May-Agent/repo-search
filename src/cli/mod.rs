@@ -6,12 +6,17 @@
 //! on stderr. The client installs no tracing subscriber and has no log.
 
 mod args;
+mod launcher;
 mod progress;
 mod render;
 
 pub use args::{Cli, Command, Invocation, Mode, SearchOptions};
+#[cfg(target_os = "macos")]
+pub use launcher::LaunchdAgents;
+pub use launcher::{Launcher, Report};
 pub use render::{IndexedOutput, StatusOutput};
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -20,28 +25,30 @@ use futures_util::StreamExt;
 use progress::ProgressLine;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
-use crate::client::{Client, ClientError};
-use crate::install::{
-    Agent, AgentConfig, Check, InstallError, Launchctl, SystemLaunchctl, ensure_agent,
-};
-use crate::protocol::{BuildId, Event, Final, Format, Hello, Request, SearchRequest};
+use crate::client::Client;
+#[cfg(target_os = "macos")]
+use crate::install::{AgentConfig, SystemLaunchctl};
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+use crate::protocol::BuildId;
+use crate::protocol::{Event, Final, Format, Hello, Request, SearchRequest};
+#[cfg(target_os = "linux")]
+use crate::spawn::OnDemand;
 
-/// The process's own environment: the working directory, the agent to
-/// install, the `launchctl` that installs it and the handshake to send.
-/// Production values come from [`Env::user`], test values from the tests.
-pub struct Env<L: Launchctl> {
+/// The process's own environment: the working directory, the launcher
+/// that keeps the daemon reachable and the handshake to send. Production
+/// values come from [`Env::user`], test values from the tests.
+pub struct Env<A: Launcher> {
     /// The directory `search` ran in; the worktree is resolved under it.
     pub cwd: PathBuf,
-    /// The agent the client keeps current.
-    pub agent: AgentConfig,
-    /// The `launchctl` implementation.
-    pub launchctl: L,
+    /// Brings the daemon up before the request and after a refused connect.
+    pub launcher: A,
     /// The handshake: this binary's protocol, version and file identity.
     pub hello: Hello,
 }
 
-/// A failure of [`Env::user`]: one of the process's own paths did not
+/// A failure of `Env::user`: one of the process's own paths did not
 /// resolve.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[derive(Debug, thiserror::Error)]
 #[error("{what}: {source}")]
 pub struct EnvError {
@@ -49,35 +56,63 @@ pub struct EnvError {
     source: io::Error,
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 impl EnvError {
     fn new(what: &'static str, source: io::Error) -> Self {
         Self { what, source }
     }
-}
 
-impl Env<SystemLaunchctl> {
-    /// The real user: `cwd`, the canonical current executable, its
-    /// [`BuildId`], and [`AgentConfig::user`]. Runs synchronously before
-    /// any runtime exists; every step is a cheap filesystem call.
-    pub fn user() -> Result<Self, EnvError> {
+    /// The working directory, the canonical current executable and its
+    /// handshake: the part of the real user's [`Env`] both platforms
+    /// share. Runs synchronously before any runtime exists; every step
+    /// is a cheap filesystem call.
+    fn process() -> Result<(PathBuf, PathBuf, Hello), Self> {
         let cwd = std::env::current_dir()
-            .map_err(|e| EnvError::new("cannot read the working directory", e))?;
+            .map_err(|e| Self::new("cannot read the working directory", e))?;
         let program = std::env::current_exe()
             .and_then(|exe| exe.canonicalize())
-            .map_err(|e| EnvError::new("cannot identify the running executable", e))?;
+            .map_err(|e| Self::new("cannot identify the running executable", e))?;
         // Canonical, so that a symlink repointed at a new install (a
-        // versioned directory, a package manager's shim) changes the plist
-        // and reinstalls.
+        // versioned directory, a package manager's shim) changes the
+        // launcher's command and replaces the daemon.
         let hello = Hello::new(
             BuildId::of_file(&program)
-                .map_err(|e| EnvError::new("cannot stat the running executable", e))?,
+                .map_err(|e| Self::new("cannot stat the running executable", e))?,
         );
+        Ok((cwd, program, hello))
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Env<LaunchdAgents<SystemLaunchctl>> {
+    /// The real user: `cwd`, the canonical current executable, its
+    /// [`BuildId`], and [`AgentConfig::user`].
+    pub fn user() -> Result<Self, EnvError> {
+        let (cwd, program, hello) = EnvError::process()?;
+        let server_agent = AgentConfig::server(program.clone())
+            .map_err(|e| EnvError::new("cannot resolve the server agent's paths", e))?;
         let agent = AgentConfig::user(program)
             .map_err(|e| EnvError::new("cannot resolve the agent's paths", e))?;
         Ok(Self {
             cwd,
-            agent,
-            launchctl: SystemLaunchctl,
+            launcher: LaunchdAgents::new(server_agent, agent, SystemLaunchctl),
+            hello,
+        })
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Env<OnDemand> {
+    /// The real user: `cwd`, the canonical current executable, its
+    /// [`BuildId`], and the daemon [`OnDemand`] spawns from the XDG
+    /// paths and `daemon.toml`.
+    pub fn user() -> Result<Self, EnvError> {
+        let (cwd, program, hello) = EnvError::process()?;
+        let launcher = OnDemand::user(program)
+            .map_err(|e| EnvError::new("cannot resolve the daemon's paths", e))?;
+        Ok(Self {
+            cwd,
+            launcher,
             hello,
         })
     }
@@ -136,17 +171,18 @@ fn mb(bytes: u64) -> String {
     format!("{:.1}", bytes as f64 / 1e6)
 }
 
-/// The `installed`/`replaced` stderr line an install outcome reports —
-/// written on a TTY or not.
-async fn announce(outcome: Agent, agent: &AgentConfig, stderr: &mut (impl AsyncWrite + Unpin)) {
-    let line = match outcome {
-        Agent::Current => return,
-        Agent::Installed => format!("installed launch agent {}", agent.plist.display()),
-        Agent::Replaced(reason) => {
-            format!("replaced launch agent {} ({reason})", agent.plist.display())
+/// Tells a launcher step's notes then its error; false when it failed.
+async fn announce(report: Report, stderr: &mut (impl AsyncWrite + Unpin)) -> bool {
+    for note in &report.notes {
+        tell(stderr, note).await;
+    }
+    match report.error {
+        Some(error) => {
+            tell(stderr, &error).await;
+            false
         }
-    };
-    tell(stderr, &line).await;
+        None => true,
+    }
 }
 
 /// The worktree `cwd` belongs to, as `git rev-parse` prints it — the
@@ -170,29 +206,13 @@ async fn resolve_worktree(cwd: &Path) -> Result<PathBuf, String> {
     ))
 }
 
-/// Runs `ensure_agent` off the executor (flock, launchctl, kqueue) and
-/// hands back the config and handle it consumed.
-async fn ensure<L: Launchctl + Send + 'static>(
-    agent: AgentConfig,
-    launchctl: L,
-    check: Check,
-) -> (AgentConfig, L, Result<Agent, InstallError>) {
-    tokio::task::spawn_blocking(move || {
-        let mut launchctl = launchctl;
-        let result = ensure_agent(&agent, &mut launchctl, check);
-        (agent, launchctl, result)
-    })
-    .await
-    .expect("the install thread does not panic")
-}
-
 /// One request's end to end: install check and worktree resolution
 /// concurrently, connect, stream progress to stderr, render the `Final`
 /// and return the grep exit code. `main` dispatches `Invocation::Daemon`
 /// before `run`, so the variant is unreachable here.
-pub async fn run<L, O, E>(invocation: Invocation, env: Env<L>, term: &mut Terminal<O, E>) -> Exit
+pub async fn run<A, O, E>(invocation: Invocation, env: Env<A>, term: &mut Terminal<O, E>) -> Exit
 where
-    L: Launchctl + Send + 'static,
+    A: Launcher,
     O: AsyncWrite + Unpin,
     E: AsyncWrite + Unpin,
 {
@@ -201,15 +221,11 @@ where
     }
     let Env {
         cwd,
-        agent,
-        launchctl,
+        mut launcher,
         hello,
     } = env;
 
-    let (worktree, ensured) = tokio::join!(
-        resolve_worktree(&cwd),
-        ensure(agent, launchctl, Check::Fast)
-    );
+    let (worktree, prepared) = tokio::join!(resolve_worktree(&cwd), launcher.prepare());
     let worktree = match worktree {
         Ok(worktree) => worktree,
         Err(message) => {
@@ -217,40 +233,23 @@ where
             return Exit::Error;
         }
     };
-    let (mut agent, launchctl, ensured) = ensured;
-    match ensured {
-        Ok(outcome) => announce(outcome, &agent, &mut term.stderr).await,
-        Err(error) => {
-            tell(&mut term.stderr, &error.to_string()).await;
-            return Exit::Error;
-        }
+    if !announce(prepared, &mut term.stderr).await {
+        return Exit::Error;
     }
 
-    // A refused or missing socket after `Check::Fast` means the trust was
-    // wrong: `Check::Verify` asks launchd itself, then connect once more.
-    let client = match Client::connect(&agent.agent.socket, &hello).await {
+    let client = match Client::connect(launcher.socket(), &hello).await {
         Ok(client) => client,
-        Err(ClientError::Connect(error))
-            if matches!(
-                error.kind(),
-                io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
-            ) =>
-        {
-            let (checked, _, ensured) = ensure(agent, launchctl, Check::Verify).await;
-            agent = checked;
-            match ensured {
-                Ok(outcome) => announce(outcome, &agent, &mut term.stderr).await,
-                Err(error) => {
-                    tell(&mut term.stderr, &error.to_string()).await;
-                    return Exit::Error;
-                }
+        Err(error) if launcher.recoverable(&error) => {
+            let recovered = launcher.recover().await;
+            if !announce(recovered, &mut term.stderr).await {
+                return Exit::Error;
             }
-            match Client::connect(&agent.agent.socket, &hello).await {
+            match Client::connect(launcher.socket(), &hello).await {
                 Ok(client) => client,
                 Err(error) => {
                     tell(
                         &mut term.stderr,
-                        &render::client_error(&error, &agent.agent.socket, &agent.agent.stderr),
+                        &render::client_error(&error, launcher.socket(), launcher.log()),
                     )
                     .await;
                     return Exit::Error;
@@ -260,7 +259,7 @@ where
         Err(error) => {
             tell(
                 &mut term.stderr,
-                &render::client_error(&error, &agent.agent.socket, &agent.agent.stderr),
+                &render::client_error(&error, launcher.socket(), launcher.log()),
             )
             .await;
             return Exit::Error;
@@ -292,14 +291,14 @@ where
             worktree: worktree.clone(),
             wait: *wait,
         },
-        Invocation::Daemon { .. } => unreachable!("checked above"),
+        Invocation::Daemon { .. } | Invocation::Server { .. } => unreachable!("checked above"),
     };
     let mut responses = match client.request(request).await {
         Ok(responses) => responses,
         Err(error) => {
             tell(
                 &mut term.stderr,
-                &render::client_error(&error, &agent.agent.socket, &agent.agent.stderr),
+                &render::client_error(&error, launcher.socket(), launcher.log()),
             )
             .await;
             return Exit::Error;
@@ -310,7 +309,7 @@ where
         Invocation::Search { options, .. } => ("search", options.json),
         Invocation::Status { json } => ("status", *json),
         Invocation::Index { json, .. } => ("index", *json),
-        Invocation::Daemon { .. } => unreachable!("checked above"),
+        Invocation::Daemon { .. } | Invocation::Server { .. } => unreachable!("checked above"),
     };
     let mut progress = ProgressLine::new(term.stderr_tty);
     while let Some(item) = responses.next().await {
@@ -322,7 +321,7 @@ where
                     Final::Error(report) => {
                         tell(
                             &mut term.stderr,
-                            &render::daemon_error(&report, &agent.agent.stderr),
+                            &render::daemon_error(&report, launcher.log()),
                         )
                         .await;
                         Exit::Error
@@ -353,7 +352,7 @@ where
                 progress.clear(&mut term.stderr).await;
                 tell(
                     &mut term.stderr,
-                    &render::client_error(&error, &agent.agent.socket, &agent.agent.stderr),
+                    &render::client_error(&error, launcher.socket(), launcher.log()),
                 )
                 .await;
                 return Exit::Error;

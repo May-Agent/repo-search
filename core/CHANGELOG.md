@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.3](https://github.com/May-Agent/repo-search/compare/core/v0.0.2...core/v0.0.3) - 2026-10-29
+
+### Added
+
+- build the library on Linux
+- *(daemon)* seed a new worktree's index from a sibling
+- *(server)* standard embeddings API and search --server
+- *(core)* model card, prompt template and embeddings wire types
+- *(daemon)* keep the index in the per-user state dir
+
+### Fixed
+
+- *(core)* gate the test re-export on the tests that use it
+- *(core)* rank keywords by exact BM25 statistics
+- *(search)* break score ties by content hash, not load order
+- *(daemon)* run a waited or freshly seeded worktree's work at stage-1 urgency
+- *(deps)* move tokio and pulldown-cmark to their patched releases
+
+### Other
+
+- Merge remote-tracking branch 'origin/dev' into fix/bm25-stats
+- *(reconcile)* make an atomic save the way an editor does
+- Merge remote-tracking branch 'origin/dev' into feat/linux-daemon
+- Merge pull request #115 from May-Agent/fix/seed-stall
+- Merge remote-tracking branch 'origin/dev' into feat/linux-daemon
+- size thread pools from the CPU count
+- drop the in-process embedder API
+- Merge remote-tracking branch 'origin/dev' into feat/embedding-server
+- *(qos)* hold an override while the worker demotes itself
+- Merge remote-tracking branch 'origin/dev' into feat/embedding-server
+
 ## [0.0.2](https://github.com/May-Agent/repo-search/compare/core/v0.0.1...core/v0.0.2) - 2026-10-21
 
 ### Fixed

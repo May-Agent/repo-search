@@ -7,6 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.3](https://github.com/May-Agent/repo-search/compare/v0.0.2...v0.0.3) - 2026-10-29
+
+### Added
+
+- *(daemon)* run the Linux daemon on demand
+- build the library on Linux
+- *(daemon)* bind its own socket and reach a server over TCP
+- *(daemon)* seed a new worktree's index from a sibling
+- *(daemon)* embed through the server over HTTP
+- *(daemon)* index scheduler that embeds through the server
+- *(install)* run the embedding server as its own launch agent
+- *(daemon)* tokenizer store and prompt-aware token counter
+- *(server)* standard embeddings API and search --server
+- *(server)* embedding server crate with the hardware scheduler
+- *(core)* model card, prompt template and embeddings wire types
+- *(daemon)* keep the index in the per-user state dir
+
+### Fixed
+
+- *(search)* break score ties by content hash, not load order
+- *(daemon)* key a worktree by its on-disk spelling
+- *(daemon)* never drop the watcher's Gone behind a pending change
+- *(daemon)* install the SIGTERM handler before reporting ready
+- *(daemon)* run a waited or freshly seeded worktree's work at stage-1 urgency
+- *(deps)* move tokio and pulldown-cmark to their patched releases
+- *(daemon)* answer a connection a stop catches before its frame
+- *(daemon)* answer queued clients when startup fails
+
+### Other
+
+- Merge remote-tracking branch 'origin/dev' into fix/knn-ties
+- *(publish)* publish repo-search-server with the other crates
+- *(spawn)* reap a leftover daemon before its temp dir goes
+- Merge remote-tracking branch 'origin/dev' into feat/linux-daemon
+- *(dist)* ship x86_64 and aarch64 Linux binaries
+- Merge remote-tracking branch 'origin/dev' into feat/linux-daemon
+- Merge remote-tracking branch 'origin/dev' into feat/linux-daemon
+- *(cli)* put daemon launching behind a Launcher trait
+- size thread pools from the CPU count
+- drop the in-process embedder API
+- Merge remote-tracking branch 'origin/dev' into feat/embedding-server
+
 ## [0.0.2](https://github.com/May-Agent/repo-search/compare/v0.0.1...v0.0.2) - 2026-10-21
 
 ### Other

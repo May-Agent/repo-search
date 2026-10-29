@@ -1,7 +1,4 @@
-//! Thread scheduling: quality-of-service classes and the default thread count.
-
-#[cfg(target_os = "macos")]
-use std::io;
+//! Thread scheduling: quality-of-service classes.
 
 /// A thread's quality-of-service class, from the most to the least urgent.
 /// The scheduler keeps the first on performance cores and may confine the last
@@ -141,32 +138,6 @@ pub fn current_thread() -> QosClass {
     read_thread(ThreadId::current())
 }
 
-/// The number of performance cores: the default scan thread count, which the
-/// caller passes to `KnnIndex::search`.
-///
-/// # Errors
-///
-/// When the platform does not report performance cores.
-#[cfg(target_os = "macos")]
-pub fn performance_cores() -> io::Result<usize> {
-    let mut count: libc::c_int = 0;
-    let mut len = size_of::<libc::c_int>();
-    // SAFETY: `count` and `len` describe a writable c_int; the name is NUL-terminated.
-    let rc = unsafe {
-        libc::sysctlbyname(
-            c"hw.perflevel0.physicalcpu".as_ptr(),
-            (&raw mut count).cast(),
-            &raw mut len,
-            std::ptr::null_mut(),
-            0,
-        )
-    };
-    if rc != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    usize::try_from(count).map_err(|_| io::Error::other("negative performance core count"))
-}
-
 /// The QoS class `thread` requested, without overrides.
 #[cfg(target_os = "macos")]
 fn read_thread(thread: ThreadId) -> QosClass {
@@ -217,14 +188,9 @@ pub fn scheduling_priority(thread: ThreadId) -> libc::c_int {
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::{
-        Override, QosClass, ThreadId, current_thread, performance_cores, read_thread,
-        scheduling_priority, set_current_thread,
+        Override, QosClass, ThreadId, current_thread, read_thread, scheduling_priority,
+        set_current_thread,
     };
-
-    #[test]
-    fn reports_at_least_one_core() {
-        assert!(performance_cores().unwrap() >= 1);
-    }
 
     #[test]
     fn each_class_round_trips() {
@@ -247,19 +213,33 @@ mod tests {
     #[test]
     fn an_override_raises_and_releases_the_target() {
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<ThreadId>();
+        let (demoted_tx, demoted_rx) = std::sync::mpsc::channel::<()>();
         let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
         let worker = std::thread::spawn(move || {
-            set_current_thread(QosClass::Background);
             ready_tx.send(ThreadId::current()).unwrap();
+            set_current_thread(QosClass::Background);
+            demoted_tx.send(()).unwrap();
             go_rx.recv().unwrap();
         });
         let thread = ready_rx.recv().unwrap();
+        // On a loaded host a thread already at Background can starve inside
+        // the demotion itself; the Utility override keeps the worker
+        // scheduled until it acknowledges. It cannot stay held for the
+        // assertions below: `pth_curpri` reads the same lifted band under
+        // any override while the thread waits, so a second override on top
+        // of it is indistinguishable (see the scheduler tests).
+        let hold = Override::start(thread, QosClass::Utility);
+        demoted_rx.recv().unwrap();
+        // The held override does not mask the class the worker requested.
         assert_eq!(read_thread(thread), QosClass::Background);
+        drop(hold);
         let base = scheduling_priority(thread);
         let over = Override::start(thread, QosClass::UserInteractive);
         let lifted = scheduling_priority(thread);
-        eprintln!("base {base}, lifted {lifted}");
-        assert!(lifted > base, "the override lifts the effective priority");
+        assert!(
+            lifted > base,
+            "the override lifts the effective priority: base {base}, lifted {lifted}"
+        );
         drop(over);
         assert_eq!(
             scheduling_priority(thread),

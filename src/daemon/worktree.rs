@@ -7,16 +7,18 @@
 //! whose changes its feeder orders into the scheduler. Its spawned
 //! `index --wait` tasks and its feeder read off its books by asking it.
 
-use std::num::NonZeroUsize;
-use std::path::PathBuf;
+use std::ffi::OsStr;
+use std::fs;
+use std::io;
+use std::os::unix::ffi::OsStrExt;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use repo_search_core::qos::performance_cores;
 use repo_search_core::reconcile::{self, Counts, PendingChunk, Reconciler, Report};
 use repo_search_core::search::{self, EmbedService, Reconciliation, Retriever};
-use repo_search_core::store::{Index, Phase, VectorCache};
-use repo_search_core::{CHUNKER_FINGERPRINT, QueryTask, TokenCounter, UnitVector};
+use repo_search_core::store::{self, Index, Phase, VectorCache};
+use repo_search_core::{CHUNKER_FINGERPRINT, QueryTask, StateDir, TokenCounter, UnitVector};
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::protocol::{
@@ -24,15 +26,17 @@ use crate::protocol::{
     QueryStats, SearchRequest, StatusReport, WirePhase,
 };
 
-use super::Backend;
+use super::counter::Tokens;
 use super::coverage::{self, Ask, AskError, Asker};
 use super::feed::{self, Feed, FeedMsg, FeederConfig};
-use super::model::{Model, ModelState};
+use super::link::{Embedding, EmbeddingState};
 use super::registry::RegistryHandle;
 use super::scheduler::{
-    DocumentsJob, EmbedError, GpuState, IndexClass, QueryJob, RepoId, SchedulerHandle,
-    SchedulerMsg, Stage1Done, WorktreeId,
+    DocumentsJob, EmbedError, IndexClass, QueryJob, RepoId, SchedulerHandle, SchedulerMsg,
+    Stage1Done, WorktreeId,
 };
+use super::server::ServerClient;
+use super::spelling;
 use super::watch::{WatchMsg, Watcher};
 use super::writer::WriterHandle;
 
@@ -56,7 +60,7 @@ pub enum OwnerMsg {
         /// Events sink.
         events: mpsc::Sender<Event>,
     },
-    /// A `status` request; never creates `.repo-search/`.
+    /// A `status` request; never creates the index file.
     Status {
         /// Events sink.
         events: mpsc::Sender<Event>,
@@ -74,7 +78,9 @@ impl OwnerMsg {
 }
 
 /// Everything the registry hands a new owner.
-pub struct OwnerConfig<B: Backend> {
+pub struct OwnerConfig<T: Tokens> {
+    /// The daemon's state root: the worktree's index lives under it.
+    pub state: StateDir,
     /// The scheduler's worktree id.
     pub id: WorktreeId,
     /// Canonical worktree root.
@@ -88,7 +94,7 @@ pub struct OwnerConfig<B: Backend> {
     /// The model-id vectors are stored under; known before the model loads.
     pub model_id: String,
     /// The model readiness watch.
-    pub model: watch::Receiver<ModelState<B>>,
+    pub model: watch::Receiver<EmbeddingState<T>>,
     /// The registry, for the shared cache and writer, `DaemonStatus`'s
     /// worktree count, and `Forget`.
     pub registry: RegistryHandle,
@@ -96,16 +102,20 @@ pub struct OwnerConfig<B: Backend> {
     pub started: Instant,
     /// Set when the daemon begins shutdown.
     pub stopping: watch::Receiver<bool>,
+    /// The embedding server's client: `GET /status` carries its GPU
+    /// report, before and after the link reaches Ready.
+    pub server: Arc<ServerClient>,
 }
 
 /// Spawns the owner task; the returned sender is its inbox.
-pub fn spawn<B: Backend>(config: OwnerConfig<B>) -> mpsc::Sender<OwnerMsg> {
+pub fn spawn<T: Tokens>(config: OwnerConfig<T>) -> mpsc::Sender<OwnerMsg> {
     let (tx, rx) = mpsc::channel(64);
     tokio::spawn(Owner::new(config, rx).run());
     tx
 }
 
-struct Owner<B: Backend> {
+struct Owner<T: Tokens> {
+    state: StateDir,
     id: WorktreeId,
     root: PathBuf,
     common_dir: PathBuf,
@@ -114,7 +124,7 @@ struct Owner<B: Backend> {
     cache: Option<VectorCache>,
     writer: Option<WriterHandle>,
     model_id: String,
-    model: watch::Receiver<ModelState<B>>,
+    model: watch::Receiver<EmbeddingState<T>>,
     registry: RegistryHandle,
     started: Instant,
     stopping: watch::Receiver<bool>,
@@ -123,6 +133,10 @@ struct Owner<B: Backend> {
     /// `(dev, ino)` of `index.db` as opened; a recreated file means the
     /// handle points at an unlinked inode.
     index_id: Option<(u64, u64)>,
+    /// Whether [`Owner::seed_index`] has run: a worktree tries a sibling's
+    /// index once, so a failed copy fails one request and the next builds
+    /// from scratch.
+    seed_tried: bool,
     phase: Phase,
     retriever: Option<Retriever<AneHandle>>,
     report: Option<Report>,
@@ -147,6 +161,8 @@ struct Owner<B: Backend> {
     /// The applied phase, published to `index --wait` tasks spawned off
     /// the owner.
     phase_tx: watch::Sender<Phase>,
+    /// The embedding server's client; `Status` reads its GPU report.
+    server: Arc<ServerClient>,
     /// The spawned `index --wait` tasks the owner has not yet seen finish.
     waits: tokio::task::JoinSet<()>,
     /// Handed to each `index --wait` task; kept so `asks` never closes.
@@ -156,12 +172,13 @@ struct Owner<B: Backend> {
     asks: mpsc::Receiver<Ask>,
 }
 
-impl<B: Backend> Owner<B> {
-    fn new(config: OwnerConfig<B>, rx: mpsc::Receiver<OwnerMsg>) -> Self {
+impl<T: Tokens> Owner<T> {
+    fn new(config: OwnerConfig<T>, rx: mpsc::Receiver<OwnerMsg>) -> Self {
         let (stage1_tx, stage1_rx) = mpsc::channel(8);
         let (phase_tx, _) = watch::channel(Phase::FirstIndex);
         let (asker, asks) = coverage::channel();
         Self {
+            state: config.state,
             id: config.id,
             root: config.root,
             common_dir: config.common_dir,
@@ -174,9 +191,11 @@ impl<B: Backend> Owner<B> {
             registry: config.registry,
             started: config.started,
             stopping: config.stopping,
+            server: config.server,
             rx,
             index: None,
             index_id: None,
+            seed_tried: false,
             phase: Phase::FirstIndex,
             retriever: None,
             report: None,
@@ -284,9 +303,9 @@ impl<B: Backend> Owner<B> {
     }
 
     /// The `Ready` model, or `None` while it is still on its way.
-    fn ready(&self) -> Option<Arc<Model<B>>> {
+    fn ready(&self) -> Option<Arc<Embedding<T>>> {
         match &*self.model.borrow() {
-            ModelState::Ready(model) => Some(model.clone()),
+            EmbeddingState::Ready(model) => Some(model.clone()),
             _ => None,
         }
     }
@@ -310,13 +329,27 @@ impl<B: Backend> Owner<B> {
         ))
     }
 
+    /// The worktree's index file under the daemon's state dir.
+    fn index_path(&self) -> PathBuf {
+        self.state.worktree_index(&self.root)
+    }
+
     /// Opens the index on first use, reading the stored phase and the file's
     /// identity; a `Status` on a worktree with no index file never reaches
-    /// here.
+    /// here. When the worktree has no index file, [`Owner::seed_index`] first
+    /// tries a sibling's index.
     async fn ensure_index(&mut self) -> Result<(), String> {
         if self.index.is_none() {
-            let index = Index::open(&self.root).await.map_err(|e| e.to_string())?;
-            let meta = tokio::fs::metadata(self.root.join(".repo-search/index.db"))
+            if !tokio::fs::try_exists(self.index_path())
+                .await
+                .map_err(|e| e.to_string())?
+            {
+                self.seed_index().await?;
+            }
+            let index = Index::open(&self.state, &self.root)
+                .await
+                .map_err(|e| e.to_string())?;
+            let meta = tokio::fs::metadata(self.index_path())
                 .await
                 .map_err(|e| e.to_string())?;
             let phase = index.phase().await.map_err(|e| e.to_string())?;
@@ -327,15 +360,65 @@ impl<B: Backend> Owner<B> {
         Ok(())
     }
 
+    /// When `index.db` does not exist, copies a sibling worktree's index
+    /// that this build's schema, chunker and model recorded — `Maintained`
+    /// preferred — into the worktree's state dir, the copy stamped
+    /// `FirstIndex` whatever the sibling's phase was: the files the
+    /// worktree differs in embed as stage-1 work and the phase flips to
+    /// `Maintained` once they are done. Index rows are worktree-relative
+    /// and `meta` holds no path, so a sibling's index is valid as it is:
+    /// the first barrier restamps every file whose bytes are unchanged
+    /// and re-chunks the rest. No matching sibling means a fresh index,
+    /// as before. Runs once per owner: a failed copy fails this request,
+    /// leaves no `index.db`, and the next request builds from scratch.
+    async fn seed_index(&mut self) -> Result<(), String> {
+        if self.seed_tried {
+            return Ok(());
+        }
+        self.seed_tried = true;
+        let output = tokio::process::Command::new("git")
+            .arg("-C")
+            .arg(&self.root)
+            .args(["worktree", "list", "--porcelain", "-z"])
+            .output()
+            .await
+            .map_err(|e| format!("git worktree list: {e}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "git worktree list failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+        let listed: Vec<PathBuf> = output
+            .stdout
+            .split(|&byte| byte == 0)
+            .filter_map(|field| field.strip_prefix(b"worktree "))
+            .map(|path| PathBuf::from(OsStr::from_bytes(path)))
+            .collect();
+        let seed = Seed {
+            state: self.state.clone(),
+            root: self.root.clone(),
+            dest: self.index_path(),
+            model_id: self.model_id.clone(),
+        };
+        let seeded = tokio::task::spawn_blocking(move || seed.copy(&listed))
+            .await
+            .map_err(|e| e.to_string())?;
+        if let Err(error) = &seeded {
+            tracing::error!(%error, root = %self.root.display(), "seeding the index from a sibling failed");
+        }
+        seeded
+    }
+
     /// Before every barrier: the index file must still be the inode it was
-    /// opened with — a recreated `.repo-search/` leaves the handle writing
-    /// into an unlinked file. On a mismatch the index, its reconciler and the
-    /// retriever are dropped and reopened.
+    /// opened with — a recreated index file under the state dir leaves the
+    /// handle writing into an unlinked file. On a mismatch the index, its
+    /// reconciler and the retriever are dropped and reopened.
     async fn verify_index(&mut self) -> Result<(), String> {
         let Some(id) = self.index_id else {
             return Ok(());
         };
-        let meta = tokio::fs::metadata(self.root.join(".repo-search/index.db")).await;
+        let meta = tokio::fs::metadata(self.index_path()).await;
         if matches!(&meta, Ok(meta) if file_id(meta) == id) {
             return Ok(());
         }
@@ -478,7 +561,7 @@ impl<B: Backend> Owner<B> {
     /// already sent.
     async fn barrier_and_retrieve(
         &mut self,
-        model: &Arc<Model<B>>,
+        model: &Arc<Embedding<T>>,
         request: &search::Request,
         events: &mpsc::Sender<Event>,
     ) -> Option<Retrieved> {
@@ -493,20 +576,12 @@ impl<B: Backend> Owner<B> {
         let barrier_us = barrier_start.elapsed().as_micros() as u64;
 
         if self.retriever.is_none() {
-            let knn_threads = match performance_cores() {
-                Ok(cores) => NonZeroUsize::new(cores),
+            let knn_threads = match std::thread::available_parallelism() {
+                Ok(threads) => threads,
                 Err(e) => {
                     send(events, error(ErrorKind::Internal, e.to_string())).await;
                     return None;
                 }
-            };
-            let Some(knn_threads) = knn_threads else {
-                send(
-                    events,
-                    error(ErrorKind::Internal, "no performance cores".into()),
-                )
-                .await;
-                return None;
             };
             let handle = AneHandle {
                 worktree: self.id,
@@ -547,7 +622,7 @@ impl<B: Backend> Owner<B> {
             .await;
             return None;
         }
-        let counter = BudgetCounter::<B>(model.counter.clone());
+        let counter = BudgetCounter::<T>(model.counter.clone());
         // Only the retrieval cancels on a hang-up: the barrier above always
         // runs to completion.
         let result = tokio::select! {
@@ -567,7 +642,7 @@ impl<B: Backend> Owner<B> {
 
     /// Drops this worktree's accumulated query stats; `Err` when the
     /// scheduler is gone.
-    async fn reset_stats(&self, model: &Arc<Model<B>>) -> Result<(), ()> {
+    async fn reset_stats(&self, model: &Arc<Embedding<T>>) -> Result<(), ()> {
         model
             .scheduler
             .take_stats(self.id)
@@ -578,7 +653,10 @@ impl<B: Backend> Owner<B> {
 
     /// Takes this worktree's accumulated query stats; `Err` when the
     /// scheduler is gone.
-    async fn take_stats(&self, model: &Arc<Model<B>>) -> Result<super::scheduler::AneStats, ()> {
+    async fn take_stats(
+        &self,
+        model: &Arc<Embedding<T>>,
+    ) -> Result<super::scheduler::AneStats, ()> {
         model.scheduler.take_stats(self.id).await.map_err(|_| ())
     }
 
@@ -648,7 +726,7 @@ impl<B: Backend> Owner<B> {
     }
 
     async fn status(&mut self, events: &mpsc::Sender<Event>) {
-        let db = self.root.join(".repo-search/index.db");
+        let db = self.index_path();
         let index_exists = match tokio::fs::try_exists(&db).await {
             Ok(exists) => exists,
             Err(e) => {
@@ -675,10 +753,14 @@ impl<B: Backend> Owner<B> {
             }
         };
         let gpu = async {
-            match &sched {
-                Some(sched) => sched.gpu_status().await,
-                None => Ok(GpuState::Absent { blocked: None }),
-            }
+            // The GPU instance lives in the server now; `GET /status`
+            // reports it. A server that cannot be reached reports like a
+            // not-ready one, as before.
+            self.server
+                .status()
+                .await
+                .map(|body| body.gpu)
+                .unwrap_or(crate::protocol::GpuStatus::Absent { blocked: None })
         };
         let index = if index_exists {
             self.index.clone()
@@ -695,7 +777,7 @@ impl<B: Backend> Owner<B> {
         // stage-1 completion below.
         let (phase, counts, gpu, worktrees) =
             tokio::join!(phase, counts, gpu, self.registry.count());
-        let (Ok(counts), Ok(gpu), Some(worktrees)) = (counts, gpu, worktrees) else {
+        let (Ok(counts), gpu, Some(worktrees)) = (counts, gpu, worktrees) else {
             send(events, shutting_down()).await;
             return;
         };
@@ -749,26 +831,23 @@ impl<B: Backend> Owner<B> {
             }
         };
         let model = match &*self.model.borrow() {
-            ModelState::Absent => ModelStatus::Downloading {
+            EmbeddingState::Absent => ModelStatus::Downloading {
                 received: 0,
                 total: None,
             },
-            ModelState::Downloading { received, total } => ModelStatus::Downloading {
+            EmbeddingState::Downloading { received, total } => ModelStatus::Downloading {
                 received: *received,
                 total: *total,
             },
-            ModelState::Loading => ModelStatus::Loading,
-            ModelState::Ready(model) => ModelStatus::Ready {
+            EmbeddingState::Loading => ModelStatus::Loading,
+            EmbeddingState::Ready(model) => ModelStatus::Ready {
                 model_id: model.id.clone(),
             },
-            ModelState::Failed(message) | ModelState::Fatal(message) => ModelStatus::Failed {
-                message: message.clone(),
-            },
-        };
-        let gpu = match gpu {
-            GpuState::Absent { blocked } => crate::protocol::GpuStatus::Absent { blocked },
-            GpuState::Loading => crate::protocol::GpuStatus::Loading,
-            GpuState::Running => crate::protocol::GpuStatus::Running,
+            EmbeddingState::Failed(message) | EmbeddingState::Fatal(message) => {
+                ModelStatus::Failed {
+                    message: message.clone(),
+                }
+            }
         };
         let report = StatusReport {
             worktree: self.root.clone(),
@@ -795,7 +874,7 @@ impl<B: Backend> Owner<B> {
     /// barrier's `Enqueue` if the read missed it.
     async fn barrier(
         &mut self,
-        model: &Arc<Model<B>>,
+        model: &Arc<Embedding<T>>,
         include_ignored: bool,
         ack: Option<oneshot::Sender<Result<(), String>>>,
     ) -> Result<(Report, String), String> {
@@ -833,7 +912,7 @@ impl<B: Backend> Owner<B> {
     /// failed feed asks the books before it takes the next feed, so asks
     /// are answered while the feeder's inbox is full: the owner never waits
     /// on a feeder that waits on it.
-    async fn feed(&mut self, model: &Arc<Model<B>>, msg: FeedMsg) {
+    async fn feed(&mut self, model: &Arc<Embedding<T>>, msg: FeedMsg) {
         let feeder = self.feeder(model);
         let permit = loop {
             tokio::select! {
@@ -849,9 +928,9 @@ impl<B: Backend> Owner<B> {
 
     /// The feeder, spawned on first use; the writer is open by then (every
     /// barrier caller ran `shared` first).
-    fn feeder(&mut self, model: &Arc<Model<B>>) -> mpsc::Sender<feed::FeedMsg> {
+    fn feeder(&mut self, model: &Arc<Embedding<T>>) -> mpsc::Sender<feed::FeedMsg> {
         if self.feeder.is_none() {
-            self.feeder = Some(feed::spawn(FeederConfig::<B> {
+            self.feeder = Some(feed::spawn(FeederConfig::<T> {
                 worktree: self.id,
                 repo: self.repo,
                 root: self.root.clone(),
@@ -891,7 +970,7 @@ impl<B: Backend> Owner<B> {
     /// the pass leaves for the feeder.
     async fn barrier_steps(
         &mut self,
-        model: &Arc<Model<B>>,
+        model: &Arc<Embedding<T>>,
         include_ignored: bool,
     ) -> Result<(Report, String, Feed), String> {
         self.writer
@@ -1190,6 +1269,92 @@ async fn stopped(stopping: &mut watch::Receiver<bool>) {
     let _ = stopping.wait_for(|stopping| *stopping).await;
 }
 
+/// What a seed copy needs, moved onto a blocking thread.
+struct Seed {
+    state: StateDir,
+    /// The canonical root of the worktree being seeded.
+    root: PathBuf,
+    /// Its `index.db`.
+    dest: PathBuf,
+    model_id: String,
+}
+
+impl Seed {
+    /// Canonicalizes each worktree `git worktree list` named to its
+    /// on-disk spelling, reads the `meta` of each sibling's index on a
+    /// read-only connection — a writer serializes the read behind its
+    /// commit under the busy timeout — and
+    /// takes one matching this build's chunker and model, `Maintained`
+    /// preferred. That index is `VACUUM INTO`'d to a temporary file beside
+    /// `dest`, stamped `FirstIndex` and linked to `dest`; a `dest` that
+    /// appeared while the copy ran is left to its opener. A listed
+    /// worktree whose directory is gone is no sibling; every other error
+    /// fails the seed.
+    fn copy(&self, listed: &[PathBuf]) -> Result<(), String> {
+        let mut source: Option<PathBuf> = None;
+        for listed in listed {
+            let path = match spelling::canonical(listed) {
+                Ok(path) => path,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(format!("{}: {e}", listed.display())),
+            };
+            if path == self.root {
+                continue;
+            }
+            let index = self.state.worktree_index(&path);
+            if !index
+                .try_exists()
+                .map_err(|e| format!("{}: {e}", index.display()))?
+            {
+                continue;
+            }
+            let Some(meta) =
+                store::stored_meta(&index).map_err(|e| format!("{}: {e}", index.display()))?
+            else {
+                continue;
+            };
+            if meta.chunker == CHUNKER_FINGERPRINT && meta.model_id == self.model_id {
+                source = Some(index);
+                if meta.phase == Phase::Maintained {
+                    break;
+                }
+            }
+        }
+        let Some(source) = source else { return Ok(()) };
+        let dir = self.dest.parent().expect("worktree_index names index.db");
+        fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        let mut tmp = self.dest.clone().into_os_string();
+        tmp.push(".seed");
+        let tmp = PathBuf::from(tmp);
+        remove_if_present(&tmp)?;
+        let seeded = store::vacuum_into(&source, &tmp)
+            .map_err(|e| format!("copying {}: {e}", source.display()))
+            .and_then(|()| {
+                // The copy starts first-index: its differing files embed
+                // as stage-1 work and the worktree turns `Maintained`
+                // once they are done.
+                store::set_stored_phase(&tmp, Phase::FirstIndex)
+                    .map_err(|e| format!("{}: {e}", tmp.display()))
+            })
+            .and_then(|()| match fs::hard_link(&tmp, &self.dest) {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+                Err(e) => Err(format!("{}: {e}", self.dest.display())),
+            });
+        let removed = remove_if_present(&tmp);
+        seeded.and(removed)
+    }
+}
+
+/// Removes the file at `path`; one already gone is no error.
+fn remove_if_present(path: &Path) -> Result<(), String> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("{}: {e}", path.display())),
+    }
+}
+
 /// `(dev, ino)` of a file's metadata.
 fn file_id(meta: &std::fs::Metadata) -> (u64, u64) {
     use std::os::unix::fs::MetadataExt;
@@ -1221,9 +1386,9 @@ struct Retrieved {
 }
 
 /// The output-budget counter over the model's tokenizer.
-struct BudgetCounter<B: Backend>(Arc<B::Counter>);
+struct BudgetCounter<T: Tokens>(Arc<T::Counter>);
 
-impl<B: Backend> search::TokenCounter for BudgetCounter<B> {
+impl<T: Tokens> search::TokenCounter for BudgetCounter<T> {
     fn count(&self, text: &str) -> usize {
         self.0.count(text)
     }
