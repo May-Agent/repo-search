@@ -14,7 +14,8 @@ use std::path::{Path, PathBuf};
 /// `worktrees/<fingerprint>/index.db` holds each worktree's index and
 /// `repos/<fingerprint>/` each repository's shared vector cache, where
 /// `fingerprint` is the blake3 hash — hex — of the canonical worktree
-/// root or git common dir.
+/// root or git common dir. A document collection lives whole under
+/// `collections/<fingerprint>/`, the fingerprint being that of its name.
 #[derive(Clone, Debug)]
 pub struct StateDir(PathBuf);
 
@@ -50,6 +51,32 @@ impl StateDir {
     /// touch the same cache.
     pub fn repo_cache(&self, common_dir: &Path) -> PathBuf {
         self.0.join("repos").join(fingerprint(common_dir))
+    }
+
+    /// The directory of the document collection `name`:
+    /// `<root>/collections/<fingerprint>`. Any string names a collection;
+    /// the hash keeps the name out of the layout.
+    pub fn collection(&self, name: &str) -> PathBuf {
+        self.0
+            .join("collections")
+            .join(fingerprint(Path::new(name)))
+    }
+
+    /// The directory holding the collection's documents as files, the
+    /// root its index and retriever treat as a worktree.
+    pub fn collection_docs(&self, name: &str) -> PathBuf {
+        self.collection(name).join("docs")
+    }
+
+    /// The collection's index database.
+    pub fn collection_index(&self, name: &str) -> PathBuf {
+        self.collection(name).join("index.db")
+    }
+
+    /// The collection's own vector cache directory; collections never
+    /// share vectors with each other or with a repository.
+    pub fn collection_cache(&self, name: &str) -> PathBuf {
+        self.collection(name).join("vectors")
     }
 }
 

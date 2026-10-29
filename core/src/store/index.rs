@@ -6,7 +6,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::io;
 use std::ops::{Range, RangeInclusive};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use tokio::sync::{mpsc, oneshot};
@@ -323,9 +323,19 @@ impl Index {
     /// written, SQLite rejects the file, or the actor thread fails to
     /// spawn.
     pub async fn open(state: &StateDir, worktree: &Path) -> Result<Self, Error> {
-        let path = state.worktree_index(worktree);
-        let worktree = worktree.to_path_buf();
-        let tx = spawn_actor("repo-search-index", move || init(&worktree, &path), serve).await?;
+        Self::open_at(worktree, state.worktree_index(worktree)).await
+    }
+
+    /// Opens — creating if needed — the index database at `path` for the
+    /// tree rooted at `root`: [`Index::open`] with the database placed by
+    /// the caller, as a document collection places its own.
+    ///
+    /// # Errors
+    ///
+    /// As [`Index::open`].
+    pub async fn open_at(root: &Path, path: PathBuf) -> Result<Self, Error> {
+        let root = root.to_path_buf();
+        let tx = spawn_actor("repo-search-index", move || init(&root, &path), serve).await?;
         Ok(Self { tx })
     }
 

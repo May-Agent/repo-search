@@ -400,6 +400,7 @@ pub fn daemon_error(report: &ErrorReport, log: &Path) -> String {
         ErrorKind::NotAWorktree => report.message.clone(),
         ErrorKind::Model => format!("the model is unavailable: {}", report.message),
         ErrorKind::Search => format!("the search failed: {}", report.message),
+        ErrorKind::NoSuchCollection => report.message.clone(),
         ErrorKind::ShuttingDown => {
             "the daemon shut down before answering; run the command again".to_owned()
         }
@@ -635,7 +636,7 @@ mod tests {
     #[test]
     fn every_error_kind_has_its_message() {
         let log = Path::new("/log/daemon.log");
-        let cases: [(ErrorKind, &str); 8] = [
+        let cases: [(ErrorKind, &str); 9] = [
             (
                 ErrorKind::ProtocolMismatch,
                 "the daemon did not restart into this build: why; see /log/daemon.log",
@@ -647,6 +648,7 @@ mod tests {
             (ErrorKind::NotAWorktree, "why"),
             (ErrorKind::Model, "the model is unavailable: why"),
             (ErrorKind::Search, "the search failed: why"),
+            (ErrorKind::NoSuchCollection, "why"),
             (
                 ErrorKind::ShuttingDown,
                 "the daemon shut down before answering; run the command again",

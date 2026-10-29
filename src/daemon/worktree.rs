@@ -527,13 +527,7 @@ impl<T: Tokens> Owner<T> {
         let results = match result {
             Ok(results) => results,
             Err(e) => {
-                let kind = match &e {
-                    search::Error::Embed(EmbedError::Model(_)) => ErrorKind::Model,
-                    search::Error::Embed(EmbedError::SchedulerGone) => ErrorKind::ShuttingDown,
-                    search::Error::Embed(EmbedError::Writer(_)) => ErrorKind::Internal,
-                    _ => ErrorKind::Search,
-                };
-                send(events, error(kind, e.to_string())).await;
+                send(events, search_failure(&e)).await;
                 return;
             }
         };
@@ -1361,16 +1355,27 @@ fn file_id(meta: &std::fs::Metadata) -> (u64, u64) {
     (meta.dev(), meta.ino())
 }
 
+/// The error reply for a failed retrieval.
+pub(super) fn search_failure(e: &search::Error<EmbedError>) -> Event {
+    let kind = match e {
+        search::Error::Embed(EmbedError::Model(_)) => ErrorKind::Model,
+        search::Error::Embed(EmbedError::SchedulerGone) => ErrorKind::ShuttingDown,
+        search::Error::Embed(EmbedError::Writer(_)) => ErrorKind::Internal,
+        _ => ErrorKind::Search,
+    };
+    error(kind, e.to_string())
+}
+
 /// Sends `event` unless the request's client hung up.
-async fn send(events: &mpsc::Sender<Event>, event: Event) -> bool {
+pub(super) async fn send(events: &mpsc::Sender<Event>, event: Event) -> bool {
     events.send(event).await.is_ok()
 }
 
-fn error(kind: ErrorKind, message: String) -> Event {
+pub(super) fn error(kind: ErrorKind, message: String) -> Event {
     Event::Final(Final::Error(ErrorReport { kind, message }))
 }
 
-fn shutting_down() -> Event {
+pub(super) fn shutting_down() -> Event {
     error(
         ErrorKind::ShuttingDown,
         "the daemon is shutting down".to_owned(),
@@ -1386,7 +1391,7 @@ struct Retrieved {
 }
 
 /// The output-budget counter over the model's tokenizer.
-struct BudgetCounter<T: Tokens>(Arc<T::Counter>);
+pub(super) struct BudgetCounter<T: Tokens>(pub(super) Arc<T::Counter>);
 
 impl<T: Tokens> search::TokenCounter for BudgetCounter<T> {
     fn count(&self, text: &str) -> usize {
@@ -1399,14 +1404,14 @@ impl<T: Tokens> search::TokenCounter for BudgetCounter<T> {
 /// work. A `Documents` job's vectors reach the cache through the
 /// repository's writer.
 #[derive(Clone)]
-struct AneHandle {
-    worktree: WorktreeId,
-    repo: RepoId,
-    model_id: String,
-    sched: mpsc::Sender<SchedulerMsg>,
+pub(super) struct AneHandle {
+    pub(super) worktree: WorktreeId,
+    pub(super) repo: RepoId,
+    pub(super) model_id: String,
+    pub(super) sched: mpsc::Sender<SchedulerMsg>,
     /// The repository's writer: on-the-spot vectors go there, and
     /// `documents` flushes it before it returns.
-    writer: WriterHandle,
+    pub(super) writer: WriterHandle,
 }
 
 impl EmbedService for AneHandle {

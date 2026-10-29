@@ -368,6 +368,7 @@ fn reply_kind(last: &Final) -> &'static str {
         Final::Answer(_) => "answer",
         Final::Status(_) => "status",
         Final::Indexed { .. } => "indexed",
+        Final::Collection(_) => "collection",
         Final::Error(_) => "error",
     }
 }
