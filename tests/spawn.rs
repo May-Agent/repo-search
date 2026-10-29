@@ -101,6 +101,18 @@ async fn spawn_host() {
         .await
         .expect("the host binds");
     let ready = ready_fd.expect("--ready-fd");
+    // `ready` is written only once the SIGTERM stream exists, as in
+    // `bound_main`: a signal landing before `run` polls it is buffered.
+    let signal = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+        Ok(signal) => signal,
+        Err(error) => {
+            let error = StartupError::Signal(error);
+            let message = error.to_string();
+            let _held = bound.refuse(&error).await;
+            report(ready, &format!("failed: {message}\n"));
+            std::process::exit(1);
+        }
+    };
     // The production `endpoint`: the token file is read and trimmed.
     let endpoint = match (server_socket, server_addr) {
         (Some(path), None) => Ok(Endpoint::Unix(path)),
@@ -130,6 +142,7 @@ async fn spawn_host() {
             bound,
             hold: config.hold_socket,
         },
+        signal,
         idle_exit: config.idle_exit,
         load_bound: daemon::LOAD_BOUND,
         tokens: StubTokens::default(),
@@ -572,7 +585,9 @@ async fn an_unreadable_token_file_shows_the_daemons_failure() {
             && stderr.contains(&world.log().display().to_string()),
         "{stderr}"
     );
-    assert_eq!(world.alive(), None, "the failed daemon exited");
+    // The host reports `failed:` before it exits, so the client can
+    // print the error while the host still holds its lifetime lock.
+    world.exited().await;
 }
 
 /// Which connect failures a fresh daemon can cure.

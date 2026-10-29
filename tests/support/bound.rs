@@ -27,6 +27,8 @@ pub async fn spawn(
     let listener = Bound::acquire(socket).await.expect("the daemon binds");
     tokio::spawn(daemon::run(Config {
         listener,
+        signal: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("the SIGTERM stream installs"),
         idle_exit,
         load_bound: daemon::LOAD_BOUND,
         tokens,

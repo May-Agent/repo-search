@@ -47,7 +47,7 @@ pub enum Error {
     /// A writer's `put_many` failed.
     #[error("vector writer failed: {0}")]
     Writer(String),
-    /// The listener or the signal handler failed.
+    /// The listener failed.
     #[error("daemon I/O: {0}")]
     Io(#[from] io::Error),
     /// `run` could not start; the queued connections were answered first.
@@ -187,6 +187,10 @@ pub struct Config<T: Tokens, L: listen::Listener> {
     /// in macOS production, a [`Bound`](listen::Bound) the daemon owns on
     /// Linux and in tests.
     pub listener: L,
+    /// The SIGTERM stream the accept loop polls. The caller installs it
+    /// before it reports readiness, so a signal landing before `run`
+    /// polls it is buffered in the stream, never defaulted.
+    pub signal: tokio::signal::unix::Signal,
     /// Exit after this long with no connections and no work.
     pub idle_exit: Duration,
     /// Fail the link — tokenizer download plus the server-readiness wait
@@ -220,6 +224,10 @@ enum ConnMsg {
 
 /// Runs the daemon until idle exit, SIGTERM or a fatal error.
 ///
+/// The SIGTERM stream arrives on the config, installed by the caller
+/// before it reports readiness: a signal landing before `run` first
+/// polls it is buffered there, so the shutdown tail still runs.
+///
 /// Shutdown — on any trigger — closes the listener first (a bound socket
 /// is unlinked and its queued connections answered `ShuttingDown`),
 /// broadcasts `stopping`, closes the registry (dropping the owners'
@@ -233,17 +241,7 @@ enum ConnMsg {
 /// lock's release stays after every flush; in the production entry
 /// points that is the process's exit.
 pub async fn run<T: Tokens, L: listen::Listener>(config: Config<T, L>) -> Result<(), Error> {
-    // The signal stream exists before anything is spawned: a failure here
-    // leaves nothing to shut down.
-    let mut signal = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-    {
-        Ok(signal) => signal,
-        Err(error) => {
-            let error = StartupError::Signal(error);
-            let _held = config.listener.refuse(&error).await?;
-            return Err(error.into());
-        }
-    };
+    let mut signal = config.signal;
     let started = Instant::now();
     let (fatal_tx, mut fatal_rx) = mpsc::channel::<Error>(64);
     let (busy_tx, mut busy_rx) = busy_channel();

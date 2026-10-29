@@ -2453,10 +2453,15 @@ async fn daemon_host() {
         chip: ChipClass::Wide,
         backend: Arc::new(backend),
     }));
+    // `READY` is printed only once the SIGTERM stream exists: a signal
+    // landing before `run` polls it is buffered, never defaulted.
+    let signal = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .expect("the SIGTERM stream installs");
     // The harness left its `test ... ` prefix unterminated on this line.
     println!("\nREADY");
     daemon::run(Config {
         listener: daemon::listen::Activated(listener),
+        signal,
         idle_exit: Duration::from_secs(3600),
         load_bound: daemon::LOAD_BOUND,
         tokens: StubTokens::default(),

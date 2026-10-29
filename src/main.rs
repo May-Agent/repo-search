@@ -202,13 +202,14 @@ fn activated_main(
     // runs inside the runtime's context.
     let _guard = runtime.enter();
     match startup(listeners, model_cache, state_dir, server) {
-        Ok((listener, tokens, server, state, build)) => {
+        Ok((listener, signal, tokens, server, state, build)) => {
             if let Err(error) = report_ready(ready_fd, "ready\n") {
                 tracing::error!(%error, "could not report readiness");
                 return ExitCode::FAILURE;
             }
             match runtime.block_on(daemon::run(Config {
                 listener: Activated(listener),
+                signal,
                 idle_exit,
                 load_bound: daemon::LOAD_BOUND,
                 tokens,
@@ -251,7 +252,7 @@ fn bound_main(
     path: PathBuf,
 ) -> ExitCode {
     use repo_search::daemon::listen::{Bound, Listener as _};
-    use repo_search::daemon::{Config, LOAD_BOUND};
+    use repo_search::daemon::{Config, LOAD_BOUND, StartupError};
     use repo_search_core::model::MODEL_ID;
 
     let bound = match runtime.block_on(Bound::acquire(&path)) {
@@ -262,6 +263,22 @@ fn bound_main(
                 ready_fd,
                 &format!("could not bind the daemon socket: {error}"),
             );
+        }
+    };
+    // `ready` is written only once the SIGTERM stream exists: a signal
+    // landing before `run` polls it is buffered, never defaulted.
+    let signal = {
+        let _guard = runtime.enter();
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+    };
+    let signal = match signal {
+        Ok(signal) => signal,
+        Err(error) => {
+            let error = StartupError::Signal(error);
+            tracing::error!(%error, "the daemon failed to start");
+            let message = error.to_string();
+            let _held = runtime.block_on(bound.refuse(&error));
+            return fail_ready(ready_fd, &message);
         }
     };
     let (tokens, server, state, build) = match checks(model_cache, state_dir, server) {
@@ -280,6 +297,7 @@ fn bound_main(
     }
     match runtime.block_on(repo_search::daemon::run(Config {
         listener: bound,
+        signal,
         idle_exit,
         load_bound: LOAD_BOUND,
         tokens,
@@ -322,6 +340,7 @@ fn fail_ready(ready_fd: Option<std::os::fd::RawFd>, message: &str) -> ExitCode {
 #[cfg(target_os = "macos")]
 type Started = (
     tokio::net::UnixListener,
+    tokio::signal::unix::Signal,
     repo_search::model_store::TokenizerStore,
     repo_search::daemon::server::Endpoint,
     repo_search_core::StateDir,
@@ -348,6 +367,12 @@ fn startup(
     if listeners.len() != 1 {
         return Err((StartupError::ListenerCount(listeners.len()), listeners));
     }
+    // `ready` is written only once the SIGTERM stream exists: a signal
+    // landing before `run` polls it is buffered, never defaulted.
+    let signal = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+        Ok(signal) => signal,
+        Err(error) => return Err((StartupError::Signal(error), listeners)),
+    };
     let (tokens, server, state, build) = match checks(model_cache, state_dir, server) {
         Ok(checked) => checked,
         Err(error) => return Err((error, listeners)),
@@ -359,7 +384,7 @@ fn startup(
         Err(error) => return Err((StartupError::Adopt(error), vec![std_listener])),
     };
     match tokio::net::UnixListener::from_std(std_listener) {
-        Ok(listener) => Ok((listener, tokens, server, state, build)),
+        Ok(listener) => Ok((listener, signal, tokens, server, state, build)),
         Err(error) => Err((StartupError::Adopt(error), vec![spare])),
     }
 }

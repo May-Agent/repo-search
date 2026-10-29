@@ -194,6 +194,8 @@ pub fn spawn_on<T: Tokens>(
         let listener = UnixListener::from_std(listener).expect("the listener adopts");
         daemon::run(Config {
             listener: daemon::listen::Activated(listener),
+            signal: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("the SIGTERM stream installs"),
             idle_exit,
             load_bound,
             tokens,
