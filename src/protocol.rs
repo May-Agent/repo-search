@@ -17,7 +17,7 @@ use tokio::net::UnixStream;
 use tokio_util::codec::{Framed, LinesCodec};
 
 /// Wire format version, bumped whenever a wire type changes.
-pub const PROTOCOL: u32 = 4;
+pub const PROTOCOL: u32 = 5;
 
 /// The largest frame a peer may send, in bytes.
 pub const MAX_FRAME: usize = 64 << 20;
@@ -115,6 +115,52 @@ pub enum Request {
         /// Block until every chunk has a vector.
         wait: bool,
     },
+    /// Put documents into a collection, replacing those with the same id.
+    UpsertDocuments {
+        /// The collection's name; it exists once written to.
+        collection: String,
+        /// The documents; ids are distinct and non-empty.
+        documents: Vec<Document>,
+    },
+    /// Remove documents from a collection by id.
+    DeleteDocuments {
+        /// The collection's name.
+        collection: String,
+        /// The ids to remove; one the collection does not hold is skipped.
+        ids: Vec<String>,
+    },
+    /// Answer a query over one collection.
+    SearchCollection(CollectionSearch),
+}
+
+/// A document a caller keeps in a collection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Document {
+    /// The caller's stable identifier; non-empty.
+    pub id: String,
+    /// The document's title, searched and shown with its text.
+    pub title: String,
+    /// The text, in Markdown.
+    pub text: String,
+}
+
+/// A query over one collection.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CollectionSearch {
+    /// The collection's name.
+    pub collection: String,
+    /// Free-text query.
+    pub query: String,
+    /// Retrieval channels.
+    pub mode: WireMode,
+    /// Output token budget.
+    pub budget: u32,
+    /// Ranked document ids only.
+    pub ids_only: bool,
+    /// How `Answer::output` is rendered.
+    pub format: Format,
 }
 
 /// A `search <query>` request.
@@ -268,8 +314,30 @@ pub enum Final {
         /// Chunks in total.
         total: u64,
     },
+    /// A document write's reply, sent once the collection's index and
+    /// vectors reflect it.
+    Collection(CollectionReport),
     /// The request failed.
     Error(ErrorReport),
+}
+
+/// What a write to a collection did.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CollectionReport {
+    /// Documents whose stored content changed: added or replaced by an
+    /// upsert, removed by a delete.
+    pub changed: u64,
+    /// Documents the write left as they were: upserted with the content
+    /// they already had, or deleted though the collection did not hold
+    /// them.
+    pub unchanged: u64,
+    /// Chunks this write sent to the embedding server.
+    pub embedded: u64,
+    /// Chunks in the collection.
+    pub chunks_total: u64,
+    /// Chunks in the collection with a vector.
+    pub chunks_with_vector: u64,
 }
 
 /// A query's rendered answer.
@@ -325,6 +393,8 @@ pub enum ErrorKind {
     Model,
     /// The query failed.
     Search,
+    /// A read named a document collection nothing was ever written to.
+    NoSuchCollection,
     /// The daemon is exiting.
     ShuttingDown,
     /// The serialized `Answer` exceeded [`MAX_FRAME`].
@@ -497,6 +567,26 @@ mod tests {
             include_ignored: true,
             format: Format::Json,
         }));
+        round_trip(&Request::UpsertDocuments {
+            collection: "messages".into(),
+            documents: vec![Document {
+                id: "msg:1".into(),
+                title: "Deploy".into(),
+                text: "Ship it\non friday".into(),
+            }],
+        });
+        round_trip(&Request::DeleteDocuments {
+            collection: "messages".into(),
+            ids: vec!["msg:1".into()],
+        });
+        round_trip(&Request::SearchCollection(CollectionSearch {
+            collection: "messages".into(),
+            query: "when do we ship".into(),
+            mode: WireMode::Hybrid,
+            budget: 2000,
+            ids_only: false,
+            format: Format::Text,
+        }));
         round_trip(&Request::Status {
             worktree: PathBuf::from("/repo"),
         });
@@ -534,6 +624,13 @@ mod tests {
                 with_vector: 9,
                 total: 9,
             },
+            Final::Collection(CollectionReport {
+                changed: 2,
+                unchanged: 1,
+                embedded: 5,
+                chunks_total: 7,
+                chunks_with_vector: 7,
+            }),
             Final::Error(ErrorReport {
                 kind: ErrorKind::ProtocolMismatch,
                 message: "daemon is 0.0.0 protocol 1".into(),
@@ -547,6 +644,7 @@ mod tests {
             ErrorKind::NotAWorktree,
             ErrorKind::Model,
             ErrorKind::Search,
+            ErrorKind::NoSuchCollection,
             ErrorKind::ShuttingDown,
             ErrorKind::TooLarge,
             ErrorKind::Internal,

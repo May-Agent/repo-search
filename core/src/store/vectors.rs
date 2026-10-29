@@ -202,12 +202,24 @@ impl VectorCache {
     /// written, the file is a corrupt cache, WAL mode is refused, SQLite
     /// rejects the file, or the actor thread fails to spawn.
     pub async fn open(state: &StateDir, git_common_dir: &Path) -> Result<Self, Error> {
-        let dir = state.repo_cache(git_common_dir);
-        let git_common_dir = git_common_dir.to_path_buf();
+        Self::open_at(git_common_dir, state.repo_cache(git_common_dir)).await
+    }
+
+    /// Opens — creating if needed — the cache in `dir`, which belongs to
+    /// the existing directory `owner`: [`VectorCache::open`] with the
+    /// cache placed by the caller, as a document collection places its
+    /// own.
+    ///
+    /// # Errors
+    ///
+    /// As [`VectorCache::open`], with `owner` in place of the git common
+    /// dir.
+    pub async fn open_at(owner: &Path, dir: PathBuf) -> Result<Self, Error> {
+        let owner = owner.to_path_buf();
         let serve_dir = dir.clone();
         let tx = spawn_actor(
             "repo-search-vectors",
-            move || init(&git_common_dir, &dir),
+            move || init(&owner, &dir),
             move |conn, rx| serve(conn, &serve_dir, rx),
         )
         .await?;
