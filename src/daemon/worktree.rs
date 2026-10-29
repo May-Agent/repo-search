@@ -36,6 +36,7 @@ use super::scheduler::{
     Stage1Done, WorktreeId,
 };
 use super::server::ServerClient;
+use super::spelling;
 use super::watch::{WatchMsg, Watcher};
 use super::writer::WriterHandle;
 
@@ -1279,9 +1280,10 @@ struct Seed {
 }
 
 impl Seed {
-    /// Canonicalizes each worktree `git worktree list` named, reads the
-    /// `meta` of each sibling's index on a read-only connection — a writer
-    /// serializes the read behind its commit under the busy timeout — and
+    /// Canonicalizes each worktree `git worktree list` named to its
+    /// on-disk spelling, reads the `meta` of each sibling's index on a
+    /// read-only connection — a writer serializes the read behind its
+    /// commit under the busy timeout — and
     /// takes one matching this build's chunker and model, `Maintained`
     /// preferred. That index is `VACUUM INTO`'d to a temporary file beside
     /// `dest`, stamped `FirstIndex` and linked to `dest`; a `dest` that
@@ -1291,7 +1293,7 @@ impl Seed {
     fn copy(&self, listed: &[PathBuf]) -> Result<(), String> {
         let mut source: Option<PathBuf> = None;
         for listed in listed {
-            let path = match fs::canonicalize(listed) {
+            let path = match spelling::canonical(listed) {
                 Ok(path) => path,
                 Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
                 Err(e) => return Err(format!("{}: {e}", listed.display())),
