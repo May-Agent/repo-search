@@ -316,7 +316,7 @@ fn masked_search_returns_the_best_rows_inside_the_mask_whatever_the_thread_count
 }
 
 #[test]
-fn masked_ties_resolve_to_the_lower_row_for_any_thread_count() {
+fn masked_ties_resolve_to_the_lower_content_hash_for_any_thread_count() {
     // Every row holds the same vector, so every score is equal.
     let mut rng = Rng(5);
     let v = rng.unit(16);
@@ -331,10 +331,8 @@ fn masked_ties_resolve_to_the_lower_row_for_any_thread_count() {
     let admitted = [30usize, 4, 17, 9, 38, 22];
     let hashes: Vec<ContentHash> = admitted.iter().map(|&i| hash_of(i)).collect();
     let mask = index.mask(&hashes);
-    let want: Vec<ContentHash> = [4usize, 9, 17, 22, 30, 38]
-        .iter()
-        .map(|&i| hash_of(i))
-        .collect();
+    let mut want = hashes.clone();
+    want.sort_unstable();
     for threads in [1, 2, 4, 7] {
         let got: Vec<ContentHash> = index
             .search(&v, threads, Some(&mask))
@@ -343,6 +341,57 @@ fn masked_ties_resolve_to_the_lower_row_for_any_thread_count() {
             .collect();
         assert_eq!(got, want, "{threads} threads");
     }
+}
+
+#[test]
+fn tied_rows_keep_the_same_set_whatever_the_load_order() {
+    // Every row holds the same vector, so every score ties and the content
+    // hash alone decides the FIRST_PASS and RESULTS cuts. Two indexes over
+    // the same (hash, slot) pairs loaded in different orders — the rows a
+    // vector lands on differ, as they do across processes loading from
+    // `HashSet`s — must keep the same hashes.
+    let mut rng = Rng(5);
+    let v = rng.unit(16);
+    let vectors: Vec<UnitVector> = (0..400).map(|_| v.clone()).collect();
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("m.f16");
+    write_rows(&file, &vectors);
+    let calibration = calibrate(&[v.clone(), rng.unit(16)]);
+
+    let mut order: Vec<usize> = (0..vectors.len()).collect();
+    for i in (1..order.len()).rev() {
+        order.swap(i, (rng.next_u64() % (i as u64 + 1)) as usize);
+    }
+    let forward = KnnIndex::build(
+        calibration.clone(),
+        &file,
+        (0..vectors.len()).map(|i| (hash_of(i), i as u64)),
+    )
+    .unwrap();
+    let shuffled = KnnIndex::build(
+        calibration,
+        &file,
+        order.iter().map(|&i| (hash_of(i), i as u64)),
+    )
+    .unwrap();
+
+    for threads in [1, 4] {
+        assert_eq!(
+            forward.search(&v, threads, None),
+            shuffled.search(&v, threads, None),
+            "{threads} threads"
+        );
+    }
+    // The cut keeps the RESULTS lowest content hashes, in hash order.
+    let mut want: Vec<ContentHash> = (0..vectors.len()).map(hash_of).collect();
+    want.sort_unstable();
+    want.truncate(RESULTS);
+    let got: Vec<ContentHash> = forward
+        .search(&v, 1, None)
+        .into_iter()
+        .map(|(h, _)| h)
+        .collect();
+    assert_eq!(got, want);
 }
 
 #[test]

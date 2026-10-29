@@ -34,6 +34,19 @@ impl ContentHash {
     }
 }
 
+impl PartialOrd for ContentHash {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// Digest-byte order, as SQLite's blob collation gives `content_hash`.
+impl Ord for ContentHash {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.as_bytes().cmp(other.as_bytes())
+    }
+}
+
 impl std::fmt::Debug for ContentHash {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "ContentHash({self})")
