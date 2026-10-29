@@ -1968,6 +1968,76 @@ async fn worktrees_and_repositories_get_separate_index_files() {
     );
 }
 
+/// Two case spellings of one worktree root reach one owner and one index:
+/// on a case-insensitive volume a mis-spelled path names the same
+/// directory, so the daemon's key must be the on-disk spelling, not the
+/// spelling it was handed. Case-insensitivity is detected on the tempdir
+/// itself — only there can two spellings resolve to one directory at all,
+/// so only there can the aliasing arise.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn case_spellings_of_one_worktree_share_an_owner_and_index() {
+    let repo = fn_repo(5, SMALL_BYTES, 5);
+    let (d, _, _) = start(&repo, Duration::ZERO, Duration::ZERO, &[]).await;
+    let wrong = PathBuf::from(
+        repo.root
+            .to_str()
+            .expect("the test root is UTF-8")
+            .to_uppercase(),
+    );
+    assert_ne!(wrong, repo.root, "the two spellings differ");
+    if !wrong.exists() {
+        // A case-sensitive volume names a directory by one spelling only:
+        // no second spelling can reach it, so no aliasing can arise.
+        eprintln!(
+            "skipping: {} is on a case-sensitive volume",
+            repo.root.display()
+        );
+        return;
+    }
+
+    for root in [&wrong, &repo.root] {
+        let events = answer_search(&d, root, MARKER).await;
+        assert!(
+            matches!(final_of(&events), Final::Answer(_)),
+            "the search on {} failed: {events:?}",
+            root.display()
+        );
+    }
+
+    // One owner served both spellings, keyed by the on-disk spelling, and
+    // one index file holds the tree.
+    let events = request(
+        &d.socket,
+        &hello(),
+        Request::Status {
+            worktree: repo.root.clone(),
+        },
+    )
+    .await;
+    let status = match final_of(&events) {
+        Final::Status(status) => status,
+        other => panic!("expected a Status, got {other:?}"),
+    };
+    assert_eq!(
+        status.daemon.worktrees, 1,
+        "both spellings reach one worktree"
+    );
+    assert_eq!(
+        status.worktree, repo.root,
+        "the owner's root is the on-disk spelling"
+    );
+    let indexes: Vec<PathBuf> = std::fs::read_dir(d.state.root().join("worktrees"))
+        .expect("the state dir lists")
+        .map(|entry| entry.expect("the entry reads").path())
+        .collect();
+    assert_eq!(indexes.len(), 1, "both spellings share one index");
+    assert!(indexes[0].join("index.db").is_file());
+    assert!(
+        repo::clean(&repo.root),
+        "the daemon wrote under the worktree"
+    );
+}
+
 /// A worktree added next to an indexed sibling copies the sibling's index
 /// instead of rebuilding: its first barrier re-chunks only the edited
 /// files and restamps the rest, and the seeded index searches as a freshly
