@@ -116,13 +116,19 @@ reqwest = { version = "0.13.5", default-features = false, features = ["rustls"] 
 cargo-dist-version = "0.33.0"
 ci = ["github"]
 installers = ["shell"]
-targets = ["aarch64-apple-darwin"]
+targets = [
+    "aarch64-apple-darwin",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-unknown-linux-gnu",
+]
 checksum = "sha256"
 dispatch-releases = true
 pr-run-mode = "plan"
+precise-builds = true
 
 [workspace.metadata.dist.github-custom-runners]
 aarch64-apple-darwin = "macos-15"
+aarch64-unknown-linux-gnu = "ubuntu-24.04-arm"
 
 [workspace.metadata.dist.github-action-commits]
 "actions/checkout" = "3d3c42e5aac5ba805825da76410c181273ba90b1" # v7.0.1
