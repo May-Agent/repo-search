@@ -195,12 +195,13 @@ fn report(fd: i32, line: &str) {
 /// One test's world: a repository, the fake server, the runtime dir the
 /// launcher spawns into and the hosts' configuration.
 struct World {
+    /// Kills the daemon a test leaves running. First, so it drops while
+    /// `tmp` still holds the `daemon.lock` it reads the pid from.
+    _reaper: lock::Reaper,
     repo: TestRepo,
     tmp: tempfile::TempDir,
     fake: FakeServer,
     host: HostConfig,
-    /// Kills the daemon a failing test leaves running.
-    _reaper: lock::Reaper,
 }
 
 impl World {
