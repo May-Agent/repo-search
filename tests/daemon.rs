@@ -3008,7 +3008,7 @@ fn host_exits_when_its_parent_is_killed() {
     parent.child.kill().expect("SIGKILL");
     parent.child.wait().expect("wait");
     assert!(
-        repo_search::kqueue::ExitWatch::register(pid)
+        repo_search_client::launcher::kqueue::ExitWatch::register(pid)
             .expect("the host's exit registers")
             .wait(Duration::from_secs(30)),
         "the host outlived a SIGKILLed parent"

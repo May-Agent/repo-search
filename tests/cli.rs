@@ -17,9 +17,10 @@ use tokio::io::AsyncWrite;
 use tokio::sync::mpsc::UnboundedSender;
 
 use clap::Parser;
-use repo_search::cli::{Cli, Env, Exit, Invocation, LaunchdAgents, Terminal};
-use repo_search::install::{AgentConfig, Plist, Timeouts};
-use repo_search::launchd::{LaunchAgent, ServerAgent};
+use repo_search::cli::{Cli, Env, Exit, Invocation, Terminal};
+use repo_search_client::launcher::LaunchdAgents;
+use repo_search_client::launcher::install::{AgentConfig, Plist, Timeouts};
+use repo_search_client::launcher::launchd::{LaunchAgent, ServerAgent};
 use repo_search_client::protocol::BuildId;
 use repo_search_server::stub::{Instance, StubBackend};
 use std::net::{IpAddr, Ipv4Addr};
@@ -46,7 +47,7 @@ fn launchd(config: &AgentConfig) -> FakeLaunchd {
 /// reads it as `Current` without touching the fake's single-job state.
 fn server_config(tmp: &Path) -> AgentConfig {
     let config = AgentConfig {
-        domain: repo_search::launchd::domain(),
+        domain: repo_search_client::launcher::launchd::domain(),
         plist: tmp.join("LaunchAgents/com.github.may-agent.repo-search.server.cli-test.plist"),
         lock: tmp.join("support/install.lock"),
         agent: Plist::Server(ServerAgent {
@@ -80,7 +81,7 @@ fn server_config(tmp: &Path) -> AgentConfig {
 fn config(tmp: &tempfile::TempDir) -> AgentConfig {
     let root = tmp.path();
     AgentConfig {
-        domain: repo_search::launchd::domain(),
+        domain: repo_search_client::launcher::launchd::domain(),
         plist: root.join("LaunchAgents/com.github.may-agent.repo-search.test.plist"),
         lock: root.join("support/install.lock"),
         agent: Plist::Daemon(LaunchAgent {

@@ -1,6 +1,6 @@
 //! The re-executed test hosts' stdin lifeline: a host exits the moment
 //! its parent is gone. The pid-exit wait a test applies to a host is
-//! `repo_search::kqueue::ExitWatch` on macOS.
+//! `repo_search_client::launcher::kqueue::ExitWatch` on macOS.
 
 use std::io::Read as _;
 

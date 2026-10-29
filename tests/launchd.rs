@@ -21,13 +21,15 @@ use std::sync::{Arc, Barrier};
 use std::time::Duration;
 
 use clap::Parser;
-use repo_search::cli::{self, Cli, Exit, LaunchdAgents, Terminal};
-use repo_search::daemon;
+use repo_search::cli::{self, Cli, Exit, Terminal};
 use repo_search::daemon::server::{Endpoint, ServerClient};
-use repo_search::install::Plist;
-use repo_search::install::{self, AgentConfig, Check, Launchctl, SystemLaunchctl, ensure_agent};
-use repo_search::kqueue::ExitWatch;
-use repo_search::launchd::{LABEL, LaunchAgent, SERVER_LABEL, ServerAgent};
+use repo_search_client::launcher::install::Plist;
+use repo_search_client::launcher::install::{
+    self, AgentConfig, Check, Launchctl, SystemLaunchctl, ensure_agent,
+};
+use repo_search_client::launcher::kqueue::ExitWatch;
+use repo_search_client::launcher::launchd::{LABEL, LaunchAgent, SERVER_LABEL, ServerAgent};
+use repo_search_client::launcher::{LaunchdAgents, SOCKET_TIMEOUT, TEARDOWN_TIMEOUT};
 use repo_search_client::protocol::{Final, Hello, Request};
 use repo_search_core::StateDir;
 
@@ -83,7 +85,7 @@ fn server_config(
     idle_exit: Duration,
 ) -> AgentConfig {
     AgentConfig {
-        domain: repo_search::launchd::domain(),
+        domain: repo_search_client::launcher::launchd::domain(),
         plist: dir.join("server-agent.plist"),
         lock: dir.join("install.lock"),
         agent: Plist::Server(ServerAgent {
@@ -99,8 +101,8 @@ fn server_config(
             stderr: dir.join("server.log"),
         }),
         timeouts: install::Timeouts {
-            teardown: daemon::TEARDOWN_TIMEOUT,
-            socket: daemon::SOCKET_TIMEOUT,
+            teardown: TEARDOWN_TIMEOUT,
+            socket: SOCKET_TIMEOUT,
         },
     }
 }
@@ -116,7 +118,7 @@ fn config(
     idle_exit: Duration,
 ) -> AgentConfig {
     AgentConfig {
-        domain: repo_search::launchd::domain(),
+        domain: repo_search_client::launcher::launchd::domain(),
         plist: dir.join("agent.plist"),
         lock: dir.join("install.lock"),
         agent: Plist::Daemon(LaunchAgent {
@@ -130,8 +132,8 @@ fn config(
             stderr: dir.join("daemon.log"),
         }),
         timeouts: install::Timeouts {
-            teardown: daemon::TEARDOWN_TIMEOUT,
-            socket: daemon::SOCKET_TIMEOUT,
+            teardown: TEARDOWN_TIMEOUT,
+            socket: SOCKET_TIMEOUT,
         },
     }
 }
@@ -154,7 +156,10 @@ impl Agent {
 
 /// The `<domain>/<label>` bootout target of `label`.
 fn target(label: &str) -> String {
-    format!("{}/{label}", repo_search::launchd::domain())
+    format!(
+        "{}/{label}",
+        repo_search_client::launcher::launchd::domain()
+    )
 }
 
 /// A test server agent; booted out on drop, whether the test passed or
@@ -235,7 +240,7 @@ fn boot_out(target: &str) {
         booted.expect("the test agent boots out");
     }
     if let Some(exit) = exit {
-        let exited = exit.wait(daemon::TEARDOWN_TIMEOUT);
+        let exited = exit.wait(TEARDOWN_TIMEOUT);
         if !std::thread::panicking() {
             assert!(exited, "the test agent's process exits on bootout");
         }
@@ -692,8 +697,8 @@ struct ListenerAgent {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "real launchd and model; the release gate runs it"]
 async fn startup_failure_reaches_the_client() {
-    use repo_search::kqueue::DirWatch;
     use repo_search_client::client::{Client, ClientError};
+    use repo_search_client::launcher::kqueue::DirWatch;
     use repo_search_client::protocol::{ErrorKind, ErrorReport};
 
     let tmp = tempfile::tempdir().expect("tmp");
@@ -725,7 +730,7 @@ async fn startup_failure_reaches_the_client() {
         .bootstrap(&config.domain, &config.plist)
         .expect("the agent bootstraps");
     assert!(
-        watch.wait_for(&socket, daemon::SOCKET_TIMEOUT),
+        watch.wait_for(&socket, SOCKET_TIMEOUT),
         "launchd binds the socket"
     );
 
