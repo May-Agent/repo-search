@@ -52,7 +52,7 @@ jobs:
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: clippy
         run: |
-          cargo clippy --locked -p repo-search -p repo-search-core --all-targets -- -D warnings
+          cargo clippy --locked -p repo-search -p repo-search-core -p repo-search-client --all-targets -- -D warnings
       - name: test
         run: |
-          cargo test --locked -p repo-search -p repo-search-core
+          cargo test --locked -p repo-search -p repo-search-core -p repo-search-client

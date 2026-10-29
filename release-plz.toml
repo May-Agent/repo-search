@@ -10,6 +10,10 @@ name = "repo-search"
 git_tag_name = "v{{ version }}"
 
 [[package]]
+name = "repo-search-client"
+git_tag_name = "client/v{{ version }}"
+
+[[package]]
 name = "repo-search-core"
 git_tag_name = "core/v{{ version }}"
 

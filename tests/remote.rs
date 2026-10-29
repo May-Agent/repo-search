@@ -16,7 +16,9 @@ use std::time::Duration;
 use futures_util::{SinkExt, StreamExt};
 use repo_search::daemon::listen::{Bound, Listener as _};
 use repo_search::daemon::server::Endpoint;
-use repo_search::protocol::{ErrorKind, Event, Final, GpuStatus, ModelStatus, Request, framed};
+use repo_search_client::protocol::{
+    ErrorKind, Event, Final, GpuStatus, ModelStatus, Request, framed,
+};
 use repo_search_core::StateDir;
 use repo_search_core::model::MODEL_ID;
 use support::bound::spawn;

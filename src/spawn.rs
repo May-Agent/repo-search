@@ -33,10 +33,10 @@ use tokio::io::{AsyncBufReadExt as _, BufReader};
 use tokio::net::unix::pipe;
 
 use crate::cli::{Launcher, Report};
-use crate::client::ClientError;
 use crate::daemon::{SOCKET_TIMEOUT, TEARDOWN_TIMEOUT};
 use crate::paths::UserPaths;
-use crate::protocol::ErrorKind;
+use repo_search_client::client::ClientError;
+use repo_search_client::protocol::ErrorKind;
 
 /// How long a client waits for the spawned daemon's readiness line: the
 /// previous daemon's shutdown tail plus the new daemon's startup — the

@@ -7,9 +7,9 @@ use std::path::Path;
 #[cfg(target_os = "macos")]
 use std::io;
 
-use crate::client::ClientError;
 #[cfg(target_os = "macos")]
 use crate::install::{Agent, AgentConfig, Check, InstallError, Launchctl, ensure_agent};
+use repo_search_client::client::ClientError;
 
 /// What one launcher step tells the user: `notes` are told in order, then
 /// `error`, which also fails the step.

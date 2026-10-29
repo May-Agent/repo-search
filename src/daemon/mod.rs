@@ -28,7 +28,7 @@ use tokio::net::UnixStream;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::codec::LinesCodecError;
 
-use crate::protocol::{
+use repo_search_client::protocol::{
     self, BuildId, ErrorKind, ErrorReport, Event, Final, Hello, PROTOCOL, Progress, Request, framed,
 };
 

@@ -14,9 +14,9 @@ mod support;
 use std::sync::mpsc;
 use std::time::Duration;
 
-use repo_search::client::{Client, ClientError};
 use repo_search::daemon;
-use repo_search::protocol::{
+use repo_search_client::client::{Client, ClientError};
+use repo_search_client::protocol::{
     Answer, CollectionReport, CollectionSearch, Document, ErrorKind, Final, Format, WireMode,
 };
 use repo_search_core::StateDir;
@@ -367,9 +367,9 @@ async fn collections_and_worktree_indexes_never_return_each_others_documents() {
     );
 }
 
-fn lexical(repo: &TestRepo, word: &str) -> repo_search::protocol::Request {
+fn lexical(repo: &TestRepo, word: &str) -> repo_search_client::protocol::Request {
     let mut request = search(&repo.root, word);
-    let repo_search::protocol::Request::Search(inner) = &mut request else {
+    let repo_search_client::protocol::Request::Search(inner) = &mut request else {
         unreachable!("search builds a Search request")
     };
     inner.mode = WireMode::Lexical;

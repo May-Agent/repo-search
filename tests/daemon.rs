@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use futures_util::StreamExt;
 use repo_search::daemon::{self, Config, Error};
 use repo_search::model_store::{ModelSpec, ModelStore};
-use repo_search::protocol::{self, ErrorKind, Event, Final, Request, WirePhase};
+use repo_search_client::protocol::{self, ErrorKind, Event, Final, Request, WirePhase};
 use repo_search_core::StateDir;
 use repo_search_core::qos::QosClass;
 use repo_search_core::store::{ContentHash, Index, Phase, VectorCache};

@@ -15,15 +15,16 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::wire::{ToCore, ToWire};
 use repo_search_core::reconcile::{self, Counts, PendingChunk, Reconciler, Report};
 use repo_search_core::search::{self, EmbedService, Reconciliation, Retriever};
 use repo_search_core::store::{self, Index, Phase, VectorCache};
 use repo_search_core::{CHUNKER_FINGERPRINT, QueryTask, StateDir, TokenCounter, UnitVector};
 use tokio::sync::{mpsc, oneshot, watch};
 
-use crate::protocol::{
+use repo_search_client::protocol::{
     Answer, ErrorKind, ErrorReport, Event, Final, Format, IndexStatus, ModelStatus, Progress,
-    QueryStats, SearchRequest, StatusReport, WirePhase,
+    QueryStats, SearchRequest, StatusReport,
 };
 
 use super::counter::Tokens;
@@ -484,7 +485,7 @@ impl<T: Tokens> Owner<T> {
         }
         let core_request = search::Request {
             query: request.query,
-            mode: request.mode.into(),
+            mode: request.mode.to_core(),
             filters: search::Filters {
                 paths: request.paths,
                 langs: request.langs,
@@ -753,8 +754,8 @@ impl<T: Tokens> Owner<T> {
             self.server
                 .status()
                 .await
-                .map(|body| body.gpu)
-                .unwrap_or(crate::protocol::GpuStatus::Absent { blocked: None })
+                .map(|body| body.gpu.to_wire())
+                .unwrap_or(repo_search_client::protocol::GpuStatus::Absent { blocked: None })
         };
         let index = if index_exists {
             self.index.clone()
@@ -815,7 +816,7 @@ impl<T: Tokens> Owner<T> {
                                 cache_probes = coverage.reads.cache_probes,
                                 cache_slots = coverage.reads.cache_slots, "status counted");
                 Some(IndexStatus {
-                    phase: WirePhase::from(phase),
+                    phase: phase.to_wire(),
                     chunks_total: coverage.chunks_total,
                     chunks_with_vector: coverage.chunks_with_vector,
                     queued_stage1: counts.queued_stage1,
@@ -847,7 +848,7 @@ impl<T: Tokens> Owner<T> {
             worktree: self.root.clone(),
             index: index_status,
             model,
-            daemon: crate::protocol::DaemonStatus {
+            daemon: repo_search_client::protocol::DaemonStatus {
                 version: env!("CARGO_PKG_VERSION").to_owned(),
                 pid: std::process::id(),
                 uptime_s: self.started.elapsed().as_secs(),

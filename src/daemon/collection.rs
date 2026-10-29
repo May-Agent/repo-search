@@ -30,7 +30,8 @@ use repo_search_core::{CHUNKER_FINGERPRINT, StateDir};
 use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc, watch};
 
-use crate::protocol::{
+use crate::wire::ToCore;
+use repo_search_client::protocol::{
     Answer, CollectionReport, CollectionSearch, Document, ErrorKind, Event, Final, Format,
     QueryStats,
 };
@@ -467,7 +468,7 @@ impl<T: Tokens> Collection<T> {
         // code query is never embedded.
         let core_request = search::Request {
             query: request.query,
-            mode: request.mode.into(),
+            mode: request.mode.to_core(),
             filters: Filters {
                 kinds: vec!["doc".to_owned()],
                 ..Filters::default()

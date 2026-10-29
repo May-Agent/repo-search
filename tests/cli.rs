@@ -20,7 +20,7 @@ use clap::Parser;
 use repo_search::cli::{Cli, Env, Exit, Invocation, LaunchdAgents, Terminal};
 use repo_search::install::{AgentConfig, Plist, Timeouts};
 use repo_search::launchd::{LaunchAgent, ServerAgent};
-use repo_search::protocol::BuildId;
+use repo_search_client::protocol::BuildId;
 use repo_search_server::stub::{Instance, StubBackend};
 use std::net::{IpAddr, Ipv4Addr};
 use support::client;

@@ -11,7 +11,7 @@ use std::time::Duration;
 use clap::{ArgMatches, Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 
 use crate::daemon;
-use crate::protocol::WireMode;
+use repo_search_client::protocol::WireMode;
 
 /// `--version` output: the binary version, the chunker fingerprint and the
 /// model's identity from [`repo_search_core::model`]'s card.
