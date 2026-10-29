@@ -130,7 +130,9 @@ impl Chunkers {
     }
 }
 
-fn chunk_with<C: FileChunker>(
+/// The records of `src` as `chunker` cuts it, plus each chunk's text, in
+/// chunk order.
+pub(crate) fn chunk_with<C: FileChunker>(
     chunker: &mut C,
     path: &str,
     src: &str,

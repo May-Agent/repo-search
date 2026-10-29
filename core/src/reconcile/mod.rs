@@ -24,6 +24,8 @@ mod books;
 mod scan;
 
 pub use books::Books;
+#[cfg(all(test, feature = "lang-rust"))]
+pub(crate) use scan::chunk_with;
 
 use std::collections::{HashMap, HashSet};
 use std::ops::RangeInclusive;
