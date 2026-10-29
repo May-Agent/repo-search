@@ -9,6 +9,7 @@ pub mod listen;
 pub mod registry;
 pub mod scheduler;
 pub mod server;
+pub mod spelling;
 pub mod watch;
 pub mod worktree;
 pub mod writer;
@@ -739,8 +740,8 @@ fn error_too_large() -> Event {
 }
 
 /// Resolves a request's worktree path in the connection task — `git
-/// rev-parse` plus canonicalization and metadata, concurrently per
-/// connection and off the registry actor.
+/// rev-parse` plus canonicalization to the on-disk spelling and metadata,
+/// concurrently per connection and off the registry actor.
 async fn resolve_worktree(worktree: &Path) -> Result<registry::ResolvedWorktree, GetError> {
     let output = tokio::process::Command::new("git")
         .arg("-C")
@@ -769,14 +770,26 @@ async fn resolve_worktree(worktree: &Path) -> Result<registry::ResolvedWorktree,
     let toplevel = line("toplevel")?;
     let common_dir = line("git-common-dir")?;
     let git_dir = line("git-dir")?;
+    // Canonicalizing to the on-disk spelling is blocking file I/O; it runs
+    // off the executor as `tokio::fs::canonicalize` did.
+    let canonical = |path: &Path| {
+        let path = path.to_path_buf();
+        tokio::task::spawn_blocking(move || spelling::canonical(&path))
+    };
     let (requested, toplevel, common_dir, git_dir) = tokio::join!(
-        tokio::fs::canonicalize(worktree),
-        tokio::fs::canonicalize(toplevel),
-        tokio::fs::canonicalize(common_dir),
-        tokio::fs::canonicalize(git_dir),
+        canonical(worktree),
+        canonical(&toplevel),
+        canonical(&common_dir),
+        canonical(&git_dir),
     );
-    let requested = requested.map_err(|_| GetError::NotAWorktree(worktree.to_path_buf()))?;
-    let path = |result: io::Result<PathBuf>| result.map_err(|e| GetError::Internal(e.to_string()));
+    let path = |result: Result<io::Result<PathBuf>, tokio::task::JoinError>| {
+        result
+            .map_err(|e| GetError::Internal(e.to_string()))
+            .and_then(|r| r.map_err(|e| GetError::Internal(e.to_string())))
+    };
+    let requested = requested
+        .map_err(|e| GetError::Internal(e.to_string()))?
+        .map_err(|_| GetError::NotAWorktree(worktree.to_path_buf()))?;
     let toplevel = path(toplevel)?;
     let common_dir = path(common_dir)?;
     let git_dir = path(git_dir)?;
