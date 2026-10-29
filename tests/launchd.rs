@@ -23,6 +23,7 @@ use std::time::Duration;
 use clap::Parser;
 use repo_search::cli::{self, Cli, Exit, LaunchdAgents, Terminal};
 use repo_search::daemon;
+use repo_search::daemon::server::{Endpoint, ServerClient};
 use repo_search::install::Plist;
 use repo_search::install::{self, AgentConfig, Check, Launchctl, SystemLaunchctl, ensure_agent};
 use repo_search::kqueue::ExitWatch;
@@ -58,6 +59,52 @@ fn launchctl(args: &[&str]) -> std::process::Output {
         .expect("launchctl runs")
 }
 
+/// The embedding server's socket: the daemon's `server_socket` and the
+/// server agent's `socket` are this one path.
+fn server_socket(dir: &Path) -> PathBuf {
+    dir.join("server.sock")
+}
+
+/// The test server agent's label, per test and per process like the
+/// daemon's.
+fn server_label(name: &str) -> String {
+    format!("{SERVER_LABEL}.test-{}-{name}", std::process::id())
+}
+
+/// The test server config, the one place a server agent's config is built:
+/// the plist, log and socket inside `dir`, `--build` naming `program` so a
+/// started server accepts it, and `model_cache` the test's model store so
+/// the model is present instead of downloaded on the runner.
+fn server_config(
+    name: &str,
+    dir: &Path,
+    program: &Path,
+    model_cache: PathBuf,
+    idle_exit: Duration,
+) -> AgentConfig {
+    AgentConfig {
+        domain: repo_search::launchd::domain(),
+        plist: dir.join("server-agent.plist"),
+        lock: dir.join("install.lock"),
+        agent: Plist::Server(ServerAgent {
+            label: server_label(name),
+            program: program.to_path_buf(),
+            socket: server_socket(dir),
+            idle_exit,
+            build: client::hello_for(program).build.to_string(),
+            model_cache: Some(model_cache),
+            token_file: None,
+            bind: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            port: server_port(),
+            stderr: dir.join("server.log"),
+        }),
+        timeouts: install::Timeouts {
+            teardown: daemon::TEARDOWN_TIMEOUT,
+            socket: daemon::SOCKET_TIMEOUT,
+        },
+    }
+}
+
 /// The test config: label `<LABEL>.test-<pid>-<name>` — per test and per
 /// process, because a stray agent from another run cannot collide with it —
 /// and the plist, lock, socket and log all inside `dir`.
@@ -76,7 +123,7 @@ fn config(
             label: format!("{LABEL}.test-{}-{name}", std::process::id()),
             program,
             socket: dir.join("daemon.sock"),
-            server_socket: dir.join("server.sock"),
+            server_socket: server_socket(dir),
             idle_exit,
             model_cache: Some(model_cache),
             state_dir: Some(dir.join("state")),
@@ -93,19 +140,61 @@ fn config(
 struct Agent {
     label: String,
     socket: PathBuf,
+    /// The server agent the daemon queries, when the test answers queries.
+    _server: Option<ServerGuard>,
     _tmp: tempfile::TempDir,
 }
 
 impl Agent {
     /// The `<domain>/<label>` bootout target.
     fn target(&self) -> String {
-        format!("{}/{}", repo_search::launchd::domain(), self.label)
+        target(&self.label)
+    }
+}
+
+/// The `<domain>/<label>` bootout target of `label`.
+fn target(label: &str) -> String {
+    format!("{}/{label}", repo_search::launchd::domain())
+}
+
+/// A test server agent; booted out on drop, whether the test passed or
+/// panicked. It is made before the install so a failed install is still
+/// cleaned up.
+struct ServerGuard {
+    label: String,
+}
+
+impl ServerGuard {
+    /// Installs the server agent of `config` through `ensure_agent`.
+    fn install(config: &AgentConfig) -> Self {
+        let guard = Self {
+            label: config.agent.label().to_owned(),
+        };
+        tokio::task::block_in_place(|| ensure_agent(config, &mut SystemLaunchctl, Check::Fast))
+            .expect("the server agent installs");
+        guard
+    }
+}
+
+impl Drop for ServerGuard {
+    fn drop(&mut self) {
+        boot_out(&target(&self.label));
     }
 }
 
 /// Installs the test agent through `ensure_agent` — the production install
-/// path — and returns once its socket is bound.
+/// path — and returns once its socket is bound. The daemon embeds through
+/// the embedding server, so the server agent is installed beside it as the
+/// CLI's `LaunchdAgents` does; without it nothing listens on the daemon's
+/// `server_socket` and every query fails.
 fn agent(name: &str, tmp: tempfile::TempDir, model_cache: PathBuf, idle_exit: Duration) -> Agent {
+    let server = ServerGuard::install(&server_config(
+        name,
+        tmp.path(),
+        &program(),
+        model_cache.clone(),
+        Duration::from_secs(600),
+    ));
     let config = config(name, tmp.path(), program(), model_cache, idle_exit);
     let socket = config.agent.socket().to_path_buf();
     let label = config.agent.label().to_owned();
@@ -114,6 +203,7 @@ fn agent(name: &str, tmp: tempfile::TempDir, model_cache: PathBuf, idle_exit: Du
     Agent {
         label,
         socket,
+        _server: Some(server),
         _tmp: tmp,
     }
 }
@@ -127,22 +217,27 @@ impl Drop for Agent {
     /// Assertions run only when the test is not already unwinding, so a
     /// failure keeps its own panic.
     fn drop(&mut self) {
-        let mut launchctl = SystemLaunchctl;
-        let pid = launchctl
-            .service(&self.target())
-            .ok()
-            .flatten()
-            .and_then(|service| service.pid);
-        let exit = pid.and_then(|pid| ExitWatch::register(pid).ok());
-        let booted = launchctl.bootout(&self.target());
+        boot_out(&self.target());
+    }
+}
+
+/// Boots `target` out of `user/<uid>` and awaits its process's exit.
+fn boot_out(target: &str) {
+    let mut launchctl = SystemLaunchctl;
+    let pid = launchctl
+        .service(target)
+        .ok()
+        .flatten()
+        .and_then(|service| service.pid);
+    let exit = pid.and_then(|pid| ExitWatch::register(pid).ok());
+    let booted = launchctl.bootout(target);
+    if !std::thread::panicking() {
+        booted.expect("the test agent boots out");
+    }
+    if let Some(exit) = exit {
+        let exited = exit.wait(daemon::TEARDOWN_TIMEOUT);
         if !std::thread::panicking() {
-            booted.expect("the test agent boots out");
-        }
-        if let Some(exit) = exit {
-            let exited = exit.wait(daemon::TEARDOWN_TIMEOUT);
-            if !std::thread::panicking() {
-                assert!(exited, "the test agent's daemon exits on bootout");
-            }
+            assert!(exited, "the test agent's process exits on bootout");
         }
     }
 }
@@ -256,9 +351,18 @@ async fn reinstall_waits_for_a_running_daemon() {
         Duration::from_secs(600),
     );
     let socket = config.agent.socket().to_path_buf();
+    // The daemon answers the queries below through the server agent.
+    let server = ServerGuard::install(&server_config(
+        "reinstall",
+        tmp.path(),
+        &program(),
+        tmp.path().join("models"),
+        Duration::from_secs(600),
+    ));
     let agent = Agent {
         label: config.agent.label().to_owned(),
         socket: socket.clone(),
+        _server: Some(server),
         _tmp: tmp,
     };
     let mut launchctl = SystemLaunchctl;
@@ -326,6 +430,7 @@ async fn reinstall_of_an_idle_agent() {
     let agent = Agent {
         label: config.agent.label().to_owned(),
         socket: config.agent.socket().to_path_buf(),
+        _server: None,
         _tmp: tmp,
     };
     let mut launchctl = SystemLaunchctl;
@@ -367,6 +472,7 @@ async fn concurrent_installs_bootstrap_once() {
     let agent = Agent {
         label: config.agent.label().to_owned(),
         socket: config.agent.socket().to_path_buf(),
+        _server: None,
         _tmp: tmp,
     };
     let barrier = Arc::new(Barrier::new(2));
@@ -408,42 +514,20 @@ fn invocation(args: &[&str]) -> cli::Invocation {
 /// The `Env` `cli::run` gets against real launchd: the test `AgentConfig`,
 /// the real `launchctl`, and the handshake matching the binary the plist
 /// names — computed when the `Env` is built, so a replaced program yields
-/// a new `BuildId`.
+/// a new `BuildId`. The CLI installs the server agent `name` beside the
+/// daemon's, built by `server_config` over the same model store.
 fn cli_env(
     cwd: &Path,
+    name: &str,
     config: AgentConfig,
     program: &Path,
+    model_cache: PathBuf,
 ) -> cli::Env<LaunchdAgents<SystemLaunchctl>> {
-    // The server agent installs for real beside the daemon's: a per-test
-    /// label and paths inside the config's own dir, `--build` naming the
-    /// test binary so a started server accepts it.
-    fn server_config(dir: &Path, program: &Path) -> AgentConfig {
-        AgentConfig {
-            domain: repo_search::launchd::domain(),
-            plist: dir.join("server-agent.plist"),
-            lock: dir.join("install.lock"),
-            agent: Plist::Server(ServerAgent {
-                label: format!("{SERVER_LABEL}.test-{}-cli", std::process::id()),
-                program: program.to_path_buf(),
-                socket: dir.join("server.sock"),
-                idle_exit: Duration::from_secs(600),
-                build: client::hello_for(program).build.to_string(),
-                model_cache: None,
-                token_file: None,
-                bind: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-                port: server_port(),
-                stderr: dir.join("server.log"),
-            }),
-            timeouts: install::Timeouts {
-                teardown: daemon::TEARDOWN_TIMEOUT,
-                socket: daemon::SOCKET_TIMEOUT,
-            },
-        }
-    }
-    let dir = config.plist.parent().unwrap().parent().unwrap();
+    let dir = config.plist.parent().unwrap();
+    let server = server_config(name, dir, program, model_cache, Duration::from_secs(600));
     cli::Env {
         cwd: cwd.to_path_buf(),
-        launcher: LaunchdAgents::new(server_config(dir, program), config, SystemLaunchctl),
+        launcher: LaunchdAgents::new(server, config, SystemLaunchctl),
         hello: hello(program),
     }
 }
@@ -472,16 +556,26 @@ async fn install_answers_through_cli_run() {
         "cli",
         tmp.path(),
         program(),
-        model_cache,
+        model_cache.clone(),
         Duration::from_secs(600),
     );
+    // The CLI installs the server agent; the guard boots it out.
     let _agent = Agent {
         label: config.agent.label().to_owned(),
         socket: config.agent.socket().to_path_buf(),
+        _server: Some(ServerGuard {
+            label: server_label("cli"),
+        }),
         _tmp: tmp,
     };
 
-    let env = cli_env(&repo.root.join("src"), config, &program());
+    let env = cli_env(
+        &repo.root.join("src"),
+        "cli",
+        config,
+        &program(),
+        model_cache,
+    );
     let mut term = vec_term();
     let exit = cli::run(invocation(&["search", "cli_probe"]), env, &mut term).await;
     assert_eq!(
@@ -527,10 +621,20 @@ async fn replaced_binary_restarts_the_daemon() {
     let agent = Agent {
         label: make_config().agent.label().to_owned(),
         socket: socket.clone(),
+        // The CLI installs the server agent; the guard boots it out.
+        _server: Some(ServerGuard {
+            label: server_label("replace"),
+        }),
         _tmp: tmp,
     };
 
-    let env = cli_env(&repo.root, make_config(), &installed_program);
+    let env = cli_env(
+        &repo.root,
+        "replace",
+        make_config(),
+        &installed_program,
+        model_cache.clone(),
+    );
     let mut term = vec_term();
     let exit = cli::run(invocation(&["search", "replace_probe"]), env, &mut term).await;
     assert_eq!(
@@ -547,7 +651,13 @@ async fn replaced_binary_restarts_the_daemon() {
     std::fs::copy(program(), &replacement).expect("the replacement copies");
     std::fs::rename(&replacement, &installed_program).expect("the replacement renames");
 
-    let env = cli_env(&repo.root, make_config(), &installed_program);
+    let env = cli_env(
+        &repo.root,
+        "replace",
+        make_config(),
+        &installed_program,
+        model_cache.clone(),
+    );
     let mut term = vec_term();
     let exit = cli::run(invocation(&["search", "replace_probe"]), env, &mut term).await;
     assert_eq!(
@@ -608,6 +718,7 @@ async fn startup_failure_reaches_the_client() {
     let agent = Agent {
         label: config.agent.label().to_owned(),
         socket: socket.clone(),
+        _server: None,
         _tmp: tmp,
     };
     SystemLaunchctl
@@ -634,54 +745,47 @@ async fn startup_failure_reaches_the_client() {
     }
 }
 
+/// How long past an expected event the server test waits for it.
+const MARGIN: Duration = Duration::from_secs(30);
+
 /// The server agent's lifecycle: `ensure_agent` installs it, a unix
 /// connect makes launchd run `search --server`, the 3 s idle exit takes
 /// it down, the next connect relaunches a new pid, and a `--build`
 /// change replaces the agent.
+///
+/// The server counts as busy while it downloads or loads the model, and
+/// the load starts at once, so the idle exit is measured only after
+/// `/status` reports the model ready — on a loaded machine the load
+/// outlasts any idle deadline. The model store is populated so nothing
+/// downloads.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "real launchd; runs only where a developer opts in"]
+#[ignore = "real launchd and model; the release gate runs it"]
 async fn server_agent_lifecycle() {
+    use repo_search_core::embed_api::{LOAD_BOUND, ModelStatus};
+
     let tmp = tempfile::tempdir().expect("tmp");
     let dir = tmp.path().to_path_buf();
-    let program = program();
-    let build = client::hello_for(&program).build.to_string();
-    let make_config = |label: &str, idle_exit: Duration| AgentConfig {
-        domain: repo_search::launchd::domain(),
-        plist: dir.join(format!("{label}.plist")),
-        lock: dir.join("install.lock"),
-        agent: Plist::Server(ServerAgent {
-            label: label.to_owned(),
-            program: program.clone(),
-            socket: dir.join("server.sock"),
-            idle_exit,
-            build: build.clone(),
-            model_cache: Some(dir.join("models")),
-            token_file: None,
-            bind: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-            port: server_port(),
-            stderr: dir.join("server.log"),
-        }),
-        timeouts: install::Timeouts {
-            teardown: daemon::TEARDOWN_TIMEOUT,
-            socket: daemon::SOCKET_TIMEOUT,
-        },
-    };
-    let label = format!("{SERVER_LABEL}.test-{}", std::process::id());
-    let config = make_config(&label, Duration::from_secs(3));
+    let _store = model::model_store(dir.join("models"));
+    let idle_exit = Duration::from_secs(3);
+    let make_config =
+        || server_config("lifecycle", &dir, &program(), dir.join("models"), idle_exit);
+    let config = make_config();
+    let label = config.agent.label().to_owned();
     let socket = config.agent.socket().to_path_buf();
-    let _agent = Agent {
+    let _agent = ServerGuard {
         label: label.clone(),
-        socket: socket.clone(),
-        _tmp: tmp,
     };
+    let _tmp = tmp;
     let mut launchctl = SystemLaunchctl;
     let outcome =
         tokio::task::block_in_place(|| ensure_agent(&config, &mut launchctl, Check::Fast))
             .expect("the server agent installs");
     assert_eq!(outcome, install::Agent::Installed);
 
-    // A unix connect makes launchd start `search --server`.
-    let service = format!("{}/{}", repo_search::launchd::domain(), label);
+    // A unix connect makes launchd start `search --server`; the status
+    // poll is that connect, repeated until the model is ready: the load's
+    // own bound plus a margin.
+    let service = target(&label);
     let server_pid = |launchctl: &mut SystemLaunchctl| {
         launchctl
             .service(&service)
@@ -689,26 +793,43 @@ async fn server_agent_lifecycle() {
             .flatten()
             .and_then(|s| s.pid)
     };
-    std::os::unix::net::UnixStream::connect(&socket).expect("the unix connect lands");
-    let deadline = std::time::Instant::now() + Duration::from_secs(30);
-    let first = loop {
-        if let Some(pid) = server_pid(&mut launchctl) {
-            break pid;
+    // Each poll is a request, so it resets the server's idle deadline.
+    let status =
+        ServerClient::new(&Endpoint::Unix(socket.clone())).expect("the status client builds");
+    let deadline = std::time::Instant::now() + LOAD_BOUND + MARGIN;
+    loop {
+        match status
+            .status()
+            .await
+            .expect("the server answers /status")
+            .model
+        {
+            ModelStatus::Ready { .. } => break,
+            ModelStatus::Failed { message } | ModelStatus::Fatal { message } => {
+                panic!("the server's model failed to load: {message}")
+            }
+            loading => {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the model was not ready within the load bound: {loading:?}"
+                );
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
         }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "launchd did not start the server"
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    };
+    }
+    let first = server_pid(&mut launchctl).expect("the ready server runs");
 
-    // The idle exit takes it down; the next connect relaunches it.
+    // The idle exit takes it down, measured from the last poll; the next
+    // connect relaunches it.
     let exited = tokio::task::block_in_place(|| {
         ExitWatch::register(first)
             .expect("the server's exit registers")
-            .wait(Duration::from_secs(30))
+            .wait(idle_exit + MARGIN)
     });
-    assert!(exited, "the server did not exit within 30 s of going idle");
+    assert!(
+        exited,
+        "the ready server did not exit within {MARGIN:?} past its idle exit"
+    );
     std::os::unix::net::UnixStream::connect(&socket).expect("the reconnect lands");
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     let second = loop {
@@ -721,12 +842,12 @@ async fn server_agent_lifecycle() {
             std::time::Instant::now() < deadline,
             "launchd did not relaunch the server"
         );
-        std::thread::sleep(Duration::from_millis(50));
+        tokio::time::sleep(Duration::from_millis(50)).await;
     };
     assert_ne!(first, second, "launchd did not start a replacement server");
 
     // A `--build` change is a plist change: the agent is replaced.
-    let mut rebuilt = make_config(&label, Duration::from_secs(3));
+    let mut rebuilt = make_config();
     let Plist::Server(server_agent) = &mut rebuilt.agent else {
         unreachable!()
     };
