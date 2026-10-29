@@ -30,10 +30,6 @@ pub use scheduler::{GpuState, SchedulerHandle};
 /// loader not busy.
 pub const IDLE_EXIT: Duration = Duration::from_secs(600);
 
-/// The cap on the model load; past it the load fails fatally with the
-/// stage it stopped in.
-pub const LOAD_BOUND: Duration = Duration::from_secs(300);
-
 /// The request body cap: 32 MiB.
 pub const BODY_LIMIT: usize = 32 << 20;
 
@@ -74,7 +70,8 @@ pub struct Config<B: Backend, M: ModelSource> {
     /// Exit after this long idle.
     pub idle_exit: Duration,
     /// Fail the model load past this bound, naming the stage it stopped
-    /// in; [`LOAD_BOUND`] in production.
+    /// in; [`embed_api::LOAD_BOUND`](repo_search_core::embed_api::LOAD_BOUND)
+    /// in production.
     pub load_bound: Duration,
     /// The model source the loader downloads from.
     pub model: M,

@@ -3,6 +3,8 @@
 //! are subcommands only as a bare first argument — every other first
 //! argument is the free-text query.
 
+use std::net::SocketAddr;
+use std::os::fd::RawFd;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -116,6 +118,46 @@ struct RawCli {
         value_name = "PATH"
     )]
     server_socket: Option<PathBuf>,
+
+    /// Bind this socket instead of taking launchd's.
+    #[arg(
+        long,
+        hide = true,
+        requires = "daemon",
+        conflicts_with = "query",
+        value_name = "PATH"
+    )]
+    listen: Option<PathBuf>,
+
+    /// The fd the daemon reports `ready` or `failed: <message>` on.
+    #[arg(
+        long,
+        hide = true,
+        requires = "daemon",
+        conflicts_with = "query",
+        value_name = "FD"
+    )]
+    ready_fd: Option<RawFd>,
+
+    /// The embedding server's TCP address, an IP literal.
+    #[arg(
+        long,
+        hide = true,
+        requires = "daemon",
+        conflicts_with_all = ["query", "server_socket"],
+        value_name = "IP:PORT"
+    )]
+    server_addr: Option<SocketAddr>,
+
+    /// The bearer token `--server-addr` sends, read from this file.
+    #[arg(
+        long,
+        hide = true,
+        requires = "server_addr",
+        conflicts_with = "query",
+        value_name = "FILE"
+    )]
+    server_token_file: Option<PathBuf>,
 }
 
 /// The parsed `search` command line.
@@ -267,9 +309,9 @@ pub enum Command {
 pub enum Invocation {
     /// `search --server`: the embedding server's entry point.
     Server {
-        /// Idle deadline; [`IDLE_EXIT`](repo_search_server::IDLE_EXIT)
-        /// unless `--idle-exit-secs`.
-        idle_exit: Duration,
+        /// `--idle-exit-secs`, when given; the server's own default
+        /// applies otherwise.
+        idle_exit: Option<Duration>,
         /// `--model-cache`, when given.
         model_cache: Option<PathBuf>,
         /// `--token-file`, when given.
@@ -277,7 +319,8 @@ pub enum Invocation {
         /// `--build`, when given.
         build: Option<String>,
     },
-    /// `search --daemon`: the launchd job's entry point.
+    /// `search --daemon`: the agent's entry point, socket-activated on
+    /// macOS and self-bound under spawn on Linux.
     Daemon {
         /// Idle deadline; [`daemon::IDLE_EXIT`] unless `--idle-exit-secs`.
         idle_exit: Duration,
@@ -287,6 +330,14 @@ pub enum Invocation {
         state_dir: Option<PathBuf>,
         /// `--server-socket`, when given.
         server_socket: Option<PathBuf>,
+        /// `--listen`: bind this socket instead of activating.
+        listen: Option<PathBuf>,
+        /// `--ready-fd`, when given.
+        ready_fd: Option<RawFd>,
+        /// `--server-addr`, when given.
+        server_addr: Option<SocketAddr>,
+        /// `--server-token-file`, when given.
+        server_token_file: Option<PathBuf>,
     },
     /// `search <query>`.
     Search {
@@ -315,9 +366,7 @@ impl Cli {
         let raw = self.0;
         if raw.server {
             return Invocation::Server {
-                idle_exit: raw
-                    .idle_exit_secs
-                    .map_or(repo_search_server::IDLE_EXIT, Duration::from_secs),
+                idle_exit: raw.idle_exit_secs.map(Duration::from_secs),
                 model_cache: raw.model_cache,
                 token_file: raw.token_file,
                 build: raw.build,
@@ -331,6 +380,10 @@ impl Cli {
                 model_cache: raw.model_cache,
                 state_dir: raw.state_dir,
                 server_socket: raw.server_socket,
+                listen: raw.listen,
+                ready_fd: raw.ready_fd,
+                server_addr: raw.server_addr,
+                server_token_file: raw.server_token_file,
             };
         }
         match raw.command {
@@ -449,7 +502,7 @@ mod tests {
                 token_file,
                 build,
             } => {
-                assert_eq!(idle_exit, repo_search_server::IDLE_EXIT);
+                assert_eq!(idle_exit, None);
                 assert_eq!(model_cache, None);
                 assert_eq!(token_file, None);
                 assert_eq!(build, None);
@@ -472,7 +525,7 @@ mod tests {
                 build,
                 ..
             } => {
-                assert_eq!(idle_exit, Duration::from_secs(30));
+                assert_eq!(idle_exit, Some(Duration::from_secs(30)));
                 assert_eq!(token_file, Some(PathBuf::from("/tmp/tok")));
                 assert_eq!(build.as_deref(), Some("1:2:3:4"));
             }
@@ -496,11 +549,19 @@ mod tests {
                 model_cache,
                 state_dir,
                 server_socket,
+                listen,
+                ready_fd,
+                server_addr,
+                server_token_file,
             } => {
                 assert_eq!(idle_exit, daemon::IDLE_EXIT);
                 assert_eq!(model_cache, None);
                 assert_eq!(state_dir, None);
                 assert_eq!(server_socket, None);
+                assert_eq!(listen, None);
+                assert_eq!(ready_fd, None);
+                assert_eq!(server_addr, None);
+                assert_eq!(server_token_file, None);
             }
             other => panic!("expected Daemon, got {other:?}"),
         }
@@ -509,6 +570,70 @@ mod tests {
                 assert_eq!(server_socket, Some(PathBuf::from("/tmp/s.sock")));
             }
             other => panic!("expected Daemon, got {other:?}"),
+        }
+        match parsed(&[
+            "search",
+            "--daemon",
+            "--listen",
+            "/tmp/d.sock",
+            "--ready-fd",
+            "3",
+            "--server-addr",
+            "127.0.0.1:41827",
+            "--server-token-file",
+            "/tmp/tok",
+        ]) {
+            Invocation::Daemon {
+                listen,
+                ready_fd,
+                server_addr,
+                server_token_file,
+                ..
+            } => {
+                assert_eq!(listen, Some(PathBuf::from("/tmp/d.sock")));
+                assert_eq!(ready_fd, Some(3));
+                assert_eq!(server_addr, Some(SocketAddr::from(([127, 0, 0, 1], 41827))));
+                assert_eq!(server_token_file, Some(PathBuf::from("/tmp/tok")));
+            }
+            other => panic!("expected Daemon, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn daemon_remote_flags_conflict() {
+        // `--server-addr` and `--server-socket` exclude each other.
+        assert!(
+            Cli::try_parse_from([
+                "search",
+                "--daemon",
+                "--server-addr",
+                "127.0.0.1:1",
+                "--server-socket",
+                "/tmp/s.sock",
+            ])
+            .is_err()
+        );
+        // `--server-token-file` needs `--server-addr`.
+        assert!(
+            Cli::try_parse_from(["search", "--daemon", "--server-token-file", "/tmp/t"]).is_err()
+        );
+        // Every daemon flag needs `--daemon`.
+        for args in [
+            &["--listen", "/tmp/d.sock"][..],
+            &["--ready-fd", "3"][..],
+            &["--server-addr", "127.0.0.1:1"][..],
+            &[
+                "--server-addr",
+                "127.0.0.1:1",
+                "--server-token-file",
+                "/tmp/t",
+            ][..],
+        ] {
+            assert!(
+                Cli::try_parse_from(["search"].iter().chain(args).copied().collect::<Vec<_>>())
+                    .is_err(),
+                "{args:?} without --daemon parses"
+            );
         }
     }
 

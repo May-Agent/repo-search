@@ -58,7 +58,7 @@ impl<S: EmbedService> Retriever<S> {
     /// index holds, [`Books::pairs`](crate::reconcile::Books::pairs) of the
     /// reconciler whose every later pass's presence is passed to
     /// [`Self::follow`]. KNN scans run on `knn_threads` threads (the
-    /// performance cores, see [`qos::performance_cores`](crate::qos)).
+    /// host's [`std::thread::available_parallelism`]).
     ///
     /// # Errors
     ///

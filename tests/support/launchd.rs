@@ -272,7 +272,7 @@ impl Owner {
             chip: repo_search_server::chip::ChipClass::Wide,
             backend: self.backend.clone(),
             idle_exit: Duration::from_secs(600),
-            load_bound: repo_search_server::LOAD_BOUND,
+            load_bound: repo_search_core::embed_api::LOAD_BOUND,
         }
     }
 

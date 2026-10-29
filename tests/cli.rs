@@ -17,7 +17,7 @@ use tokio::io::AsyncWrite;
 use tokio::sync::mpsc::UnboundedSender;
 
 use clap::Parser;
-use repo_search::cli::{Cli, Env, Exit, Invocation, Terminal};
+use repo_search::cli::{Cli, Env, Exit, Invocation, LaunchdAgents, Terminal};
 use repo_search::install::{AgentConfig, Plist, Timeouts};
 use repo_search::launchd::{LaunchAgent, ServerAgent};
 use repo_search::protocol::BuildId;
@@ -102,12 +102,18 @@ fn config(tmp: &tempfile::TempDir) -> AgentConfig {
 
 /// The `Env` `cli::run` gets in a test: the test cwd and config, the
 /// fake's `Launchctl`, and the handshake matching the fake's daemons.
-fn cli_env(config: AgentConfig, launchd: &FakeLaunchd, cwd: &Path) -> Env<FakeLaunchctl> {
+fn cli_env(
+    config: AgentConfig,
+    launchd: &FakeLaunchd,
+    cwd: &Path,
+) -> Env<LaunchdAgents<FakeLaunchctl>> {
     Env {
         cwd: cwd.to_path_buf(),
-        server_agent: server_config(config.plist.parent().unwrap().parent().unwrap()),
-        agent: config,
-        launchctl: launchd.launchctl(),
+        launcher: LaunchdAgents::new(
+            server_config(config.plist.parent().unwrap().parent().unwrap()),
+            config,
+            launchd.launchctl(),
+        ),
         hello: client::hello(),
     }
 }

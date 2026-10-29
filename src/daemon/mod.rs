@@ -5,6 +5,7 @@ pub mod counter;
 pub mod coverage;
 pub mod feed;
 pub mod link;
+pub mod listen;
 pub mod registry;
 pub mod scheduler;
 pub mod server;
@@ -21,7 +22,7 @@ use std::time::{Duration, Instant};
 use futures_util::SinkExt;
 use futures_util::stream::StreamExt;
 use repo_search_core::StateDir;
-use tokio::net::{UnixListener, UnixStream};
+use tokio::net::UnixStream;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::codec::LinesCodecError;
 
@@ -46,7 +47,7 @@ pub enum Error {
     /// A writer's `put_many` failed.
     #[error("vector writer failed: {0}")]
     Writer(String),
-    /// The listener or the signal handler failed.
+    /// The listener failed.
     #[error("daemon I/O: {0}")]
     Io(#[from] io::Error),
     /// `run` could not start; the queued connections were answered first.
@@ -76,6 +77,14 @@ pub enum StartupError {
     /// The `Listener` fd could not be adopted into the runtime.
     #[error("could not adopt the Listener fd: {0}")]
     Adopt(#[source] io::Error),
+    /// The `--server-token-file` could not be read.
+    #[error("could not read the token file {}: {source}", .path.display())]
+    TokenFile {
+        /// The file the daemon was told to read.
+        path: PathBuf,
+        /// The read's failure.
+        source: io::Error,
+    },
     /// The SIGTERM handler could not be installed.
     #[error("could not install the SIGTERM handler: {0}")]
     Signal(#[source] io::Error),
@@ -84,10 +93,21 @@ pub enum StartupError {
 /// Answers every connection already queued on `listener` with a
 /// [`ErrorKind::Startup`] error, so no client is left waiting on a daemon
 /// that is about to exit. `listener` must be nonblocking.
+pub async fn refuse(listener: std::os::unix::net::UnixListener, error: &StartupError) {
+    answer_queued(listener, ErrorKind::Startup, error.to_string()).await
+}
+
+/// Answers every connection already queued on `listener` with a `kind`
+/// error carrying `message`, so no client is left waiting on a daemon
+/// that is about to exit. `listener` must be nonblocking.
 ///
 /// Each connection's first frame is read (and ignored) before the answer,
 /// so the client's `Hello` write cannot hit a closed connection.
-pub async fn refuse(listener: std::os::unix::net::UnixListener, error: &StartupError) {
+pub(crate) async fn answer_queued(
+    listener: std::os::unix::net::UnixListener,
+    kind: ErrorKind,
+    message: String,
+) {
     let mut streams = Vec::new();
     loop {
         match listener.accept() {
@@ -99,7 +119,6 @@ pub async fn refuse(listener: std::os::unix::net::UnixListener, error: &StartupE
             }
         }
     }
-    let message = error.to_string();
     // Keeps `read_frame`'s shutdown arm pending for the whole refusal.
     let (_stop, stopping) = tokio::sync::watch::channel(false);
     let mut answers = tokio::task::JoinSet::new();
@@ -119,7 +138,7 @@ pub async fn refuse(listener: std::os::unix::net::UnixListener, error: &StartupE
             };
             let mut framed = framed(stream);
             let _ = read_hello(&mut framed, &stopping).await;
-            send_final(&mut framed, ErrorKind::Startup, message).await;
+            send_final(&mut framed, kind, message).await;
         });
     }
     let mut answered = 0usize;
@@ -128,10 +147,7 @@ pub async fn refuse(listener: std::os::unix::net::UnixListener, error: &StartupE
             answered += 1;
         }
     }
-    tracing::info!(
-        answered,
-        "answered pending connections with the startup error"
-    );
+    tracing::info!(answered, kind = ?kind, "answered pending connections");
 }
 
 /// A connection that sends no `Hello` within this long is closed; it also
@@ -141,10 +157,21 @@ const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 /// The daemon exits after this long with no connections and no work.
 pub const IDLE_EXIT: Duration = Duration::from_secs(600);
 
+/// `launchctl bootout` returns before launchd finishes the teardown; the
+/// agent's process exit is awaited this long before `bootstrap`. On Linux
+/// it is the old daemon's shutdown tail a replacement waits out.
+pub const TEARDOWN_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// `launchctl bootstrap` returns once the job is loaded; launchd binds the
+/// `SockPathName` a moment later, awaited this long. On Linux it is the
+/// new daemon's startup after the old one is gone.
+pub const SOCKET_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// The bound on one link attempt — the tokenizer download plus the wait
 /// for the server to report the model ready: the server's own load bound
 /// plus slack for the tokenizer fetch and the probe round trips.
-pub const LOAD_BOUND: Duration = Duration::from_secs(repo_search_server::LOAD_BOUND.as_secs() + 30);
+pub const LOAD_BOUND: Duration =
+    Duration::from_secs(repo_search_core::embed_api::LOAD_BOUND.as_secs() + 30);
 
 /// A busy-source registration for the idle-exit tracker. Each source owns
 /// its `watch::Sender<bool>` — state, not transitions, so nothing is lost —
@@ -155,10 +182,15 @@ pub struct BusySource {
 }
 
 /// The daemon's configuration.
-pub struct Config<T: Tokens> {
-    /// The socket to accept on; launchd's in production, a bound one in
-    /// tests.
-    pub listener: UnixListener,
+pub struct Config<T: Tokens, L: listen::Listener> {
+    /// The socket to accept on: launchd's [`Activated`](listen::Activated)
+    /// in macOS production, a [`Bound`](listen::Bound) the daemon owns on
+    /// Linux and in tests.
+    pub listener: L,
+    /// The SIGTERM stream the accept loop polls. The caller installs it
+    /// before it reports readiness, so a signal landing before `run`
+    /// polls it is buffered in the stream, never defaulted.
+    pub signal: tokio::signal::unix::Signal,
     /// Exit after this long with no connections and no work.
     pub idle_exit: Duration,
     /// Fail the link — tokenizer download plus the server-readiness wait
@@ -166,8 +198,8 @@ pub struct Config<T: Tokens> {
     pub load_bound: Duration,
     /// The tokenizer source the link's `load` starts on at once.
     pub tokens: T,
-    /// Where the embedding server listens; `--server-socket` in
-    /// production.
+    /// Where the embedding server listens; `--server-socket` or
+    /// `--server-addr` in production.
     pub server: Endpoint,
     /// The model-id vectors are stored under and the server is expected
     /// to list; `MODEL_ID` in production, the stub server's in tests.
@@ -192,24 +224,24 @@ enum ConnMsg {
 
 /// Runs the daemon until idle exit, SIGTERM or a fatal error.
 ///
-/// Shutdown — on any trigger — stops accepting, broadcasts `stopping`,
-/// closes the registry (dropping the owners' inboxes and watchers, and the
-/// writer handles they hold), tells the scheduler to stop (which answers
-/// the embedding threads' pulls with `Stop`), then awaits the writer
+/// The SIGTERM stream arrives on the config, installed by the caller
+/// before it reports readiness: a signal landing before `run` first
+/// polls it is buffered there, so the shutdown tail still runs.
+///
+/// Shutdown — on any trigger — closes the listener first (a bound socket
+/// is unlinked and its queued connections answered `ShuttingDown`),
+/// broadcasts `stopping`, closes the registry (dropping the owners'
+/// inboxes and watchers, and the writer handles they hold), tells the
+/// scheduler to stop (which answers the embedding threads' pulls with
+/// `Stop`), then awaits the writer
 /// tasks: with every `WriterHandle` dropped, each writer's close-flush
 /// commits the buffered vectors. The connection tasks are awaited last.
-pub async fn run<T: Tokens>(config: Config<T>) -> Result<(), Error> {
-    // The signal stream exists before anything is spawned: a failure here
-    // leaves nothing to shut down.
-    let mut signal = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-    {
-        Ok(signal) => signal,
-        Err(error) => {
-            let error = StartupError::Signal(error);
-            refuse(config.listener.into_std()?, &error).await;
-            return Err(error.into());
-        }
-    };
+/// What [`close`](listen::Listener::close) returns — a `Bound`
+/// listener's lifetime lock — is held until `run` returns, so the
+/// lock's release stays after every flush; in the production entry
+/// points that is the process's exit.
+pub async fn run<T: Tokens, L: listen::Listener>(config: Config<T, L>) -> Result<(), Error> {
+    let mut signal = config.signal;
     let started = Instant::now();
     let (fatal_tx, mut fatal_rx) = mpsc::channel::<Error>(64);
     let (busy_tx, mut busy_rx) = busy_channel();
@@ -221,7 +253,7 @@ pub async fn run<T: Tokens>(config: Config<T>) -> Result<(), Error> {
         Ok(client) => Arc::new(client),
         Err(error) => {
             let error = StartupError::ServerClient(error);
-            refuse(config.listener.into_std()?, &error).await;
+            let _held = config.listener.refuse(&error).await?;
             return Err(error.into());
         }
     };
@@ -269,7 +301,7 @@ pub async fn run<T: Tokens>(config: Config<T>) -> Result<(), Error> {
         };
         tokio::select! {
             accepted = config.listener.accept() => match accepted {
-                Ok((stream, _)) => {
+                Ok(stream) => {
                     conns += 1;
                     conn_tasks.spawn(connection(
                         stream,
@@ -317,6 +349,12 @@ pub async fn run<T: Tokens>(config: Config<T>) -> Result<(), Error> {
         };
     }
 
+    // The listener goes first, whatever the trigger: nothing new arrives
+    // while the tail works, and a `Bound` socket answers its queued
+    // connections `ShuttingDown` and stops existing. What `close` hands
+    // back — a `Bound`'s lifetime lock — is held until `run` returns, so
+    // the next daemon's acquire still waits on this tail.
+    let held = config.listener.close().await;
     // Shutdown: watchers die with their owners, the threads pull `Stop`,
     // and the writers flush once every handle is dropped. Connections end
     // quickly once owners answer `ShuttingDown` and exit; they are awaited
@@ -332,6 +370,7 @@ pub async fn run<T: Tokens>(config: Config<T>) -> Result<(), Error> {
     // A finishing connection must not block on a close report nobody reads.
     drop(conn_rx);
     while conn_tasks.join_next().await.is_some() {}
+    drop(held);
     outcome
 }
 

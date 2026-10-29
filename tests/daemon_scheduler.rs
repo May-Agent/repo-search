@@ -15,8 +15,8 @@
 //! wait runs on gates, records, scheduler state or the busy report —
 //! never a sleep.
 
-#![cfg(target_os = "macos")]
-
+#[path = "support/embed_server.rs"]
+mod embed_server;
 #[path = "support/fake_embeddings.rs"]
 mod fake_embeddings;
 
@@ -26,6 +26,7 @@ use std::sync::Arc;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+use embed_server::{embeddings_body, error_body, json_response, serve};
 use fake_embeddings::{FakeEmbeddings, Gate, Kind, Record, StubQueries};
 use repo_search::daemon::scheduler::{
     self, Counts, DocumentsJob, EmbedError, Enqueue, IndexClass, Interest, QueryJob, RepoId,
@@ -33,7 +34,7 @@ use repo_search::daemon::scheduler::{
 };
 use repo_search::daemon::server::{Embeddings, Endpoint, ServerClient};
 use repo_search::daemon::{Error, writer};
-use repo_search_core::embed_api::{Urgency, encode_vector};
+use repo_search_core::embed_api::Urgency;
 use repo_search_core::reconcile::PendingChunk;
 use repo_search_core::store::{ContentHash, VectorCache};
 use repo_search_core::{QueryTask, UnitVector};
@@ -1726,157 +1727,6 @@ async fn a_failed_request_is_fatal_and_the_scheduler_exits() {
 // Fatal handling, through a real `ServerClient` on a hyper test server.
 // ---------------------------------------------------------------------
 
-/// What the test server recorded of a request.
-struct Recorded {
-    /// Which accepted connection the request came on, from 1.
-    conn: usize,
-    /// The request path.
-    path: String,
-    /// The `Priority` header, as sent.
-    priority: Option<String>,
-    /// The JSON body.
-    body: serde_json::Value,
-}
-
-/// A hyper test server: every accepted connection serves requests that
-/// `handler` answers — `None` kills the connection without a response.
-struct TestServer {
-    addr: SocketAddr,
-    requests: mpsc::Receiver<Recorded>,
-}
-
-impl TestServer {
-    /// The next request the server recorded.
-    fn next(&self) -> Recorded {
-        tokio::task::block_in_place(|| {
-            self.requests
-                .recv_timeout(TIMEOUT)
-                .expect("the request arrives")
-        })
-    }
-
-    /// The connections of every request recorded so far, in order.
-    fn conns(&self) -> Vec<usize> {
-        self.requests
-            .try_iter()
-            .map(|request| request.conn)
-            .collect()
-    }
-}
-
-fn serve<F>(handler: F) -> TestServer
-where
-    F: Fn(usize) -> Option<hyper::Response<http_body_util::Full<bytes::Bytes>>>
-        + Send
-        + Sync
-        + 'static,
-{
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-    listener.set_nonblocking(true).expect("nonblocking");
-    let addr = listener.local_addr().expect("local addr");
-    let listener = tokio::net::TcpListener::from_std(listener).expect("tokio listener");
-    let (tx, requests) = mpsc::channel();
-    let handler = Arc::new(handler);
-    tokio::spawn(async move {
-        let mut conn = 0usize;
-        loop {
-            let Ok((stream, _)) = listener.accept().await else {
-                return;
-            };
-            conn += 1;
-            let n = conn;
-            let io = hyper_util::rt::TokioIo::new(stream);
-            let handler = handler.clone();
-            let tx = tx.clone();
-            tokio::spawn(async move {
-                let service = hyper::service::service_fn(
-                    move |req: hyper::Request<hyper::body::Incoming>| {
-                        let handler = handler.clone();
-                        let tx = tx.clone();
-                        async move {
-                            let (parts, body) = req.into_parts();
-                            let body = http_body_util::BodyExt::collect(body)
-                                .await
-                                .map(|c| c.to_bytes())
-                                .unwrap_or_default();
-                            let _ = tx.send(Recorded {
-                                conn: n,
-                                path: parts.uri.path().to_owned(),
-                                priority: parts
-                                    .headers
-                                    .get("priority")
-                                    .and_then(|v| v.to_str().ok())
-                                    .map(str::to_owned),
-                                body: serde_json::from_slice(&body).unwrap_or_default(),
-                            });
-                            match handler(n) {
-                                Some(response) => Ok::<_, std::io::Error>(response),
-                                None => Err(std::io::Error::new(
-                                    std::io::ErrorKind::ConnectionAborted,
-                                    "killed",
-                                )),
-                            }
-                        }
-                    },
-                );
-                let _ = hyper::server::conn::http1::Builder::new()
-                    .serve_connection(io, service)
-                    .await;
-            });
-        }
-    });
-    TestServer { addr, requests }
-}
-
-/// A JSON response, with an optional `Server-Timing` header.
-fn json_response(
-    status: u16,
-    body: serde_json::Value,
-    timing: Option<&str>,
-) -> hyper::Response<http_body_util::Full<bytes::Bytes>> {
-    let mut builder = hyper::Response::builder()
-        .status(status)
-        .header("content-type", "application/json");
-    if let Some(timing) = timing {
-        builder = builder.header("server-timing", timing);
-    }
-    builder
-        .body(http_body_util::Full::new(bytes::Bytes::from(
-            body.to_string(),
-        )))
-        .expect("a response builds")
-}
-
-/// A standard `EmbeddingResponse` body carrying `vectors` as base64.
-fn embeddings_body(vectors: &[&[f32]]) -> serde_json::Value {
-    serde_json::json!({
-        "object": "list",
-        "data": vectors
-            .iter()
-            .enumerate()
-            .map(|(index, vector)| serde_json::json!({
-                "object": "embedding",
-                "index": index,
-                "embedding": encode_vector(vector),
-            }))
-            .collect::<Vec<_>>(),
-        "model": repo_search_core::model::MODEL_ID,
-        "usage": {"prompt_tokens": 1, "total_tokens": 1},
-    })
-}
-
-/// A standard error envelope body.
-fn error_body(message: &str) -> serde_json::Value {
-    serde_json::json!({
-        "error": {
-            "message": message,
-            "type": "server_error",
-            "param": null,
-            "code": null,
-        }
-    })
-}
-
 /// The client a test endpoint is built from.
 fn client(addr: SocketAddr) -> ServerClient {
     ServerClient::new(&Endpoint::Tcp { addr, token: None }).expect("the client builds")
@@ -1887,14 +1737,14 @@ fn client(addr: SocketAddr) -> ServerClient {
 /// `Error::Server` goes to `run`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_transport_error_is_retried_once_then_fatal() {
-    let server = serve(|conn| {
+    let server = serve(|conn, _| {
         if conn == 1 {
             None
         } else {
             Some(json_response(500, error_body("the model died"), None))
         }
     });
-    let mut rig = rig(Arc::new(client(server.addr))).await;
+    let mut rig = rig(Arc::new(client(server.addr()))).await;
     enqueue(&rig, small([0]), IndexClass::Stage1).await;
     let error = tokio::time::timeout(TIMEOUT, rig.fatal.recv())
         .await
@@ -1914,14 +1764,14 @@ async fn a_transport_error_is_retried_once_then_fatal() {
 /// A non-2xx answer is fatal without a retry.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_5xx_is_fatal() {
-    let server = serve(|_| {
+    let server = serve(|_, _| {
         Some(json_response(
             503,
             error_body("the model is downloading"),
             None,
         ))
     });
-    let mut rig = rig(Arc::new(client(server.addr))).await;
+    let mut rig = rig(Arc::new(client(server.addr()))).await;
     enqueue(&rig, small([0]), IndexClass::Stage1).await;
     let error = tokio::time::timeout(TIMEOUT, rig.fatal.recv())
         .await
@@ -1945,14 +1795,14 @@ async fn a_5xx_is_fatal() {
 /// the urgency given.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn server_client_decodes_base64() {
-    let server = serve(|_| {
+    let server = serve(|_, _| {
         Some(json_response(
             200,
             embeddings_body(&[&[1.0, 0.0, 0.0]]),
             None,
         ))
     });
-    let answered = client(server.addr)
+    let answered = client(server.addr())
         .embed(vec!["fn main() {}".to_owned()], Urgency::new(3))
         .await
         .expect("embeds");
@@ -1972,14 +1822,14 @@ async fn server_client_decodes_base64() {
 /// The `Server-Timing` header parses into `Answered::timing`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn server_client_parses_server_timing() {
-    let server = serve(|_| {
+    let server = serve(|_, _| {
         Some(json_response(
             200,
             embeddings_body(&[&[0.5, 0.5]]),
             Some("wait;dur=1.25, overtaken;desc=\"2\""),
         ))
     });
-    let answered = client(server.addr)
+    let answered = client(server.addr())
         .embed(vec!["x".to_owned()], Urgency::new(0))
         .await
         .expect("embeds");
@@ -1990,14 +1840,14 @@ async fn server_client_parses_server_timing() {
 /// A 503 answer surfaces the envelope's message.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn server_client_surfaces_503_detail() {
-    let server = serve(|_| {
+    let server = serve(|_, _| {
         Some(json_response(
             503,
             error_body("the model is downloading"),
             None,
         ))
     });
-    let error = client(server.addr)
+    let error = client(server.addr())
         .embed(vec!["x".to_owned()], Urgency::new(0))
         .await
         .expect_err("a 503 fails");
@@ -2012,14 +1862,14 @@ async fn server_client_surfaces_503_detail() {
 /// connection, and the second attempt answers.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn server_client_retries_once_on_transport_error() {
-    let server = serve(|conn| {
+    let server = serve(|conn, _| {
         if conn == 1 {
             None
         } else {
             Some(json_response(200, embeddings_body(&[&[1.0]]), None))
         }
     });
-    let answered = client(server.addr)
+    let answered = client(server.addr())
         .embed(vec!["x".to_owned()], Urgency::new(0))
         .await
         .expect("the retry answers");
@@ -2030,8 +1880,8 @@ async fn server_client_retries_once_on_transport_error() {
 /// A 5xx answer is fatal without a retry.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn server_client_treats_5xx_as_fatal_without_retry() {
-    let server = serve(|_| Some(json_response(500, error_body("boom"), None)));
-    let error = client(server.addr)
+    let server = serve(|_, _| Some(json_response(500, error_body("boom"), None)));
+    let error = client(server.addr())
         .embed(vec!["x".to_owned()], Urgency::new(0))
         .await
         .expect_err("a 500 fails");

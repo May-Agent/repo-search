@@ -57,10 +57,9 @@ impl fmt::Display for Sha256Digest {
 }
 
 /// The per-user cache root the model archive and the tokenizer share:
-/// `~/Library/Caches/repo-search/models`.
+/// `models/` under the OS cache root ([`crate::paths`]).
 fn user_cache_root() -> Result<PathBuf, Error> {
-    let home = std::env::home_dir().ok_or(Error::NoHomeDir)?;
-    Ok(home.join("Library/Caches/repo-search/models"))
+    Ok(crate::paths::UserPaths::user()?.cache.join("models"))
 }
 
 /// A model archive to fetch and the digest that verifies it.
@@ -112,7 +111,7 @@ impl ModelStore {
         })
     }
 
-    /// The per-user store: `~/Library/Caches/repo-search/models`.
+    /// The per-user store: `models/` under the OS cache root.
     pub fn user_cache() -> Result<Self, Error> {
         Self::new(user_cache_root()?, ModelSpec::embedding_gemma_2())
     }
@@ -471,9 +470,6 @@ pub enum Error {
     /// A blocking-pool task could not complete.
     #[error("model store task failed: {0}")]
     Task(#[from] tokio::task::JoinError),
-    /// No home directory to derive the cache path from.
-    #[error("cannot locate the user cache directory: no home directory")]
-    NoHomeDir,
 }
 
 #[cfg(test)]

@@ -193,7 +193,9 @@ pub fn spawn_on<T: Tokens>(
             .expect("the listener goes nonblocking");
         let listener = UnixListener::from_std(listener).expect("the listener adopts");
         daemon::run(Config {
-            listener,
+            listener: daemon::listen::Activated(listener),
+            signal: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("the SIGTERM stream installs"),
             idle_exit,
             load_bound,
             tokens,
@@ -276,7 +278,7 @@ pub async fn daemon<T: Tokens>(
             // as launchd does, so it keeps the production idle exit,
             // which `server/tests/api.rs` covers.
             idle_exit: repo_search_server::IDLE_EXIT,
-            load_bound: repo_search_server::LOAD_BOUND,
+            load_bound: repo_search_core::embed_api::LOAD_BOUND,
         },
     ))
     .await
