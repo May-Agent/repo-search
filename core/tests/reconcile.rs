@@ -73,6 +73,17 @@ impl Fixture {
         fs::write(path, text).unwrap();
     }
 
+    /// Rewrites `rel` with its own bytes the way an editor's atomic save
+    /// does — a sibling written, then renamed over it — so the file keeps
+    /// its bytes but gets a new mtime and an inode that differs: the new
+    /// one is allocated while the old still exists.
+    fn atomic_save(&self, rel: &str) {
+        let path = self.tree.path().join(rel);
+        let staged = path.with_extension("atomic-save");
+        fs::write(&staged, fs::read(&path).unwrap()).unwrap();
+        fs::rename(&staged, &path).unwrap();
+    }
+
     fn run(&self, options: Options) -> Pass {
         self.run_chunker(CHUNKER_FINGERPRINT, options)
     }
@@ -420,10 +431,7 @@ fn a_touched_file_with_the_same_bytes_is_not_rechunked() {
     let chunk_ids: String = fx.query("SELECT group_concat(id) FROM chunks");
 
     // Same bytes, new inode and mtime, as an editor's atomic save leaves.
-    let path = fx.tree.path().join("a.rs");
-    let bytes = fs::read(&path).unwrap();
-    fs::remove_file(&path).unwrap();
-    fs::write(&path, bytes).unwrap();
+    fx.atomic_save("a.rs");
 
     let r = fx.pass();
     assert_eq!(r.report.files_restamped, 1);
@@ -885,10 +893,7 @@ fn a_malformed_file_with_moved_stat_is_restamped_not_parsed() {
     let before: i64 = fx.query("SELECT inode FROM unchunkable");
 
     // Same bytes, new inode and mtime.
-    let path = fx.tree.path().join("c.json");
-    let bytes = fs::read(&path).unwrap();
-    fs::remove_file(&path).unwrap();
-    fs::write(&path, bytes).unwrap();
+    fx.atomic_save("c.json");
 
     let r = fx.pass();
     assert_eq!(r.report.files_chunked, 0);
@@ -1139,10 +1144,7 @@ fn a_restamped_file_offers_its_uncached_chunks_again() {
     assert!(!a0.is_empty());
 
     // Same bytes, new inode and mtime, as an editor's atomic save leaves.
-    let path = fx.tree.path().join("a.rs");
-    let bytes = fs::read(&path).unwrap();
-    fs::remove_file(&path).unwrap();
-    fs::write(&path, bytes).unwrap();
+    fx.atomic_save("a.rs");
 
     let r = fx.reconcile_only(Options::default());
     assert_eq!(r.report.files_restamped, 1);
@@ -1288,10 +1290,7 @@ fn a_restamped_file_reads_only_its_own_rows() {
     let rows: i64 = fx.query("SELECT count(*) FROM chunks WHERE path = 'm5.rs'");
 
     // Same bytes, new inode and mtime, as an editor's atomic save leaves.
-    let path = fx.tree.path().join("m5.rs");
-    let bytes = fs::read(&path).unwrap();
-    fs::remove_file(&path).unwrap();
-    fs::write(&path, bytes).unwrap();
+    fx.atomic_save("m5.rs");
 
     let r = fx.reconcile_only(Options::default());
     assert_eq!(r.report.files_restamped, 1);
