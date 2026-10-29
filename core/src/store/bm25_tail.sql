@@ -1,2 +1,2 @@
-ORDER BY bm25(fts), c.id
+ORDER BY score, c.id
 LIMIT :limit

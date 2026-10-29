@@ -12,6 +12,7 @@ use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, 
 use tokio::sync::{mpsc, oneshot};
 
 use super::query::{self, ChunkFilter, ChunkId, ChunkRow, Side};
+use super::rank;
 use super::{
     ChunkRecord, ContentHash, Error, FileState, Unchunkable, ensure_version, open_conn,
     open_read_only, remove_db_files, send_and_wait, spawn_actor,
@@ -19,7 +20,7 @@ use super::{
 use crate::StateDir;
 
 /// Schema generation; a database at any other version is deleted and rebuilt.
-const SCHEMA_VERSION: i64 = 7;
+const SCHEMA_VERSION: i64 = 8;
 
 /// One file's change inside an atomic batch.
 #[derive(Debug)]
@@ -566,13 +567,21 @@ impl Index {
     }
 }
 
-/// Creates the index's state directory when missing and opens the index
-/// database. Runs on the actor thread.
+/// Creates the index's state directory when missing, opens the index
+/// database and registers `exact_bm25` on the connection. Runs on the actor
+/// thread.
 fn init(worktree: &Path, path: &Path) -> Result<Connection, Error> {
     if !worktree.is_dir() {
         return Err(Error::NotDirectory(worktree.to_path_buf()));
     }
     fs::create_dir_all(path.parent().expect("worktree_index names index.db"))?;
+    let conn = open_schema(path)?;
+    rank::register(&conn)?;
+    Ok(conn)
+}
+
+/// Opens the index database at `path` at this build's schema version.
+fn open_schema(path: &Path) -> Result<Connection, Error> {
     let mut conn = open_conn(path)?;
     match ensure_version(&mut conn, SCHEMA_VERSION, include_str!("index.sql"))? {
         None => Ok(conn),
@@ -739,6 +748,7 @@ fn align(conn: &mut Connection, chunker: &str, model_id: &str) -> Result<bool, E
     if populated {
         tx.execute_batch(
             "INSERT INTO fts (fts) VALUES ('delete-all');
+             UPDATE bm25_stats SET rows = 0, title_tokens = 0, body_tokens = 0;
              DELETE FROM chunk_members;
              DELETE FROM chunks;
              DELETE FROM files;
@@ -819,9 +829,11 @@ fn record_unchunkable(
 }
 
 /// Deletes every stored row of `path`, FTS first: the contentless table only
-/// forgets the rows it is told to by rowid. Returns the deleted rows' content
+/// forgets the rows it is told to by rowid. The rows' sizes leave the BM25
+/// statistics before the rows leave `fts`. Returns the deleted rows' content
 /// hashes.
 fn remove(tx: &Transaction<'_>, path: &str) -> Result<Vec<ContentHash>, Error> {
+    adjust_stats(tx, -fts_sizes(tx, path)?)?;
     tx.execute(
         "DELETE FROM fts WHERE rowid IN (SELECT id FROM chunks WHERE path = ?1)",
         [path],
@@ -899,7 +911,100 @@ fn replace(
         }
         fts_stmt.execute(params![chunk_id, chunk.title, chunk.fts_body])?;
     }
+    adjust_stats(tx, fts_sizes(tx, &state.path)?)?;
     Ok((removed, chunks.len() as u64))
+}
+
+/// The number of `fts` columns: `title` and `body`.
+const FTS_COLUMNS: usize = 2;
+
+/// The `fts` rows of a set of chunks: how many, and their token count in each
+/// column.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct FtsSizes {
+    rows: i64,
+    tokens: [i64; FTS_COLUMNS],
+}
+
+impl std::ops::Neg for FtsSizes {
+    type Output = Self;
+
+    fn neg(self) -> Self {
+        Self {
+            rows: -self.rows,
+            tokens: self.tokens.map(|t| -t),
+        }
+    }
+}
+
+/// The sizes of the `fts` rows of `path`'s stored chunks, read from the
+/// table's `fts_docsize` shadow table: the per-row column sizes FTS5 itself
+/// wrote on insert and reads for `bm25()`'s row lengths.
+fn fts_sizes(tx: &Transaction<'_>, path: &str) -> Result<FtsSizes, Error> {
+    let mut stmt = tx
+        .prepare("SELECT d.sz FROM fts_docsize d JOIN chunks c ON d.id = c.id WHERE c.path = ?1")?;
+    let mut rows = stmt.query([path])?;
+    let mut sizes = FtsSizes::default();
+    while let Some(row) = rows.next()? {
+        let blob = row
+            .get_ref(0)?
+            .as_blob()
+            .map_err(|_| Error::CorruptBlob("fts_docsize"))?;
+        let columns = docsize_columns(blob)?;
+        sizes.rows += 1;
+        for (total, column) in sizes.tokens.iter_mut().zip(columns) {
+            *total += column;
+        }
+    }
+    Ok(sizes)
+}
+
+/// Decodes one `fts_docsize.sz` blob: each column's token count as an SQLite
+/// varint, in column order, filling the blob exactly
+/// (`fts5StorageDecodeSizeArray`).
+fn docsize_columns(blob: &[u8]) -> Result<[i64; FTS_COLUMNS], Error> {
+    const CORRUPT: Error = Error::CorruptBlob("fts_docsize");
+    let mut columns = [0; FTS_COLUMNS];
+    let mut rest = blob;
+    for column in &mut columns {
+        let (value, len) = sqlite_varint(rest).ok_or(CORRUPT)?;
+        *column = i64::try_from(value).map_err(|_| CORRUPT)?;
+        rest = &rest[len..];
+    }
+    if rest.is_empty() {
+        Ok(columns)
+    } else {
+        Err(CORRUPT)
+    }
+}
+
+/// Reads one SQLite varint from the front of `bytes`: up to eight bytes of
+/// seven bits each, high bit set while more follow, then a ninth byte of
+/// eight bits (`sqlite3Fts5GetVarint`). Returns the value and its length, or
+/// `None` when `bytes` ends inside it.
+fn sqlite_varint(bytes: &[u8]) -> Option<(u64, usize)> {
+    let mut value: u64 = 0;
+    for (i, &byte) in bytes.iter().enumerate().take(9) {
+        if i == 8 {
+            return Some(((value << 8) | u64::from(byte), 9));
+        }
+        value = (value << 7) | u64::from(byte & 0x7f);
+        if byte & 0x80 == 0 {
+            return Some((value, i + 1));
+        }
+    }
+    None
+}
+
+/// Adds `sizes` to the BM25 statistics row; negated sizes take rows out.
+fn adjust_stats(tx: &Transaction<'_>, sizes: FtsSizes) -> Result<(), Error> {
+    let [title, body] = sizes.tokens;
+    tx.execute(
+        "UPDATE bm25_stats SET rows = rows + ?1, title_tokens = title_tokens + ?2, \
+         body_tokens = body_tokens + ?3",
+        params![sizes.rows, title, body],
+    )?;
+    Ok(())
 }
 
 fn chunks_by_hash(conn: &Connection, hashes: &[ContentHash]) -> Result<Vec<StoredChunk>, Error> {
@@ -1067,3 +1172,7 @@ fn unchunkables(conn: &Connection) -> Result<Vec<Unchunkable>, Error> {
         .collect::<Result<_, _>>()?;
     Ok(records)
 }
+
+#[cfg(all(test, feature = "lang-rust"))]
+#[path = "bm25_tests.rs"]
+mod bm25_tests;

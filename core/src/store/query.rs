@@ -149,6 +149,19 @@ pub(super) fn bm25(
     filter: &ChunkFilter,
     limit: u32,
 ) -> Result<Vec<ChunkId>, Error> {
+    Ok(bm25_scored(conn, query, filter, limit)?
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect())
+}
+
+/// [`bm25`] with each chunk's `exact_bm25` score: negative, lower is better.
+pub(super) fn bm25_scored(
+    conn: &Connection,
+    query: &str,
+    filter: &ChunkFilter,
+    limit: u32,
+) -> Result<Vec<(ChunkId, f64)>, Error> {
     let p = filter.params();
     let mut stmt = conn.prepare(concat!(
         include_str!("bm25_head.sql"),
@@ -162,7 +175,7 @@ pub(super) fn bm25(
                 ":paths": p.paths, ":extensions": p.extensions, ":kinds": p.kinds,
                 ":symbol": p.symbol,
             },
-            |row| row.get(0).map(ChunkId),
+            |row| Ok((ChunkId(row.get(0)?), row.get(1)?)),
         )?
         .collect::<Result<_, _>>()?;
     Ok(ids)

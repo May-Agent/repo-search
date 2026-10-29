@@ -24,6 +24,8 @@ mod books;
 mod scan;
 
 pub use books::Books;
+#[cfg(test)]
+pub(crate) use scan::chunk_with;
 
 use std::collections::{HashMap, HashSet};
 use std::ops::RangeInclusive;
