@@ -670,7 +670,8 @@ async fn stage_2_runs_at_background_qos() {
     );
 
     // Stage 2: a new long chunk is embedded by the ANE, the one record this
-    // test waits for, at background QoS.
+    // test waits for, at background QoS. The index request does not wait:
+    // an attached `index --wait` would lift the chunk to stage-1 urgency.
     repo::append(
         &repo.root,
         "src/s0.rs",
@@ -681,12 +682,14 @@ async fn stage_2_runs_at_background_qos() {
         &hello(),
         Request::Index {
             worktree: repo.root.clone(),
-            wait: true,
+            wait: false,
         },
     )
     .await;
     assert!(matches!(final_of(&events), Final::Indexed { .. }));
-    log.extend(d.records.try_iter());
+    wait_for(&mut log, &d.records, |r| {
+        r.instance == Instance::Ane && r.kind == Kind::Index && r.tokens > 256
+    });
     let long = log
         .iter()
         .find(|r| r.instance == Instance::Ane && r.kind == Kind::Index && r.tokens > 256)
@@ -2008,10 +2011,11 @@ async fn a_new_worktree_seeds_its_index_from_a_sibling() {
         "the seeded barrier re-chunks only the two edited files: {output}"
     );
 
-    // The stored phase is kept: `Maintained` at once — the seeded chunks
-    // are all in the shared vector cache, so nothing embeds at all. The
-    // armed gate keeps a from-scratch index first-index, so `Maintained`
-    // here can only come from the seed.
+    // The seeded index starts first-index, but its chunks are all in the
+    // shared vector cache: the seeded barrier's stage-1 interest is
+    // empty, nothing embeds, and the phase flips to `Maintained` at once.
+    // The armed gate keeps a from-scratch index first-index, so
+    // `Maintained` here can only come from the seed.
     let events = request(
         &d.socket,
         &hello(),
@@ -2026,7 +2030,10 @@ async fn a_new_worktree_seeds_its_index_from_a_sibling() {
     };
     let index = status.index.as_ref().expect("the worktree is indexed");
     assert_eq!(index.phase, WirePhase::Maintained);
-    assert_eq!(index.queued_stage1, 0, "no stage-1 work on a kept phase");
+    assert_eq!(
+        index.queued_stage1, 0,
+        "the empty stage-1 pass queued nothing"
+    );
     assert_eq!(
         (index.chunks_with_vector, index.chunks_total),
         (23, 23),
@@ -2096,6 +2103,74 @@ async fn a_new_worktree_seeds_its_index_from_a_sibling() {
     index_request(&d, &linked, true).await;
 }
 
+/// A seeded index starts first-index: the files a seeded worktree
+/// differs from its sibling in embed at stage-1 urgency — a kept
+/// `Maintained` phase would run them at background QoS, which a loaded
+/// host can starve — and the worktree turns `Maintained` once they are
+/// done.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_seeded_index_embeds_its_differences_as_stage_1() {
+    let repo = fn_repo(10, SMALL_BYTES, 5);
+    let (d, _, _) = start(&repo, Duration::ZERO, Duration::ZERO, &[]).await;
+    let linked = repo::add_worktree(&repo, "linked", "linked");
+    index_request(&d, &repo.root, true).await;
+
+    // Edits only in `linked`: chunks the sibling's cache lacks.
+    for (path, name) in [("src/f0.rs", "seed_edit_0"), ("src/f1.rs", "seed_edit_1")] {
+        repo::append(&linked, path, &repo::rust_fn(name, SMALL_BYTES));
+    }
+
+    // `linked`'s first request seeds from `repo.root`; the wait's own
+    // barrier wants exactly the two new chunks.
+    index_request(&d, &linked, true).await;
+    let seeded = visible_hashes(&d.state, &repo.root).await;
+    let added: HashSet<ContentHash> = visible_hashes(&d.state, &linked)
+        .await
+        .difference(&seeded)
+        .copied()
+        .collect();
+    assert_eq!(
+        added.len(),
+        2,
+        "only the two appended chunks are new: {added:?}"
+    );
+    let log: Vec<Record> = d.records.try_iter().collect();
+    for hash in &added {
+        let embeds: Vec<QosClass> = log
+            .iter()
+            .filter(|r| r.kind == Kind::Index && r.hash == Some(*hash))
+            .map(|r| r.qos)
+            .collect();
+        assert_eq!(
+            embeds,
+            vec![QosClass::UserInitiated],
+            "the chunk embedded once, at stage-1 urgency"
+        );
+    }
+
+    // Stage 1 done: the seeded worktree is `Maintained`.
+    let events = request(
+        &d.socket,
+        &hello(),
+        Request::Status {
+            worktree: linked.clone(),
+        },
+    )
+    .await;
+    let status = match final_of(&events) {
+        Final::Status(status) => status,
+        other => panic!("expected a Status, got {other:?}"),
+    };
+    assert_eq!(
+        status
+            .index
+            .as_ref()
+            .expect("the worktree is indexed")
+            .phase,
+        WirePhase::Maintained
+    );
+}
+
 /// A sibling index stored under another chunker fingerprint is no seed:
 /// the new worktree builds its index from scratch.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2120,8 +2195,8 @@ async fn a_sibling_index_with_another_chunker_is_not_seeded() {
     drop(sibling);
 
     // No copy: the fresh index is first-index with an embed held at the
-    // gate. A copy would have kept the sibling's `Maintained` through the
-    // realign.
+    // gate — the realigned sibling's `meta` names another chunker, so the
+    // seed check passes it over.
     gate.arm();
     index_request(&d, &linked, false).await;
     let mut log = Vec::new();

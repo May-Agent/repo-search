@@ -12,8 +12,11 @@
 //! queries and a search's `Documents` job preempt indexing at `u=0`.
 //! HTTP/1.1 cannot change a request's priority, so a `Background`→`Stage1`
 //! class flip of an in-flight item aborts its request and requeues it;
-//! the reverse is left alone — at most 32 items finish slightly early. A
-//! `Documents` job embeds every chunk it needs in one `u=0` request,
+//! the reverse is left alone — at most 32 items finish slightly early.
+//! While an `index --wait` client is attached to a worktree — it holds a
+//! counts watch — every `Background` item that worktree wants is classed
+//! `Stage1` the same way; the last detach drops the remaining ones back.
+//! A `Documents` job embeds every chunk it needs in one `u=0` request,
 //! holding each away from indexing first — a chunk already in flight has
 //! its request aborted, since the daemon cannot tell whether the server
 //! is running it or it is still queued. Finished vectors go to the
@@ -470,7 +473,7 @@ struct Item {
     chunk: PendingChunk,
     tokens: u32,
     /// Derived: `Stage1` while any interested worktree is still in
-    /// stage 1.
+    /// stage 1 or has an `index --wait` attached.
     class: IndexClass,
     queue: Queue,
     worktrees: Vec<WorktreeId>,
@@ -639,7 +642,8 @@ struct Scheduler<E: Embeddings, Q: QueryInput> {
     barriers: HashMap<RepoId, OpenBarriers>,
     /// `index --wait` watches, pushing each worktree's counts on change —
     /// one sender per waiting task, since waits no longer serialize on
-    /// the owner.
+    /// the owner. A worktree with an entry here is waited on: its
+    /// `Background` items class `Stage1` until the last sender goes.
     watchers: HashMap<WorktreeId, Vec<watch::Sender<Counts>>>,
     /// Query jobs whose request tasks have not reported yet.
     queries_in_flight: u64,
@@ -758,8 +762,13 @@ impl<E: Embeddings, Q: QueryInput> Scheduler<E, Q> {
                 }
             }
             SchedulerMsg::WatchCounts { worktree, reply } => {
+                // An `index --wait` attaches: once its watch marks the
+                // worktree waited, its items' classes are re-derived, so
+                // its background work lifts to stage-1 urgency while it
+                // waits.
                 let (watch, rx) = watch::channel(self.counts_for(worktree));
                 self.watchers.entry(worktree).or_default().push(watch);
+                self.refresh_interest(worktree);
                 let _ = reply.send(rx);
             }
             SchedulerMsg::Stop => {
@@ -994,10 +1003,7 @@ impl<E: Embeddings, Q: QueryInput> Scheduler<E, Q> {
         for item in items {
             self.add_interest(worktree, repo, class, item);
         }
-        let interest: Vec<ItemId> = self.worktrees[&worktree].interest.iter().copied().collect();
-        for item in interest {
-            self.refresh_class(item);
-        }
+        self.refresh_interest(worktree);
         self.recompute_stage1_left(worktree);
     }
 
@@ -1053,11 +1059,7 @@ impl<E: Embeddings, Q: QueryInput> Scheduler<E, Q> {
         // activity flipped: a late `Stage1` `Change` after completion, or
         // the `Background` `Change` after `Stage1Done`.
         if flipped {
-            let interest: Vec<ItemId> =
-                self.worktrees[&worktree].interest.iter().copied().collect();
-            for item in interest {
-                self.refresh_class(item);
-            }
+            self.refresh_interest(worktree);
             self.recompute_stage1_left(worktree);
         }
     }
@@ -1191,16 +1193,18 @@ impl<E: Embeddings, Q: QueryInput> Scheduler<E, Q> {
 
     /// Re-derives an item's class from its worktrees, moves it between
     /// the queues on a change, and keeps the `stage1_left` counts right.
-    /// A `Background`→`Stage1` flip of an in-flight item aborts its
-    /// request — HTTP/1.1 cannot re-prioritize one — and requeues it so
-    /// `fill` sends it at stage-1 urgency. The reverse flip leaves the
-    /// flight alone: it finishes slightly early, which is harmless.
+    /// An item is `Stage1` while any worktree wanting it is stage-1
+    /// active or has an `index --wait` attached. A `Background`→`Stage1`
+    /// flip of an in-flight item aborts its request — HTTP/1.1 cannot
+    /// re-prioritize one — and requeues it so `fill` sends it at stage-1
+    /// urgency. The reverse flip leaves the flight alone: it finishes
+    /// slightly early, which is harmless.
     fn refresh_class(&mut self, item: ItemId) {
         let entry = &self.items[&item];
         let class = if entry
             .worktrees
             .iter()
-            .any(|w| self.worktrees[w].stage1_active())
+            .any(|w| self.worktrees[w].stage1_active() || self.waited(*w))
         {
             IndexClass::Stage1
         } else {
@@ -1612,6 +1616,26 @@ impl<E: Embeddings, Q: QueryInput> Scheduler<E, Q> {
         }
     }
 
+    /// Whether an `index --wait` is attached to `worktree`: a counts
+    /// watch is held for it. A waiter's worktree runs its background work
+    /// at stage-1 urgency.
+    fn waited(&self, worktree: WorktreeId) -> bool {
+        self.watchers.contains_key(&worktree)
+    }
+
+    /// Re-derives the class of every item `worktree` wants: a stage-1
+    /// activation, a stage-1 completion, a waiter's attach or its last
+    /// detach. A no-op for a worktree the scheduler does not know.
+    fn refresh_interest(&mut self, worktree: WorktreeId) {
+        let Some(state) = self.worktrees.get(&worktree) else {
+            return;
+        };
+        let interest: Vec<ItemId> = state.interest.iter().copied().collect();
+        for item in interest {
+            self.refresh_class(item);
+        }
+    }
+
     /// Runs stage-1 completion for `worktree` when its stage-1 items are
     /// all embedded.
     fn maybe_complete_stage1(&mut self, worktree: WorktreeId) {
@@ -1633,10 +1657,7 @@ impl<E: Embeddings, Q: QueryInput> Scheduler<E, Q> {
             .get_mut(&worktree)
             .expect("the worktree exists");
         state.stage1_done = true;
-        let interest: Vec<ItemId> = state.interest.iter().copied().collect();
-        for item in interest {
-            self.refresh_class(item);
-        }
+        self.refresh_interest(worktree);
         let state = &self.worktrees[&worktree];
         let writer = self.writers[&state.repo].clone();
         let stage1_done = state.stage1_done_tx.clone();
@@ -1691,9 +1712,12 @@ impl<E: Embeddings, Q: QueryInput> Scheduler<E, Q> {
     }
 
     /// Pushes each watched worktree's counts when they changed, dropping
-    /// senders whose `index --wait` went away.
+    /// senders whose `index --wait` went away. A worktree whose last
+    /// sender went has no waiter left: its remaining items go back to
+    /// background.
     fn push_counts(&mut self) {
         let mut watchers = std::mem::take(&mut self.watchers);
+        let mut detached = Vec::new();
         watchers.retain(|worktree, watches| {
             let counts = self.counts_for(*worktree);
             watches.retain(|watch| {
@@ -1707,9 +1731,15 @@ impl<E: Embeddings, Q: QueryInput> Scheduler<E, Q> {
                 });
                 !watch.is_closed()
             });
+            if watches.is_empty() {
+                detached.push(*worktree);
+            }
             !watches.is_empty()
         });
         self.watchers = watchers;
+        for worktree in detached {
+            self.refresh_interest(worktree);
+        }
     }
 
     /// Queued or in-flight work of any kind keeps the daemon busy: query

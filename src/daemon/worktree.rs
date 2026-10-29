@@ -361,13 +361,15 @@ impl<T: Tokens> Owner<T> {
 
     /// When `index.db` does not exist, copies a sibling worktree's index
     /// that this build's schema, chunker and model recorded — `Maintained`
-    /// preferred — into the worktree's state dir, keeping the stored phase.
-    /// Index rows are worktree-relative and `meta` holds no path, so a
-    /// sibling's index is valid as it is: the first barrier restamps every
-    /// file whose bytes are unchanged and re-chunks the rest. No matching
-    /// sibling means a fresh index, as before. Runs once per owner: a failed
-    /// copy fails this request, leaves no `index.db`, and the next request
-    /// builds from scratch.
+    /// preferred — into the worktree's state dir, the copy stamped
+    /// `FirstIndex` whatever the sibling's phase was: the files the
+    /// worktree differs in embed as stage-1 work and the phase flips to
+    /// `Maintained` once they are done. Index rows are worktree-relative
+    /// and `meta` holds no path, so a sibling's index is valid as it is:
+    /// the first barrier restamps every file whose bytes are unchanged
+    /// and re-chunks the rest. No matching sibling means a fresh index,
+    /// as before. Runs once per owner: a failed copy fails this request,
+    /// leaves no `index.db`, and the next request builds from scratch.
     async fn seed_index(&mut self) -> Result<(), String> {
         if self.seed_tried {
             return Ok(());
@@ -1282,9 +1284,10 @@ impl Seed {
     /// serializes the read behind its commit under the busy timeout — and
     /// takes one matching this build's chunker and model, `Maintained`
     /// preferred. That index is `VACUUM INTO`'d to a temporary file beside
-    /// `dest` and linked to `dest`; a `dest` that appeared while the copy ran
-    /// is left to its opener. A listed worktree whose directory is gone is
-    /// no sibling; every other error fails the seed.
+    /// `dest`, stamped `FirstIndex` and linked to `dest`; a `dest` that
+    /// appeared while the copy ran is left to its opener. A listed
+    /// worktree whose directory is gone is no sibling; every other error
+    /// fails the seed.
     fn copy(&self, listed: &[PathBuf]) -> Result<(), String> {
         let mut source: Option<PathBuf> = None;
         for listed in listed {
@@ -1324,6 +1327,13 @@ impl Seed {
         remove_if_present(&tmp)?;
         let seeded = store::vacuum_into(&source, &tmp)
             .map_err(|e| format!("copying {}: {e}", source.display()))
+            .and_then(|()| {
+                // The copy starts first-index: its differing files embed
+                // as stage-1 work and the worktree turns `Maintained`
+                // once they are done.
+                store::set_stored_phase(&tmp, Phase::FirstIndex)
+                    .map_err(|e| format!("{}: {e}", tmp.display()))
+            })
             .and_then(|()| match fs::hard_link(&tmp, &self.dest) {
                 Ok(()) => Ok(()),
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(()),

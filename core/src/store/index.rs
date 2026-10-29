@@ -187,6 +187,19 @@ pub fn vacuum_into(src: &Path, dst: &Path) -> Result<(), Error> {
     Ok(())
 }
 
+/// Stores `phase` in the `meta` row of the index at `path` on its own
+/// write connection: the seeding path stamps a copy `FirstIndex` before
+/// the worktree's `Index` opens it.
+///
+/// # Errors
+///
+/// [`Error::NotAligned`] when the index has recorded no identity; or when
+/// `path` cannot be opened or SQLite rejects the write.
+pub fn set_stored_phase(path: &Path, phase: Phase) -> Result<(), Error> {
+    let conn = open_conn(path)?;
+    set_phase(&conn, phase)
+}
+
 /// How far the index has come: whether indexing has ever caught up with the
 /// worktree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
