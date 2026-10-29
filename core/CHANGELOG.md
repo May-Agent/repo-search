@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.4](https://github.com/May-Agent/repo-search/compare/core/v0.0.3...core/v0.0.4) - 2026-10-29
+
+### Added
+
+- document collections indexed for caller-supplied documents
+
 ## [0.0.3](https://github.com/May-Agent/repo-search/compare/core/v0.0.2...core/v0.0.3) - 2026-10-29
 
 ### Added
