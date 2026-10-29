@@ -1762,7 +1762,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "repo-search"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "askama",
  "bytes",
@@ -1777,6 +1777,7 @@ dependencies = [
  "kqueue",
  "libc",
  "notify",
+ "repo-search-client",
  "repo-search-core",
  "repo-search-coreml",
  "repo-search-server",
@@ -1798,8 +1799,21 @@ dependencies = [
 ]
 
 [[package]]
-name = "repo-search-core"
+name = "repo-search-client"
 version = "0.0.3"
+dependencies = [
+ "futures-util",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
+name = "repo-search-core"
+version = "0.0.4"
 dependencies = [
  "askama",
  "base64 0.23.1",
@@ -1838,7 +1852,7 @@ dependencies = [
 
 [[package]]
 name = "repo-search-coreml"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "block2",
  "numkong",
@@ -1856,7 +1870,7 @@ dependencies = [
 
 [[package]]
 name = "repo-search-server"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "constant_time_eq",
  "http-body-util",

@@ -344,7 +344,7 @@ type Started = (
     repo_search::model_store::TokenizerStore,
     repo_search::daemon::server::Endpoint,
     repo_search_core::StateDir,
-    repo_search::protocol::BuildId,
+    repo_search_client::protocol::BuildId,
 );
 
 /// The reportable startup checks, in order. On failure the std listeners
@@ -402,13 +402,13 @@ fn checks(
         repo_search::model_store::TokenizerStore,
         repo_search::daemon::server::Endpoint,
         repo_search_core::StateDir,
-        repo_search::protocol::BuildId,
+        repo_search_client::protocol::BuildId,
     ),
     repo_search::daemon::StartupError,
 > {
     use repo_search::daemon::StartupError;
     use repo_search::model_store::TokenizerStore;
-    use repo_search::protocol::BuildId;
+    use repo_search_client::protocol::BuildId;
     use repo_search_core::StateDir;
 
     let build = BuildId::of_current_exe().map_err(StartupError::Build)?;
@@ -533,7 +533,7 @@ fn server_main(
 ) -> ExitCode {
     use repo_search::launchd;
     use repo_search::model_store::{ModelSpec, ModelStore};
-    use repo_search::protocol::BuildId;
+    use repo_search_client::protocol::BuildId;
 
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)

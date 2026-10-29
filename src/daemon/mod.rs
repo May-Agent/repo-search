@@ -1,6 +1,7 @@
 //! The `search` daemon: the embedding pipeline and, behind it, the model
 //! loader, the worktree registry and the socket server.
 
+pub mod collection;
 pub mod counter;
 pub mod coverage;
 pub mod feed;
@@ -27,10 +28,11 @@ use tokio::net::UnixStream;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::codec::LinesCodecError;
 
-use crate::protocol::{
+use repo_search_client::protocol::{
     self, BuildId, ErrorKind, ErrorReport, Event, Final, Hello, PROTOCOL, Progress, Request, framed,
 };
 
+use collection::CollectionMsg;
 use counter::Tokens;
 use link::{EmbeddingState, LoaderMsg};
 use registry::{GetError, RegistryHandle};
@@ -548,7 +550,7 @@ async fn serve<T: Tokens>(
             let worktree = match &request {
                 Request::Search(search) => &search.worktree,
                 Request::Index { worktree, .. } => worktree,
-                Request::Status { .. } => unreachable!(),
+                _ => unreachable!("matched above"),
             };
             match get_owner(registry, framed, worktree.clone(), stopping).await {
                 Some(handle) => match request {
@@ -568,8 +570,58 @@ async fn serve<T: Tokens>(
                             })
                             .await
                     }
-                    Request::Status { .. } => unreachable!(),
+                    _ => unreachable!("matched above"),
                 },
+                None => return ConnMsg::Closed,
+            }
+        }
+        Request::UpsertDocuments { .. }
+        | Request::DeleteDocuments { .. }
+        | Request::SearchCollection(_) => {
+            match await_model(framed, model, loader, stopping).await {
+                ModelWait::Ready => {}
+                ModelWait::Stop => return ConnMsg::Closed,
+                ModelWait::Failed => return ConnMsg::Closed,
+            }
+            let creates = matches!(request, Request::UpsertDocuments { .. });
+            let (name, msg) = match request {
+                Request::UpsertDocuments {
+                    collection,
+                    documents,
+                } => (
+                    collection,
+                    CollectionMsg::Upsert {
+                        documents,
+                        events: events_tx,
+                    },
+                ),
+                Request::DeleteDocuments { collection, ids } => (
+                    collection,
+                    CollectionMsg::Delete {
+                        ids,
+                        events: events_tx,
+                    },
+                ),
+                Request::SearchCollection(request) => (
+                    request.collection.clone(),
+                    CollectionMsg::Search {
+                        request,
+                        events: events_tx,
+                    },
+                ),
+                _ => unreachable!("matched above"),
+            };
+            if name.is_empty() {
+                send_final(
+                    framed,
+                    ErrorKind::BadRequest,
+                    "a collection name is empty".into(),
+                )
+                .await;
+                return ConnMsg::Closed;
+            }
+            match get_collection(registry, framed, name, creates, stopping).await {
+                Some(handle) => handle.dispatch(msg).await,
                 None => return ConnMsg::Closed,
             }
         }
@@ -806,6 +858,38 @@ async fn resolve_worktree(worktree: &Path) -> Result<registry::ResolvedWorktree,
     })
 }
 
+async fn get_collection(
+    registry: &RegistryHandle,
+    framed: &mut protocol::Connection,
+    name: String,
+    create: bool,
+    stopping: &tokio::sync::watch::Receiver<bool>,
+) -> Option<registry::CollectionHandle> {
+    let mut stopping = stopping.clone();
+    tokio::select! {
+        owner = registry.collection(name, create) => match owner {
+            Some(Ok(handle)) => Some(handle),
+            Some(Err(error @ GetError::NoSuchCollection(_))) => {
+                send_final(framed, ErrorKind::NoSuchCollection, error.to_string()).await;
+                None
+            }
+            Some(Err(GetError::Internal(message))) => {
+                send_final(framed, ErrorKind::Internal, message).await;
+                None
+            }
+            Some(Err(GetError::NotAWorktree(_))) => unreachable!("a collection is no worktree"),
+            None => {
+                send_final(framed, ErrorKind::ShuttingDown, "the daemon is shutting down".into()).await;
+                None
+            }
+        },
+        _ = stopping.changed() => {
+            send_final(framed, ErrorKind::ShuttingDown, "the daemon is shutting down".into()).await;
+            None
+        }
+    }
+}
+
 async fn get_owner(
     registry: &RegistryHandle,
     framed: &mut protocol::Connection,
@@ -827,6 +911,7 @@ async fn get_owner(
             send_final(framed, ErrorKind::Internal, message).await;
             return None;
         }
+        Err(GetError::NoSuchCollection(_)) => unreachable!("a worktree is no collection"),
     };
     let mut stopping = stopping.clone();
     tokio::select! {
@@ -836,6 +921,7 @@ async fn get_owner(
                 send_final(framed, ErrorKind::NotAWorktree, format!("{} is not a worktree root", worktree.display())).await;
                 None
             }
+            Some(Err(GetError::NoSuchCollection(_))) => unreachable!("a worktree is no collection"),
             Some(Err(GetError::Internal(message))) => {
                 send_final(framed, ErrorKind::Internal, message).await;
                 None

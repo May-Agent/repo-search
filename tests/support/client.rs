@@ -7,8 +7,8 @@ use std::path::Path;
 use std::time::Duration;
 
 use futures_util::StreamExt;
-use repo_search::client::{Client, Responses};
-use repo_search::protocol::{
+use repo_search_client::client::{Client, Responses};
+use repo_search_client::protocol::{
     BuildId, Event, Final, Format, Hello, Request, SearchRequest, WireMode,
 };
 

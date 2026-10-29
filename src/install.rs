@@ -25,7 +25,7 @@ use crate::paths::{
     lock_path, log_path, plist_path, server_config_path, server_log_path, server_socket_path,
     socket_path,
 };
-use crate::protocol::BuildId;
+use repo_search_client::protocol::BuildId;
 
 /// One of the two LaunchAgents the client keeps current: the search
 /// daemon or the embedding server.

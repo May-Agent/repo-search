@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use tokio::net::{UnixListener, UnixStream};
 
 use super::StartupError;
-use crate::protocol::ErrorKind;
+use repo_search_client::protocol::ErrorKind;
 
 /// The socket `run` accepts on, however it got here.
 pub trait Listener: Send + Sync + 'static {

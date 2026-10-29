@@ -10,9 +10,9 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use repo_search::client::Responses;
 use repo_search::model_store::{ModelSpec, ModelStore, TokenizerSpec, TokenizerStore};
-use repo_search::protocol::{Event, Final, Hello, Progress, Request, WirePhase};
+use repo_search_client::client::Responses;
+use repo_search_client::protocol::{Event, Final, Hello, Progress, Request, WirePhase};
 use repo_search_core::StateDir;
 use repo_search_core::store::{Index, VectorCache};
 

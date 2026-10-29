@@ -23,7 +23,7 @@ use std::time::Duration;
 use repo_search::daemon::server::Endpoint;
 use repo_search::daemon::{self, Config};
 use repo_search::model_store::{ModelSpec, ModelStore};
-use repo_search::protocol::{Final, Request};
+use repo_search_client::protocol::{Final, Request};
 use repo_search_core::StateDir;
 use repo_search_server::chip::ChipClass;
 use repo_search_server::coreml::CoreMlBackend;

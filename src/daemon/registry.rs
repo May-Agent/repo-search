@@ -17,6 +17,7 @@ use repo_search_core::StateDir;
 use repo_search_core::store::VectorCache;
 use tokio::sync::{mpsc, oneshot, watch};
 
+use super::collection::{self, CollectionConfig, CollectionMsg};
 use super::counter::Tokens;
 use super::link::EmbeddingState;
 use super::scheduler::{RepoId, WorktreeId};
@@ -31,8 +32,20 @@ use super::{BusySource, Error};
 struct RepoShared {
     /// The scheduler's repository id.
     id: RepoId,
+    /// Where the cache lives.
+    home: CacheHome,
     /// The opened half, once any request needed it.
     open: Option<RepoOpen>,
+}
+
+/// Whose vector cache a [`RepoShared`] holds: a git repository's, shared
+/// by its worktrees, or a document collection's own.
+enum CacheHome {
+    /// The cache of the repository whose common dir is the entry's key.
+    Repository,
+    /// The cache of the named collection; the entry's key is the
+    /// collection's directory.
+    Collection(String),
 }
 
 struct RepoOpen {
@@ -103,6 +116,16 @@ pub enum RegistryMsg {
         /// The repo's shared handles, or why they cannot open.
         reply: oneshot::Sender<Result<RepoHandle, GetError>>,
     },
+    /// Resolve the collection `name` to its owner; with `create`, a
+    /// collection never written is created on first sight.
+    Collection {
+        /// The collection's name.
+        name: String,
+        /// Whether a missing collection is created; a read leaves it unset.
+        create: bool,
+        /// The owner's inbox, or why there is none.
+        reply: oneshot::Sender<Result<CollectionHandle, GetError>>,
+    },
     /// An owner exited because its root is gone; forget the entry if it is
     /// still this owner's.
     Forget {
@@ -133,6 +156,9 @@ pub enum GetError {
     /// `git`, the vector cache or the busy tracker failed.
     #[error("{0}")]
     Internal(String),
+    /// A read named a collection nothing was ever written to.
+    #[error("the collection {0:?} does not exist")]
+    NoSuchCollection(String),
 }
 
 /// A resolved owner's inbox; consumed by `dispatch` so the sender's close
@@ -149,6 +175,23 @@ impl OwnerHandle {
     ///
     /// When the owner is gone.
     pub async fn dispatch(self, msg: OwnerMsg) -> Result<(), OwnerGone> {
+        self.tx.send(msg).await.map_err(|_| OwnerGone)
+    }
+}
+
+/// A resolved collection owner's inbox; consumed by `dispatch` like
+/// [`OwnerHandle`].
+pub struct CollectionHandle {
+    tx: mpsc::Sender<CollectionMsg>,
+}
+
+impl CollectionHandle {
+    /// Hand `msg` to the owner.
+    ///
+    /// # Errors
+    ///
+    /// When the owner is gone.
+    pub async fn dispatch(self, msg: CollectionMsg) -> Result<(), OwnerGone> {
         self.tx.send(msg).await.map_err(|_| OwnerGone)
     }
 }
@@ -177,6 +220,32 @@ impl RegistryHandle {
         self.tx
             .send(RegistryMsg::Get {
                 resolved: Box::new(resolved),
+                reply,
+            })
+            .await
+            .ok()?;
+        rx.await.ok()
+    }
+
+    /// The owner of the collection `name`; with `create`, a collection
+    /// never written is created, otherwise it is an error and nothing is
+    /// created on disk or in the registry.
+    ///
+    /// # Errors
+    ///
+    /// [`GetError::NoSuchCollection`] when `create` is unset and the
+    /// collection does not exist, [`GetError::Internal`] when its directory
+    /// cannot be inspected or created. `None` when the registry is gone.
+    pub async fn collection(
+        &self,
+        name: String,
+        create: bool,
+    ) -> Option<Result<CollectionHandle, GetError>> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(RegistryMsg::Collection {
+                name,
+                create,
                 reply,
             })
             .await
@@ -252,6 +321,7 @@ pub fn spawn<T: Tokens>(config: RegistryConfig<T>) -> RegistryHandle {
     tokio::spawn(
         Registry {
             owners: HashMap::new(),
+            collections: HashMap::new(),
             repos: HashMap::new(),
             next_worktree: 0,
             next_repo: 0,
@@ -267,7 +337,10 @@ pub fn spawn<T: Tokens>(config: RegistryConfig<T>) -> RegistryHandle {
 struct Registry<T: Tokens> {
     /// Owner entries by canonical worktree root.
     owners: HashMap<PathBuf, OwnerEntry>,
-    /// Shared repository state by canonical git common dir.
+    /// Collection owners' inboxes by name.
+    collections: HashMap<String, mpsc::Sender<CollectionMsg>>,
+    /// Shared repository state by canonical git common dir, and each
+    /// collection's by its directory.
     repos: HashMap<PathBuf, RepoShared>,
     next_worktree: u64,
     next_repo: u64,
@@ -285,6 +358,13 @@ impl<T: Tokens> Registry<T> {
                 RegistryMsg::Get { resolved, reply } => {
                     let _ = reply.send(self.get(*resolved).await);
                 }
+                RegistryMsg::Collection {
+                    name,
+                    create,
+                    reply,
+                } => {
+                    let _ = reply.send(self.collection(name, create).await);
+                }
                 RegistryMsg::Shared { common_dir, reply } => {
                     let _ = reply.send(self.shared(&common_dir).await);
                 }
@@ -298,6 +378,7 @@ impl<T: Tokens> Registry<T> {
                 }
                 RegistryMsg::Shutdown { reply } => {
                     self.owners.clear();
+                    self.collections.clear();
                     let tasks = std::mem::take(&mut self.repos)
                         .into_values()
                         .filter_map(|shared| shared.open.map(|open| open.task))
@@ -316,8 +397,14 @@ impl<T: Tokens> Registry<T> {
         if !self.repos.contains_key(&w.common_dir) {
             let id = RepoId(self.next_repo);
             self.next_repo += 1;
-            self.repos
-                .insert(w.common_dir.clone(), RepoShared { id, open: None });
+            self.repos.insert(
+                w.common_dir.clone(),
+                RepoShared {
+                    id,
+                    home: CacheHome::Repository,
+                    open: None,
+                },
+            );
         }
         let same = self.owners.get(&w.toplevel).is_some_and(|entry| {
             entry.common_dir == w.common_dir
@@ -360,14 +447,71 @@ impl<T: Tokens> Registry<T> {
         Ok(OwnerHandle { tx })
     }
 
+    async fn collection(
+        &mut self,
+        name: String,
+        create: bool,
+    ) -> Result<CollectionHandle, GetError> {
+        if let Some(tx) = self.collections.get(&name) {
+            return Ok(CollectionHandle { tx: tx.clone() });
+        }
+        let state = &self.config.state;
+        let docs = state.collection_docs(&name);
+        if create {
+            tokio::fs::create_dir_all(&docs)
+                .await
+                .map_err(|e| GetError::Internal(format!("{}: {e}", docs.display())))?;
+        } else {
+            match tokio::fs::metadata(&docs).await {
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(GetError::NoSuchCollection(name));
+                }
+                Err(e) => return Err(GetError::Internal(format!("{}: {e}", docs.display()))),
+            }
+        }
+        let key = state.collection(&name);
+        let repo = RepoId(self.next_repo);
+        self.next_repo += 1;
+        self.repos.insert(
+            key.clone(),
+            RepoShared {
+                id: repo,
+                home: CacheHome::Collection(name.clone()),
+                open: None,
+            },
+        );
+        let worktree = WorktreeId(self.next_worktree);
+        self.next_worktree += 1;
+        let tx = collection::spawn(CollectionConfig {
+            state: state.clone(),
+            name: name.clone(),
+            key,
+            id: worktree,
+            repo,
+            model_id: self.config.model_id.clone(),
+            model: self.config.model.clone(),
+            registry: self.handle.clone(),
+            stopping: self.config.stopping.clone(),
+        });
+        self.collections.insert(name, tx.clone());
+        Ok(CollectionHandle { tx })
+    }
+
     async fn shared(&mut self, common_dir: &Path) -> Result<RepoHandle, GetError> {
         let shared = self.repos.get_mut(common_dir).ok_or_else(|| {
             GetError::Internal(format!("unknown repository {}", common_dir.display()))
         })?;
         if shared.open.is_none() {
-            let cache = VectorCache::open(&self.config.state, common_dir)
-                .await
-                .map_err(|e| GetError::Internal(e.to_string()))?;
+            let state = &self.config.state;
+            let cache = match &shared.home {
+                CacheHome::Repository => VectorCache::open(state, common_dir).await,
+                CacheHome::Collection(name) => {
+                    VectorCache::open_at(&state.collection_docs(name), state.collection_cache(name))
+                        .await
+                }
+            }
+            .map_err(|e| GetError::Internal(e.to_string()))?;
             let (busy_tx, busy_rx) = watch::channel(false);
             self.config
                 .busy

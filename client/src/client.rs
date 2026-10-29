@@ -17,7 +17,10 @@ use thiserror::Error;
 use tokio::net::UnixStream;
 use tokio_util::codec::LinesCodecError;
 
-use crate::protocol::{self, Connection, ErrorKind, ErrorReport, Event, Final, Hello, Request};
+use crate::protocol::{
+    self, Answer, CollectionReport, CollectionSearch, Connection, Document, ErrorKind, ErrorReport,
+    Event, Final, Hello, Request,
+};
 
 /// One wire message as a frame line: compact JSON, always serializable.
 fn line(value: &impl Serialize) -> String {
@@ -92,10 +95,86 @@ impl Client {
     }
 }
 
+impl Client {
+    /// Put `documents` into the collection `collection`, replacing those
+    /// with the same id. The reply comes once the collection's index and
+    /// vectors reflect the write; a document whose content is unchanged
+    /// is neither re-chunked nor re-embedded.
+    pub async fn upsert_documents(
+        self,
+        collection: impl Into<String>,
+        documents: Vec<Document>,
+    ) -> Result<CollectionReport, ClientError> {
+        self.write(Request::UpsertDocuments {
+            collection: collection.into(),
+            documents,
+        })
+        .await
+    }
+
+    /// Remove the documents with `ids` from the collection `collection`;
+    /// ids it does not hold count as unchanged.
+    pub async fn delete_documents(
+        self,
+        collection: impl Into<String>,
+        ids: Vec<String>,
+    ) -> Result<CollectionReport, ClientError> {
+        self.write(Request::DeleteDocuments {
+            collection: collection.into(),
+            ids,
+        })
+        .await
+    }
+
+    /// Answer `search` over its collection.
+    pub async fn search_collection(self, search: CollectionSearch) -> Result<Answer, ClientError> {
+        match self
+            .request(Request::SearchCollection(search))
+            .await?
+            .finish()
+            .await?
+        {
+            Final::Answer(answer) => Ok(answer),
+            _ => Err(ClientError::Protocol(
+                "a collection search was answered with a reply other than an answer",
+            )),
+        }
+    }
+
+    async fn write(self, request: Request) -> Result<CollectionReport, ClientError> {
+        match self.request(request).await?.finish().await? {
+            Final::Collection(report) => Ok(report),
+            _ => Err(ClientError::Protocol(
+                "a document write was answered with a reply other than a collection report",
+            )),
+        }
+    }
+}
+
 /// The daemon's streamed reply; ends after the `Final` frame.
 pub struct Responses {
     framed: Connection,
     done: bool,
+}
+
+impl Responses {
+    /// Reads the reply to its closing frame, discarding progress frames.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::Refused`] when the closing frame is an error report,
+    /// or the stream's own failure.
+    pub async fn finish(mut self) -> Result<Final, ClientError> {
+        while let Some(event) = self.next().await {
+            if let Event::Final(last) = event? {
+                return match last {
+                    Final::Error(report) => Err(ClientError::Refused(report)),
+                    last => Ok(last),
+                };
+            }
+        }
+        unreachable!("the reply stream ends at its Final frame, or with an error");
+    }
 }
 
 impl Stream for Responses {

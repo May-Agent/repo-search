@@ -5,7 +5,7 @@ use repo_search_core::search::Coverage;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 use super::mb;
-use crate::protocol::Progress;
+use repo_search_client::protocol::Progress;
 
 /// The one-line text a `Progress` draws on a TTY. The texts carry no
 /// paths, so a line never wraps and `\r` always returns to its start.

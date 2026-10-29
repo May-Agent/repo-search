@@ -25,14 +25,14 @@ use futures_util::StreamExt;
 use progress::ProgressLine;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
-use crate::client::Client;
 #[cfg(target_os = "macos")]
 use crate::install::{AgentConfig, SystemLaunchctl};
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-use crate::protocol::BuildId;
-use crate::protocol::{Event, Final, Format, Hello, Request, SearchRequest};
 #[cfg(target_os = "linux")]
 use crate::spawn::OnDemand;
+use repo_search_client::client::Client;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+use repo_search_client::protocol::BuildId;
+use repo_search_client::protocol::{Event, Final, Format, Hello, Request, SearchRequest};
 
 /// The process's own environment: the working directory, the launcher
 /// that keeps the daemon reachable and the handshake to send. Production
@@ -368,6 +368,7 @@ fn reply_kind(last: &Final) -> &'static str {
         Final::Answer(_) => "answer",
         Final::Status(_) => "status",
         Final::Indexed { .. } => "indexed",
+        Final::Collection(_) => "collection",
         Final::Error(_) => "error",
     }
 }

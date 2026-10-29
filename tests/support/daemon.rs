@@ -13,7 +13,7 @@ use repo_search::daemon::counter::Tokens;
 use repo_search::daemon::server::{Embeddings, Endpoint, ServerClient};
 use repo_search::daemon::{self, Config, Error};
 use repo_search::model_store::{ModelSpec, ModelStore, Sha256Digest};
-use repo_search::protocol::BuildId;
+use repo_search_client::protocol::BuildId;
 use repo_search_core::StateDir;
 use repo_search_core::embed_api::Urgency;
 use repo_search_server::chip::ChipClass;
