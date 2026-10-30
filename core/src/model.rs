@@ -32,10 +32,23 @@ pub const TOKENIZER: Pin = Pin {
 
 /// The model build's identity, on `/v1/models` and in the vector cache:
 /// the archive's sha256, so vectors from different builds never mix.
+#[cfg(target_os = "macos")]
 pub const MODEL_ID: &str = ARCHIVE.sha256;
 
+/// The model build's identity off macOS: `onnx-` plus the sha256 of the
+/// pinned ONNX graph file the server's manifest names, so ONNX and Core
+/// ML vectors never mix. The manifest a model directory ships declares
+/// this same id.
+#[cfg(not(target_os = "macos"))]
+pub const MODEL_ID: &str = "onnx-d06edd601f851c633a2519304cbeb8dc6170d7ceb61b436625c17fb9b6e74953";
+
 /// Human-readable name of the embedded model, shown by `search --version`.
+#[cfg(target_os = "macos")]
 pub const MODEL_NAME: &str = "google/embeddinggemma-2 (Core ML conversion)";
+
+/// Human-readable name of the embedded model, shown by `search --version`.
+#[cfg(not(target_os = "macos"))]
+pub const MODEL_NAME: &str = "google/embeddinggemma-2 (ONNX conversion)";
 
 /// SPDX identifier of the model's license, shown by `search --version`.
 pub const MODEL_LICENSE: &str = "Apache-2.0";
