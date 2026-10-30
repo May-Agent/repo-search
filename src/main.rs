@@ -818,11 +818,11 @@ fn ort_server_main(
                 }
             },
         };
-        if let Some(parent) = path.parent() {
-            if let Err(error) = std::fs::create_dir_all(parent) {
-                tracing::error!(%error, "could not create {}", parent.display());
-                return ExitCode::FAILURE;
-            }
+        if let Some(parent) = path.parent()
+            && let Err(error) = std::fs::create_dir_all(parent)
+        {
+            tracing::error!(%error, "could not create {}", parent.display());
+            return ExitCode::FAILURE;
         }
         // A stale socket file from a dead server is removed; a live one is
         // left alone and the bind error is reported.
