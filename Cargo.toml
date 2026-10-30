@@ -24,7 +24,7 @@ clap = { version = "4.6.7", default-features = false, features = [
 
 [package]
 name = "repo-search"
-version = "0.0.6"
+version = "0.0.7"
 description = "Search a repository for code you can describe but cannot name"
 edition.workspace = true
 rust-version.workspace = true
@@ -132,6 +132,7 @@ precise-builds = true
 [workspace.metadata.dist.github-custom-runners]
 aarch64-apple-darwin = "macos-15"
 aarch64-unknown-linux-gnu = "ubuntu-24.04-arm"
+x86_64-unknown-linux-gnu = "ubuntu-24.04"
 
 [workspace.metadata.dist.github-action-commits]
 "actions/checkout" = "3d3c42e5aac5ba805825da76410c181273ba90b1" # v7.0.1
