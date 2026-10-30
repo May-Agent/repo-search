@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.6](https://github.com/May-Agent/repo-search/compare/v0.0.5...v0.0.6) - 2026-10-30
+
+### Added
+
+- packaged ONNX model, auto-download, and EP selection on non-macOS
+- ONNX embedding server for Linux
+
 ## [0.0.5](https://github.com/May-Agent/repo-search/compare/v0.0.4...v0.0.5) - 2026-10-29
 
 ### Added
