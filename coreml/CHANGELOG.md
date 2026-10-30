@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.5](https://github.com/May-Agent/repo-search/compare/coreml/v0.0.4...coreml/v0.0.5) - 2026-10-30
+
+### Other
+
+- updated the following local packages: repo-search-core
+
 ## [0.0.4](https://github.com/May-Agent/repo-search/compare/coreml/v0.0.3...coreml/v0.0.4) - 2026-10-29
 
 ### Other
