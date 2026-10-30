@@ -83,6 +83,17 @@ impl ModelSpec {
                 .expect("pinned archive digest is valid hex"),
         }
     }
+
+    /// The published EmbeddingGemma 2 ONNX archive the non-macOS server
+    /// loads, from [`repo_search_core::model`]'s model card.
+    #[cfg(not(target_os = "macos"))]
+    pub fn embedding_gemma_2_onnx() -> Self {
+        Self {
+            url: repo_search_core::model::ONNX_ARCHIVE.url.to_owned(),
+            sha256: Sha256Digest::from_hex(repo_search_core::model::ONNX_ARCHIVE.sha256)
+                .expect("pinned archive digest is valid hex"),
+        }
+    }
 }
 
 /// HTTP client configuration shared by production and tests: a connect
@@ -116,6 +127,13 @@ impl ModelStore {
     /// The per-user store: `models/` under the OS cache root.
     pub fn user_cache() -> Result<Self, Error> {
         Self::new(user_cache_root()?, ModelSpec::embedding_gemma_2())
+    }
+
+    /// The per-user store serving the ONNX archive the non-macOS server
+    /// loads.
+    #[cfg(not(target_os = "macos"))]
+    pub fn user_cache_onnx() -> Result<Self, Error> {
+        Self::new(user_cache_root()?, ModelSpec::embedding_gemma_2_onnx())
     }
 
     /// Directory the archive unpacks to.

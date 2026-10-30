@@ -25,8 +25,14 @@ hyper-util = { version = "0.1.21", default-features = false, features = [
 ort = { version = "=2.0.0-rc.15", default-features = false, features = [
     "download-binaries",
     "copy-dylibs",
+    "lax-feature-matching",
     "std",
     "tls-rustls",
+    "openvino",
+    "qnn",
+    "directml",
+    "xnnpack",
+    "onednn",
 ] }
 repo-search-core.workspace = true
 serde = { version = "1.0.229", default-features = false, features = ["derive"] }
