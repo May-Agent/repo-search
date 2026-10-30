@@ -545,7 +545,7 @@ fn server_main(
     build: Option<String>,
 ) -> ExitCode {
     use repo_search::launchd;
-    use repo_search::model_store::{ModelSpec, ModelStore};
+    use repo_search::model_store::ModelStore;
     use repo_search_client::protocol::BuildId;
 
     tracing_subscriber::fmt()
@@ -643,7 +643,10 @@ fn server_main(
         }
     }
     let model_store = match &model_cache {
-        Some(root) => ModelStore::new(root.clone(), ModelSpec::embedding_gemma_2()),
+        Some(root) => ModelStore::new(
+            root.clone(),
+            repo_search::model_store::ModelSpec::embedding_gemma_2(),
+        ),
         None => ModelStore::user_cache(),
     };
     let model_store = match model_store {
@@ -946,7 +949,7 @@ fn ort_server_main(
         let model_dir = match model_dir {
             Some(dir) => dir,
             None => {
-                use repo_search::model_store::{ModelSpec, ModelStore};
+                use repo_search::model_store::ModelStore;
                 let store = match model_cache {
                     Some(root) => ModelStore::new(root, onnx_spec()),
                     None => onnx_store(),
