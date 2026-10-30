@@ -94,6 +94,16 @@ impl ModelSpec {
                 .expect("pinned archive digest is valid hex"),
         }
     }
+
+    /// The fp16 variant, served on NVIDIA GPUs.
+    #[cfg(not(target_os = "macos"))]
+    pub fn embedding_gemma_2_onnx_fp16() -> Self {
+        Self {
+            url: repo_search_core::model::ONNX_FP16_ARCHIVE.url.to_owned(),
+            sha256: Sha256Digest::from_hex(repo_search_core::model::ONNX_FP16_ARCHIVE.sha256)
+                .expect("pinned archive digest is valid hex"),
+        }
+    }
 }
 
 /// HTTP client configuration shared by production and tests: a connect
@@ -134,6 +144,12 @@ impl ModelStore {
     #[cfg(not(target_os = "macos"))]
     pub fn user_cache_onnx() -> Result<Self, Error> {
         Self::new(user_cache_root()?, ModelSpec::embedding_gemma_2_onnx())
+    }
+
+    /// The per-user store serving the fp16 ONNX archive.
+    #[cfg(not(target_os = "macos"))]
+    pub fn user_cache_onnx_fp16() -> Result<Self, Error> {
+        Self::new(user_cache_root()?, ModelSpec::embedding_gemma_2_onnx_fp16())
     }
 
     /// Directory the archive unpacks to.
