@@ -41,12 +41,26 @@ fn main() -> ExitCode {
             model_cache,
             token_file,
             build,
+            ..
         } => server_main(idle_exit, model_cache, token_file, build),
         #[cfg(not(target_os = "macos"))]
-        Invocation::Server { .. } => {
-            let _ = std::io::stderr().write_all(b"search: --server runs on macOS only\n");
-            ExitCode::from(2)
-        }
+        Invocation::Server {
+            idle_exit,
+            token_file,
+            build,
+            model_cache,
+            model_dir,
+            socket,
+            addr,
+        } => ort_server_main(
+            idle_exit,
+            token_file,
+            build,
+            model_dir,
+            model_cache,
+            socket,
+            addr,
+        ),
         client => client_main(client),
     }
 }
@@ -715,6 +729,215 @@ fn server_main(
         chip,
         backend: std::sync::Arc::new(repo_search_server::coreml::CoreMlBackend),
     })) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            tracing::error!(%error, "the server stopped on a fatal error");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `search --server` off macOS: the ONNX embedding server — its own
+/// listeners (a unix socket, plus optional TCP), the `--model-dir`
+/// model and the same idle exit. The `--build` check matches the launchd
+/// agent's: a mismatched registered build refuses to run.
+#[cfg(not(target_os = "macos"))]
+fn ort_server_main(
+    idle_exit: Option<Duration>,
+    token_file: Option<PathBuf>,
+    build: Option<String>,
+    model_dir: Option<PathBuf>,
+    model_cache: Option<PathBuf>,
+    socket: Option<PathBuf>,
+    addr: Vec<std::net::SocketAddr>,
+) -> ExitCode {
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_max_level(tracing::Level::INFO)
+        .init();
+    #[cfg(unix)]
+    if let Some(expected) = &build {
+        match repo_search_client::protocol::BuildId::of_current_exe() {
+            Ok(actual) if actual.to_string() == *expected => {}
+            Ok(actual) => {
+                let _ = std::io::stderr().write_all(
+                    format!("search: --build {expected} does not match this binary {actual}\n")
+                        .as_bytes(),
+                );
+                return ExitCode::from(2);
+            }
+            Err(error) => {
+                let _ = std::io::stderr().write_all(
+                    format!("search: could not identify the running binary: {error}\n").as_bytes(),
+                );
+                return ExitCode::from(2);
+            }
+        }
+    }
+    let token = match &token_file {
+        Some(path) => match std::fs::read_to_string(path) {
+            Ok(token) => Some(token.trim_end_matches(['\n', '\r']).to_owned()),
+            Err(error) => {
+                let _ = std::io::stderr().write_all(
+                    format!(
+                        "search: could not read the token file {}: {error}\n",
+                        path.display()
+                    )
+                    .as_bytes(),
+                );
+                return ExitCode::from(2);
+            }
+        },
+        None => None,
+    };
+    // A non-loopback TCP listener without a token is open to the network.
+    if token.is_none() && addr.iter().any(|addr| !addr.ip().is_loopback()) {
+        let _ =
+            std::io::stderr().write_all(b"search: a non-loopback --addr requires --token-file\n");
+        return ExitCode::from(2);
+    }
+
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            tracing::error!(%error, "could not build the tokio runtime");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    #[cfg(unix)]
+    let unix = {
+        use std::os::unix::net::UnixListener as StdUnixListener;
+        let path = match socket {
+            Some(path) => path,
+            None => match repo_search_client::launcher::paths::server_socket_path() {
+                Ok(path) => path,
+                Err(error) => {
+                    tracing::error!(%error, "could not resolve the server socket path");
+                    return ExitCode::FAILURE;
+                }
+            },
+        };
+        if let Some(parent) = path.parent()
+            && let Err(error) = std::fs::create_dir_all(parent)
+        {
+            tracing::error!(%error, "could not create {}", parent.display());
+            return ExitCode::FAILURE;
+        }
+        // A stale socket file from a dead server is removed; a live one is
+        // left alone and the bind error is reported.
+        if path.exists() {
+            match std::os::unix::net::UnixStream::connect(&path) {
+                Ok(_) => {
+                    tracing::error!("a server already answers on {}", path.display());
+                    return ExitCode::FAILURE;
+                }
+                Err(_) => {
+                    if let Err(error) = std::fs::remove_file(&path) {
+                        tracing::error!(%error, "could not remove the stale {}", path.display());
+                        return ExitCode::FAILURE;
+                    }
+                }
+            }
+        }
+        let listener = match StdUnixListener::bind(&path) {
+            Ok(listener) => listener,
+            Err(error) => {
+                tracing::error!(%error, "could not bind {}", path.display());
+                return ExitCode::FAILURE;
+            }
+        };
+        // The socket's file permissions are the unix listener's auth.
+        use std::os::unix::fs::PermissionsExt as _;
+        if let Err(error) = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+        {
+            tracing::error!(%error, "could not permission {}", path.display());
+            return ExitCode::FAILURE;
+        }
+        listener
+    };
+
+    let mut tcp = Vec::new();
+    for addr in addr {
+        let listener = match std::net::TcpListener::bind(addr) {
+            Ok(listener) => listener,
+            Err(error) => {
+                tracing::error!(%error, %addr, "could not bind the TCP listener");
+                return ExitCode::FAILURE;
+            }
+        };
+        tcp.push(listener);
+    }
+
+    let _guard = runtime.enter();
+    #[cfg(unix)]
+    let unix = {
+        if let Err(error) = unix.set_nonblocking(true) {
+            tracing::error!(%error, "could not set the unix listener nonblocking");
+            return ExitCode::FAILURE;
+        }
+        match tokio::net::UnixListener::from_std(unix) {
+            Ok(listener) => Some(listener),
+            Err(error) => {
+                tracing::error!(%error, "could not adopt the unix listener");
+                return ExitCode::FAILURE;
+            }
+        }
+    };
+    let mut adopted = Vec::with_capacity(tcp.len());
+    for listener in tcp {
+        if let Err(error) = listener.set_nonblocking(true) {
+            tracing::error!(%error, "could not set a TCP listener nonblocking");
+            return ExitCode::FAILURE;
+        }
+        match tokio::net::TcpListener::from_std(listener) {
+            Ok(listener) => adopted.push(listener),
+            Err(error) => {
+                tracing::error!(%error, "could not adopt a TCP listener");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+    let result = runtime.block_on(async {
+        // `--model-dir` points at an unpacked model directory; without it
+        // the pinned ONNX archive is fetched and unpacked under the model
+        // cache (`--model-cache`, else the per-user cache).
+        let model_dir = match model_dir {
+            Some(dir) => dir,
+            None => {
+                use repo_search::model_store::{ModelSpec, ModelStore};
+                let store = match model_cache {
+                    Some(root) => ModelStore::new(root, ModelSpec::embedding_gemma_2_onnx()),
+                    None => ModelStore::user_cache_onnx(),
+                }
+                .map_err(|error| format!("model store: {error}"))?;
+                let (progress, _watch) =
+                    tokio::sync::watch::channel(repo_search_core::model::Fetch {
+                        received: 0,
+                        total: None,
+                    });
+                store
+                    .ensure(&progress)
+                    .await
+                    .map_err(|error| format!("model download: {error}"))?
+            }
+        };
+        repo_search_ort::server::run(repo_search_ort::server::Config {
+            #[cfg(unix)]
+            unix,
+            tcp: adopted,
+            token,
+            idle_exit: idle_exit.unwrap_or(repo_search_client::launcher::SERVER_IDLE_EXIT),
+            model_dir,
+        })
+        .await
+        .map_err(|error| error.to_string())
+    });
+    match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             tracing::error!(%error, "the server stopped on a fatal error");

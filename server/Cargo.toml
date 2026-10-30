@@ -1,6 +1,6 @@
 [package]
 name = "repo-search-server"
-version = "0.0.4"
+version = "0.0.5"
 description = "repo-search's embedding server"
 edition.workspace = true
 rust-version.workspace = true

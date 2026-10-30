@@ -23,6 +23,17 @@ pub const ARCHIVE: Pin = Pin {
         "57287aaa3fea181447dd2bd378d064aeef77684da0c722302e893dd95e43ab2c",
 };
 
+/// The published EmbeddingGemma 2 ONNX archive served off macOS:
+/// `manifest.json`, `tokenizer.json`, the quantized graph and its
+/// weights, packed as `tar.zst` like the Core ML build.
+#[cfg(not(target_os = "macos"))]
+#[rustfmt::skip]
+pub const ONNX_ARCHIVE: Pin = Pin {
+    url: "https://huggingface.co/lexoliu/repo-search-embeddinggemma2-onnx/resolve/090c8ce7415de7af5bcb3f8ba106ee6a1cfc2563/eg2-onnx-914f7f89-a4acdbe8.tar.zst",
+    sha256:
+        "a4acdbe8cbcdc2d2a8e95b81317a694c966f2de64a534dda5189b34faad14acf",
+};
+
 /// The tokenizer the daemon counts and prefixes chunks with, pinned at the
 /// model's upstream revision; the archive ships the same bytes.
 pub const TOKENIZER: Pin = Pin {
@@ -32,10 +43,23 @@ pub const TOKENIZER: Pin = Pin {
 
 /// The model build's identity, on `/v1/models` and in the vector cache:
 /// the archive's sha256, so vectors from different builds never mix.
+#[cfg(target_os = "macos")]
 pub const MODEL_ID: &str = ARCHIVE.sha256;
 
+/// The model build's identity off macOS: `onnx-` plus the sha256 of the
+/// pinned ONNX graph file the server's manifest names, so ONNX and Core
+/// ML vectors never mix. The manifest a model directory ships declares
+/// this same id.
+#[cfg(not(target_os = "macos"))]
+pub const MODEL_ID: &str = "onnx-d06edd601f851c633a2519304cbeb8dc6170d7ceb61b436625c17fb9b6e74953";
+
 /// Human-readable name of the embedded model, shown by `search --version`.
+#[cfg(target_os = "macos")]
 pub const MODEL_NAME: &str = "google/embeddinggemma-2 (Core ML conversion)";
+
+/// Human-readable name of the embedded model, shown by `search --version`.
+#[cfg(not(target_os = "macos"))]
+pub const MODEL_NAME: &str = "google/embeddinggemma-2 (ONNX conversion)";
 
 /// SPDX identifier of the model's license, shown by `search --version`.
 pub const MODEL_LICENSE: &str = "Apache-2.0";

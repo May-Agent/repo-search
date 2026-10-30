@@ -1,0 +1,50 @@
+[package]
+name = "repo-search-ort"
+version = "0.0.4"
+description = "ONNX Runtime token embedding for repo-search (Linux, Windows)"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# The whole crate is compiled out on macOS: its library is empty and every
+# dependency is target-gated, so `ort` and the ONNX Runtime binaries are never
+# fetched or built there.
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+constant_time_eq = { version = "0.4.2", default-features = false }
+http-body-util = { version = "0.1.5", default-features = false }
+hyper = { version = "1.12.0", default-features = false, features = [
+    "http1",
+    "server",
+] }
+hyper-util = { version = "0.1.21", default-features = false, features = [
+    "http1",
+    "server",
+    "tokio",
+] }
+ort = { version = "=2.0.0-rc.15", default-features = false, features = [
+    "download-binaries",
+    "copy-dylibs",
+    "lax-feature-matching",
+    "std",
+    "tls-rustls",
+    "openvino",
+    "qnn",
+    "directml",
+    "xnnpack",
+    "onednn",
+] }
+repo-search-core.workspace = true
+serde = { version = "1.0.229", default-features = false, features = ["derive"] }
+serde_json = { version = "1.0.154", default-features = false, features = ["std"] }
+thiserror = { version = "2.0.21", default-features = false }
+tokenizers = { version = "0.23.2", default-features = false, features = ["fancy-regex"] }
+tokio = { version = "1.54.1", default-features = false, features = [
+    "macros",
+    "net",
+    "rt",
+    "signal",
+    "sync",
+    "time",
+] }
+tracing = { version = "0.1.44", default-features = false, features = ["std"] }
