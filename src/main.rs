@@ -177,7 +177,6 @@ fn activated_main(
     use repo_search::daemon::listen::Activated;
     use repo_search::daemon::{self, Config};
     use repo_search::launchd;
-    use repo_search_core::model::MODEL_ID;
     use std::os::unix::net::UnixListener;
 
     let fds = match launchd::activate_socket("Listener") {
