@@ -946,7 +946,7 @@ fn ort_server_main(
         let model_dir = match model_dir {
             Some(dir) => dir,
             None => {
-                use repo_search::model_store::{ModelSpec, ModelStore};
+                use repo_search::model_store::ModelStore;
                 let store = match model_cache {
                     Some(root) => ModelStore::new(root, onnx_spec()),
                     None => onnx_store(),
