@@ -59,7 +59,7 @@ pub struct Answered {
 /// scheduler-level tests drive a recording fake.
 pub trait Embeddings: Send + Sync + 'static {
     /// The request's failure.
-    type Error: std::error::Error + Send + Sync + 'static;
+    type Error: RequestError;
 
     /// Embeds `inputs` in one request at `urgency`.
     fn embed(
@@ -84,6 +84,8 @@ pub enum Error {
         status: u16,
         /// `error.message` of the standard envelope, else the raw body.
         message: String,
+        /// `error.code` of the standard envelope, when it sent one.
+        code: Option<String>,
     },
     /// A 2xx answer that did not parse or carry base64 vectors.
     #[error("embedding server sent a malformed response: {0}")]
@@ -95,6 +97,21 @@ impl Error {
     /// retries.
     fn is_transport(&self) -> bool {
         matches!(self, Self::Transport(_))
+    }
+}
+
+/// What an [`Embeddings`] failure means for its caller: only a client
+/// error may fail one job; every other failure means the server is
+/// unhealthy and is fatal to the daemon.
+pub trait RequestError: std::error::Error + Send + Sync + 'static {
+    /// Whether the request's own inputs were refused (a 4xx); the server
+    /// itself is fine.
+    fn is_client_error(&self) -> bool;
+}
+
+impl RequestError for Error {
+    fn is_client_error(&self) -> bool {
+        matches!(self, Self::Status { status, .. } if (400..500).contains(status))
     }
 }
 
@@ -156,12 +173,15 @@ impl ServerClient {
         let status = response.status();
         if !status.is_success() {
             let body = response.bytes().await.unwrap_or_default();
-            let message = serde_json::from_slice::<ErrorBody>(&body)
-                .map(|body| body.error.message)
-                .unwrap_or_else(|_| String::from_utf8_lossy(&body).into_owned());
+            let envelope = serde_json::from_slice::<ErrorBody>(&body).ok();
+            let message = envelope
+                .as_ref()
+                .map(|body| body.error.message.clone())
+                .unwrap_or_else(|| String::from_utf8_lossy(&body).into_owned());
             return Err(Error::Status {
                 status: status.as_u16(),
                 message,
+                code: envelope.and_then(|body| body.error.code),
             });
         }
         let timing = response
@@ -248,6 +268,7 @@ impl ServerClient {
             _ => Err(Error::Status {
                 status: status.as_u16(),
                 message,
+                code: None,
             }),
         }
     }
@@ -259,12 +280,15 @@ impl ServerClient {
         let status = response.status();
         let body = response.bytes().await.map_err(Error::Transport)?;
         if !status.is_success() {
-            let message = serde_json::from_slice::<ErrorBody>(&body)
-                .map(|body| body.error.message)
-                .unwrap_or_else(|_| String::from_utf8_lossy(&body).into_owned());
+            let envelope = serde_json::from_slice::<ErrorBody>(&body).ok();
+            let message = envelope
+                .as_ref()
+                .map(|body| body.error.message.clone())
+                .unwrap_or_else(|| String::from_utf8_lossy(&body).into_owned());
             return Err(Error::Status {
                 status: status.as_u16(),
                 message,
+                code: envelope.and_then(|body| body.error.code),
             });
         }
         serde_json::from_slice(&body).map_err(|e| Error::Response(e.to_string()))
