@@ -88,6 +88,10 @@ pub enum Error {
     /// `REPO_SEARCH_ORT_EP` named a provider this build does not know.
     #[error("unknown execution provider: {0}")]
     UnknownProvider(String),
+    /// `REPO_SEARCH_ORT_EP` mixed `cpu` with accelerator providers; CPU
+    /// runs only when no accelerator is available, never alongside one.
+    #[error("cpu cannot share a provider chain with accelerators")]
+    CpuMixed,
     /// The ONNX Runtime failure.
     #[error("onnx runtime: {0}")]
     Ort(#[from] ort::Error),
@@ -126,20 +130,39 @@ impl Encoder {
     }
 }
 
-/// The ordered execution-provider preference: the `REPO_SEARCH_ORT_EP`
-/// environment variable's comma-separated names (default `cpu`), with
-/// `cpu` appended as the last resort when absent.
-fn ep_chain() -> Vec<String> {
-    let mut chain: Vec<String> = std::env::var("REPO_SEARCH_ORT_EP")
-        .unwrap_or_else(|_| "cpu".to_owned())
+/// The candidate execution-provider chains, in preference order; the
+/// first that commits a session wins.
+///
+/// CPU is only ever a chain of its own: a GPU/NPU provider never shares
+/// a chain with `cpu`, because ONNX Runtime would silently land rejected
+/// nodes on it. `REPO_SEARCH_ORT_EP` names one explicit comma-separated
+/// chain — mixing `cpu` with an accelerator there is a startup error —
+/// while the unset default tries each accelerator alone, ending on CPU
+/// only when none of them registered.
+fn ep_chains() -> Result<Vec<Vec<String>>, Error> {
+    let spec = match std::env::var("REPO_SEARCH_ORT_EP") {
+        Ok(spec) => spec,
+        Err(_) => {
+            return Ok(vec![
+                vec!["qnn".to_owned()],
+                vec!["openvino-npu".to_owned()],
+                vec!["directml".to_owned()],
+                vec!["cpu".to_owned()],
+            ]);
+        }
+    };
+    let chain: Vec<String> = spec
         .split(',')
         .map(|name| name.trim().to_lowercase())
         .filter(|name| !name.is_empty())
         .collect();
-    if !chain.iter().any(|name| name == "cpu") {
-        chain.push("cpu".to_owned());
+    if chain.len() > 1 && chain.iter().any(|name| name == "cpu") {
+        return Err(Error::CpuMixed);
     }
-    chain
+    if chain.is_empty() {
+        return Err(Error::UnknownProvider(String::new()));
+    }
+    Ok(vec![chain])
 }
 
 /// Commits a session over `model`, registering `chain`'s providers in
@@ -208,23 +231,52 @@ impl OrtEmbedder {
 
         let _ = stage.send(LoadStage::Open);
         let environment = ort::init().with_name("repo-search-ort").build()?;
-        // Provider preference: `REPO_SEARCH_ORT_EP` names an ordered
-        // comma-separated chain (`qnn`, `openvino`, `openvino-npu`,
-        // `directml`, `xnnpack`, `onednn`, `cpu`), CPU
-        // appended as the last resort. A chain that fails to register —
-        // the usual case when the accelerator's provider library is not
-        // installed — drops to CPU alone rather than half-initialized
-        // hardware offload.
-        let providers = ep_chain();
-        tracing::info!(?providers, "execution provider preference");
-        let session = match commit_session(&environment, &providers, dir.join(&manifest.model)) {
-            Ok(session) => session,
-            Err(error) => {
-                tracing::warn!(%error, "provider chain unavailable, falling back to cpu");
-                commit_session(&environment, &["cpu".to_owned()], dir.join(&manifest.model))?
+        // Provider preference: candidate chains in order; the first whose
+        // session commits AND passes the warm run wins — a provider that
+        // registers but cannot execute falls through to the next
+        // candidate. An explicit `REPO_SEARCH_ORT_EP` is a single chain,
+        // so its failure is fatal and never a silent drop to CPU.
+        let candidates = ep_chains()?;
+        let mut embedder = None;
+        let mut last_error = None;
+        for chain in &candidates {
+            match Self::open_on(
+                &environment,
+                chain,
+                dir,
+                &manifest,
+                encoder.clone(),
+                pad,
+                stage,
+            ) {
+                Ok(opened) => {
+                    tracing::info!(providers = ?chain, "execution provider selected");
+                    embedder = Some(opened);
+                    break;
+                }
+                Err(error) => {
+                    tracing::warn!(providers = ?chain, %error, "provider chain unavailable");
+                    last_error = Some(error);
+                }
             }
-        };
+        }
+        embedder.ok_or_else(|| last_error.expect("candidates are nonempty"))
+    }
 
+    /// One candidate chain's try: commits the session, checks the model
+    /// contract, then proves the provider executes with one warm run at
+    /// the largest bucket — paying the graph's initial compile and the
+    /// allocator's warm-up here, not on the first request.
+    fn open_on(
+        environment: &ort::environment::Environment,
+        chain: &[String],
+        dir: &Path,
+        manifest: &Manifest,
+        encoder: Encoder,
+        pad: i64,
+        stage: &watch::Sender<LoadStage>,
+    ) -> Result<Self, Error> {
+        let session = commit_session(environment, chain, dir.join(&manifest.model))?;
         let mut seen = session
             .inputs()
             .iter()
@@ -256,22 +308,19 @@ impl OrtEmbedder {
             };
             extras.push((input.name().to_owned(), vec![0, width]));
         }
-
         let _ = stage.send(LoadStage::WarmUp);
         let mut embedder = Self {
             session,
             extras,
             encoder,
             pad,
-            buckets: manifest.buckets.into_boxed_slice(),
+            buckets: manifest.buckets.clone().into_boxed_slice(),
             dim: manifest.embedding_dim,
-            model_id: manifest.model_id,
+            model_id: manifest.model_id.clone(),
         };
-        // One run at the largest bucket: the graph's initial compile and
-        // the allocator's warm-up are paid here, not on the first request.
         let largest = *embedder.buckets.last().expect("manifest requires buckets");
         let warm = vec![pad as u32; largest];
-        let _ = embedder.embed_tokens(&warm)?;
+        embedder.embed_tokens(&warm)?;
         Ok(embedder)
     }
 
