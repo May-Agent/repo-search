@@ -57,9 +57,11 @@ impl fmt::Display for Sha256Digest {
 }
 
 /// The per-user cache root the model archive and the tokenizer share:
-/// `models/` under the OS cache root ([`crate::paths`]).
+/// `models/` under the OS cache root ([`UserPaths`](repo_search_client::launcher::paths::UserPaths)).
 fn user_cache_root() -> Result<PathBuf, Error> {
-    Ok(crate::paths::UserPaths::user()?.cache.join("models"))
+    Ok(repo_search_client::launcher::paths::UserPaths::user()?
+        .cache
+        .join("models"))
 }
 
 /// A model archive to fetch and the digest that verifies it.

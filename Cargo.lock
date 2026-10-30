@@ -1762,19 +1762,17 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "repo-search"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "askama",
  "bytes",
  "clap",
  "const_format",
- "etcetera",
  "futures-util",
  "hex",
  "http-body-util",
  "hyper",
  "hyper-util",
- "kqueue",
  "libc",
  "notify",
  "repo-search-client",
@@ -1792,7 +1790,6 @@ dependencies = [
  "tokenizers",
  "tokio",
  "tokio-util",
- "toml_edit",
  "tracing",
  "tracing-subscriber",
  "zstd",
@@ -1800,15 +1797,20 @@ dependencies = [
 
 [[package]]
 name = "repo-search-client"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
+ "askama",
+ "etcetera",
  "futures-util",
+ "kqueue",
+ "libc",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror",
  "tokio",
  "tokio-util",
+ "toml_edit",
 ]
 
 [[package]]
@@ -1870,7 +1872,7 @@ dependencies = [
 
 [[package]]
 name = "repo-search-server"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "constant_time_eq",
  "http-body-util",

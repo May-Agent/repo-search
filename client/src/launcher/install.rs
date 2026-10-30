@@ -18,14 +18,14 @@ use std::time::Duration;
 
 use askama::Template;
 
-use crate::daemon::{IDLE_EXIT, SOCKET_TIMEOUT, TEARDOWN_TIMEOUT};
-use crate::kqueue::{DirWatch, ExitWatch};
-use crate::launchd::{LABEL, LaunchAgent, SERVER_LABEL, ServerAgent, ServerConfig, domain};
-use crate::paths::{
+use super::kqueue::{DirWatch, ExitWatch};
+use super::launchd::{LABEL, LaunchAgent, SERVER_LABEL, ServerAgent, ServerConfig, domain};
+use super::paths::{
     lock_path, log_path, plist_path, server_config_path, server_log_path, server_socket_path,
     socket_path,
 };
-use repo_search_client::protocol::BuildId;
+use super::{DAEMON_IDLE_EXIT, SERVER_IDLE_EXIT, SOCKET_TIMEOUT, TEARDOWN_TIMEOUT};
+use crate::protocol::BuildId;
 
 /// One of the two LaunchAgents the client keeps current: the search
 /// daemon or the embedding server.
@@ -107,7 +107,7 @@ impl AgentConfig {
                 label: LABEL.to_owned(),
                 program,
                 socket: socket_path()?,
-                idle_exit: IDLE_EXIT,
+                idle_exit: DAEMON_IDLE_EXIT,
                 model_cache: None,
                 state_dir: None,
                 server_socket: server_socket_path()?,
@@ -134,7 +134,7 @@ impl AgentConfig {
                 build: BuildId::of_file(&program)?.to_string(),
                 program,
                 socket: server_socket_path()?,
-                idle_exit: repo_search_server::IDLE_EXIT,
+                idle_exit: SERVER_IDLE_EXIT,
                 model_cache: None,
                 token_file: config.token_file,
                 bind: config.bind,

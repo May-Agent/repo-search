@@ -6,14 +6,10 @@
 //! on stderr. The client installs no tracing subscriber and has no log.
 
 mod args;
-mod launcher;
 mod progress;
 mod render;
 
 pub use args::{Cli, Command, Invocation, Mode, SearchOptions};
-#[cfg(target_os = "macos")]
-pub use launcher::LaunchdAgents;
-pub use launcher::{Launcher, Report};
 pub use render::{IndexedOutput, StatusOutput};
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -25,11 +21,11 @@ use futures_util::StreamExt;
 use progress::ProgressLine;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
-#[cfg(target_os = "macos")]
-use crate::install::{AgentConfig, SystemLaunchctl};
 #[cfg(target_os = "linux")]
-use crate::spawn::OnDemand;
-use repo_search_client::client::Client;
+use repo_search_client::launcher::spawn::OnDemand;
+use repo_search_client::launcher::{ConnectError, Launcher};
+#[cfg(target_os = "macos")]
+use repo_search_client::launcher::{LaunchdAgents, install::SystemLaunchctl};
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 use repo_search_client::protocol::BuildId;
 use repo_search_client::protocol::{Event, Final, Format, Hello, Request, SearchRequest};
@@ -89,13 +85,11 @@ impl Env<LaunchdAgents<SystemLaunchctl>> {
     /// [`BuildId`], and [`AgentConfig::user`].
     pub fn user() -> Result<Self, EnvError> {
         let (cwd, program, hello) = EnvError::process()?;
-        let server_agent = AgentConfig::server(program.clone())
-            .map_err(|e| EnvError::new("cannot resolve the server agent's paths", e))?;
-        let agent = AgentConfig::user(program)
-            .map_err(|e| EnvError::new("cannot resolve the agent's paths", e))?;
+        let launcher = LaunchdAgents::user(program)
+            .map_err(|e| EnvError::new("cannot resolve the launch agents", e))?;
         Ok(Self {
             cwd,
-            launcher: LaunchdAgents::new(server_agent, agent, SystemLaunchctl),
+            launcher,
             hello,
         })
     }
@@ -171,20 +165,6 @@ fn mb(bytes: u64) -> String {
     format!("{:.1}", bytes as f64 / 1e6)
 }
 
-/// Tells a launcher step's notes then its error; false when it failed.
-async fn announce(report: Report, stderr: &mut (impl AsyncWrite + Unpin)) -> bool {
-    for note in &report.notes {
-        tell(stderr, note).await;
-    }
-    match report.error {
-        Some(error) => {
-            tell(stderr, &error).await;
-            false
-        }
-        None => true,
-    }
-}
-
 /// The worktree `cwd` belongs to, as `git rev-parse` prints it — the
 /// daemon canonicalizes and checks it.
 async fn resolve_worktree(cwd: &Path) -> Result<PathBuf, String> {
@@ -233,30 +213,20 @@ where
             return Exit::Error;
         }
     };
-    if !announce(prepared, &mut term.stderr).await {
-        return Exit::Error;
-    }
-
-    let client = match Client::connect(launcher.socket(), &hello).await {
+    let client = match repo_search_client::launcher::connect(
+        &mut launcher,
+        &hello,
+        prepared,
+        async |note: &str| tell(&mut term.stderr, note).await,
+    )
+    .await
+    {
         Ok(client) => client,
-        Err(error) if launcher.recoverable(&error) => {
-            let recovered = launcher.recover().await;
-            if !announce(recovered, &mut term.stderr).await {
-                return Exit::Error;
-            }
-            match Client::connect(launcher.socket(), &hello).await {
-                Ok(client) => client,
-                Err(error) => {
-                    tell(
-                        &mut term.stderr,
-                        &render::client_error(&error, launcher.socket(), launcher.log()),
-                    )
-                    .await;
-                    return Exit::Error;
-                }
-            }
+        Err(ConnectError::Launcher(message)) => {
+            tell(&mut term.stderr, &message).await;
+            return Exit::Error;
         }
-        Err(error) => {
+        Err(ConnectError::Client(error)) => {
             tell(
                 &mut term.stderr,
                 &render::client_error(&error, launcher.socket(), launcher.log()),
