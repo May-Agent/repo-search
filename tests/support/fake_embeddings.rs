@@ -58,9 +58,17 @@ pub struct Record {
 }
 
 /// The fake's failure; scheduler-level tests inject it with `fail`.
+/// The `bool` is [`RequestError::is_client_error`]: `fail` injects a
+/// fatal server failure, `fail_client_error` a per-request refusal.
 #[derive(Debug, thiserror::Error)]
 #[error("fake embeddings failure: {0}")]
-pub struct FakeError(String);
+pub struct FakeError(String, bool);
+
+impl repo_search::daemon::server::RequestError for FakeError {
+    fn is_client_error(&self) -> bool {
+        self.1
+    }
+}
 
 /// A [`QueryInput`] that never truncates: the stub counts fit every test
 /// query under the model's cap.
@@ -111,7 +119,7 @@ pub struct FakeEmbeddings {
     hash_gates: HashMap<ContentHash, watch::Receiver<bool>>,
     index_gate: Option<watch::Receiver<bool>>,
     interactive_gate: Option<watch::Receiver<bool>>,
-    failures: HashMap<ContentHash, String>,
+    failures: HashMap<ContentHash, (String, bool)>,
 }
 
 impl FakeEmbeddings {
@@ -150,7 +158,13 @@ impl FakeEmbeddings {
     /// Makes every indexing call of the document `hash` fail with
     /// `message` once its gates open.
     pub fn fail(&mut self, hash: ContentHash, message: &str) {
-        self.failures.insert(hash, message.to_owned());
+        self.failures.insert(hash, (message.to_owned(), false));
+    }
+
+    /// Like [`Self::fail`], but the injected failure is a client error:
+    /// the request is refused, the server stays healthy.
+    pub fn fail_client_error(&mut self, hash: ContentHash, message: &str) {
+        self.failures.insert(hash, (message.to_owned(), true));
     }
 
     /// `input`'s document title and text, parsed back out of
@@ -240,6 +254,14 @@ impl Embeddings for FakeEmbeddings {
         };
         if interactive {
             pass(self.interactive_gate.as_ref()).await;
+            unanswered.armed = false;
+            for &(_, hash) in &parsed {
+                if let Some((message, client_error)) =
+                    hash.and_then(|hash| self.failures.get(&hash))
+                {
+                    return Err(FakeError(message.clone(), *client_error));
+                }
+            }
         } else {
             for &(_, hash) in &parsed {
                 if let Some(hash) = hash {
@@ -249,8 +271,10 @@ impl Embeddings for FakeEmbeddings {
             pass(self.index_gate.as_ref()).await;
             unanswered.armed = false;
             for &(_, hash) in &parsed {
-                if let Some(message) = hash.and_then(|hash| self.failures.get(&hash)) {
-                    return Err(FakeError(message.clone()));
+                if let Some((message, client_error)) =
+                    hash.and_then(|hash| self.failures.get(&hash))
+                {
+                    return Err(FakeError(message.clone(), *client_error));
                 }
             }
         }

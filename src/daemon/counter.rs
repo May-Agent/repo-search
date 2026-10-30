@@ -139,7 +139,7 @@ impl PromptCounter {
 impl TokenCounter for PromptCounter {
     fn count(&self, text: &str) -> usize {
         self.tokenizer
-            .encode_fast(text, true)
+            .encode(text, true)
             .expect("a loaded tokenizer encodes every input")
             .len()
     }

@@ -38,7 +38,7 @@ use tracing::{debug, error};
 
 use super::Error;
 use super::counter::PromptCounter;
-use super::server::Embeddings;
+use super::server::{Embeddings, RequestError};
 use super::writer::WriterHandle;
 
 /// Inbox capacity of the scheduler and every component channel.
@@ -878,11 +878,16 @@ impl<E: Embeddings, Q: QueryInput> Scheduler<E, Q> {
                     let _ = tx.send(SchedulerMsg::IndexDone { item, generation }).await;
                 }
                 Err(error) => {
-                    let _ = tx
-                        .send(SchedulerMsg::ServerFailed {
-                            error: error.to_string(),
-                        })
-                        .await;
+                    if error.is_client_error() {
+                        error!(%error, %hash, "an indexing embed was refused; the chunk keeps no vector");
+                        let _ = tx.send(SchedulerMsg::IndexDone { item, generation }).await;
+                    } else {
+                        let _ = tx
+                            .send(SchedulerMsg::ServerFailed {
+                                error: error.to_string(),
+                            })
+                            .await;
+                    }
                 }
             }
         });
@@ -1439,6 +1444,40 @@ impl<E: Embeddings, Q: QueryInput> Scheduler<E, Q> {
                             spot: id,
                             timing: answered.timing,
                         })
+                        .await;
+                }
+                Err(error) if error.is_client_error() => {
+                    let mut timing = ServerTiming::default();
+                    for (hash, text) in inputs {
+                        match embeddings
+                            .embed(vec![text], Urgency::new(URGENCY_INTERACTIVE))
+                            .await
+                        {
+                            Ok(answered) => {
+                                let vector = answered
+                                    .vectors
+                                    .into_iter()
+                                    .next()
+                                    .expect("one input embeds to one vector");
+                                let _ = writer.vector(hash, vector).await;
+                                timing.wait = timing.wait.max(answered.timing.wait);
+                                timing.overtaken += answered.timing.overtaken;
+                            }
+                            Err(error) if error.is_client_error() => {
+                                error!(%error, %hash, "a documents embed was refused; the chunk keeps no vector");
+                            }
+                            Err(error) => {
+                                let _ = tx
+                                    .send(SchedulerMsg::ServerFailed {
+                                        error: error.to_string(),
+                                    })
+                                    .await;
+                                return;
+                            }
+                        }
+                    }
+                    let _ = tx
+                        .send(SchedulerMsg::DocumentsDone { spot: id, timing })
                         .await;
                 }
                 Err(error) => {
