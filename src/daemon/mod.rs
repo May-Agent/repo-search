@@ -455,8 +455,30 @@ async fn connection<T: Tokens>(
     build: BuildId,
 ) {
     let mut framed = framed(stream);
-    let end = serve(&mut framed, &model, &loader, &registry, &stopping, build).await;
-    let _ = conn.send(end).await;
+    match serve(&mut framed, &model, &loader, &registry, &stopping, build).await {
+        Served::Closed => {
+            let _ = conn.send(ConnMsg::Closed).await;
+        }
+        Served::Mismatch(message) => {
+            // The refusal sends the client to its launcher, which starts a
+            // daemon only when it finds no socket: it goes out once the
+            // accept loop has closed the listener — a `Bound` socket is
+            // unlinked by then — and raised `stopping`.
+            let _ = conn.send(ConnMsg::Mismatch).await;
+            let mut stopping = stopping;
+            let _ = stopping.wait_for(|stopping| *stopping).await;
+            send_final(&mut framed, ErrorKind::ProtocolMismatch, message).await;
+        }
+    }
+}
+
+/// How [`serve`] ended a connection.
+enum Served {
+    /// The connection is done.
+    Closed,
+    /// The `Hello` named another protocol, version or build; the refusal's
+    /// message, sent by [`connection`] once the listener is closed.
+    Mismatch(String),
 }
 
 async fn serve<T: Tokens>(
@@ -466,13 +488,13 @@ async fn serve<T: Tokens>(
     registry: &RegistryHandle,
     stopping: &tokio::sync::watch::Receiver<bool>,
     build: BuildId,
-) -> ConnMsg {
+) -> Served {
     let frame = match read_hello(framed, stopping).await {
         Read::Frame(frame) => frame,
-        Read::Gone => return ConnMsg::Closed,
+        Read::Gone => return Served::Closed,
         Read::Stopping => {
             answer_stop(framed, model).await;
-            return ConnMsg::Closed;
+            return Served::Closed;
         }
     };
     let hello = match serde_json::from_str::<Hello>(&frame) {
@@ -484,31 +506,25 @@ async fn serve<T: Tokens>(
                 "expected a Hello frame".into(),
             )
             .await;
-            return ConnMsg::Closed;
+            return Served::Closed;
         }
     };
     let ours = Hello::new(build);
     if hello != ours {
-        send_final(
-            framed,
-            ErrorKind::ProtocolMismatch,
-            format!(
-                "client is protocol {} {} build {}, daemon is {PROTOCOL} {} build {}",
-                hello.protocol, hello.version, hello.build, ours.version, ours.build
-            ),
-        )
-        .await;
-        return ConnMsg::Mismatch;
+        return Served::Mismatch(format!(
+            "client is protocol {} {} build {}, daemon is {PROTOCOL} {} build {}",
+            hello.protocol, hello.version, hello.build, ours.version, ours.build
+        ));
     }
     if framed.send(line(&ours)).await.is_err() {
-        return ConnMsg::Closed;
+        return Served::Closed;
     }
     let frame = match read_frame(framed, stopping).await {
         Read::Frame(frame) => frame,
-        Read::Gone => return ConnMsg::Closed,
+        Read::Gone => return Served::Closed,
         Read::Stopping => {
             answer_stop(framed, model).await;
-            return ConnMsg::Closed;
+            return Served::Closed;
         }
     };
     let request = match serde_json::from_str::<Request>(&frame) {
@@ -520,7 +536,7 @@ async fn serve<T: Tokens>(
                 "expected a Request frame".into(),
             )
             .await;
-            return ConnMsg::Closed;
+            return Served::Closed;
         }
     };
 
@@ -531,8 +547,8 @@ async fn serve<T: Tokens>(
         Request::Search(_) | Request::Index { .. } => {
             match await_model(framed, model, loader, stopping).await {
                 ModelWait::Ready => {}
-                ModelWait::Stop => return ConnMsg::Closed,
-                ModelWait::Failed => return ConnMsg::Closed,
+                ModelWait::Stop => return Served::Closed,
+                ModelWait::Failed => return Served::Closed,
             }
             let worktree = match &request {
                 Request::Search(search) => &search.worktree,
@@ -559,7 +575,7 @@ async fn serve<T: Tokens>(
                     }
                     _ => unreachable!("matched above"),
                 },
-                None => return ConnMsg::Closed,
+                None => return Served::Closed,
             }
         }
         Request::UpsertDocuments { .. }
@@ -567,8 +583,8 @@ async fn serve<T: Tokens>(
         | Request::SearchCollection(_) => {
             match await_model(framed, model, loader, stopping).await {
                 ModelWait::Ready => {}
-                ModelWait::Stop => return ConnMsg::Closed,
-                ModelWait::Failed => return ConnMsg::Closed,
+                ModelWait::Stop => return Served::Closed,
+                ModelWait::Failed => return Served::Closed,
             }
             let creates = matches!(request, Request::UpsertDocuments { .. });
             let (name, msg) = match request {
@@ -605,11 +621,11 @@ async fn serve<T: Tokens>(
                     "a collection name is empty".into(),
                 )
                 .await;
-                return ConnMsg::Closed;
+                return Served::Closed;
             }
             match get_collection(registry, framed, name, creates, stopping).await {
                 Some(handle) => handle.dispatch(msg).await,
-                None => return ConnMsg::Closed,
+                None => return Served::Closed,
             }
         }
         Request::Status { worktree } => {
@@ -619,7 +635,7 @@ async fn serve<T: Tokens>(
                         .dispatch(OwnerMsg::Status { events: events_tx })
                         .await
                 }
-                None => return ConnMsg::Closed,
+                None => return Served::Closed,
             }
         }
     };
@@ -630,7 +646,7 @@ async fn serve<T: Tokens>(
             "the daemon is shutting down".into(),
         )
         .await;
-        return ConnMsg::Closed;
+        return Served::Closed;
     }
 
     // Forward events until the Final. The protocol sends nothing after the
@@ -669,7 +685,7 @@ async fn serve<T: Tokens>(
             }
         }
     }
-    ConnMsg::Closed
+    Served::Closed
 }
 
 enum ModelWait {

@@ -26,6 +26,7 @@ use repo_search::daemon::server::Endpoint;
 use repo_search::daemon::{self, Config, StartupError};
 use repo_search_client::launcher::Launcher as _;
 use repo_search_client::launcher::spawn::{DaemonCommand, DaemonConfig, OnDemand, ServerTarget};
+use repo_search_client::protocol::{self, ErrorKind, Event, Final};
 use repo_search_core::StateDir;
 use repo_search_core::model::MODEL_ID;
 use serde::{Deserialize, Serialize};
@@ -58,6 +59,11 @@ struct HostConfig {
     /// listener it connects here and lingers, holding the lifetime lock,
     /// until the test hangs up — a shutdown tail of the test's length.
     hold_socket: Option<PathBuf>,
+    /// A socket the test listens on: once the accept loop has stopped,
+    /// and before the listener closes, the host connects here and stays
+    /// until the test hangs up — the moment between a mismatch ending the
+    /// loop and the socket's unlink, stretched to the test's length.
+    close_gate: Option<PathBuf>,
 }
 
 /// The re-executed test acting as the daemon: it parses the flags the
@@ -139,6 +145,7 @@ async fn spawn_host() {
     let outcome = daemon::run(Config {
         listener: Lingering {
             bound,
+            gate: config.close_gate,
             hold: config.hold_socket,
         },
         signal,
@@ -154,11 +161,22 @@ async fn spawn_host() {
     std::process::exit(i32::from(outcome.is_err()));
 }
 
-/// A [`Bound`] whose `close` lingers after the socket is gone: the
-/// shutdown tail, stretched to however long the test holds `hold`.
+/// A [`Bound`] whose `close` stays on `gate` before the socket goes and
+/// lingers on `hold` after: the shutdown tail, stretched at either end to
+/// however long the test holds each.
 struct Lingering {
     bound: Bound,
+    gate: Option<PathBuf>,
     hold: Option<PathBuf>,
+}
+
+/// Connects to `path` and stays until the peer hangs up.
+async fn linger_on(path: Option<PathBuf>) {
+    if let Some(path) = path
+        && let Ok(mut stream) = tokio::net::UnixStream::connect(path).await
+    {
+        let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut [0u8; 1]).await;
+    }
 }
 
 impl Listener for Lingering {
@@ -169,13 +187,10 @@ impl Listener for Lingering {
     }
 
     async fn close(self) -> LifetimeLock {
+        linger_on(self.gate).await;
         // The socket is unlinked and its queue drained; the lock stays.
         let held = self.bound.close().await;
-        if let Some(path) = self.hold
-            && let Ok(mut stream) = tokio::net::UnixStream::connect(path).await
-        {
-            let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut [0u8; 1]).await;
-        }
+        linger_on(self.hold).await;
         held
     }
 
@@ -220,6 +235,7 @@ impl World {
             idle_exit: Duration::from_secs(600),
             skew_marker: None,
             hold_socket: None,
+            close_gate: None,
         };
         Self {
             _reaper: lock::Reaper(tmp.path().join("run")),
@@ -527,6 +543,75 @@ async fn a_build_mismatch_respawns_the_matching_build() {
     let answered = world.status_pid(&target).await;
     assert_ne!(answered, old, "the matching build answered");
     assert_eq!(world.starts(), 2);
+}
+
+/// A build mismatch is refused only once the daemon's socket is gone: the
+/// refusal sends the client to its launcher, which must find no socket
+/// and spawn the matching build, not reconnect to the daemon that is
+/// shutting down. The gate holds the daemon between the end of its accept
+/// loop and the unlink, the moment a refusal sent too early lands in.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_build_mismatch_is_refused_only_once_the_socket_is_gone() {
+    use futures_util::{SinkExt as _, StreamExt as _};
+
+    let mut world = World::new();
+    let marker = world.tmp.path().join("skew");
+    std::fs::write(&marker, "").expect("the skew marker");
+    world.host.skew_marker = Some(marker);
+    let gate = world.tmp.path().join("gate.sock");
+    world.host.close_gate = Some(gate.clone());
+    let gate = UnixListener::bind(&gate).expect("the gate binds");
+    let target = world.target();
+
+    let report = world.launcher(&target).recover().await;
+    assert_eq!(report.error, None);
+
+    let socket = world.socket();
+    let refused = tokio::spawn(async move {
+        let stream = tokio::net::UnixStream::connect(&socket)
+            .await
+            .expect("the skewed daemon accepts");
+        let mut framed = protocol::framed(stream);
+        framed
+            .send(serde_json::to_string(&hello()).expect("the hello serializes"))
+            .await
+            .expect("the hello goes out");
+        let line = framed
+            .next()
+            .await
+            .expect("the daemon answers")
+            .expect("the answer is a frame");
+        let answer: Event = serde_json::from_str(&line).expect("the answer is an event");
+        (answer, socket.exists())
+    });
+    tokio::pin!(refused);
+    let (held, _) = tokio::time::timeout(TIMEOUT, gate.accept())
+        .await
+        .expect("the daemon reaches its close")
+        .expect("the gate accepts");
+    // A refusal sent before the unlink arrives while the gate is held; a
+    // correct daemon sends nothing until the gate opens.
+    let early = tokio::select! {
+        early = &mut refused => Some(early),
+        () = tokio::time::sleep(Duration::from_millis(500)) => None,
+    };
+    drop(held);
+    let (answer, socket_left) = match early {
+        Some(early) => early,
+        None => tokio::time::timeout(TIMEOUT, refused)
+            .await
+            .expect("the refusal arrives once the gate opens"),
+    }
+    .expect("the client task joins");
+    match answer {
+        Event::Final(Final::Error(report)) => {
+            assert_eq!(report.kind, ErrorKind::ProtocolMismatch);
+        }
+        other => panic!("expected a ProtocolMismatch, got {other:?}"),
+    }
+    assert!(!socket_left, "the socket outlived the refusal");
+    world.exited().await;
+    assert_eq!(world.starts(), 1);
 }
 
 /// A `daemon.toml` change renders another command: the next search
