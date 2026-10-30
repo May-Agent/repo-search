@@ -33,6 +33,9 @@ ort = { version = "=2.0.0-rc.15", default-features = false, features = [
     "directml",
     "xnnpack",
     "onednn",
+    "cuda",
+    "tensorrt",
+    "nvrtx",
 ] }
 repo-search-core.workspace = true
 serde = { version = "1.0.229", default-features = false, features = ["derive"] }
