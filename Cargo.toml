@@ -24,7 +24,7 @@ clap = { version = "4.6.7", default-features = false, features = [
 
 [package]
 name = "repo-search"
-version = "0.0.6"
+version = "0.0.7"
 description = "Search a repository for code you can describe but cannot name"
 edition.workspace = true
 rust-version.workspace = true
