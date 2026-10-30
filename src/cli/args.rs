@@ -556,6 +556,7 @@ mod tests {
                 model_cache,
                 token_file,
                 build,
+                ..
             } => {
                 assert_eq!(idle_exit, None);
                 assert_eq!(model_cache, None);

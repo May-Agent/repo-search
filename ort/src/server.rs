@@ -393,10 +393,7 @@ async fn handle(
 
 /// `POST /v1/embeddings`: readiness, body cap, parse, tokenize, submit,
 /// encode.
-async fn embeddings(
-    shared: Arc<Shared>,
-    request: Request<Incoming>,
-) -> Response<Full<Bytes>> {
+async fn embeddings(shared: Arc<Shared>, request: Request<Incoming>) -> Response<Full<Bytes>> {
     let _busy = Busy::new(&shared);
     let urgency = Urgency::from_header(
         request

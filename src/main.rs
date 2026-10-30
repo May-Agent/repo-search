@@ -775,8 +775,11 @@ fn ort_server_main(
             Ok(token) => Some(token.trim_end_matches(['\n', '\r']).to_owned()),
             Err(error) => {
                 let _ = std::io::stderr().write_all(
-                    format!("search: could not read the token file {}: {error}\n", path.display())
-                        .as_bytes(),
+                    format!(
+                        "search: could not read the token file {}: {error}\n",
+                        path.display()
+                    )
+                    .as_bytes(),
                 );
                 return ExitCode::from(2);
             }
@@ -785,8 +788,8 @@ fn ort_server_main(
     };
     // A non-loopback TCP listener without a token is open to the network.
     if token.is_none() && addr.iter().any(|addr| !addr.ip().is_loopback()) {
-        let _ = std::io::stderr()
-            .write_all(b"search: a non-loopback --addr requires --token-file\n");
+        let _ =
+            std::io::stderr().write_all(b"search: a non-loopback --addr requires --token-file\n");
         return ExitCode::from(2);
     }
 
@@ -846,7 +849,8 @@ fn ort_server_main(
         };
         // The socket's file permissions are the unix listener's auth.
         use std::os::unix::fs::PermissionsExt as _;
-        if let Err(error) = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)) {
+        if let Err(error) = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+        {
             tracing::error!(%error, "could not permission {}", path.display());
             return ExitCode::FAILURE;
         }
@@ -894,14 +898,16 @@ fn ort_server_main(
             }
         }
     }
-    match runtime.block_on(repo_search_ort::server::run(repo_search_ort::server::Config {
-        #[cfg(unix)]
-        unix,
-        tcp: adopted,
-        token,
-        idle_exit: idle_exit.unwrap_or(repo_search_client::launcher::SERVER_IDLE_EXIT),
-        model_dir,
-    })) {
+    match runtime.block_on(repo_search_ort::server::run(
+        repo_search_ort::server::Config {
+            #[cfg(unix)]
+            unix,
+            tcp: adopted,
+            token,
+            idle_exit: idle_exit.unwrap_or(repo_search_client::launcher::SERVER_IDLE_EXIT),
+            model_dir,
+        },
+    )) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             tracing::error!(%error, "the server stopped on a fatal error");

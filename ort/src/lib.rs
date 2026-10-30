@@ -156,9 +156,7 @@ impl OrtEmbedder {
         if tokenizer.get_vocab_size(true) > i64::MAX as usize {
             return Err(Error::VocabTooLarge);
         }
-        let pad = tokenizer
-            .token_to_id("<pad>")
-            .ok_or(Error::NoPadToken)? as i64;
+        let pad = tokenizer.token_to_id("<pad>").ok_or(Error::NoPadToken)? as i64;
         let max_len = *manifest.buckets.last().expect("manifest requires buckets");
         let encoder = Encoder { tokenizer, max_len };
 
@@ -257,10 +255,7 @@ impl OrtEmbedder {
         let [vector] = self
             .run(&[ids.to_vec()])?
             .try_into()
-            .map_err(|_| Error::EmbeddingDim {
-                got: 0,
-                want: 1,
-            })?;
+            .map_err(|_| Error::EmbeddingDim { got: 0, want: 1 })?;
         Ok(vector)
     }
 
