@@ -79,6 +79,41 @@ struct RawCli {
     )]
     build: Option<String>,
 
+    /// The ONNX model directory the server loads (`manifest.json`,
+    /// `tokenizer.json`, the model and its sidecar data).
+    #[cfg(not(target_os = "macos"))]
+    #[arg(
+        long,
+        hide = true,
+        requires = "server",
+        conflicts_with = "query",
+        value_name = "DIR"
+    )]
+    model_dir: Option<PathBuf>,
+
+    /// The unix socket the server binds, defaulting to the runtime dir's
+    /// `server.sock`.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[arg(
+        long,
+        hide = true,
+        requires = "server",
+        conflicts_with = "query",
+        value_name = "PATH"
+    )]
+    socket: Option<PathBuf>,
+
+    /// A TCP address the server also listens on; repeatable.
+    #[cfg(not(target_os = "macos"))]
+    #[arg(
+        long,
+        hide = true,
+        requires = "server",
+        conflicts_with = "query",
+        value_name = "ADDR"
+    )]
+    addr: Vec<SocketAddr>,
+
     /// Exit after this many seconds with no connections and no work.
     #[arg(
         long,
@@ -318,6 +353,15 @@ pub enum Invocation {
         token_file: Option<PathBuf>,
         /// `--build`, when given.
         build: Option<String>,
+        /// `--model-dir`, when given. The flag exists only off macOS, so
+        /// this is always `None` there.
+        model_dir: Option<PathBuf>,
+        /// `--socket`, when given. The flag exists only on non-macOS unix,
+        /// so this is always `None` elsewhere.
+        socket: Option<PathBuf>,
+        /// Every `--addr`. The flag exists only off macOS, so this is
+        /// always empty there.
+        addr: Vec<SocketAddr>,
     },
     /// `search --daemon`: the agent's entry point, socket-activated on
     /// macOS and self-bound under spawn on Linux.
@@ -365,11 +409,22 @@ impl Cli {
     pub fn invocation(self) -> Invocation {
         let raw = self.0;
         if raw.server {
+            #[cfg(not(target_os = "macos"))]
+            let (model_dir, addr) = (raw.model_dir, raw.addr);
+            #[cfg(target_os = "macos")]
+            let (model_dir, addr): (Option<PathBuf>, Vec<SocketAddr>) = (None, Vec::new());
+            #[cfg(all(unix, not(target_os = "macos")))]
+            let socket = raw.socket;
+            #[cfg(not(all(unix, not(target_os = "macos"))))]
+            let socket: Option<PathBuf> = None;
             return Invocation::Server {
                 idle_exit: raw.idle_exit_secs.map(Duration::from_secs),
                 model_cache: raw.model_cache,
                 token_file: raw.token_file,
                 build: raw.build,
+                model_dir,
+                socket,
+                addr,
             };
         }
         if raw.daemon {
