@@ -48,11 +48,19 @@ fn main() -> ExitCode {
             idle_exit,
             token_file,
             build,
+            model_cache,
             model_dir,
             socket,
             addr,
-            ..
-        } => ort_server_main(idle_exit, token_file, build, model_dir, socket, addr),
+        } => ort_server_main(
+            idle_exit,
+            token_file,
+            build,
+            model_dir,
+            model_cache,
+            socket,
+            addr,
+        ),
         client => client_main(client),
     }
 }
@@ -739,6 +747,7 @@ fn ort_server_main(
     token_file: Option<PathBuf>,
     build: Option<String>,
     model_dir: Option<PathBuf>,
+    model_cache: Option<PathBuf>,
     socket: Option<PathBuf>,
     addr: Vec<std::net::SocketAddr>,
 ) -> ExitCode {
@@ -746,11 +755,6 @@ fn ort_server_main(
         .with_writer(std::io::stderr)
         .with_max_level(tracing::Level::INFO)
         .init();
-
-    let Some(model_dir) = model_dir else {
-        let _ = std::io::stderr().write_all(b"search: --server requires --model-dir\n");
-        return ExitCode::from(2);
-    };
     #[cfg(unix)]
     if let Some(expected) = &build {
         match repo_search_client::protocol::BuildId::of_current_exe() {
@@ -898,16 +902,42 @@ fn ort_server_main(
             }
         }
     }
-    match runtime.block_on(repo_search_ort::server::run(
-        repo_search_ort::server::Config {
+    let result = runtime.block_on(async {
+        // `--model-dir` points at an unpacked model directory; without it
+        // the pinned ONNX archive is fetched and unpacked under the model
+        // cache (`--model-cache`, else the per-user cache).
+        let model_dir = match model_dir {
+            Some(dir) => dir,
+            None => {
+                use repo_search::model_store::{ModelSpec, ModelStore};
+                let store = match model_cache {
+                    Some(root) => ModelStore::new(root, ModelSpec::embedding_gemma_2_onnx()),
+                    None => ModelStore::user_cache_onnx(),
+                }
+                .map_err(|error| format!("model store: {error}"))?;
+                let (progress, _watch) =
+                    tokio::sync::watch::channel(repo_search_core::model::Fetch {
+                        received: 0,
+                        total: None,
+                    });
+                store
+                    .ensure(&progress)
+                    .await
+                    .map_err(|error| format!("model download: {error}"))?
+            }
+        };
+        repo_search_ort::server::run(repo_search_ort::server::Config {
             #[cfg(unix)]
             unix,
             tcp: adopted,
             token,
             idle_exit: idle_exit.unwrap_or(repo_search_client::launcher::SERVER_IDLE_EXIT),
             model_dir,
-        },
-    )) {
+        })
+        .await
+        .map_err(|error| error.to_string())
+    });
+    match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             tracing::error!(%error, "the server stopped on a fatal error");

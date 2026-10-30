@@ -85,6 +85,9 @@ pub enum Error {
         /// The manifest's `embedding_dim`.
         want: usize,
     },
+    /// `REPO_SEARCH_ORT_EP` named a provider this build does not know.
+    #[error("unknown execution provider: {0}")]
+    UnknownProvider(String),
     /// The ONNX Runtime failure.
     #[error("onnx runtime: {0}")]
     Ort(#[from] ort::Error),
@@ -121,6 +124,49 @@ impl Encoder {
         }
         Ok(ids)
     }
+}
+
+/// The ordered execution-provider preference: the `REPO_SEARCH_ORT_EP`
+/// environment variable's comma-separated names (default `cpu`), with
+/// `cpu` appended as the last resort when absent.
+fn ep_chain() -> Vec<String> {
+    let mut chain: Vec<String> = std::env::var("REPO_SEARCH_ORT_EP")
+        .unwrap_or_else(|_| "cpu".to_owned())
+        .split(',')
+        .map(|name| name.trim().to_lowercase())
+        .filter(|name| !name.is_empty())
+        .collect();
+    if !chain.iter().any(|name| name == "cpu") {
+        chain.push("cpu".to_owned());
+    }
+    chain
+}
+
+/// Commits a session over `model`, registering `chain`'s providers in
+/// order — ONNX Runtime runs on the first provider that accepts each
+/// node, so an NPU-capable name placed first prefers the NPU.
+fn commit_session(
+    environment: &ort::environment::Environment,
+    chain: &[String],
+    model: PathBuf,
+) -> Result<Session, Error> {
+    let mut providers: Vec<ort::ep::ExecutionProviderDispatch> = Vec::with_capacity(chain.len());
+    for name in chain {
+        providers.push(match name.as_str() {
+            "cpu" => ort::ep::CPU::default().build(),
+            "openvino" => ort::ep::OpenVINO::default().build(),
+            "openvino-npu" => ort::ep::OpenVINO::default().with_device_type("NPU").build(),
+            "qnn" => ort::ep::QNN::default().build(),
+            "directml" => ort::ep::DirectML::default().build(),
+            "xnnpack" => ort::ep::XNNPACK::default().build(),
+            "onednn" => ort::ep::OneDNN::default().build(),
+            other => return Err(Error::UnknownProvider(other.to_owned())),
+        });
+    }
+    Ok(Session::builder(environment)?
+        .with_execution_providers(providers)
+        .map_err(ort::Error::from)?
+        .commit_from_file(model)?)
 }
 
 /// An EmbeddingGemma ONNX session: one `input_ids`/`attention_mask` pair
@@ -162,10 +208,22 @@ impl OrtEmbedder {
 
         let _ = stage.send(LoadStage::Open);
         let environment = ort::init().with_name("repo-search-ort").build()?;
-        let session = Session::builder(&environment)?
-            .with_execution_providers([ort::ep::CPU::default().build()])
-            .map_err(|error| Error::Ort(ort::Error::from(error)))?
-            .commit_from_file(dir.join(&manifest.model))?;
+        // Provider preference: `REPO_SEARCH_ORT_EP` names an ordered
+        // comma-separated chain (`qnn`, `openvino`, `openvino-npu`,
+        // `directml`, `xnnpack`, `onednn`, `cpu`), CPU
+        // appended as the last resort. A chain that fails to register —
+        // the usual case when the accelerator's provider library is not
+        // installed — drops to CPU alone rather than half-initialized
+        // hardware offload.
+        let providers = ep_chain();
+        tracing::info!(?providers, "execution provider preference");
+        let session = match commit_session(&environment, &providers, dir.join(&manifest.model)) {
+            Ok(session) => session,
+            Err(error) => {
+                tracing::warn!(%error, "provider chain unavailable, falling back to cpu");
+                commit_session(&environment, &["cpu".to_owned()], dir.join(&manifest.model))?
+            }
+        };
 
         let mut seen = session
             .inputs()
