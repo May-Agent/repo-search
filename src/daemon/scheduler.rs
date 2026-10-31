@@ -195,7 +195,7 @@ pub struct DocumentsJob {
     pub enqueued: Instant,
     /// Answered `Ok` once every chunk's vector is with `writer`; the
     /// caller flushes it to commit them.
-    pub reply: oneshot::Sender<Result<(), EmbedError>>,
+    pub reply: oneshot::Sender<Result<u64, EmbedError>>,
 }
 
 /// A `Documents` job the scheduler is tracking, as it numbered it.
@@ -264,6 +264,14 @@ pub enum SchedulerMsg {
         /// completion of a cancelled and requeued flight is ignored.
         generation: u64,
     },
+    /// An indexing item's request was refused; the item completes
+    /// without a vector and is *not* noted committed.
+    IndexSkipped {
+        /// The completed item.
+        item: ItemId,
+        /// The flight's generation, checked like [`IndexDone::generation`].
+        generation: u64,
+    },
     /// A request's embed call failed, past its retry: fatal.
     ServerFailed {
         /// What failed, for the log and waiting queries.
@@ -276,14 +284,18 @@ pub enum SchedulerMsg {
         spot: SpotId,
         /// The request's `Server-Timing`.
         timing: ServerTiming,
+        /// Hashes the server refused: they were unheld without a vector
+        /// and are not noted committed.
+        skipped: Vec<ContentHash>,
     },
     /// A query job's request ended; its reply is already sent.
     QueryDone {
         /// The job's worktree.
         worktree: WorktreeId,
-        /// The request's `Server-Timing`, or its failure past its retry,
-        /// which is fatal.
-        outcome: Result<ServerTiming, String>,
+        /// The request's `Server-Timing`, or its failure past its retry.
+        /// A `true` flag marks a refused input: the caller got the error
+        /// and the scheduler stays up; any other failure is fatal.
+        outcome: Result<ServerTiming, (String, bool)>,
     },
     /// The owner takes its accumulated query stats.
     TakeStats {
@@ -532,7 +544,7 @@ struct Spot {
     held: Vec<ContentHash>,
     /// The job's `u=0` request task.
     task: AbortHandle,
-    reply: oneshot::Sender<Result<(), EmbedError>>,
+    reply: oneshot::Sender<Result<u64, EmbedError>>,
 }
 
 /// The queue an item of `class` sits in.
@@ -734,8 +746,15 @@ impl<E: Embeddings, Q: QueryInput> Scheduler<E, Q> {
             SchedulerMsg::Query(job) => self.on_query(*job),
             SchedulerMsg::Documents(job) => self.on_documents(*job),
             SchedulerMsg::IndexDone { item, generation } => self.on_index_done(item, generation),
+            SchedulerMsg::IndexSkipped { item, generation } => {
+                self.on_index_skipped(item, generation);
+            }
             SchedulerMsg::ServerFailed { error } => self.on_fatal(error).await,
-            SchedulerMsg::DocumentsDone { spot, timing } => self.on_documents_done(spot, timing),
+            SchedulerMsg::DocumentsDone {
+                spot,
+                timing,
+                skipped,
+            } => self.on_documents_done(spot, timing, skipped),
             SchedulerMsg::QueryDone { worktree, outcome } => {
                 self.on_query_done(worktree, outcome).await
             }
@@ -878,9 +897,11 @@ impl<E: Embeddings, Q: QueryInput> Scheduler<E, Q> {
                     let _ = tx.send(SchedulerMsg::IndexDone { item, generation }).await;
                 }
                 Err(error) => {
-                    if error.is_client_error() {
+                    if error.is_input_refusal() {
                         error!(%error, %hash, "an indexing embed was refused; the chunk keeps no vector");
-                        let _ = tx.send(SchedulerMsg::IndexDone { item, generation }).await;
+                        let _ = tx
+                            .send(SchedulerMsg::IndexSkipped { item, generation })
+                            .await;
                     } else {
                         let _ = tx
                             .send(SchedulerMsg::ServerFailed {
@@ -918,7 +939,26 @@ impl<E: Embeddings, Q: QueryInput> Scheduler<E, Q> {
             return;
         }
         self.flights.remove(&item);
-        self.item_done(item);
+        self.item_done(item, true);
+    }
+
+    /// Like [`Self::on_index_done`] for a refused request: the item
+    /// completes without a vector and without a committed note, so a
+    /// later enqueue of the same hash is not filtered out.
+    fn on_index_skipped(&mut self, item: ItemId, generation: u64) {
+        let current = self
+            .items
+            .get(&item)
+            .is_some_and(|i| i.queue == Queue::InFlight)
+            && self
+                .flights
+                .get(&item)
+                .is_some_and(|flight| flight.generation == generation);
+        if !current {
+            return;
+        }
+        self.flights.remove(&item);
+        self.item_done(item, false);
     }
 
     /// Applies a worktree's `Enqueue`: a `Replace` or a `Change` of its
@@ -1351,12 +1391,13 @@ impl<E: Embeddings, Q: QueryInput> Scheduler<E, Q> {
                         .await;
                 }
                 Err(error) => {
+                    let refusal = error.is_input_refusal();
                     let message = error.to_string();
                     let _ = job.reply.send(Err(EmbedError::Model(message.clone())));
                     let _ = tx
                         .send(SchedulerMsg::QueryDone {
                             worktree,
-                            outcome: Err(message),
+                            outcome: Err((message, refusal)),
                         })
                         .await;
                 }
@@ -1411,7 +1452,7 @@ impl<E: Embeddings, Q: QueryInput> Scheduler<E, Q> {
             self.hold(repo, hash);
         }
         if embed.is_empty() {
-            let _ = reply.send(Ok(()));
+            let _ = reply.send(Ok(0));
             return;
         }
         let Some(tx) = self.tx.upgrade() else {
@@ -1443,11 +1484,13 @@ impl<E: Embeddings, Q: QueryInput> Scheduler<E, Q> {
                         .send(SchedulerMsg::DocumentsDone {
                             spot: id,
                             timing: answered.timing,
+                            skipped: Vec::new(),
                         })
                         .await;
                 }
-                Err(error) if error.is_client_error() => {
+                Err(error) if error.is_input_refusal() => {
                     let mut timing = ServerTiming::default();
+                    let mut skipped = Vec::new();
                     for (hash, text) in inputs {
                         match embeddings
                             .embed(vec![text], Urgency::new(URGENCY_INTERACTIVE))
@@ -1463,8 +1506,9 @@ impl<E: Embeddings, Q: QueryInput> Scheduler<E, Q> {
                                 timing.wait = timing.wait.max(answered.timing.wait);
                                 timing.overtaken += answered.timing.overtaken;
                             }
-                            Err(error) if error.is_client_error() => {
+                            Err(error) if error.is_input_refusal() => {
                                 error!(%error, %hash, "a documents embed was refused; the chunk keeps no vector");
+                                skipped.push(hash);
                             }
                             Err(error) => {
                                 let _ = tx
@@ -1477,7 +1521,11 @@ impl<E: Embeddings, Q: QueryInput> Scheduler<E, Q> {
                         }
                     }
                     let _ = tx
-                        .send(SchedulerMsg::DocumentsDone { spot: id, timing })
+                        .send(SchedulerMsg::DocumentsDone {
+                            spot: id,
+                            timing,
+                            skipped,
+                        })
                         .await;
                 }
                 Err(error) => {
@@ -1566,19 +1614,23 @@ impl<E: Embeddings, Q: QueryInput> Scheduler<E, Q> {
         }
     }
 
-    /// The job's request landed and its vectors went to the writer. Each
-    /// held item is finished as an indexing item would be.
-    fn on_documents_done(&mut self, id: SpotId, timing: ServerTiming) {
+    /// The job's request landed and its vectors went to the writer.
+    /// Each held item with a vector is finished as an indexing item
+    /// would be; a refused hash is only unheld — it has no vector, is
+    /// not committed, and queues again like any unembedded chunk.
+    fn on_documents_done(&mut self, id: SpotId, timing: ServerTiming, skipped: Vec<ContentHash>) {
         let Some(spot) = self.spots.remove(&id) else {
             // The job was dropped or stopped before its request landed.
             return;
         };
         self.note_timing(spot.worktree, timing);
         let repo = spot.repo;
+        let skipped: HashSet<ContentHash> = skipped.into_iter().collect();
         for hash in spot.held {
-            // The item finishes whether or not another job still holds
-            // the hash: its vector is with the writer either way.
             self.unhold(repo, hash);
+            if skipped.contains(&hash) {
+                continue;
+            }
             self.note_committed(repo, hash);
             if let Some(&item) = self.by_hash.get(&(repo, hash)) {
                 assert_eq!(
@@ -1586,19 +1638,23 @@ impl<E: Embeddings, Q: QueryInput> Scheduler<E, Q> {
                     Queue::Held,
                     "an item of a held hash is Held"
                 );
-                self.item_done(item);
+                self.item_done(item, true);
             }
         }
-        let _ = spot.reply.send(Ok(()));
+        let _ = spot.reply.send(Ok(skipped.len() as u64));
     }
 
-    /// A request finished `item`: the vector already went to the repo
-    /// writer, so drop the item and close stage 1 for any worktree it
-    /// completed.
-    fn item_done(&mut self, item: ItemId) {
+    /// A request finished `item`: when `committed` the vector already
+    /// went to the repo writer and the hash is noted committed; a
+    /// refused item is dropped without a vector and without the note.
+    /// Either way the item leaves its queue and closes stage 1 for any
+    /// worktree it completed.
+    fn item_done(&mut self, item: ItemId, committed: bool) {
         let entry = self.items.remove(&item).expect("done item exists");
         self.by_hash.remove(&(entry.repo, entry.hash));
-        self.note_committed(entry.repo, entry.hash);
+        if committed {
+            self.note_committed(entry.repo, entry.hash);
+        }
         for worktree in &entry.worktrees {
             if let Some(state) = self.worktrees.get_mut(worktree) {
                 state.interest.remove(&item);
@@ -1622,16 +1678,24 @@ impl<E: Embeddings, Q: QueryInput> Scheduler<E, Q> {
         }
     }
 
-    /// A query job's request ended: accumulate the worktree's stats, or
-    /// go fatal on its failure.
-    async fn on_query_done(&mut self, worktree: WorktreeId, outcome: Result<ServerTiming, String>) {
+    /// A query job's request ended: accumulate the worktree's stats,
+    /// ignore a refused input — its caller already has the error — or
+    /// go fatal on any other failure.
+    async fn on_query_done(
+        &mut self,
+        worktree: WorktreeId,
+        outcome: Result<ServerTiming, (String, bool)>,
+    ) {
         self.queries_in_flight = self
             .queries_in_flight
             .checked_sub(1)
             .expect("a QueryDone without an in-flight query");
         match outcome {
             Ok(timing) => self.note_timing(worktree, timing),
-            Err(error) => self.on_fatal(error).await,
+            Err((error, refusal)) if refusal => {
+                error!(%error, "a query embed was refused");
+            }
+            Err((error, _)) => self.on_fatal(error).await,
         }
     }
 

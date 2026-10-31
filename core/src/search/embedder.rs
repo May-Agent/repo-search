@@ -27,8 +27,11 @@ pub trait EmbedService: Send + Sync {
     /// also runs indexing may commit a chunk's vector from the indexing
     /// embedder already holding it instead of embedding it again. The
     /// chunks' content hashes are distinct.
+    /// Embeds every chunk's document. Returns how many inputs the
+    /// server refused under the model contract — their vectors do not
+    /// exist; every other failure is the error.
     fn documents(
         &self,
         chunks: Vec<PendingChunk>,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+    ) -> impl Future<Output = Result<u64, Self::Error>> + Send;
 }

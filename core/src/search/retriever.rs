@@ -315,11 +315,8 @@ impl<S: EmbedService> Retriever<S> {
             .await
             .map_err(Error::Embed)?;
         let stored = self.cache.get_many(model, &hashes).await?;
-        assert_eq!(
-            stored.len(),
-            hashes.len(),
-            "the embed service commits a vector for every chunk"
-        );
+        // A refused input keeps no vector: the stored set can be smaller
+        // than the requested one, and those chunks simply do not match.
         // Each vector is loaded on every side the worktree holds its hash on.
         self.vectors
             .adopt::<S::Error>(

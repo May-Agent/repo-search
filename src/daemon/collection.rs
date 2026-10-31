@@ -315,8 +315,10 @@ impl<T: Tokens> Collection<T> {
             sched: model.scheduler.tx(),
             writer: open.writer.clone(),
         };
+        let mut skipped = 0u64;
         for batch in pending.chunks(EMBED_BATCH) {
-            ane.documents(batch.to_vec())
+            skipped += ane
+                .documents(batch.to_vec())
                 .await
                 .map_err(|e| e.to_string())?;
         }
@@ -329,7 +331,7 @@ impl<T: Tokens> Collection<T> {
         report.chunks_total = counts.chunks_total;
         report.chunks_with_vector = counts.chunks_with_vector;
         open.report = report;
-        Ok(pending.len() as u64)
+        Ok(pending.len() as u64 - skipped)
     }
 
     async fn upsert(
