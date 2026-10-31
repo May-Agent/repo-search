@@ -106,7 +106,7 @@ impl<E: BlockingEmbed> EmbedService for EmbedThread<E> {
         rx.await.expect(GONE)
     }
 
-    async fn documents(&self, chunks: Vec<PendingChunk>) -> Result<(), Self::Error> {
+    async fn documents(&self, chunks: Vec<PendingChunk>) -> Result<u64, Self::Error> {
         let hashes: Vec<ContentHash> = chunks.iter().map(|chunk| chunk.content_hash).collect();
         let (reply, rx) = oneshot::channel();
         let request = Request::Documents { chunks, reply };
@@ -116,6 +116,6 @@ impl<E: BlockingEmbed> EmbedService for EmbedThread<E> {
             .put_many(&self.model, hashes.into_iter().zip(vectors).collect())
             .await
             .expect("the test cache commits");
-        Ok(())
+        Ok(0)
     }
 }

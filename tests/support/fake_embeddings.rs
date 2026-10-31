@@ -58,14 +58,14 @@ pub struct Record {
 }
 
 /// The fake's failure; scheduler-level tests inject it with `fail`.
-/// The `bool` is [`RequestError::is_client_error`]: `fail` injects a
-/// fatal server failure, `fail_client_error` a per-request refusal.
+/// The `bool` is [`RequestError::is_input_refusal`]: `fail` injects a
+/// fatal server failure, `fail_input_refusal` a per-request refusal.
 #[derive(Debug, thiserror::Error)]
 #[error("fake embeddings failure: {0}")]
 pub struct FakeError(String, bool);
 
 impl repo_search::daemon::server::RequestError for FakeError {
-    fn is_client_error(&self) -> bool {
+    fn is_input_refusal(&self) -> bool {
         self.1
     }
 }
@@ -120,6 +120,7 @@ pub struct FakeEmbeddings {
     index_gate: Option<watch::Receiver<bool>>,
     interactive_gate: Option<watch::Receiver<bool>>,
     failures: HashMap<ContentHash, (String, bool)>,
+    query_failure: Option<(String, bool)>,
 }
 
 impl FakeEmbeddings {
@@ -131,6 +132,7 @@ impl FakeEmbeddings {
             index_gate: None,
             interactive_gate: None,
             failures: HashMap::new(),
+            query_failure: None,
         }
     }
 
@@ -161,10 +163,16 @@ impl FakeEmbeddings {
         self.failures.insert(hash, (message.to_owned(), false));
     }
 
-    /// Like [`Self::fail`], but the injected failure is a client error:
+    /// Like [`Self::fail`], but the injected failure is an input refusal:
     /// the request is refused, the server stays healthy.
-    pub fn fail_client_error(&mut self, hash: ContentHash, message: &str) {
+    pub fn fail_input_refusal(&mut self, hash: ContentHash, message: &str) {
         self.failures.insert(hash, (message.to_owned(), true));
+    }
+
+    /// Makes every interactive call that is a plain query — no document
+    /// parses out of its input — fail as an input refusal.
+    pub fn fail_query(&mut self, message: &str) {
+        self.query_failure = Some((message.to_owned(), true));
     }
 
     /// `input`'s document title and text, parsed back out of
@@ -256,9 +264,11 @@ impl Embeddings for FakeEmbeddings {
             pass(self.interactive_gate.as_ref()).await;
             unanswered.armed = false;
             for &(_, hash) in &parsed {
-                if let Some((message, client_error)) =
-                    hash.and_then(|hash| self.failures.get(&hash))
-                {
+                let failure = match hash {
+                    Some(hash) => self.failures.get(&hash),
+                    None => self.query_failure.as_ref(),
+                };
+                if let Some((message, client_error)) = failure {
                     return Err(FakeError(message.clone(), *client_error));
                 }
             }

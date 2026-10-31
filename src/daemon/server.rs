@@ -100,18 +100,20 @@ impl Error {
     }
 }
 
-/// What an [`Embeddings`] failure means for its caller: only a client
-/// error may fail one job; every other failure means the server is
+/// What an [`Embeddings`] failure means for its caller: only a refused
+/// input may fail one job; every other failure means the server is
 /// unhealthy and is fatal to the daemon.
 pub trait RequestError: std::error::Error + Send + Sync + 'static {
-    /// Whether the request's own inputs were refused (a 4xx); the server
-    /// itself is fine.
-    fn is_client_error(&self) -> bool;
+    /// Whether one of the request's inputs was refused under the model
+    /// contract (`context_length_exceeded`); the server itself is fine.
+    /// Authentication and model-mismatch 4xx answers are *not* input
+    /// refusals: they are operational failures and stay fatal.
+    fn is_input_refusal(&self) -> bool;
 }
 
 impl RequestError for Error {
-    fn is_client_error(&self) -> bool {
-        matches!(self, Self::Status { status, .. } if (400..500).contains(status))
+    fn is_input_refusal(&self) -> bool {
+        matches!(self, Self::Status { code: Some(code), .. } if code == "context_length_exceeded")
     }
 }
 
