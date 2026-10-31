@@ -1,6 +1,6 @@
 [package]
 name = "repo-search-coreml"
-version = "0.0.5"
+version = "0.0.6"
 description = "Core ML token embedding for repo-search (Apple Silicon)"
 edition.workspace = true
 rust-version.workspace = true

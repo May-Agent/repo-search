@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.6](https://github.com/May-Agent/repo-search/compare/core/v0.0.5...core/v0.0.6) - 2026-10-31
+
+### Added
+
+- fp16 ONNX archive for NVIDIA hosts
+
+### Fixed
+
+- *(embed)* refused inputs never mark a chunk committed and never panic
+
 ## [0.0.5](https://github.com/May-Agent/repo-search/compare/core/v0.0.4...core/v0.0.5) - 2026-10-30
 
 ### Added
