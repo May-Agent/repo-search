@@ -1,6 +1,6 @@
 [package]
 name = "repo-search-ort"
-version = "0.0.4"
+version = "0.0.5"
 description = "ONNX Runtime token embedding for repo-search (Linux, Windows)"
 edition.workspace = true
 rust-version.workspace = true
