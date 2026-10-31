@@ -34,6 +34,17 @@ pub const ONNX_ARCHIVE: Pin = Pin {
         "a4acdbe8cbcdc2d2a8e95b81317a694c966f2de64a534dda5189b34faad14acf",
 };
 
+/// The fp16 variant of the ONNX archive, served on NVIDIA GPUs: CUDA's
+/// tensor cores run fp16 natively, where the int8 quantization gains
+/// nothing.
+#[cfg(not(target_os = "macos"))]
+#[rustfmt::skip]
+pub const ONNX_FP16_ARCHIVE: Pin = Pin {
+    url: "https://huggingface.co/lexoliu/repo-search-embeddinggemma2-onnx/resolve/d4e1b374f97451cf89262d03f4f8e387822511d4/eg2-onnx-fp16-914f7f89-ac32bf70.tar.zst",
+    sha256:
+        "ac32bf7023a81cf0d58e5f487ecb8e46979898d966f606bc564c5dba8585b414",
+};
+
 /// The tokenizer the daemon counts and prefixes chunks with, pinned at the
 /// model's upstream revision; the archive ships the same bytes.
 pub const TOKENIZER: Pin = Pin {

@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.8](https://github.com/May-Agent/repo-search/compare/v0.0.7...v0.0.8) - 2026-10-31
+
+### Added
+
+- fp16 ONNX archive for NVIDIA hosts
+
+### Fixed
+
+- *(embed)* refused inputs never mark a chunk committed and never panic
+- *(daemon)* a refused embed no longer kills the scheduler
+- ModelSpec import unused on non-macOS targets
+- drop the unused ModelSpec import
+- drop the now-unused MODEL_ID import
+
 ## [0.0.7](https://github.com/May-Agent/repo-search/compare/v0.0.6...v0.0.7) - 2026-10-30
 
 ### Fixed

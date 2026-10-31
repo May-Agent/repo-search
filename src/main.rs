@@ -177,7 +177,6 @@ fn activated_main(
     use repo_search::daemon::listen::Activated;
     use repo_search::daemon::{self, Config};
     use repo_search::launchd;
-    use repo_search_core::model::MODEL_ID;
     use std::os::unix::net::UnixListener;
 
     let fds = match launchd::activate_socket("Listener") {
@@ -228,7 +227,7 @@ fn activated_main(
                 load_bound: daemon::LOAD_BOUND,
                 tokens,
                 server,
-                model_id: MODEL_ID.to_owned(),
+                model_id: model_id(),
                 state,
                 build,
             })) {
@@ -267,7 +266,6 @@ fn bound_main(
 ) -> ExitCode {
     use repo_search::daemon::listen::{Bound, Listener as _};
     use repo_search::daemon::{Config, LOAD_BOUND, StartupError};
-    use repo_search_core::model::MODEL_ID;
 
     let bound = match runtime.block_on(Bound::acquire(&path)) {
         Ok(bound) => bound,
@@ -316,7 +314,7 @@ fn bound_main(
         load_bound: LOAD_BOUND,
         tokens,
         server,
-        model_id: MODEL_ID.to_owned(),
+        model_id: model_id(),
         state,
         build,
     })) {
@@ -547,7 +545,7 @@ fn server_main(
     build: Option<String>,
 ) -> ExitCode {
     use repo_search::launchd;
-    use repo_search::model_store::{ModelSpec, ModelStore};
+    use repo_search::model_store::ModelStore;
     use repo_search_client::protocol::BuildId;
 
     tracing_subscriber::fmt()
@@ -645,7 +643,10 @@ fn server_main(
         }
     }
     let model_store = match &model_cache {
-        Some(root) => ModelStore::new(root.clone(), ModelSpec::embedding_gemma_2()),
+        Some(root) => ModelStore::new(
+            root.clone(),
+            repo_search::model_store::ModelSpec::embedding_gemma_2(),
+        ),
         None => ModelStore::user_cache(),
     };
     let model_store = match model_store {
@@ -734,6 +735,45 @@ fn server_main(
             tracing::error!(%error, "the server stopped on a fatal error");
             ExitCode::FAILURE
         }
+    }
+}
+
+/// The model id the daemon expects the embedding server to list.
+/// `REPO_SEARCH_MODEL_ID` overrides it for deployments whose server
+/// runs a different pinned build — the fp16 ONNX archive on an NVIDIA
+/// host advertises `onnx-a49e227d…`, not the int8 default.
+fn model_id() -> String {
+    #[cfg(not(target_os = "macos"))]
+    if let Ok(id) = std::env::var("REPO_SEARCH_MODEL_ID") {
+        return id;
+    }
+    repo_search_core::model::MODEL_ID.to_owned()
+}
+
+/// Whether the server should fetch the fp16 ONNX archive (the NVIDIA
+/// build) instead of the int8 default: `REPO_SEARCH_ORT_ARCHIVE=fp16`.
+#[cfg(not(target_os = "macos"))]
+fn onnx_fp16() -> bool {
+    std::env::var("REPO_SEARCH_ORT_ARCHIVE").is_ok_and(|a| a == "fp16")
+}
+
+/// The [`ModelSpec`] matching [`onnx_fp16`]'s archive choice.
+#[cfg(not(target_os = "macos"))]
+fn onnx_spec() -> repo_search::model_store::ModelSpec {
+    if onnx_fp16() {
+        repo_search::model_store::ModelSpec::embedding_gemma_2_onnx_fp16()
+    } else {
+        repo_search::model_store::ModelSpec::embedding_gemma_2_onnx()
+    }
+}
+
+/// The per-user [`ModelStore`] matching [`onnx_fp16`]'s archive choice.
+#[cfg(not(target_os = "macos"))]
+fn onnx_store() -> Result<repo_search::model_store::ModelStore, repo_search::model_store::Error> {
+    if onnx_fp16() {
+        repo_search::model_store::ModelStore::user_cache_onnx_fp16()
+    } else {
+        repo_search::model_store::ModelStore::user_cache_onnx()
     }
 }
 
@@ -909,10 +949,10 @@ fn ort_server_main(
         let model_dir = match model_dir {
             Some(dir) => dir,
             None => {
-                use repo_search::model_store::{ModelSpec, ModelStore};
+                use repo_search::model_store::ModelStore;
                 let store = match model_cache {
-                    Some(root) => ModelStore::new(root, ModelSpec::embedding_gemma_2_onnx()),
-                    None => ModelStore::user_cache_onnx(),
+                    Some(root) => ModelStore::new(root, onnx_spec()),
+                    None => onnx_store(),
                 }
                 .map_err(|error| format!("model store: {error}"))?;
                 let (progress, _watch) =

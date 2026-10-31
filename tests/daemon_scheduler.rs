@@ -353,7 +353,7 @@ async fn query(rig: &Rig, text: &str) {
 async fn send_spot(
     rig: &Rig,
     chunks: Vec<PendingChunk>,
-) -> oneshot::Receiver<Result<(), EmbedError>> {
+) -> oneshot::Receiver<Result<u64, EmbedError>> {
     let (reply, rx) = oneshot::channel();
     rig.sched
         .documents(DocumentsJob {
@@ -370,7 +370,7 @@ async fn send_spot(
 }
 
 /// Awaits a `Documents` job's answer within the timeout.
-async fn answered(docs: oneshot::Receiver<Result<(), EmbedError>>) -> Result<(), EmbedError> {
+async fn answered(docs: oneshot::Receiver<Result<u64, EmbedError>>) -> Result<u64, EmbedError> {
     tokio::time::timeout(TIMEOUT, docs)
         .await
         .expect("the documents job is answered")
@@ -1723,6 +1723,141 @@ async fn a_failed_request_is_fatal_and_the_scheduler_exits() {
     assert!(index_hashes(&mut log, &records).is_empty());
 }
 
+/// A refused indexing request — the server answered 4xx — is not fatal:
+/// the refused chunk is dropped without a vector, every other item still
+/// embeds, and the scheduler stays up.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_client_error_drops_its_chunk_and_the_scheduler_lives() {
+    let (tx, records) = mpsc::channel();
+    let mut fake = FakeEmbeddings::new(tx);
+    fake.fail_input_refusal(hash(0, 100), "input has 513 tokens, over the 512-token cap");
+    let mut rig = fake_rig(fake).await;
+    let mut log = Vec::new();
+    let _done = enqueue(&rig, small(0..3), IndexClass::Stage1).await;
+    rig.sched.barrier(REPO, true).await;
+
+    wait_started(&mut log, &records, 3);
+    rig.sched.barrier(REPO, false).await;
+    await_idle(&rig).await;
+    assert!(rig.fatal.try_recv().is_err(), "no fatal error arrives");
+    let indexed = index_hashes(&mut log, &records);
+    assert!(
+        indexed.contains(&hash(1, 100)) && indexed.contains(&hash(2, 100)),
+        "the refused chunk's siblings still embed: {indexed:?}"
+    );
+    assert!(
+        !indexed.contains(&hash(0, 100)),
+        "the refused chunk is skipped: {indexed:?}"
+    );
+    assert!(
+        rig.sched.counts_for(WORKTREE).await.is_ok(),
+        "the scheduler is alive"
+    );
+}
+
+/// A refused `Documents` request falls back to one input at a time:
+/// the refused chunk is skipped, its siblings' vectors still land, and
+/// the job answers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refused_documents_job_embeds_the_rest() {
+    let (tx, records) = mpsc::channel();
+    let mut fake = FakeEmbeddings::new(tx);
+    fake.fail_input_refusal(hash(5, 100), "input has 513 tokens, over the 512-token cap");
+    let mut rig = fake_rig(fake).await;
+    let mut log = Vec::new();
+    rig.sched.barrier(REPO, true).await;
+    let docs = send_spot(&rig, vec![pending(5, 100).chunk, pending(6, 100).chunk]).await;
+
+    let skipped = answered(docs).await.expect("the job answers Ok");
+    assert_eq!(skipped, 1, "the refused chunk is reported skipped");
+    rig.sched.barrier(REPO, false).await;
+    await_idle(&rig).await;
+    assert!(rig.fatal.try_recv().is_err(), "no fatal error arrives");
+    let embeds = embeds_of(&mut log, &records, hash(6, 100));
+    assert!(
+        embeds.contains(&(Kind::QueryDocument, 0)),
+        "the good chunk embedded alone after the batch was refused: {embeds:?}"
+    );
+    assert_cached(&rig, &[hash(6, 100)]).await;
+    assert!(
+        rig.sched.counts_for(WORKTREE).await.is_ok(),
+        "the scheduler is alive"
+    );
+}
+
+/// A refused query — a 4xx on the query's own input — answers the
+/// caller with the error and the scheduler stays up: it is not a
+/// server failure.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refused_query_errors_the_caller_and_the_scheduler_lives() {
+    let (tx, records) = mpsc::channel();
+    let mut fake = FakeEmbeddings::new(tx);
+    fake.fail_query("query has 513 tokens, over the 512-token cap");
+    let mut rig = fake_rig(fake).await;
+    let mut log = Vec::new();
+
+    let error = send_query(&rig, "an overlong query")
+        .await
+        .await
+        .expect("the query answers")
+        .expect_err("the refusal reaches the caller");
+    assert!(
+        matches!(error, EmbedError::Model(ref m) if m.contains("513 tokens")),
+        "the refusal message reaches the caller: {error:?}"
+    );
+    await_idle(&rig).await;
+    assert!(rig.fatal.try_recv().is_err(), "no fatal error arrives");
+    assert!(
+        rig.sched.counts_for(WORKTREE).await.is_ok(),
+        "the scheduler is alive"
+    );
+    // And a later indexing request still embeds.
+    rig.sched.barrier(REPO, true).await;
+    let _done = enqueue(&rig, small(0..1), IndexClass::Stage1).await;
+    wait_started(&mut log, &records, 1);
+    rig.sched.barrier(REPO, false).await;
+    await_idle(&rig).await;
+    assert!(
+        rig.fatal.try_recv().is_err(),
+        "the refused query never went fatal"
+    );
+}
+
+/// A refused indexing chunk is *not* noted committed: re-enqueuing it
+/// while a barrier is still open dispatches it to the embedder again —
+/// it is not filtered as already done.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refused_chunk_is_not_committed_and_requeues() {
+    let (tx, records) = mpsc::channel();
+    let mut fake = FakeEmbeddings::new(tx);
+    fake.fail_input_refusal(hash(0, 100), "input has 513 tokens, over the 512-token cap");
+    let rig = fake_rig(fake).await;
+    let mut log = Vec::new();
+    rig.sched.barrier(REPO, true).await;
+
+    let _done = send_replace(&rig, WORKTREE, small(0..1), IndexClass::Stage1).await;
+    wait_started(&mut log, &records, 1);
+    await_counts(&rig, WORKTREE, counts(0, 0, 0, true)).await;
+
+    // The same hash enqueued again inside the still-open barrier is
+    // embedded again, not suppressed as already committed.
+    let _done = send_replace(&rig, WORKTREE, small(0..1), IndexClass::Stage1).await;
+    wait_started(&mut log, &records, 1);
+    await_counts(&rig, WORKTREE, counts(0, 0, 0, true)).await;
+
+    rig.sched.barrier(REPO, false).await;
+    await_idle(&rig).await;
+    let starts = starts_of(&mut log, &records, hash(0, 100));
+    assert!(
+        starts.len() >= 2,
+        "the refused hash re-embeds under the open barrier: {starts:?}"
+    );
+    assert!(
+        rig.sched.counts_for(WORKTREE).await.is_ok(),
+        "the scheduler is alive"
+    );
+}
+
 // ---------------------------------------------------------------------
 // Fatal handling, through a real `ServerClient` on a hyper test server.
 // ---------------------------------------------------------------------
@@ -1851,7 +1986,10 @@ async fn server_client_surfaces_503_detail() {
         .embed(vec!["x".to_owned()], Urgency::new(0))
         .await
         .expect_err("a 503 fails");
-    let repo_search::daemon::server::Error::Status { status, message } = error else {
+    let repo_search::daemon::server::Error::Status {
+        status, message, ..
+    } = error
+    else {
         panic!("a status error, got {error:?}");
     };
     assert_eq!(status, 503);

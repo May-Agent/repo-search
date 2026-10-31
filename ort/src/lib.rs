@@ -147,6 +147,7 @@ fn ep_chains() -> Result<Vec<Vec<String>>, Error> {
                 vec!["qnn".to_owned()],
                 vec!["openvino-npu".to_owned()],
                 vec!["directml".to_owned()],
+                vec!["cuda".to_owned()],
                 vec!["cpu".to_owned()],
             ]);
         }
@@ -181,6 +182,9 @@ fn commit_session(
             "openvino-npu" => ort::ep::OpenVINO::default().with_device_type("NPU").build(),
             "qnn" => ort::ep::QNN::default().build(),
             "directml" => ort::ep::DirectML::default().build(),
+            "cuda" => ort::ep::CUDA::default().build(),
+            "tensorrt" => ort::ep::TensorRT::default().build(),
+            "nvrtx" => ort::ep::NVRTX::default().build(),
             "xnnpack" => ort::ep::XNNPACK::default().build(),
             "onednn" => ort::ep::OneDNN::default().build(),
             other => return Err(Error::UnknownProvider(other.to_owned())),

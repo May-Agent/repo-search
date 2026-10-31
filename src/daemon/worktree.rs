@@ -1438,7 +1438,7 @@ impl EmbedService for AneHandle {
         rx.await.map_err(|_| EmbedError::SchedulerGone)?
     }
 
-    async fn documents(&self, chunks: Vec<PendingChunk>) -> Result<(), Self::Error> {
+    async fn documents(&self, chunks: Vec<PendingChunk>) -> Result<u64, Self::Error> {
         let (reply, rx) = oneshot::channel();
         self.sched
             .send(SchedulerMsg::Documents(Box::new(DocumentsJob {
@@ -1451,12 +1451,13 @@ impl EmbedService for AneHandle {
             })))
             .await
             .map_err(|_| EmbedError::SchedulerGone)?;
-        rx.await.map_err(|_| EmbedError::SchedulerGone)??;
-        // Every vector is with the writer: commit them for the
+        let skipped = rx.await.map_err(|_| EmbedError::SchedulerGone)??;
+        // Every landed vector is with the writer: commit them for the
         // retriever's read.
         self.writer
             .flush()
             .await
-            .map_err(|error| EmbedError::Writer(error.to_string()))
+            .map_err(|error| EmbedError::Writer(error.to_string()))?;
+        Ok(skipped)
     }
 }
