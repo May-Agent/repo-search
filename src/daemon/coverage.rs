@@ -10,7 +10,7 @@
 //! frame or a resync's listing costs the same however many chunks already
 //! have a vector. The books stay single-owned.
 
-use repo_search_core::reconcile::{Counts, Missing, Options, Reconciler};
+use repo_search_core::reconcile::{Counts, Missing, Reconciler};
 use tokio::sync::{mpsc, oneshot};
 
 /// Asks queued at once; each wait and the feeder keep at most one
@@ -27,9 +27,8 @@ pub struct Ask {
 enum Question {
     /// `index --wait`'s coverage now.
     Counts(oneshot::Sender<Result<Counts, String>>),
-    /// The scope's chunks with no vector now, for a promoted resync.
+    /// The chunks with no vector now, for a promoted resync.
     Missing {
-        options: Options,
         reply: oneshot::Sender<Result<Missing, String>>,
     },
 }
@@ -55,7 +54,7 @@ impl Ask {
             // `index --wait`'s scope never holds ignored files, as its
             // barrier.
             Question::Counts(reply) => {
-                let counts = reconciler.counts(false).await.map_err(|e| e.to_string());
+                let counts = reconciler.counts().await.map_err(|e| e.to_string());
                 if let Ok(counts) = &counts {
                     tracing::debug!(
                         chunk_rows = counts.reads.chunk_rows,
@@ -66,11 +65,8 @@ impl Ask {
                 }
                 let _ = reply.send(counts);
             }
-            Question::Missing { options, reply } => {
-                let missing = reconciler
-                    .missing(options.include_ignored)
-                    .await
-                    .map_err(|e| e.to_string());
+            Question::Missing { reply } => {
+                let missing = reconciler.missing().await.map_err(|e| e.to_string());
                 let _ = reply.send(missing);
             }
         }
@@ -106,14 +102,13 @@ impl Asker {
         self.ask(Question::Counts).await
     }
 
-    /// The chunks of `options`' scope with no vector now, as the owner's
-    /// books list them.
+    /// The chunks with no vector now, as the owner's books list them.
     ///
     /// # Errors
     ///
     /// When the owner is gone or its books could not be read.
-    pub async fn missing(&self, options: Options) -> Result<Missing, AskError> {
-        self.ask(|reply| Question::Missing { options, reply }).await
+    pub async fn missing(&self) -> Result<Missing, AskError> {
+        self.ask(|reply| Question::Missing { reply }).await
     }
 
     async fn ask<T>(
@@ -146,7 +141,7 @@ mod tests {
     use std::path::Path;
     use std::sync::Arc;
 
-    use repo_search_core::reconcile::{Options, Reads};
+    use repo_search_core::reconcile::Reads;
     use repo_search_core::store::{ContentHash, Index, VectorCache};
     use repo_search_core::{CHUNKER_FINGERPRINT, TokenCounter, UnitVector};
 
@@ -218,7 +213,7 @@ mod tests {
             .expect("cache");
         let mut reconciler = Reconciler::new(index.clone(), cache.clone(), MODEL, tree.path());
         reconciler
-            .reconcile(CHUNKER_FINGERPRINT, Options::default(), Arc::new(CapOff))
+            .reconcile(CHUNKER_FINGERPRINT, Arc::new(CapOff))
             .await
             .expect("the barrier's pass");
 
@@ -230,7 +225,7 @@ mod tests {
             }
         });
 
-        let rows = index.chunk_hashes(false).await.expect("rows");
+        let rows = index.chunk_hashes().await.expect("rows");
         let mut distinct: Vec<ContentHash> = Vec::new();
         let mut seen = HashSet::new();
         for hash in &rows {
@@ -316,7 +311,7 @@ mod tests {
         let mut reconciler = Reconciler::new(index.clone(), cache.clone(), MODEL, tree.path());
         let pass = async |reconciler: &mut Reconciler| {
             reconciler
-                .reconcile(CHUNKER_FINGERPRINT, Options::default(), Arc::new(CapOff))
+                .reconcile(CHUNKER_FINGERPRINT, Arc::new(CapOff))
                 .await
                 .expect("the barrier's pass")
         };
@@ -336,7 +331,7 @@ mod tests {
                 ask.answer(Some(&mut reconciler)).await;
             }
         });
-        let missing = asker.missing(Options::default()).await.expect("listed");
+        let missing = asker.missing().await.expect("listed");
         let listed: HashSet<ContentHash> = missing.hashes().iter().copied().collect();
         assert_eq!(
             listed,
@@ -374,10 +369,7 @@ mod tests {
             let ask = asks.recv().await.expect("one ask");
             ask.answer(None).await;
         });
-        assert!(matches!(
-            asker.missing(Options::default()).await,
-            Err(AskError::Books(_))
-        ));
+        assert!(matches!(asker.missing().await, Err(AskError::Books(_))));
         owner.await.expect("the owner answered");
         assert!(matches!(asker.now().await, Err(AskError::OwnerGone)));
     }

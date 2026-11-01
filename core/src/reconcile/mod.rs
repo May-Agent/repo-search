@@ -52,6 +52,10 @@ pub enum Error {
     #[error("walking the worktree: {0}")]
     Walk(#[from] ignore::Error),
 
+    /// Listing the worktree's git index failed.
+    #[error("listing the git index: {0}")]
+    Git(#[from] git2::Error),
+
     /// Reading a file failed for a reason other than it having vanished.
     #[error("reading {path}: {source}")]
     Io {
@@ -78,17 +82,6 @@ pub enum Error {
     /// here, never as a panic in the caller.
     #[error("reconcile worker exited without answering")]
     WorkerGone,
-}
-
-/// How a pass walks the worktree.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct Options {
-    /// Index files that `.gitignore`, `.git/info/exclude`, global excludes and
-    /// `.ignore` files would hide (`--include-ignored`), flagged as ignored.
-    /// A pass without it keeps the flagged files stored but does not look at
-    /// them, and queues none of their chunks for embedding. Hidden files and
-    /// dot-directories are indexed either way; `.git/` never is.
-    pub include_ignored: bool,
 }
 
 /// A chunk whose vector is missing from the cache, with the text to embed.
@@ -176,12 +169,11 @@ pub struct Report {
     pub chunks_added: u64,
     /// Chunk rows deleted, including those of re-chunked files.
     pub chunks_removed: u64,
-    /// Chunk rows visible to a search with the pass's `include_ignored`.
+    /// Stored chunk rows.
     pub chunks_total: u64,
     /// Chunk rows whose vector is in the cache for the model.
     pub chunks_with_vector: u64,
-    /// Chunk rows on the docs side visible to a search with the pass's
-    /// `include_ignored`.
+    /// Stored chunk rows on the docs side.
     pub doc_chunks: u64,
     /// The index was built by another chunker (or token counter) and was
     /// emptied, so every file was re-chunked this pass.
@@ -344,11 +336,9 @@ impl Reconciler {
     pub async fn reconcile(
         &mut self,
         chunker: &str,
-        options: Options,
         tokens: Arc<dyn TokenCounter>,
     ) -> Result<Reconciled, Error> {
         let books = self.books.take();
-        let include_ignored = options.include_ignored;
         let rechunked = self.index.align_chunker(chunker, &self.model_id).await?;
         let (states, unchunkables) =
             tokio::try_join!(self.index.file_states(), self.index.unchunkables())?;
@@ -373,9 +363,7 @@ impl Reconciler {
             }
         };
         let (plan, books) = tokio::join!(
-            run_blocking(move || {
-                scan::plan(&root, include_ignored, stored, recorded, &*tokens)
-            }),
+            run_blocking(move || scan::plan(&root, stored, recorded, &*tokens)),
             books,
         );
         let plan = plan??;
@@ -429,7 +417,7 @@ impl Reconciler {
                 let stored: Vec<StoredChunk> = rows
                     .into_iter()
                     .filter(|row| {
-                        books.is_visible(&row.content_hash, include_ignored)
+                        books.is_visible(&row.content_hash)
                             && !books.is_cached(&row.content_hash)
                             && taken.insert(row.content_hash)
                     })
@@ -448,7 +436,7 @@ impl Reconciler {
             let dropped = applied
                 .removed_hashes
                 .into_iter()
-                .filter(|hash| !books.is_visible(hash, include_ignored))
+                .filter(|hash| !books.is_visible(hash))
                 .collect();
             Some(Changes { added, dropped })
         };
@@ -474,9 +462,9 @@ impl Reconciler {
             files_chunked: plan.files_chunked,
             chunks_added: applied.chunks_added,
             chunks_removed: applied.chunks_removed,
-            chunks_total: books.chunks_total(include_ignored),
-            chunks_with_vector: books.chunks_with_vector(include_ignored),
-            doc_chunks: books.doc_chunks(include_ignored),
+            chunks_total: books.chunks_total(),
+            chunks_with_vector: books.chunks_with_vector(),
+            doc_chunks: books.doc_chunks(),
             rechunked,
             skipped: plan.skipped,
             reads,
@@ -495,39 +483,38 @@ impl Reconciler {
         })
     }
 
-    /// The coverage of `include_ignored`'s scope now, from the books: the
-    /// rows as the last pass left them, and every vector the cache stored
-    /// since the books last looked. Without books (before the first pass or
-    /// after a failed one) they are read whole first and kept for the next
-    /// pass.
+    /// The coverage now, from the books: the rows as the last pass left
+    /// them, and every vector the cache stored since the books last looked.
+    /// Without books (before the first pass or after a failed one) they are
+    /// read whole first and kept for the next pass.
     ///
     /// # Errors
     ///
     /// When the index or the cache rejects a read. The books are dropped
     /// then; the next pass loads them again.
-    pub async fn counts(&mut self, include_ignored: bool) -> Result<Counts, Error> {
+    pub async fn counts(&mut self) -> Result<Counts, Error> {
         let (books, reads) = self.current().await?;
         Ok(Counts {
-            chunks_total: books.chunks_total(include_ignored),
-            chunks_with_vector: books.chunks_with_vector(include_ignored),
+            chunks_total: books.chunks_total(),
+            chunks_with_vector: books.chunks_with_vector(),
             reads,
         })
     }
 
-    /// Every distinct hash visible in `include_ignored`'s scope that has no
-    /// vector now, from the books, as [`Self::counts`] reads them: only the
-    /// vectors the cache stored since the books last looked, however many
-    /// chunks already have one. Without books they are read whole first and
-    /// kept for the next pass. [`Missing::pending`] later drops what was
-    /// stored after this listing.
+    /// Every distinct hash a stored row holds that has no vector now, from
+    /// the books, as [`Self::counts`] reads them: only the vectors the cache
+    /// stored since the books last looked, however many chunks already have
+    /// one. Without books they are read whole first and kept for the next
+    /// pass. [`Missing::pending`] later drops what was stored after this
+    /// listing.
     ///
     /// # Errors
     ///
     /// When the index or the cache rejects a read. The books are dropped
     /// then; the next pass loads them again.
-    pub async fn missing(&mut self, include_ignored: bool) -> Result<Missing, Error> {
+    pub async fn missing(&mut self) -> Result<Missing, Error> {
         let (books, reads) = self.current().await?;
-        let hashes = books.uncached(include_ignored);
+        let hashes = books.uncached();
         let high_water = books.high_water();
         Ok(Missing {
             hashes,

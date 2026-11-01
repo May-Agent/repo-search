@@ -8,12 +8,6 @@ use std::collections::{HashMap, HashSet};
 use super::{Presence, Reads};
 use crate::store::{self, CachedSlot, ContentHash, FileChange, Index, Side, VectorCache};
 
-/// The tally a row counts in: rows of files that are not ignored, then
-/// rows of ignored files.
-fn tally(ignored: bool) -> usize {
-    usize::from(ignored)
-}
-
 /// The books of one index under one model.
 ///
 /// A pass keeps them current from its own changes and from the cache's
@@ -26,17 +20,17 @@ fn tally(ignored: bool) -> usize {
 pub struct Books {
     /// The first slot of the model's log not yet read.
     high_water: u64,
-    /// Every stored file with at least one chunk row: its ignored flag and
-    /// its rows' hashes and sides in index order.
+    /// Every stored file with at least one chunk row: its rows' hashes and
+    /// sides in index order.
     files: HashMap<String, BookedFile>,
     /// Every hash some stored row holds.
     hashes: HashMap<ContentHash, BookedHash>,
-    /// Stored rows, by tally.
-    rows: [u64; 2],
-    /// Stored rows whose hash has a vector, by tally.
-    with_vector: [u64; 2],
-    /// Stored rows on the docs side, by tally.
-    docs: [u64; 2],
+    /// Stored rows.
+    rows: u64,
+    /// Stored rows whose hash has a vector.
+    with_vector: u64,
+    /// Stored rows on the docs side.
+    docs: u64,
     /// The `(hash, side)` pairs whose presence in the index flipped since
     /// [`Self::take_presence`] last ran; a pair that flips back leaves.
     flipped: HashSet<(ContentHash, Side)>,
@@ -44,14 +38,13 @@ pub struct Books {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct BookedFile {
-    ignored: bool,
     rows: Vec<(ContentHash, Side)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct BookedHash {
-    /// Rows holding the hash, by tally.
-    rows: [u32; 2],
+    /// Rows holding the hash.
+    rows: u32,
     /// Rows holding the hash, by side.
     sides: [u32; 2],
     /// Whether the cache holds a vector for the hash.
@@ -83,10 +76,7 @@ impl Books {
         for row in rows {
             files
                 .entry(row.path)
-                .or_insert_with(|| BookedFile {
-                    ignored: row.ignored,
-                    rows: Vec::new(),
-                })
+                .or_insert_with(|| BookedFile { rows: Vec::new() })
                 .rows
                 .push((row.content_hash, row.side));
         }
@@ -94,14 +84,14 @@ impl Books {
             high_water,
             files: HashMap::with_capacity(files.len()),
             hashes: HashMap::new(),
-            rows: [0; 2],
-            with_vector: [0; 2],
-            docs: [0; 2],
+            rows: 0,
+            with_vector: 0,
+            docs: 0,
             flipped: HashSet::new(),
         };
         let mut fresh = Vec::new();
         for (path, file) in files {
-            books.add_file(path, file.ignored, file.rows, &mut fresh);
+            books.add_file(path, file.rows, &mut fresh);
         }
         // Loaded books describe the index whole; nothing has flipped yet.
         books.flipped.clear();
@@ -125,19 +115,19 @@ impl Books {
         self.high_water
     }
 
-    /// Chunk rows visible in the scope.
-    pub(super) fn chunks_total(&self, include_ignored: bool) -> u64 {
-        in_scope(self.rows, include_ignored)
+    /// Stored chunk rows.
+    pub(super) fn chunks_total(&self) -> u64 {
+        self.rows
     }
 
-    /// Chunk rows visible in the scope whose hash has a vector.
-    pub(super) fn chunks_with_vector(&self, include_ignored: bool) -> u64 {
-        in_scope(self.with_vector, include_ignored)
+    /// Stored chunk rows whose hash has a vector.
+    pub(super) fn chunks_with_vector(&self) -> u64 {
+        self.with_vector
     }
 
-    /// Chunk rows on the docs side visible in the scope.
-    pub(super) fn doc_chunks(&self, include_ignored: bool) -> u64 {
-        in_scope(self.docs, include_ignored)
+    /// Stored chunk rows on the docs side.
+    pub(super) fn doc_chunks(&self) -> u64 {
+        self.docs
     }
 
     /// Whether the cache holds a vector for `hash`, as far as the books know.
@@ -145,19 +135,17 @@ impl Books {
         self.hashes.get(hash).is_some_and(|entry| entry.cached)
     }
 
-    /// Whether a row visible in the scope holds `hash`.
-    pub(super) fn is_visible(&self, hash: &ContentHash, include_ignored: bool) -> bool {
-        self.hashes
-            .get(hash)
-            .is_some_and(|entry| entry.rows[0] > 0 || (include_ignored && entry.rows[1] > 0))
+    /// Whether a stored row holds `hash`.
+    pub(super) fn is_visible(&self, hash: &ContentHash) -> bool {
+        self.hashes.get(hash).is_some_and(|entry| entry.rows > 0)
     }
 
-    /// Every hash a row visible in the scope holds that has no vector, as
-    /// far as the books know, in no particular order.
-    pub(super) fn uncached(&self, include_ignored: bool) -> Vec<ContentHash> {
+    /// Every hash a stored row holds that has no vector, as far as the
+    /// books know, in no particular order.
+    pub(super) fn uncached(&self) -> Vec<ContentHash> {
         self.hashes
             .iter()
-            .filter(|&(hash, entry)| !entry.cached && self.is_visible(hash, include_ignored))
+            .filter(|&(hash, entry)| !entry.cached && self.is_visible(hash))
             .map(|(&hash, _)| hash)
             .collect()
     }
@@ -199,7 +187,6 @@ impl Books {
                 self.drop_file(&state.path);
                 self.add_file(
                     state.path.clone(),
-                    state.ignored,
                     records
                         .iter()
                         .map(|record| (record.content_hash, Side::of_kind(&record.kind)))
@@ -209,8 +196,7 @@ impl Books {
             }
             FileChange::Remove(path) => self.drop_file(path),
             FileChange::Unchunkable(record) => self.drop_file(&record.state.path),
-            FileChange::Restamp(state) => self.restamp(&state.path, state.ignored),
-            FileChange::RestampUnchunkable(_) => {}
+            FileChange::Restamp(_) | FileChange::RestampUnchunkable(_) => {}
         }
     }
 
@@ -220,8 +206,7 @@ impl Books {
             && !entry.cached
         {
             entry.cached = true;
-            self.with_vector[0] += u64::from(entry.rows[0]);
-            self.with_vector[1] += u64::from(entry.rows[1]);
+            self.with_vector += u64::from(entry.rows);
         }
     }
 
@@ -236,7 +221,6 @@ impl Books {
     fn add_file(
         &mut self,
         path: String,
-        ignored: bool,
         rows: Vec<(ContentHash, Side)>,
         fresh: &mut Vec<ContentHash>,
     ) {
@@ -244,106 +228,64 @@ impl Books {
             return;
         }
         for &(hash, side) in &rows {
-            self.add_row(hash, side, ignored, fresh);
+            self.add_row(hash, side, fresh);
         }
-        let previous = self.files.insert(path, BookedFile { ignored, rows });
+        let previous = self.files.insert(path, BookedFile { rows });
         assert!(previous.is_none(), "a file is booked once");
     }
 
     fn drop_file(&mut self, path: &str) {
         if let Some(file) = self.files.remove(path) {
             for (hash, side) in file.rows {
-                self.drop_row(hash, side, file.ignored);
+                self.drop_row(hash, side);
             }
         }
     }
 
-    /// Moves a file's rows to the tally of its new ignored flag. A file
-    /// with no chunk row is not booked and has nothing to move.
-    fn restamp(&mut self, path: &str, ignored: bool) {
-        let Some(file) = self.files.get_mut(path) else {
-            return;
-        };
-        if file.ignored == ignored {
-            return;
-        }
-        let (from, to) = (tally(file.ignored), tally(ignored));
-        file.ignored = ignored;
-        for (hash, side) in &file.rows {
-            let entry = self
-                .hashes
-                .get_mut(hash)
-                .expect("a booked row's hash is booked");
-            entry.rows[from] -= 1;
-            entry.rows[to] += 1;
-            self.rows[from] -= 1;
-            self.rows[to] += 1;
-            if *side == Side::Docs {
-                self.docs[from] -= 1;
-                self.docs[to] += 1;
-            }
-            if entry.cached {
-                self.with_vector[from] -= 1;
-                self.with_vector[to] += 1;
-            }
-        }
-    }
-
-    fn add_row(
-        &mut self,
-        hash: ContentHash,
-        side: Side,
-        ignored: bool,
-        fresh: &mut Vec<ContentHash>,
-    ) {
+    fn add_row(&mut self, hash: ContentHash, side: Side, fresh: &mut Vec<ContentHash>) {
         let entry = self.hashes.entry(hash).or_insert_with(|| {
             fresh.push(hash);
             BookedHash {
-                rows: [0; 2],
+                rows: 0,
                 sides: [0; 2],
                 cached: false,
             }
         });
-        entry.rows[tally(ignored)] += 1;
+        entry.rows += 1;
         entry.sides[side as usize] += 1;
-        self.rows[tally(ignored)] += 1;
+        self.rows += 1;
         if side == Side::Docs {
-            self.docs[tally(ignored)] += 1;
+            self.docs += 1;
         }
         if entry.cached {
-            self.with_vector[tally(ignored)] += 1;
+            self.with_vector += 1;
         }
         if entry.sides[side as usize] == 1 {
             flip(&mut self.flipped, (hash, side));
         }
     }
 
-    fn drop_row(&mut self, hash: ContentHash, side: Side, ignored: bool) {
+    fn drop_row(&mut self, hash: ContentHash, side: Side) {
         let entry = self
             .hashes
             .get_mut(&hash)
             .expect("a booked row's hash is booked");
-        entry.rows[tally(ignored)] -= 1;
+        entry.rows -= 1;
         entry.sides[side as usize] -= 1;
-        self.rows[tally(ignored)] -= 1;
+        self.rows -= 1;
         if side == Side::Docs {
-            self.docs[tally(ignored)] -= 1;
+            self.docs -= 1;
         }
         if entry.cached {
-            self.with_vector[tally(ignored)] -= 1;
+            self.with_vector -= 1;
         }
         if entry.sides[side as usize] == 0 {
             flip(&mut self.flipped, (hash, side));
         }
-        if entry.rows == [0, 0] {
+        if entry.rows == 0 {
             self.hashes.remove(&hash);
         }
     }
-}
-
-/// The rows of `by_tally` visible in the scope.
-fn in_scope(by_tally: [u64; 2], include_ignored: bool) -> u64 {
-    by_tally[0] + if include_ignored { by_tally[1] } else { 0 }
 }
 
 /// Records that `pair`'s presence flipped: a second flip cancels the first.

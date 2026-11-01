@@ -376,6 +376,7 @@ async fn first_search_spawns_and_answers() {
         "src/edit.rs",
         &repo::rust_fn(&format!("{MARKER}_fn"), 500),
     );
+    repo::track(&world.repo.root, "src/edit.rs");
     assert_eq!(world.alive(), None, "no daemon before the first search");
 
     let (exit, stdout, stderr) = world.client(&world.target(), &[MARKER]).await;

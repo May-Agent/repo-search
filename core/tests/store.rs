@@ -18,7 +18,6 @@ fn state(path: &str, content: &[u8]) -> FileState {
         mtime_ns: 1_700_000_000_000_000_000,
         inode: 42,
         content_hash: ContentHash::of_file(content),
-        ignored: false,
     }
 }
 
@@ -829,7 +828,6 @@ fn chunk_queries_bind_the_doc_kind_and_expose_filters() {
         block_on(index.replace_file(state(path, text.as_bytes()), vec![record])).unwrap();
     }
     let filter = |side, paths: Option<Vec<&str>>, kinds: Vec<&str>| ChunkFilter {
-        include_ignored: true,
         side,
         paths: paths.map(|p| p.into_iter().map(str::to_owned).collect()),
         extensions: Vec::new(),
@@ -900,7 +898,6 @@ fn the_extension_filter_is_ascii_case_insensitive() {
     // `--lang markdown` carries `md`: `README.MD` is markdown because the
     // SQL `LIKE` on the path is ASCII case-insensitive.
     let filter = ChunkFilter {
-        include_ignored: true,
         side: Side::Docs,
         paths: None,
         extensions: vec!["md"],

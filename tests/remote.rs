@@ -58,6 +58,7 @@ async fn marker_search(socket: &Path, repo: &TestRepo) {
         "src/edit.rs",
         &repo::rust_fn(&format!("{MARKER}_fn"), 500),
     );
+    repo::track(&repo.root, "src/edit.rs");
     let events = request(socket, &hello(), search(&repo.root, MARKER)).await;
     let answer = match final_of(&events) {
         Final::Answer(answer) => answer,

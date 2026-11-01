@@ -247,7 +247,6 @@ where
             symbol: options.symbol.clone(),
             budget: options.budget,
             files_only: options.files,
-            include_ignored: options.include_ignored,
             format: if options.json {
                 Format::Json
             } else {

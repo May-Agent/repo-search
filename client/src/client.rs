@@ -313,7 +313,6 @@ mod tests {
             symbol: None,
             budget: 4000,
             files_only: false,
-            include_ignored: false,
             format: Format::Text,
         });
         let responses = client.request(request.clone()).await.unwrap();
