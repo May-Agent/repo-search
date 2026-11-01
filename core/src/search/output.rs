@@ -160,19 +160,27 @@ pub struct Freshness {
     /// Chunks with a vector after this query's on-the-spot embedding;
     /// serialized as a fraction.
     pub vectors: Coverage,
+    /// The index is incomplete: how to wait for full coverage. `None` when
+    /// every chunk has a vector.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
     /// Files the index holds but could not chunk.
     pub unparsable: Vec<Unparsable>,
 }
 
 impl Freshness {
     pub(super) fn new(reconciliation: Reconciliation, embedded_on_the_spot: u64) -> Self {
+        let vectors = Coverage::new(
+            reconciliation.chunks_with_vector + embedded_on_the_spot,
+            reconciliation.chunks_total,
+        );
         Self {
             commit: reconciliation.commit,
             changed_files: reconciliation.changed_files,
-            vectors: Coverage::new(
-                reconciliation.chunks_with_vector + embedded_on_the_spot,
-                reconciliation.chunks_total,
-            ),
+            vectors,
+            note: (vectors.with_vector() < vectors.total()).then(|| {
+                "index incomplete — run 'search index --wait' for complete results".to_owned()
+            }),
             unparsable: reconciliation.unparsable,
         }
     }
@@ -181,6 +189,14 @@ impl Freshness {
     #[must_use]
     pub fn percent(&self) -> u32 {
         self.vectors.percent()
+    }
+
+    /// The text line's incomplete-index suffix: empty at full coverage.
+    fn incomplete_note(&self) -> String {
+        self.note
+            .as_ref()
+            .map(|note| format!("; {note}"))
+            .unwrap_or_default()
     }
 
     /// The text line's unparsable-files suffix: empty when every file chunked.
@@ -1067,6 +1083,30 @@ mod tests {
         assert_eq!(json["freshness"]["commit"], "abc123");
         assert_eq!(json["freshness"]["changed_files"], 2);
         assert_eq!(json["freshness"]["vectors"], 0.9);
+        assert_eq!(
+            json["freshness"]["note"],
+            "index incomplete — run 'search index --wait' for complete results"
+        );
+    }
+
+    #[test]
+    fn a_complete_index_carries_no_note() {
+        let mut r = results();
+        r.freshness = Freshness::new(
+            Reconciliation {
+                commit: "abc123".to_owned(),
+                changed_files: 0,
+                chunks_total: 10,
+                chunks_with_vector: 10,
+                doc_chunks: 0,
+                unparsable: Vec::new(),
+            },
+            0,
+        );
+        assert!(r.freshness.note.is_none());
+        let json: serde_json::Value = serde_json::from_str(&r.to_json()).unwrap();
+        assert!(json["freshness"].get("note").is_none());
+        assert!(r.to_text().ends_with("vectors 100%\n"));
     }
 
     #[test]
@@ -1111,7 +1151,7 @@ docs/guide.md
   3-9  Guide › Stacks  [vector]
     Stacks align items.
 
--- fresh @ abc123 +2 changed files reconciled; vectors 90%
+-- fresh @ abc123 +2 changed files reconciled; vectors 90%; index incomplete — run 'search index --wait' for complete results
 ";
         assert_eq!(results().to_text(), expected);
     }
@@ -1137,14 +1177,16 @@ docs/guide.md
     fn the_freshness_line_counts_unparsable_files() {
         assert!(
             with_unparsable().to_text().ends_with(
-                "-- fresh @ abc123 +2 changed files reconciled; vectors 90%; 2 files unparsable\n"
+                "-- fresh @ abc123 +2 changed files reconciled; vectors 90%; 2 files unparsable; index incomplete — run 'search index --wait' for complete results\n"
             ),
             "{}",
             with_unparsable().to_text()
         );
         let mut one = with_unparsable();
         one.freshness.unparsable.pop();
-        assert!(one.to_text().ends_with("vectors 90%; 1 file unparsable\n"));
+        assert!(one.to_text().ends_with(
+            "vectors 90%; 1 file unparsable; index incomplete — run 'search index --wait' for complete results\n"
+        ));
     }
 
     #[test]
@@ -1181,7 +1223,7 @@ docs/guide.md
         };
         assert_eq!(
             r.to_text(),
-            "Code:\na.rs\nb.rs\n\n-- fresh @ abc123 +2 changed files reconciled; vectors 90%\n"
+            "Code:\na.rs\nb.rs\n\n-- fresh @ abc123 +2 changed files reconciled; vectors 90%; index incomplete — run 'search index --wait' for complete results\n"
         );
     }
 
