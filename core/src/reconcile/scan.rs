@@ -202,13 +202,11 @@ impl Plan {
     }
 }
 
-/// A walked file that passed the filters: worktree-relative path, language,
-/// whether only an unfiltered walk reaches it, and its fingerprint minus the
-/// content hash.
+/// A file under the root that passed the filters: worktree-relative path,
+/// language and fingerprint minus the content hash.
 struct Candidate {
     rel: String,
     language: Language,
-    ignored: bool,
     size: u64,
     mtime_ns: i64,
     inode: u64,
@@ -239,11 +237,10 @@ enum Work {
     NotUtf8(FileState),
 }
 
-/// Walks `root` and diffs it against `stored`, the chunked files, and
-/// `recorded`, the files that failed to chunk.
+/// Lists `root`'s files and diffs them against `stored`, the chunked files,
+/// and `recorded`, the files that failed to chunk.
 pub(super) fn plan(
     root: &Path,
-    include_ignored: bool,
     stored: HashMap<String, FileState>,
     recorded: HashMap<String, Unchunkable>,
     tokens: &dyn TokenCounter,
@@ -251,7 +248,7 @@ pub(super) fn plan(
     let Walked {
         candidates,
         skipped,
-    } = walk(root, include_ignored)?;
+    } = list(root)?;
     let mut plan = Plan {
         changes: Vec::new(),
         texts: HashMap::new(),
@@ -274,34 +271,15 @@ pub(super) fn plan(
     for cand in candidates {
         let previous = stored.get(&cand.rel);
         let failed = recorded.get(&cand.rel);
-        if let Some(state) = previous.filter(|state| cand.matches(state)) {
+        if previous.filter(|state| cand.matches(state)).is_some() {
             live.insert(cand.rel.clone());
-            if state.ignored == cand.ignored {
-                work.push((cand, Work::Live));
-            } else {
-                // Only the flag moved: no read, no re-chunk.
-                plan.files_restamped += 1;
-                let state = FileState {
-                    ignored: cand.ignored,
-                    ..state.clone()
-                };
-                work.push((cand, Work::Restamp(state)));
-            }
+            work.push((cand, Work::Live));
             continue;
         }
         if let Some(record) = failed.filter(|record| cand.matches(&record.state)) {
             live.insert(cand.rel.clone());
             let reason = record.reason.clone();
-            if record.state.ignored == cand.ignored {
-                work.push((cand, Work::KeepUnchunkable(reason)));
-            } else {
-                plan.files_restamped += 1;
-                let state = FileState {
-                    ignored: cand.ignored,
-                    ..record.state.clone()
-                };
-                work.push((cand, Work::RestampUnchunkable(state, reason)));
-            }
+            work.push((cand, Work::KeepUnchunkable(reason)));
             continue;
         }
         let bytes = match fs::read(root.join(&cand.rel)) {
@@ -326,7 +304,6 @@ pub(super) fn plan(
             mtime_ns: cand.mtime_ns,
             inode: cand.inode,
             content_hash,
-            ignored: cand.ignored,
         };
         if previous.is_some_and(|old| old.content_hash == content_hash) {
             live.insert(cand.rel.clone());
@@ -451,13 +428,12 @@ pub(super) fn plan(
         }
     }
     // Whatever was stored but not seen alive is gone: deleted (including
-    // vanished mid-pass) or newly ignored. A chunked file that now fails to
-    // chunk was counted as removed when it was recorded. A pass that does not
-    // include ignored files cannot see the flagged ones, so it keeps them.
+    // vanished mid-pass) or no longer tracked. A chunked file that now
+    // fails to chunk was counted as removed when it was recorded.
     let mut gone: Vec<String> = stored
         .values()
         .chain(recorded.values().map(|record| &record.state))
-        .filter(|state| (include_ignored || !state.ignored) && !live.contains(&state.path))
+        .filter(|state| !live.contains(&state.path))
         .map(|state| state.path.clone())
         .collect();
     gone.sort_unstable();
@@ -520,11 +496,11 @@ pub(super) fn read_chunks(
     Ok(out)
 }
 
-/// What the walk found.
+/// What the listing found.
 struct Walked {
     /// Every supported file under the root, sorted by path.
     candidates: Vec<Candidate>,
-    /// Files the walk could not index.
+    /// Files the listing could not index.
     skipped: Vec<Skipped>,
 }
 
@@ -538,40 +514,129 @@ fn is_vanished(err: &ignore::Error) -> bool {
             .is_some_and(|e| e.kind() == io::ErrorKind::NotFound)
 }
 
-/// Walks `root`. With `include_ignored` the tree is walked twice, with the
-/// ignore filters on and off, concurrently; a file only the unfiltered walk
-/// reaches is flagged ignored. Without it only the filtered walk runs.
-fn walk(root: &Path, include_ignored: bool) -> Result<Walked, Error> {
-    if !include_ignored {
-        return walk_once(root, true);
+/// The files a pass looks at: `root`'s git-tracked files when it is inside
+/// a git worktree, else the filtered walk's.
+fn list(root: &Path) -> Result<Walked, Error> {
+    match tracked(root) {
+        Some(listed) => listed,
+        None => walk_once(root),
     }
-    let (filtered, all) = std::thread::scope(|scope| {
-        let filtered = scope.spawn(|| walk_once(root, true));
-        let all = walk_once(root, false);
-        (
-            filtered.join().expect("the filtered walk does not panic"),
-            all,
-        )
-    });
-    let (filtered, mut all) = (filtered?, all?);
-    let visible: HashSet<&str> = filtered
-        .candidates
-        .iter()
-        .map(|cand| cand.rel.as_str())
-        .collect();
-    for cand in &mut all.candidates {
-        cand.ignored = !visible.contains(cand.rel.as_str());
-    }
-    Ok(all)
 }
 
-fn walk_once(root: &Path, standard_filters: bool) -> Result<Walked, Error> {
+/// `root`'s git index entries: `None` when `root` is not inside a git
+/// worktree (or the worktree's index cannot be read as files), else the
+/// tracked regular files under it. Untracked and ignored files are never
+/// listed; an entry that has no file on disk — deleted, or a path now held
+/// by a directory or a symlink — is skipped.
+fn tracked(root: &Path) -> Option<Result<Walked, Error>> {
+    let repo = git2::Repository::discover(root).ok()?;
+    let workdir = repo.workdir()?;
+    // `root` is `workdir` or under it; the prefix in the index's
+    // `/`-separated spelling selects the entries under `root`.
+    let prefix = std::fs::canonicalize(root)
+        .ok()
+        .zip(std::fs::canonicalize(workdir).ok())
+        .and_then(|(root, workdir)| root.strip_prefix(&workdir).ok().map(|p| p.to_owned()))
+        .and_then(|prefix| rel_string(&prefix))?;
+    Some((|| {
+        // The index is sorted by path; a set dedups a conflicted entry's
+        // stages and keeps the order.
+        let mut paths = std::collections::BTreeSet::new();
+        let mut skipped = Vec::new();
+        for entry in repo.index()?.iter() {
+            // A regular file only: a gitlink, symlink or tree entry has no
+            // bytes of its own.
+            let file = [
+                git2::FileMode::Blob,
+                git2::FileMode::BlobGroupWritable,
+                git2::FileMode::BlobExecutable,
+            ]
+            .map(u32::from);
+            if !file.contains(&entry.mode) {
+                continue;
+            }
+            let Ok(path) = str::from_utf8(&entry.path) else {
+                tracing::warn!(path = ?entry.path, "skipping a path that is not valid UTF-8");
+                skipped.push(Skipped {
+                    path: String::from_utf8_lossy(&entry.path).into_owned(),
+                    reason: SkipReason::NotUtf8Path,
+                });
+                continue;
+            };
+            let rel = if prefix.is_empty() {
+                path
+            } else {
+                match path
+                    .strip_prefix(prefix.as_str())
+                    .and_then(|rest| rest.strip_prefix('/'))
+                {
+                    Some(rel) => rel,
+                    None => continue,
+                }
+            };
+            paths.insert(rel.to_owned());
+        }
+        let mut candidates = Vec::with_capacity(paths.len());
+        for rel in paths {
+            match candidate(root, &rel) {
+                Ok(Some(cand)) => candidates.push(cand),
+                Ok(None) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(Walked {
+            candidates,
+            skipped,
+        })
+    })())
+}
+
+/// The candidate `rel` under `root` makes: `None` for a file that vanished,
+/// is not regular, or speaks no language; an unstatable or unmeasurable
+/// file is an `Err`.
+fn candidate(root: &Path, rel: &str) -> Result<Option<Candidate>, Error> {
+    let meta = match fs::symlink_metadata(root.join(rel)) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(Error::Io {
+                path: rel.to_owned(),
+                source,
+            });
+        }
+    };
+    if !meta.is_file() {
+        return Ok(None);
+    }
+    let Some(language) = Language::of_path(Path::new(rel)) else {
+        return Ok(None);
+    };
+    let mtime_ns = meta
+        .mtime()
+        .checked_mul(1_000_000_000)
+        .and_then(|ns| ns.checked_add(meta.mtime_nsec()))
+        .ok_or_else(|| Error::Mtime {
+            path: rel.to_owned(),
+            secs: meta.mtime(),
+        })?;
+    Ok(Some(Candidate {
+        rel: rel.to_owned(),
+        language,
+        size: meta.len(),
+        mtime_ns,
+        inode: meta.ino(),
+    }))
+}
+
+/// Walks every supported file under `root`: it is not inside a git
+/// worktree, so no ignore rules apply — a collection's documents must not
+/// be hidden by a rule a parent directory carries. Reserved directories are
+/// skipped, dot-files are source too and symlinks are not followed.
+fn walk_once(root: &Path) -> Result<Walked, Error> {
     let mut builder = WalkBuilder::new(root);
     builder
-        .standard_filters(standard_filters)
-        // Dot-files and dot-directories are source too.
+        .standard_filters(false)
         .hidden(false)
-        // `.gitignore` applies in any tree, with or without a `.git` marker.
         .require_git(false)
         .follow_links(false)
         .filter_entry(|entry| {
@@ -621,7 +686,6 @@ fn walk_once(root: &Path, standard_filters: bool) -> Result<Walked, Error> {
         candidates.push(Candidate {
             rel: rel_utf8,
             language,
-            ignored: false,
             size: meta.len(),
             mtime_ns,
             inode: meta.ino(),

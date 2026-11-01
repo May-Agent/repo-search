@@ -23,7 +23,7 @@ use std::time::Instant;
 
 use askama::Template;
 use futures_util::stream::{self, StreamExt, TryStreamExt};
-use repo_search_core::reconcile::{self, Reconciler, Report};
+use repo_search_core::reconcile::{Reconciler, Report};
 use repo_search_core::search::{self, EmbedService, Filters, Reconciliation, Retriever};
 use repo_search_core::store::{Index, VectorCache};
 use repo_search_core::{CHUNKER_FINGERPRINT, StateDir};
@@ -49,13 +49,6 @@ const FILE_CONCURRENCY: usize = 16;
 /// Chunks sent to the scheduler in one `Documents` job: a write that adds
 /// a large corpus embeds in jobs of this size, one after the other.
 const EMBED_BATCH: usize = 64;
-
-/// Every file of the collection's directory is indexed: the walk's ignore
-/// rules must not hide a document because a parent directory of the state
-/// dir carries one.
-const RECONCILE: reconcile::Options = reconcile::Options {
-    include_ignored: true,
-};
 
 /// The collection owner's inbox: one message per connection's request.
 #[derive(Debug)]
@@ -286,7 +279,7 @@ impl<T: Tokens> Collection<T> {
             .map_err(|e| format!("vector writer flush: {e}"))?;
         let reconciled = open
             .reconciler
-            .reconcile(CHUNKER_FINGERPRINT, RECONCILE, model.counter.clone())
+            .reconcile(CHUNKER_FINGERPRINT, model.counter.clone())
             .await
             .map_err(|e| e.to_string())?;
         if let Some(retriever) = &open.retriever {
@@ -301,7 +294,7 @@ impl<T: Tokens> Collection<T> {
             .unwrap_or_default();
         let pending = open
             .reconciler
-            .missing(true)
+            .missing()
             .await
             .map_err(|e| e.to_string())?
             .pending(known)
@@ -322,11 +315,7 @@ impl<T: Tokens> Collection<T> {
                 .await
                 .map_err(|e| e.to_string())?;
         }
-        let counts = open
-            .reconciler
-            .counts(true)
-            .await
-            .map_err(|e| e.to_string())?;
+        let counts = open.reconciler.counts().await.map_err(|e| e.to_string())?;
         let mut report = reconciled.report;
         report.chunks_total = counts.chunks_total;
         report.chunks_with_vector = counts.chunks_with_vector;
@@ -477,7 +466,6 @@ impl<T: Tokens> Collection<T> {
             },
             budget: request.budget as usize,
             files_only: request.ids_only,
-            include_ignored: true,
         };
         let reconciliation = Reconciliation::new(self.name.clone(), &open.report);
         let counter = BudgetCounter::<T>(model.counter.clone());

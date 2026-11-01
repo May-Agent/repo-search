@@ -15,7 +15,7 @@ mod support;
 
 use counters::CapOff;
 use futures_executor::block_on;
-use repo_search_core::reconcile::{Books, Options, PendingChunk, Presence, Reconciler};
+use repo_search_core::reconcile::{Books, PendingChunk, Presence, Reconciler};
 use repo_search_core::search::{
     Channel, Error, FilterError, Filters, Mode, ON_THE_SPOT, Reconciliation, Request, Results,
     Retriever, TokenCounter, VectorReads,
@@ -182,7 +182,6 @@ const GUIDE: &str = "# Guide\n\n## Stacks\nStacks align their children along the
 /// The code filter that admits everything on the code side.
 fn code_filter() -> ChunkFilter {
     ChunkFilter {
-        include_ignored: true,
         side: Side::Code,
         paths: None,
         extensions: Vec::new(),
@@ -220,14 +219,11 @@ impl Fixture {
         let index = block_on(Index::open(&state, tree.path())).unwrap();
         let cache = block_on(VectorCache::open(&state, common.path())).unwrap();
         let reconciled = block_on(
-            Reconciler::new(index.clone(), cache.clone(), MODEL, tree.path()).reconcile(
-                CHUNKER_FINGERPRINT,
-                Options::default(),
-                Arc::new(CapOff),
-            ),
+            Reconciler::new(index.clone(), cache.clone(), MODEL, tree.path())
+                .reconcile(CHUNKER_FINGERPRINT, Arc::new(CapOff)),
         )
         .unwrap();
-        let code_pending = missing(&index, &cache, tree.path(), false);
+        let code_pending = missing(&index, &cache, tree.path());
         let mut pending = code_pending.clone();
         let mut total = reconciled.report.chunks_total;
         let mut doc_chunks = 0;
@@ -284,7 +280,6 @@ impl Fixture {
                     mtime_ns: 0,
                     inode: 0,
                     content_hash: ContentHash::of_file(GUIDE.as_bytes()),
-                    ignored: false,
                 },
                 records,
             ))
@@ -370,16 +365,22 @@ impl Fixture {
     }
 }
 
-/// The chunks of a scope with no vector, with their texts, listed by a
-/// reconciler of their own so no caller's books move.
-fn missing(
-    index: &Index,
-    cache: &VectorCache,
-    root: &Path,
-    include_ignored: bool,
-) -> Vec<PendingChunk> {
+/// Runs `git` in `root`.
+fn git(root: &Path, args: &[&str]) {
+    let status = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .status()
+        .unwrap();
+    assert!(status.success());
+}
+
+/// The chunks with no vector, with their texts, listed by a reconciler of
+/// their own so no caller's books move.
+fn missing(index: &Index, cache: &VectorCache, root: &Path) -> Vec<PendingChunk> {
     let mut reconciler = Reconciler::new(index.clone(), cache.clone(), MODEL, root);
-    let missing = block_on(reconciler.missing(include_ignored)).unwrap();
+    let missing = block_on(reconciler.missing()).unwrap();
     block_on(missing.pending(Vec::new())).unwrap().chunks
 }
 
@@ -912,7 +913,6 @@ fn a_content_hash_shared_by_code_and_docs_is_searched_on_both_sides() {
             mtime_ns: 0,
             inode: 0,
             content_hash: ContentHash::of_file(shared.text.as_bytes()),
-            ignored: false,
         },
         vec![ChunkRecord {
             lines: 1..=shared.text.lines().count() as u32,
@@ -1006,10 +1006,9 @@ impl Fixture {
 }
 
 #[test]
-fn alternating_searches_show_ignored_files_only_when_asked() {
+fn only_tracked_files_are_indexed() {
     let tree = tempfile::tempdir().unwrap();
     let common = tempfile::tempdir().unwrap();
-    fs::write(tree.path().join(".gitignore"), "secret.rs\n").unwrap();
     fs::write(
         tree.path().join("kept.rs"),
         rust_item(
@@ -1026,6 +1025,8 @@ fn alternating_searches_show_ignored_files_only_when_asked() {
         ),
     )
     .unwrap();
+    git(tree.path(), &["init", "-q"]);
+    git(tree.path(), &["add", "kept.rs"]);
     let state = repo_search_core::StateDir::new(common.path().join("state"));
     let index = block_on(Index::open(&state, tree.path())).unwrap();
     let cache = block_on(VectorCache::open(&state, common.path())).unwrap();
@@ -1050,12 +1051,12 @@ fn alternating_searches_show_ignored_files_only_when_asked() {
         .unwrap(),
     );
     // Every pass is followed, as the daemon's barrier does.
-    let pass = |include_ignored| {
-        let reconciled = block_on(reconciler.borrow_mut().reconcile(
-            CHUNKER_FINGERPRINT,
-            Options { include_ignored },
-            Arc::new(CapOff),
-        ))
+    let pass = || {
+        let reconciled = block_on(
+            reconciler
+                .borrow_mut()
+                .reconcile(CHUNKER_FINGERPRINT, Arc::new(CapOff)),
+        )
         .unwrap();
         block_on(retriever.borrow().follow(reconciled.presence.clone())).unwrap();
         reconciled
@@ -1067,19 +1068,18 @@ fn alternating_searches_show_ignored_files_only_when_asked() {
             .collect();
         block_on(cache.put_many(MODEL, batch)).unwrap();
     };
-    let search = |include_ignored: bool, mode: Mode, files_only: bool| {
-        let reconciled = pass(include_ignored);
+    let search = |mode: Mode, files_only: bool, total: u64| {
+        let reconciled = pass();
         assert!(
-            missing(&index, &cache, tree.path(), include_ignored).is_empty(),
+            missing(&index, &cache, tree.path()).is_empty(),
             "everything is embedded"
         );
         let report = &reconciled.report;
-        assert_eq!(report.chunks_total, if include_ignored { 2 } else { 1 });
+        assert_eq!(report.chunks_total, total);
         assert_eq!(report.chunks_with_vector, report.chunks_total);
         let request = Request {
             mode,
             files_only,
-            include_ignored,
             budget: 100_000,
             ..Request::new("widgets count")
         };
@@ -1091,16 +1091,26 @@ fn alternating_searches_show_ignored_files_only_when_asked() {
         .unwrap()
     };
 
-    let _first = pass(true);
-    let first_pending = missing(&index, &cache, tree.path(), true);
-    assert!(first_pending.iter().any(|p| p.path == "secret.rs"));
+    let _first = pass();
+    let first_pending = missing(&index, &cache, tree.path());
+    assert!(!first_pending.is_empty());
     embed(&first_pending);
 
+    // secret.rs is untracked: no mode or output shape reaches it.
     for mode in [Mode::Lexical, Mode::Semantic, Mode::Hybrid] {
         for files_only in [false, true] {
-            let plain = search(false, mode, files_only);
-            assert_eq!(paths(&plain.code), ["kept.rs"], "{mode:?} {files_only}");
-            let all = search(true, mode, files_only);
+            let found = search(mode, files_only, 1);
+            assert_eq!(paths(&found.code), ["kept.rs"], "{mode:?} {files_only}");
+        }
+    }
+
+    // Tracking it makes it reachable.
+    git(tree.path(), &["add", "secret.rs"]);
+    let pending = missing(&index, &cache, tree.path());
+    embed(&pending);
+    for mode in [Mode::Lexical, Mode::Semantic, Mode::Hybrid] {
+        for files_only in [false, true] {
+            let all = search(mode, files_only, 2);
             let mut found = paths(&all.code);
             found.sort_unstable();
             assert_eq!(found, ["kept.rs", "secret.rs"], "{mode:?} {files_only}");
@@ -1238,7 +1248,7 @@ fn vector_reads(files: usize) -> Scenario {
     let cache = block_on(VectorCache::open(&state, common.path())).unwrap();
     let mut reconciler = Reconciler::new(index.clone(), cache.clone(), MODEL, tree.path());
     let embed_missing = || {
-        let pending = missing(&index, &cache, tree.path(), false);
+        let pending = missing(&index, &cache, tree.path());
         let batch = pending
             .iter()
             .map(|p| (p.content_hash, document_vector(p)))
@@ -1247,9 +1257,7 @@ fn vector_reads(files: usize) -> Scenario {
         pending
     };
 
-    let first =
-        block_on(reconciler.reconcile(CHUNKER_FINGERPRINT, Options::default(), Arc::new(CapOff)))
-            .unwrap();
+    let first = block_on(reconciler.reconcile(CHUNKER_FINGERPRINT, Arc::new(CapOff))).unwrap();
     embed_missing();
     let pairs = reconciler.books().unwrap().pairs();
     let distinct = pairs
@@ -1269,12 +1277,8 @@ fn vector_reads(files: usize) -> Scenario {
     assert!(first.report.chunks_total >= files as u64);
 
     let mut search = |query: &str| {
-        let reconciled = block_on(reconciler.reconcile(
-            CHUNKER_FINGERPRINT,
-            Options::default(),
-            Arc::new(CapOff),
-        ))
-        .unwrap();
+        let reconciled =
+            block_on(reconciler.reconcile(CHUNKER_FINGERPRINT, Arc::new(CapOff))).unwrap();
         block_on(retriever.follow(reconciled.presence.clone())).unwrap();
         block_on(retriever.search(
             &Request {

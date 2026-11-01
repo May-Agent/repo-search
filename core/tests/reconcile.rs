@@ -12,7 +12,7 @@ use counters::CapOff;
 use futures_executor::block_on;
 use repo_search_core::StateDir;
 use repo_search_core::reconcile::{
-    Books, Changes, Counts, Options, PendingChunk, Presence, Reads, Reconciled, Reconciler, Report,
+    Books, Changes, Counts, PendingChunk, Presence, Reads, Reconciled, Reconciler, Report,
     SkipReason,
 };
 use repo_search_core::store::{ContentHash, Index, Side, VectorCache};
@@ -84,22 +84,33 @@ impl Fixture {
         fs::rename(&staged, &path).unwrap();
     }
 
-    fn run(&self, options: Options) -> Pass {
-        self.run_chunker(CHUNKER_FINGERPRINT, options)
+    /// Runs `git` in the tree, turning it into a repository.
+    fn git(&self, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(self.tree.path())
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    fn run(&self) -> Pass {
+        self.run_chunker(CHUNKER_FINGERPRINT)
     }
 
     /// A pass of the fixture's reconciler under `chunker`, followed.
-    fn run_chunker(&self, chunker: &str, options: Options) -> Pass {
-        let pass = self.run_with(&mut self.reconciler.borrow_mut(), chunker, options);
+    fn run_chunker(&self, chunker: &str) -> Pass {
+        let pass = self.run_with(&mut self.reconciler.borrow_mut(), chunker);
         self.follow(&pass.presence);
         pass
     }
 
     /// A pass of `reconciler`, then its `missing` read the way the feeder
     /// reads it.
-    fn run_with(&self, reconciler: &mut Reconciler, chunker: &str, options: Options) -> Pass {
-        let reconciled = self.reconcile_with(reconciler, chunker, options);
-        let pending = self.missing_with(reconciler, options.include_ignored);
+    fn run_with(&self, reconciler: &mut Reconciler, chunker: &str) -> Pass {
+        let reconciled = self.reconcile_with(reconciler, chunker);
+        let pending = self.missing_with(reconciler);
         Pass {
             report: reconciled.report,
             changes: reconciled.changes,
@@ -112,14 +123,8 @@ impl Fixture {
     /// keeps are the books a fresh load reads, its counts are what a
     /// recount of every row finds, and a whole presence is the index's
     /// pairs.
-    fn reconcile_with(
-        &self,
-        reconciler: &mut Reconciler,
-        chunker: &str,
-        options: Options,
-    ) -> Reconciled {
-        let reconciled =
-            block_on(reconciler.reconcile(chunker, options, Arc::new(CapOff))).unwrap();
+    fn reconcile_with(&self, reconciler: &mut Reconciler, chunker: &str) -> Reconciled {
+        let reconciled = block_on(reconciler.reconcile(chunker, Arc::new(CapOff))).unwrap();
         let (loaded, _) = block_on(Books::load(&self.index, &self.cache, MODEL)).unwrap();
         assert_eq!(
             reconciler.books(),
@@ -132,7 +137,7 @@ impl Fixture {
                 reconciled.report.chunks_with_vector,
                 reconciled.report.doc_chunks
             ),
-            self.recount(options.include_ignored),
+            self.recount(),
             "the counts are a full recount's"
         );
         match &reconciled.presence {
@@ -190,17 +195,13 @@ impl Fixture {
     /// Checked: the hashes are what a recount of every row against the
     /// cache finds, and every listed hash whose text the worktree still
     /// holds comes back once.
-    fn missing_with(
-        &self,
-        reconciler: &mut Reconciler,
-        include_ignored: bool,
-    ) -> Vec<PendingChunk> {
-        let missing = block_on(reconciler.missing(include_ignored)).unwrap();
+    fn missing_with(&self, reconciler: &mut Reconciler) -> Vec<PendingChunk> {
+        let missing = block_on(reconciler.missing()).unwrap();
         let listed: HashSet<ContentHash> = missing.hashes().iter().copied().collect();
         assert_eq!(listed.len(), missing.hashes().len(), "listed once each");
         assert_eq!(
             listed,
-            self.uncached(include_ignored),
+            self.uncached(),
             "the books list what a full recount finds"
         );
         let pending = block_on(missing.pending(Vec::new())).unwrap().chunks;
@@ -213,8 +214,8 @@ impl Fixture {
 
     /// The distinct hashes of the scope's rows with no cached vector,
     /// recounted from every row.
-    fn uncached(&self, include_ignored: bool) -> HashSet<ContentHash> {
-        let distinct: Vec<ContentHash> = block_on(self.index.chunk_hashes(include_ignored))
+    fn uncached(&self) -> HashSet<ContentHash> {
+        let distinct: Vec<ContentHash> = block_on(self.index.chunk_hashes())
             .unwrap()
             .into_iter()
             .collect::<HashSet<_>>()
@@ -228,9 +229,9 @@ impl Fixture {
     }
 
     /// `counts` of the fixture's reconciler, checked against a recount.
-    fn counts(&self, include_ignored: bool) -> Counts {
-        let counts = block_on(self.reconciler.borrow_mut().counts(include_ignored)).unwrap();
-        let (total, with_vector, _) = self.recount(include_ignored);
+    fn counts(&self) -> Counts {
+        let counts = block_on(self.reconciler.borrow_mut().counts()).unwrap();
+        let (total, with_vector, _) = self.recount();
         assert_eq!(
             (counts.chunks_total, counts.chunks_with_vector),
             (total, with_vector),
@@ -241,12 +242,9 @@ impl Fixture {
 
     /// Runs only a pass of the fixture's reconciler, which therefore reads
     /// no file outside the pass itself, and follows it.
-    fn reconcile_only(&self, options: Options) -> Reconciled {
-        let reconciled = self.reconcile_with(
-            &mut self.reconciler.borrow_mut(),
-            CHUNKER_FINGERPRINT,
-            options,
-        );
+    fn reconcile_only(&self) -> Reconciled {
+        let reconciled =
+            self.reconcile_with(&mut self.reconciler.borrow_mut(), CHUNKER_FINGERPRINT);
         self.follow(&reconciled.presence);
         reconciled
     }
@@ -264,16 +262,13 @@ impl Fixture {
 
     /// `(rows, rows with a cached vector, docs rows)` in the scope, counted
     /// from every stored row the way a pass counted before it kept books.
-    fn recount(&self, include_ignored: bool) -> (u64, u64, u64) {
+    fn recount(&self) -> (u64, u64, u64) {
         let conn = rusqlite::Connection::open(self.db()).unwrap();
         let mut stmt = conn
-            .prepare(
-                "SELECT content_hash, kind = 'doc' FROM chunks WHERE ?1 OR path NOT IN \
-                 (SELECT path FROM files WHERE ignored = 1)",
-            )
+            .prepare("SELECT content_hash, kind = 'doc' FROM chunks")
             .unwrap();
         let rows: Vec<(ContentHash, bool)> = stmt
-            .query_map([include_ignored], |row| Ok((row.get(0)?, row.get(1)?)))
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
             .unwrap()
             .collect::<Result<_, _>>()
             .unwrap();
@@ -291,7 +286,7 @@ impl Fixture {
     }
 
     fn pass(&self) -> Pass {
-        self.run(Options::default())
+        self.run()
     }
 
     /// Stores a vector for every pending chunk, as an embedder would.
@@ -446,155 +441,24 @@ fn a_touched_file_with_the_same_bytes_is_not_rechunked() {
 }
 
 #[test]
-fn ignored_files_are_skipped_unless_asked_for() {
+fn only_git_tracked_files_are_indexed() {
     let fx = Fixture::new();
-    fx.write(".gitignore", "target/\nsecret.rs\n");
-    fx.write("kept.rs", "fn kept() {}\n");
-    fx.write("secret.rs", "fn hidden() {}\n");
-    fx.write("target/gen.rs", "fn generated() {}\n");
-    fx.write(".git/hooks/x.rs", "fn inner() {}\n");
+    fx.write("tracked.rs", "fn tracked() {}\n");
+    fx.write("untracked.rs", "fn loose() {}\n");
+    fx.write(".worktrees/other/dup.rs", "fn dup() {}\n");
+    fx.git(&["init", "-q"]);
+    fx.git(&["add", "tracked.rs"]);
 
-    let plain = fx.pass();
-    assert_eq!(plain.report.files_scanned, 1);
-    assert_eq!(fx.fts_hits("hidden"), 0);
-    assert_eq!(fx.fts_hits("generated"), 0);
+    let pass = fx.pass();
+    assert_eq!(pass.report.files_scanned, 1);
+    assert_eq!(fx.fts_hits("loose"), 0);
+    assert_eq!(fx.fts_hits("dup"), 0, "untracked files are not indexed");
 
-    let all = fx.run(Options {
-        include_ignored: true,
-    });
-    assert_eq!(all.report.files_added, 2);
-    assert_eq!(fx.fts_hits("hidden"), 1);
-    assert_eq!(fx.fts_hits("generated"), 1);
-    assert_eq!(fx.fts_hits("inner"), 0, ".git is never indexed");
-
-    // Back to the default: the ignored files stay stored but are hidden.
-    let again = fx.pass();
-    assert_eq!(again.report.files_removed, 0);
-    assert_eq!(again.report.files_scanned, 1);
-    assert_eq!(again.report.chunks_total, 1);
-    assert_eq!(fx.query::<i64>("SELECT count(*) FROM files"), 3);
-    assert_eq!(
-        fx.query::<i64>("SELECT count(*) FROM files WHERE ignored = 1"),
-        2
-    );
-}
-
-const WITH_IGNORED: Options = Options {
-    include_ignored: true,
-};
-
-/// A tree with one normal file and one ignored file, indexed with the flag
-/// and embedded.
-fn ignored_fixture() -> Fixture {
-    let fx = Fixture::new();
-    fx.write(".gitignore", "secret.rs\n");
-    fx.write("kept.rs", "fn kept() {}\n");
-    fx.write("secret.rs", "fn hidden() {}\n");
-    let first = fx.run(WITH_IGNORED);
-    assert_eq!(first.report.files_added, 2, "kept.rs and secret.rs");
-    assert!(paths(&first.pending).contains(&"secret.rs"));
-    fx.embed(&first.pending);
-    fx
-}
-
-#[test]
-fn alternating_passes_keep_ignored_rows_without_rework() {
-    let fx = ignored_fixture();
-    let ignored =
-        |fx: &Fixture| fx.query::<i64>("SELECT ignored FROM files WHERE path = 'secret.rs'");
-    assert_eq!(ignored(&fx), 1);
-    let both = fx.run(WITH_IGNORED).report.chunks_total;
-
-    // Without the flag nothing is removed or re-chunked, the ignored chunks
-    // are not counted and none is queued for embedding.
-    let plain = fx.pass();
-    let r = &plain.report;
-    assert_eq!(
-        (r.files_removed, r.files_chunked, r.chunks_added),
-        (0, 0, 0)
-    );
-    assert_eq!(r.chunks_removed, 0);
-    assert_eq!(r.chunks_total, 1);
-    assert!(r.chunks_total < both);
-    assert!(plain.pending.is_empty());
-    assert_eq!(ignored(&fx), 1);
-
-    // An ignored file edited meanwhile is not read by a pass without the flag
-    // and never queued; the flagged pass picks the edit up.
-    fx.write("secret.rs", "fn hidden() {}\nfn extra() {}\n");
-    let plain = fx.pass();
-    assert_eq!(plain.report.files_chunked, 0);
-    assert!(plain.pending.is_empty());
-    let again = fx.run(WITH_IGNORED);
-    assert_eq!(again.report.files_modified, 1);
-    assert!(paths(&again.pending).iter().all(|p| *p == "secret.rs"));
-    fx.embed(&again.pending);
-
-    // The next flagged pass has nothing to chunk or embed.
-    let settled = fx.run(WITH_IGNORED);
-    assert_eq!(settled.report.files_changed(), 0);
-    assert_eq!(settled.report.files_chunked, 0);
-    assert_eq!(settled.report.chunks_added, 0);
-    assert!(settled.pending.is_empty());
-    assert_eq!(
-        settled.report.chunks_with_vector,
-        settled.report.chunks_total
-    );
-}
-
-#[test]
-fn an_unignored_file_is_flipped_without_rechunking() {
-    let fx = ignored_fixture();
-    let chunk_ids: String = fx.query("SELECT group_concat(id) FROM chunks");
-    fx.write(".gitignore", "");
-    let r = fx.pass();
-    assert_eq!(r.report.files_scanned, 2, "kept.rs and secret.rs");
-    assert_eq!((r.report.files_chunked, r.report.files_removed), (0, 0));
-    assert_eq!(r.report.files_restamped, 1);
-    assert_eq!(
-        fx.query::<i64>("SELECT ignored FROM files WHERE path = 'secret.rs'"),
-        0
-    );
-    assert_eq!(
-        fx.query::<String>("SELECT group_concat(id) FROM chunks"),
-        chunk_ids
-    );
-    assert!(r.pending.is_empty());
-    assert_eq!(r.report.chunks_with_vector, r.report.chunks_total);
-}
-
-#[test]
-fn a_newly_ignored_file_is_flagged_by_a_pass_that_includes_ignored() {
-    let fx = Fixture::new();
-    fx.write("a.rs", "fn alpha() {}\n");
-    fx.pass();
-    fx.write(".gitignore", "a.rs\n");
-    let r = fx.run(WITH_IGNORED);
-    assert_eq!((r.report.files_chunked, r.report.files_removed), (0, 0));
-    assert_eq!(
-        fx.query::<i64>("SELECT ignored FROM files WHERE path = 'a.rs'"),
-        1
-    );
-    // A pass without the flag no longer sees it, and keeps it.
-    let plain = fx.pass();
-    assert_eq!(plain.report.files_removed, 0);
-    assert_eq!(fx.query::<i64>("SELECT count(*) FROM files"), 1);
-}
-
-#[test]
-fn an_ignored_file_is_removed_when_deleted_and_a_flagged_pass_runs() {
-    let fx = ignored_fixture();
-    fs::remove_file(fx.tree.path().join("secret.rs")).unwrap();
-
-    // Not walked without the flag: the row waits for the next flagged pass.
-    let plain = fx.pass();
-    assert_eq!(plain.report.files_removed, 0);
-    assert_eq!(fx.query::<i64>("SELECT count(*) FROM files"), 2);
-
-    let flagged = fx.run(WITH_IGNORED);
-    assert_eq!(flagged.report.files_removed, 1);
-    assert_eq!(fx.query::<i64>("SELECT count(*) FROM files"), 1);
-    assert_eq!(fx.fts_hits("hidden"), 0);
+    // Untracking drops the stored rows.
+    fx.git(&["rm", "-q", "--cached", "tracked.rs"]);
+    let pass = fx.pass();
+    assert_eq!(pass.report.files_removed, 1);
+    assert_eq!(fx.fts_hits("tracked"), 0);
 }
 
 #[test]
@@ -633,11 +497,11 @@ fn a_failing_transaction_lands_nothing() {
     )
     .unwrap();
 
-    let err = block_on(fx.reconciler.borrow_mut().reconcile(
-        CHUNKER_FINGERPRINT,
-        Options::default(),
-        Arc::new(CapOff),
-    ))
+    let err = block_on(
+        fx.reconciler
+            .borrow_mut()
+            .reconcile(CHUNKER_FINGERPRINT, Arc::new(CapOff)),
+    )
     .unwrap_err();
     assert!(err.to_string().contains("boom"), "{err}");
     assert_eq!(fx.query::<i64>("SELECT count(*) FROM files"), 0);
@@ -750,11 +614,8 @@ fn a_missing_worktree_is_an_error_and_leaves_the_index_untouched() {
 
     let missing = fx.tree.path().join("no-such-subdir");
     let err = block_on(
-        Reconciler::new(fx.index.clone(), fx.cache.clone(), MODEL, &missing).reconcile(
-            CHUNKER_FINGERPRINT,
-            Options::default(),
-            Arc::new(CapOff),
-        ),
+        Reconciler::new(fx.index.clone(), fx.cache.clone(), MODEL, &missing)
+            .reconcile(CHUNKER_FINGERPRINT, Arc::new(CapOff)),
     )
     .unwrap_err();
     assert!(
@@ -945,7 +806,7 @@ fn another_chunker_rechunks_and_reuses_cached_vectors() {
     let fx = Fixture::new();
     fx.write("a.rs", "fn alpha() { 1; }\n\nstruct Gamma;\n");
     fx.write("b.rs", "fn beta() { 2; }\n");
-    let first = fx.run_chunker("chunker-a", Options::default());
+    let first = fx.run_chunker("chunker-a");
     assert!(!first.report.rechunked);
     fx.embed(&first.pending);
     // Mark the stored rows; a rebuilt index must not carry the mark.
@@ -956,7 +817,7 @@ fn another_chunker_rechunks_and_reuses_cached_vectors() {
     let total = first.report.chunks_total;
 
     let mut reopened = fx.reconciler_for(&block_on(Index::open(&fx.dirs, fx.tree.path())).unwrap());
-    let second = fx.run_with(&mut reopened, "chunker-b", Options::default());
+    let second = fx.run_with(&mut reopened, "chunker-b");
     assert!(second.changes.is_none(), "a rechunk reports no changes");
     let r = &second.report;
     assert!(r.rechunked);
@@ -973,7 +834,7 @@ fn another_chunker_rechunks_and_reuses_cached_vectors() {
         "the chunk rows were rebuilt"
     );
 
-    let third = fx.run_with(&mut reopened, "chunker-b", Options::default());
+    let third = fx.run_with(&mut reopened, "chunker-b");
     assert!(!third.report.rechunked);
     assert_eq!(third.report.files_changed(), 0);
     assert_eq!(third.report.chunks_added, 0);
@@ -983,9 +844,9 @@ fn another_chunker_rechunks_and_reuses_cached_vectors() {
 fn the_same_chunker_reopens_without_rechunking() {
     let fx = Fixture::new();
     fx.write("a.rs", "fn alpha() { 1; }\n");
-    fx.run_chunker("chunker-a", Options::default());
+    fx.run_chunker("chunker-a");
     let mut reopened = fx.reconciler_for(&block_on(Index::open(&fx.dirs, fx.tree.path())).unwrap());
-    let again = fx.run_with(&mut reopened, "chunker-a", Options::default());
+    let again = fx.run_with(&mut reopened, "chunker-a");
     assert!(!again.report.rechunked);
     assert_eq!(again.report.chunks_added, 0);
     assert_eq!(again.report.files_changed(), 0);
@@ -996,12 +857,12 @@ fn another_chunker_retries_recorded_unchunkable_files() {
     let fx = Fixture::new();
     fx.write("ok.json", "{\"a\": 1}");
     fx.write("c.json", "{\"a\": ");
-    fx.run_chunker("chunker-a", Options::default());
+    fx.run_chunker("chunker-a");
     assert_eq!(fx.query::<i64>("SELECT count(*) FROM unchunkable"), 1);
 
     // Unchanged files under a new chunker: the recorded failure is parsed
     // again rather than trusted, since the new chunker may accept it.
-    let r = fx.run_chunker("chunker-b", Options::default());
+    let r = fx.run_chunker("chunker-b");
     assert!(r.report.rechunked);
     assert_eq!(r.report.files_chunked, 2);
     assert_eq!(r.report.skipped.len(), 1);
@@ -1023,7 +884,7 @@ fn a_no_change_pass_reads_no_file_while_vectors_are_missing() {
     let b = fx.tree.path().join("b.rs");
     // ctime only: size, mtime and inode hold, so nothing changed.
     fs::set_permissions(&b, fs::Permissions::from_mode(0o000)).unwrap();
-    let r = fx.reconcile_only(Options::default());
+    let r = fx.reconcile_only();
     fs::set_permissions(&b, fs::Permissions::from_mode(0o644)).unwrap();
     assert_eq!(r.report.files_changed(), 0);
     assert_eq!(r.report.files_chunked, 0);
@@ -1052,7 +913,7 @@ fn an_edit_offers_that_files_chunks_and_drops_its_old_ones() {
     assert!(!a0.is_empty() && !b0.is_empty());
 
     fx.write("a.rs", "fn alpha() { 10; }\n");
-    let r = fx.reconcile_only(Options::default());
+    let r = fx.reconcile_only();
     let c = r.changes.expect("a plain pass reports its changes");
     assert!(!c.added.is_empty());
     assert!(c.added.iter().all(|chunk| chunk.path == "a.rs"));
@@ -1104,7 +965,7 @@ fn an_unchanged_chunk_of_an_edited_file_stays_wanted() {
 
     fx.write("a.rs", &(big("alpha") + &big("beta_two")));
     let c = fx
-        .reconcile_only(Options::default())
+        .reconcile_only()
         .changes
         .expect("a plain pass reports its changes");
     assert!(c.dropped.contains(&beta));
@@ -1126,7 +987,7 @@ fn a_deleted_file_drops_its_hashes() {
 
     fs::remove_file(fx.tree.path().join("b.rs")).unwrap();
     let c = fx
-        .reconcile_only(Options::default())
+        .reconcile_only()
         .changes
         .expect("a plain pass reports its changes");
     assert!(c.added.is_empty());
@@ -1146,7 +1007,7 @@ fn a_restamped_file_offers_its_uncached_chunks_again() {
     // Same bytes, new inode and mtime, as an editor's atomic save leaves.
     fx.atomic_save("a.rs");
 
-    let r = fx.reconcile_only(Options::default());
+    let r = fx.reconcile_only();
     assert_eq!(r.report.files_restamped, 1);
     assert_eq!(r.report.files_chunked, 0);
     let c = r.changes.expect("a plain pass reports its changes");
@@ -1162,44 +1023,6 @@ fn a_restamped_file_offers_its_uncached_chunks_again() {
         assert_eq!(chunk.text, first_chunk.text);
     }
     assert!(c.dropped.is_empty());
-}
-
-#[test]
-fn an_unignored_file_offers_its_uncached_chunks() {
-    let fx = Fixture::new();
-    fx.write(".gitignore", "secret.rs\n");
-    fx.write("kept.rs", "fn kept() {}\n");
-    fx.write("secret.rs", "fn hidden() {}\n");
-    let first = fx.run(WITH_IGNORED);
-    let secret = hashes_on(&first.pending, "secret.rs");
-    assert!(!secret.is_empty());
-
-    fx.write(".gitignore", "");
-    let r = fx.reconcile_only(Options::default());
-    assert_eq!(r.report.files_restamped, 1);
-    let c = r.changes.expect("a plain pass reports its changes");
-    let added: std::collections::HashSet<_> =
-        c.added.iter().map(|chunk| chunk.content_hash).collect();
-    assert_eq!(added, secret);
-}
-
-#[test]
-fn a_scope_true_pass_drops_a_deleted_ignored_file() {
-    let fx = Fixture::new();
-    fx.write(".gitignore", "secret.rs\n");
-    fx.write("kept.rs", "fn kept() {}\n");
-    fx.write("secret.rs", "fn hidden() {}\n");
-    let first = fx.run(WITH_IGNORED);
-    let secret = hashes_on(&first.pending, "secret.rs");
-    assert!(!secret.is_empty());
-
-    fs::remove_file(fx.tree.path().join("secret.rs")).unwrap();
-    let c = fx
-        .reconcile_only(WITH_IGNORED)
-        .changes
-        .expect("a plain pass reports its changes");
-    let dropped: std::collections::HashSet<_> = c.dropped.iter().copied().collect();
-    assert_eq!(dropped, secret);
 }
 
 /// `count` files whose chunks hash apart from every other file's.
@@ -1232,7 +1055,7 @@ fn a_no_change_pass_reads_no_chunk_row_and_looks_up_no_hash() {
     let (half, _) = first.pending.split_at(first.pending.len() / 2);
     fx.embed(half);
     // Nothing changed but vectors arrived: only the slot log is read.
-    let second = fx.reconcile_only(Options::default());
+    let second = fx.reconcile_only();
     assert_eq!(second.report.files_changed(), 0);
     assert_eq!(
         second.report.reads,
@@ -1247,7 +1070,7 @@ fn a_no_change_pass_reads_no_chunk_row_and_looks_up_no_hash() {
 
     // Nothing changed and nothing arrived: the pass reads nothing, however
     // many chunks the index holds.
-    let third = fx.reconcile_only(Options::default());
+    let third = fx.reconcile_only();
     assert_eq!(third.report.reads, Reads::default());
     assert_eq!(
         third.report.chunks_with_vector,
@@ -1261,13 +1084,13 @@ fn a_pass_looks_up_only_the_hashes_of_the_file_it_changed() {
     write_modules(&fx, 20);
     let first = fx.pass();
     fx.embed(&first.pending);
-    fx.reconcile_only(Options::default());
+    fx.reconcile_only();
 
     fx.write(
         "m3.rs",
         "fn alpha_3() { 3; }\n\nfn changed_3() { 33; }\n\nstruct Gamma3;\n",
     );
-    let r = fx.reconcile_only(Options::default());
+    let r = fx.reconcile_only();
     assert_eq!(r.report.files_modified, 1);
     let reads = r.report.reads;
     assert_eq!((reads.chunk_rows, reads.cache_slots), (0, 0));
@@ -1286,40 +1109,18 @@ fn a_restamped_file_reads_only_its_own_rows() {
     write_modules(&fx, 20);
     let first = fx.pass();
     fx.embed(&first.pending);
-    fx.reconcile_only(Options::default());
+    fx.reconcile_only();
     let rows: i64 = fx.query("SELECT count(*) FROM chunks WHERE path = 'm5.rs'");
 
     // Same bytes, new inode and mtime, as an editor's atomic save leaves.
     fx.atomic_save("m5.rs");
 
-    let r = fx.reconcile_only(Options::default());
+    let r = fx.reconcile_only();
     assert_eq!(r.report.files_restamped, 1);
     assert_eq!(
         r.report.reads,
         Reads {
             chunk_rows: rows as u64,
-            cache_probes: 0,
-            cache_slots: 0
-        }
-    );
-}
-
-#[test]
-fn an_unignored_file_moves_its_rows_into_the_plain_scope() {
-    let fx = ignored_fixture();
-    let plain = fx.reconcile_only(Options::default());
-    assert_eq!(plain.report.chunks_total, 1);
-    let secret: i64 = fx.query("SELECT count(*) FROM chunks WHERE path = 'secret.rs'");
-
-    fx.write(".gitignore", "");
-    let r = fx.reconcile_only(Options::default());
-    assert_eq!(r.report.files_restamped, 1);
-    assert_eq!(r.report.chunks_total, 1 + secret as u64);
-    assert_eq!(r.report.chunks_with_vector, r.report.chunks_total);
-    assert_eq!(
-        r.report.reads,
-        Reads {
-            chunk_rows: secret as u64,
             cache_probes: 0,
             cache_slots: 0
         }
@@ -1336,7 +1137,7 @@ fn a_reconciler_without_books_loads_them_once() {
     let distinct: i64 = fx.query("SELECT count(DISTINCT content_hash) FROM chunks");
 
     let mut fresh = fx.reconciler_for(&fx.index);
-    let loaded = fx.run_with(&mut fresh, CHUNKER_FINGERPRINT, Options::default());
+    let loaded = fx.run_with(&mut fresh, CHUNKER_FINGERPRINT);
     assert_eq!(
         loaded.report.reads,
         Reads {
@@ -1347,7 +1148,7 @@ fn a_reconciler_without_books_loads_them_once() {
     );
     assert_eq!(loaded.report.chunks_with_vector, loaded.report.chunks_total);
 
-    let again = fx.run_with(&mut fresh, CHUNKER_FINGERPRINT, Options::default());
+    let again = fx.run_with(&mut fresh, CHUNKER_FINGERPRINT);
     assert_eq!(again.report.reads, Reads::default());
 }
 
@@ -1355,12 +1156,12 @@ fn a_reconciler_without_books_loads_them_once() {
 fn a_rechunk_starts_the_books_over() {
     let fx = Fixture::new();
     write_modules(&fx, 5);
-    let first = fx.run_chunker("chunker-a", Options::default());
+    let first = fx.run_chunker("chunker-a");
     fx.embed(&first.pending);
-    fx.run_chunker("chunker-a", Options::default());
+    fx.run_chunker("chunker-a");
     let distinct: i64 = fx.query("SELECT count(DISTINCT content_hash) FROM chunks");
 
-    let r = fx.run_chunker("chunker-b", Options::default());
+    let r = fx.run_chunker("chunker-b");
     assert!(r.report.rechunked);
     // The emptied index loads no row; every re-chunked hash is new to the
     // books and looked up once.
@@ -1390,11 +1191,11 @@ fn a_failed_pass_drops_the_books() {
     .unwrap();
     fx.write("b.rs", "fn beta() { 22; }\n");
 
-    let err = block_on(fx.reconciler.borrow_mut().reconcile(
-        CHUNKER_FINGERPRINT,
-        Options::default(),
-        Arc::new(CapOff),
-    ))
+    let err = block_on(
+        fx.reconciler
+            .borrow_mut()
+            .reconcile(CHUNKER_FINGERPRINT, Arc::new(CapOff)),
+    )
     .unwrap_err();
     assert!(err.to_string().contains("boom"), "{err}");
     assert!(
@@ -1403,7 +1204,7 @@ fn a_failed_pass_drops_the_books() {
     );
 
     conn.execute_batch("DROP TRIGGER boom").unwrap();
-    let r = fx.reconcile_only(Options::default());
+    let r = fx.reconcile_only();
     assert_eq!(r.report.files_modified, 1);
     assert_eq!(
         r.report.reads.chunk_rows, rows as u64,
@@ -1429,7 +1230,7 @@ fn a_pass_reports_only_the_pairs_it_changed() {
     let pairs = pairs.len();
 
     // Nothing changed: an empty presence, however many pairs the index holds.
-    let unchanged = fx.reconcile_only(Options::default());
+    let unchanged = fx.reconcile_only();
     assert_eq!(
         unchanged.presence,
         Presence::Changed {
@@ -1444,7 +1245,7 @@ fn a_pass_reports_only_the_pairs_it_changed() {
         "m3.rs",
         "fn alpha_3() { 3; }\n\nfn changed_3() { 33; }\n\nstruct Gamma3;\n",
     );
-    let r = fx.reconcile_only(Options::default());
+    let r = fx.reconcile_only();
     let Presence::Changed { appeared, vanished } = &r.presence else {
         panic!("a pass with books reports changes: {:?}", r.presence);
     };
@@ -1459,16 +1260,16 @@ fn a_pass_after_reloaded_books_reports_every_pair() {
     let fx = Fixture::new();
     write_modules(&fx, 5);
     fx.pass();
-    fx.reconcile_only(Options::default());
+    fx.reconcile_only();
 
     // Books read whole between passes, as `counts` does without them.
     fx.forget_books();
-    fx.counts(false);
-    let r = fx.reconcile_only(Options::default());
+    fx.counts();
+    let r = fx.reconcile_only();
     assert!(matches!(r.presence, Presence::Whole(_)), "{:?}", r.presence);
     assert_eq!(r.report.reads, Reads::default(), "counts loaded the books");
 
-    let again = fx.reconcile_only(Options::default());
+    let again = fx.reconcile_only();
     assert!(matches!(again.presence, Presence::Changed { .. }));
 }
 
@@ -1481,14 +1282,14 @@ fn counts_between_passes_read_only_the_vectors_stored_since() {
 
     // Nothing stored since the pass: nothing is read, whatever the index
     // holds.
-    let idle = fx.counts(false);
+    let idle = fx.counts();
     assert_eq!(idle.reads, Reads::default());
     assert_eq!(idle.chunks_with_vector, 0);
 
     // Vectors stored since: only those are read, from the slot log.
     let (half, _) = first.pending.split_at(first.pending.len() / 2);
     fx.embed(half);
-    let after = fx.counts(false);
+    let after = fx.counts();
     assert_eq!(
         after.reads,
         Reads {
@@ -1498,10 +1299,10 @@ fn counts_between_passes_read_only_the_vectors_stored_since() {
         }
     );
     assert!(after.chunks_with_vector > 0);
-    assert_eq!(fx.counts(false).reads, Reads::default());
+    assert_eq!(fx.counts().reads, Reads::default());
 
     // The next pass picks up from where `counts` left the books.
-    let r = fx.reconcile_only(Options::default());
+    let r = fx.reconcile_only();
     assert_eq!(r.report.reads, Reads::default());
     assert_eq!(r.report.chunks_with_vector, after.chunks_with_vector);
 }
@@ -1516,7 +1317,7 @@ fn counts_without_books_read_them_whole_once() {
     let distinct: i64 = fx.query("SELECT count(DISTINCT content_hash) FROM chunks");
 
     fx.forget_books();
-    let loaded = fx.counts(false);
+    let loaded = fx.counts();
     assert_eq!(
         loaded.reads,
         Reads {
@@ -1526,18 +1327,7 @@ fn counts_without_books_read_them_whole_once() {
         }
     );
     assert_eq!(loaded.chunks_with_vector, loaded.chunks_total);
-    assert_eq!(fx.counts(false).reads, Reads::default());
-}
-
-#[test]
-fn counts_follow_the_scope() {
-    let fx = ignored_fixture();
-    fx.reconcile_only(Options::default());
-    let secret: i64 = fx.query("SELECT count(*) FROM chunks WHERE path = 'secret.rs'");
-    let plain = fx.counts(false);
-    let all = fx.counts(true);
-    assert_eq!(all.chunks_total, plain.chunks_total + secret as u64);
-    assert_eq!(all.reads, Reads::default());
+    assert_eq!(fx.counts().reads, Reads::default());
 }
 
 /// What a resync reads once every chunk but those of `m0.rs` to `m2.rs`
@@ -1555,13 +1345,13 @@ fn resync_reads(modules: usize) -> (Reads, Reads, usize, usize) {
     assert!(left.len() >= 3);
     fx.embed(&rest);
     // The barrier the resync belongs to books the vectors stored since.
-    fx.reconcile_only(Options::default());
+    fx.reconcile_only();
 
     let mut reconciler = fx.reconciler.borrow_mut();
-    let missing = block_on(reconciler.missing(false)).unwrap();
+    let missing = block_on(reconciler.missing()).unwrap();
     let listing = missing.reads;
     let listed: HashSet<ContentHash> = missing.hashes().iter().copied().collect();
-    assert_eq!(listed, fx.uncached(false));
+    assert_eq!(listed, fx.uncached());
     assert_eq!(
         listed,
         left.iter().map(|c| c.content_hash).collect::<HashSet<_>>()
@@ -1601,40 +1391,6 @@ fn a_resync_reads_nothing_for_the_chunks_that_have_a_vector() {
 }
 
 #[test]
-fn a_scope_flip_resync_lists_the_ignored_chunks_from_the_books() {
-    let fx = Fixture::new();
-    fx.write(".gitignore", "secret.rs\n");
-    fx.write("kept.rs", "fn kept() {}\n");
-    fx.write("secret.rs", "fn hidden() {}\n");
-    let plain = fx.pass();
-    assert_eq!(paths(&plain.pending), ["kept.rs"]);
-    fx.embed(&plain.pending);
-    // The flip's barrier indexes the ignored file and looks up only its
-    // hashes; its resync then reads nothing.
-    let flip = fx.reconcile_only(Options {
-        include_ignored: true,
-    });
-    let mut reconciler = fx.reconciler.borrow_mut();
-    let missing = block_on(reconciler.missing(true)).unwrap();
-    assert_eq!(missing.reads, Reads::default());
-    let listed: HashSet<ContentHash> = missing.hashes().iter().copied().collect();
-    assert_eq!(listed, fx.uncached(true));
-    assert!(!listed.is_empty());
-    let pending = block_on(missing.pending(Vec::new())).unwrap();
-    assert_eq!(paths(&pending.chunks), ["secret.rs"]);
-    assert_eq!(
-        pending.chunks,
-        flip.changes
-            .expect("a plain pass reports its changes")
-            .added
-    );
-    // The plain scope wants nothing.
-    let plain = block_on(reconciler.missing(false)).unwrap();
-    assert!(plain.hashes().is_empty());
-    assert_eq!(plain.reads, Reads::default());
-}
-
-#[test]
 fn a_resync_without_books_loads_them_whole_once() {
     let fx = Fixture::new();
     write_modules(&fx, 10);
@@ -1647,7 +1403,7 @@ fn a_resync_without_books_loads_them_whole_once() {
     // A reopened index's owner holds no books: the resync loads them.
     fx.forget_books();
     let mut reconciler = fx.reconciler.borrow_mut();
-    let missing = block_on(reconciler.missing(false)).unwrap();
+    let missing = block_on(reconciler.missing()).unwrap();
     assert_eq!(
         missing.reads,
         Reads {
@@ -1658,13 +1414,13 @@ fn a_resync_without_books_loads_them_whole_once() {
     );
     assert_eq!(
         missing.hashes().iter().copied().collect::<HashSet<_>>(),
-        fx.uncached(false)
+        fx.uncached()
     );
     // The books stay for the next resync and the next pass.
-    let again = block_on(reconciler.missing(false)).unwrap();
+    let again = block_on(reconciler.missing()).unwrap();
     assert_eq!(again.reads, Reads::default());
     drop(reconciler);
-    let pass = fx.reconcile_only(Options::default());
+    let pass = fx.reconcile_only();
     assert_eq!(pass.report.reads, Reads::default());
     assert!(matches!(pass.presence, Presence::Whole(_)));
 }

@@ -128,7 +128,7 @@ pub async fn committed(
         .canonicalize()
         .expect("the common dir canonicalizes");
     let index = Index::open(state, &worktree).await.expect("index opens");
-    let hashes = index.chunk_hashes(false).await.expect("chunk hashes");
+    let hashes = index.chunk_hashes().await.expect("chunk hashes");
     let cache = VectorCache::open(state, &common_dir)
         .await
         .expect("cache opens");

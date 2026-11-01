@@ -154,7 +154,6 @@ impl Fixture {
 fn unrestricted() -> ChunkFilter {
     ChunkFilter {
         side: Side::Code,
-        include_ignored: true,
         paths: None,
         extensions: Vec::new(),
         kinds: Vec::new(),
@@ -169,7 +168,6 @@ fn file_state(path: &str, src: &str) -> FileState {
         mtime_ns: 1_700_000_000_000_000_000,
         inode: 7,
         content_hash: ContentHash::of_file(src.as_bytes()),
-        ignored: false,
     }
 }
 
