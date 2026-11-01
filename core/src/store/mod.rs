@@ -111,6 +111,21 @@ pub enum Error {
     EmptyCalibration(String),
 }
 
+impl Error {
+    /// The write failed because the volume is full; the batch is dropped
+    /// and the daemon keeps serving.
+    #[must_use]
+    pub fn is_disk_full(&self) -> bool {
+        match self {
+            Self::Sqlite(rusqlite::Error::SqliteFailure(error, _)) => {
+                error.code == rusqlite::ErrorCode::DiskFull
+            }
+            Self::Io(error) => error.kind() == io::ErrorKind::StorageFull,
+            _ => false,
+        }
+    }
+}
+
 /// Sends `request` to an actor and awaits its reply.
 async fn send_and_wait<M, T: Send>(
     tx: &mpsc::Sender<M>,
@@ -212,4 +227,32 @@ fn remove_db_files(path: &Path) -> Result<(), Error> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Error;
+
+    #[test]
+    fn a_full_volume_is_recoverable() {
+        let sqlite = Error::Sqlite(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(13),
+            None,
+        ));
+        assert!(sqlite.is_disk_full(), "{sqlite:?}");
+        let io = Error::Io(std::io::Error::from(std::io::ErrorKind::StorageFull));
+        assert!(io.is_disk_full(), "{io:?}");
+    }
+
+    #[test]
+    fn other_failures_are_not_recoverable() {
+        let busy = Error::Sqlite(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(5),
+            None,
+        ));
+        assert!(!busy.is_disk_full(), "{busy:?}");
+        let io = Error::Io(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        assert!(!io.is_disk_full(), "{io:?}");
+        assert!(!Error::ActorGone.is_disk_full());
+    }
 }
