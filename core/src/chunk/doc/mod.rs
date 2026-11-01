@@ -178,7 +178,14 @@ impl<'a> Sectioner<'a> {
         let cap = Cap::new(self.tokens, &title);
         if body.is_empty() {
             if let (true, Some(heading)) = (keep_bare, heading) {
-                for part in token_split(&cap, "", "", &self.src[heading.clone()], MAX_BYTES) {
+                for part in token_split(
+                    &cap,
+                    "",
+                    "",
+                    &self.src[heading.clone()],
+                    MAX_BYTES,
+                    trim_range,
+                ) {
                     let part = heading.start + part.start..heading.start + part.end;
                     self.push(heading_path, &title, [part]);
                 }
@@ -268,11 +275,17 @@ impl<'a> Sectioner<'a> {
         budget: usize,
     ) -> Vec<Range<usize>> {
         let block = trim_range(self.src, block);
-        token_split(cap, prefix, prefix, &self.src[block.clone()], budget)
-            .into_iter()
-            .map(|part| trim_range(self.src, block.start + part.start..block.start + part.end))
-            .filter(|part| !part.is_empty())
-            .collect()
+        token_split(
+            cap,
+            prefix,
+            prefix,
+            &self.src[block.clone()],
+            budget,
+            trim_range,
+        )
+        .into_iter()
+        .map(|part| block.start + part.start..block.start + part.end)
+        .collect()
     }
 
     fn is_protected(&self, offset: usize) -> bool {
