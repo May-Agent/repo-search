@@ -1104,8 +1104,10 @@ fn only_tracked_files_are_indexed() {
         }
     }
 
-    // Tracking it makes it reachable.
+    // Tracking it makes it reachable; the next pass has to index it
+    // before the embed can see its chunk.
     git(tree.path(), &["add", "secret.rs"]);
+    pass();
     let pending = missing(&index, &cache, tree.path());
     embed(&pending);
     for mode in [Mode::Lexical, Mode::Semantic, Mode::Hybrid] {
