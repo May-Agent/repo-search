@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.5](https://github.com/May-Agent/repo-search/compare/client/v0.0.4...client/v0.0.5) - 2026-11-01
+
+### Added
+
+- *(reconcile)* index only git-tracked files
+
 ## [0.0.4](https://github.com/May-Agent/repo-search/compare/client/v0.0.3...client/v0.0.4) - 2026-10-29
 
 ### Added
