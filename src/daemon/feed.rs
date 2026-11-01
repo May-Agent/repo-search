@@ -28,8 +28,6 @@ pub enum Feed {
     /// pending set in `options`' scope, rebuild its texts and replace the
     /// scheduler's interest with it.
     Resync {
-        /// The scope.
-        options: reconcile::Options,
         /// The set, listed from the owner's books inside the barrier.
         missing: Missing,
         /// Texts the pass already holds, so they need not be rebuilt.
@@ -41,9 +39,8 @@ pub enum Feed {
 
 /// What the feeder does with one feed.
 enum Work {
-    /// Replace the scheduler's interest with the scope's whole set.
+    /// Replace the scheduler's interest with the whole pending set.
     Resync {
-        options: reconcile::Options,
         /// The set as the barrier listed it; `None` for a `Change` a failed
         /// feed promoted, whose set the owner's books list on asking.
         listed: Option<Missing>,
@@ -99,36 +96,23 @@ pub fn spawn<T: Tokens>(config: FeederConfig<T>) -> mpsc::Sender<FeedMsg> {
     } = config;
     let (tx, mut rx) = mpsc::channel(INBOX);
     tokio::spawn(async move {
-        // The last `Resync`'s scope; a `Change` applies in that scope.
-        let mut scope: Option<reconcile::Options> = None;
         // A feed failed, so the scheduler's interest no longer matches what
         // the barriers reported: the next `Change` is promoted to a resync.
         let mut stale = false;
         while let Some(FeedMsg { feed, class, ack }) = rx.recv().await {
             let work = match feed {
                 Feed::Change(changes) if stale => Work::Resync {
-                    options: scope.expect("a Change follows a Resync"),
                     listed: None,
                     known: changes.added,
                 },
-                Feed::Resync {
-                    options,
-                    missing,
-                    known,
-                } => Work::Resync {
-                    options,
+                Feed::Resync { missing, known } => Work::Resync {
                     listed: Some(missing),
                     known,
                 },
                 Feed::Change(changes) => Work::Change(changes),
             };
             let interest: Result<Interest, String> = match work {
-                Work::Resync {
-                    options,
-                    listed,
-                    known,
-                } => {
-                    scope = Some(options);
+                Work::Resync { listed, known } => {
                     // Vectors the writer still buffers would read as
                     // missing: the scheduler would drop them from the
                     // `Replace`, but only after their text was rebuilt and
@@ -143,7 +127,7 @@ pub fn spawn<T: Tokens>(config: FeederConfig<T>) -> mpsc::Sender<FeedMsg> {
                             .map_err(|e| format!("vector writer flush: {e}"))?;
                         let missing = match listed {
                             Some(missing) => missing,
-                            None => books.missing(options).await.map_err(|e| e.to_string())?,
+                            None => books.missing().await.map_err(|e| e.to_string())?,
                         };
                         let listed = missing.reads;
                         let pending = missing.pending(known).await.map_err(|e| e.to_string())?;

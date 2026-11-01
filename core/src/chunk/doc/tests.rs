@@ -4,7 +4,8 @@
 use super::DocChunker;
 use crate::TokenCounter;
 use crate::chunk::{Chunk, ChunkKind, DocFormat, FileChunker, MemberKind};
-use crate::counters::{CapOff, CharTokens};
+use crate::counters::{CapOff, CharTokens, Glued};
+use crate::model::MAX_TOKENS;
 
 fn chunks(format: DocFormat, path: &str, src: &str) -> Vec<(String, String)> {
     chunks_full(format, path, src)
@@ -454,4 +455,26 @@ fn a_single_line_over_the_cap_splits_on_char_boundaries() {
         total += text.matches('名').count();
     }
     assert_eq!(total, 2000);
+}
+
+/// Removing a part's leading space can raise its token count, so the range
+/// a part is checked at is the range it is emitted at.
+#[test]
+fn trimmed_split_parts_stay_under_the_cap() {
+    let words = vec!["a"; 2037].join(" ");
+    let src = format!("# H\n\n{words}\n");
+    let all = DocChunker::new(DocFormat::Markdown)
+        .chunk_file("a.md", &src, &Glued)
+        .unwrap();
+    assert!(all.len() > 1);
+    for chunk in &all {
+        let mut text = String::new();
+        chunk.write_text(&src, &mut text);
+        assert!(
+            Glued.fits(&chunk.title, &[&text], MAX_TOKENS),
+            "{title} is over the cap at {tokens} tokens",
+            title = chunk.title,
+            tokens = Glued.document_tokens(&chunk.title, &text)
+        );
+    }
 }

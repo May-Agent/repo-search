@@ -52,8 +52,6 @@ pub struct ChunkId(pub i64);
 pub struct ChunkFilter {
     /// Which list the chunks belong to.
     pub side: Side,
-    /// Whether chunks of ignored files are visible (`--include-ignored`).
-    pub include_ignored: bool,
     /// When set, only chunks of exactly these worktree-relative paths.
     pub paths: Option<Vec<String>>,
     /// When non-empty, only chunks in files with one of these extensions:
@@ -74,8 +72,7 @@ impl ChunkFilter {
     /// needs no mask.
     #[must_use]
     pub fn is_unrestricted(&self) -> bool {
-        self.include_ignored
-            && self.paths.is_none()
+        self.paths.is_none()
             && self.extensions.is_empty()
             && self.kinds.is_empty()
             && self.symbol.is_none()
@@ -85,7 +82,6 @@ impl ChunkFilter {
 /// A filter's SQL parameters: JSON arrays that `json_each` expands.
 pub(super) struct FilterParams {
     docs: bool,
-    include_ignored: bool,
     doc_kind: &'static str,
     paths: Option<String>,
     extensions: Option<String>,
@@ -100,7 +96,6 @@ impl ChunkFilter {
         }
         FilterParams {
             docs: self.side == Side::Docs,
-            include_ignored: self.include_ignored,
             doc_kind: DOC_KIND,
             paths: self.paths.as_deref().map(json),
             extensions: (!self.extensions.is_empty()).then(|| json(&self.extensions)),
@@ -171,7 +166,7 @@ pub(super) fn bm25_scored(
     let ids = stmt
         .query_map(
             named_params! {
-                ":query": query, ":limit": limit, ":docs": p.docs, ":include_ignored": p.include_ignored, ":doc_kind": p.doc_kind,
+                ":query": query, ":limit": limit, ":docs": p.docs, ":doc_kind": p.doc_kind,
                 ":paths": p.paths, ":extensions": p.extensions, ":kinds": p.kinds,
                 ":symbol": p.symbol,
             },
@@ -201,7 +196,7 @@ pub(super) fn by_hashes(
             let ids = stmt
                 .query_map(
                     named_params! {
-                        ":hash": hash, ":docs": p.docs, ":include_ignored": p.include_ignored, ":doc_kind": p.doc_kind,
+                        ":hash": hash, ":docs": p.docs, ":doc_kind": p.doc_kind,
                         ":paths": p.paths, ":extensions": p.extensions, ":kinds": p.kinds,
                         ":symbol": p.symbol,
                     },
@@ -277,7 +272,7 @@ pub(super) fn hashes_matching(
     let hashes = stmt
         .query_map(
             named_params! {
-                ":docs": p.docs, ":include_ignored": p.include_ignored, ":doc_kind": p.doc_kind, ":paths": p.paths,
+                ":docs": p.docs, ":doc_kind": p.doc_kind, ":paths": p.paths,
                 ":extensions": p.extensions, ":kinds": p.kinds, ":symbol": p.symbol,
             },
             |row| row.get(0),

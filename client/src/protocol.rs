@@ -183,8 +183,6 @@ pub struct SearchRequest {
     pub budget: u32,
     /// Ranked file list only.
     pub files_only: bool,
-    /// Include files `.gitignore` excludes.
-    pub include_ignored: bool,
     /// How `Answer::output` is rendered.
     pub format: Format,
 }
@@ -535,7 +533,6 @@ mod tests {
             symbol: Some("Environment::*".into()),
             budget: 4000,
             files_only: false,
-            include_ignored: true,
             format: Format::Json,
         }));
         round_trip(&Request::UpsertDocuments {

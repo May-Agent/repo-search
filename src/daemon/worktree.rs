@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::wire::{ToCore, ToWire};
-use repo_search_core::reconcile::{self, Counts, PendingChunk, Reconciler, Report};
+use repo_search_core::reconcile::{Counts, PendingChunk, Reconciler, Report};
 use repo_search_core::search::{self, EmbedService, Reconciliation, Retriever};
 use repo_search_core::store::{self, Index, Phase, VectorCache};
 use repo_search_core::{CHUNKER_FINGERPRINT, QueryTask, StateDir, TokenCounter, UnitVector};
@@ -143,11 +143,11 @@ struct Owner<T: Tokens> {
     report: Option<Report>,
     commit: String,
     watcher: Option<Watcher>,
-    /// The scope whose whole pending set the feeder was last told to hold
-    /// (a `Resync`), every later pass's changes following it; `None` until
-    /// the first barrier and after anything that may have broken that —
-    /// a failed barrier or a reopened index.
-    sync: Option<reconcile::Options>,
+    /// Whether the feeder holds the books' whole pending set (a `Resync`)
+    /// plus every later pass's changes; `false` until the first barrier and
+    /// after anything that may have broken that — a failed barrier or a
+    /// reopened index.
+    sync: bool,
     /// Reconciles `index`, keeping its books between barriers; built at
     /// the first barrier or `Status` and dropped with the index handle it
     /// holds. Its books answer the coverage of `Status` and of
@@ -202,7 +202,7 @@ impl<T: Tokens> Owner<T> {
             report: None,
             commit: String::new(),
             watcher: None,
-            sync: None,
+            sync: false,
             reconciler: None,
             feeder: None,
             stage1_tx,
@@ -426,7 +426,7 @@ impl<T: Tokens> Owner<T> {
         self.index = None;
         self.retriever = None;
         self.index_id = None;
-        self.sync = None;
+        self.sync = false;
         self.reconciler = None;
         self.set_phase(Phase::FirstIndex);
         self.ensure_index().await
@@ -494,7 +494,6 @@ impl<T: Tokens> Owner<T> {
             },
             budget: request.budget as usize,
             files_only: request.files_only,
-            include_ignored: request.include_ignored,
         };
         let sched = model.scheduler.clone();
         // The search's window: it opens before the freshness barrier's
@@ -561,7 +560,7 @@ impl<T: Tokens> Owner<T> {
         events: &mpsc::Sender<Event>,
     ) -> Option<Retrieved> {
         let barrier_start = Instant::now();
-        let (report, commit) = match self.barrier(model, request.include_ignored, None).await {
+        let (report, commit) = match self.barrier(model, None).await {
             Ok(done) => done,
             Err(message) => {
                 send(events, error(ErrorKind::Search, message)).await;
@@ -687,7 +686,7 @@ impl<T: Tokens> Owner<T> {
             return;
         }
         let (ack_tx, ack_rx) = oneshot::channel::<Result<(), String>>();
-        let (report, _) = match self.barrier(&model, false, Some(ack_tx)).await {
+        let (report, _) = match self.barrier(&model, Some(ack_tx)).await {
             Ok(done) => done,
             Err(message) => {
                 send(events, error(ErrorKind::Internal, message)).await;
@@ -804,7 +803,7 @@ impl<T: Tokens> Owner<T> {
                 }
                 // From the books the barriers keep: no chunk row is read and
                 // no hash looked up, only the vectors stored since.
-                let coverage = match self.reconciler().counts(false).await {
+                let coverage = match self.reconciler().counts().await {
                     Ok(coverage) => coverage,
                     Err(e) => {
                         send(events, error(ErrorKind::Internal, e.to_string())).await;
@@ -870,17 +869,16 @@ impl<T: Tokens> Owner<T> {
     async fn barrier(
         &mut self,
         model: &Arc<Embedding<T>>,
-        include_ignored: bool,
         ack: Option<oneshot::Sender<Result<(), String>>>,
     ) -> Result<(Report, String), String> {
         self.verify_index().await?;
         let sched = model.scheduler.clone();
         sched.barrier(self.repo, true).await;
-        match self.barrier_steps(model, include_ignored).await {
+        match self.barrier_steps(model).await {
             Ok((report, commit, feed)) => {
                 self.report = Some(report.clone());
                 self.commit = commit.clone();
-                self.sync = Some(reconcile::Options { include_ignored });
+                self.sync = true;
                 let resync = matches!(feed, Feed::Resync { .. });
                 let class = match self.phase {
                     Phase::FirstIndex => IndexClass::Stage1,
@@ -895,7 +893,7 @@ impl<T: Tokens> Owner<T> {
                 Ok((report, commit))
             }
             Err(message) => {
-                self.sync = None;
+                self.sync = false;
                 drop(ack);
                 sched.barrier(self.repo, false).await;
                 Err(message)
@@ -966,7 +964,6 @@ impl<T: Tokens> Owner<T> {
     async fn barrier_steps(
         &mut self,
         model: &Arc<Embedding<T>>,
-        include_ignored: bool,
     ) -> Result<(Report, String, Feed), String> {
         self.writer
             .as_ref()
@@ -978,11 +975,7 @@ impl<T: Tokens> Owner<T> {
         let root = self.root.clone();
         let reconciler = self.reconciler();
         let (reconciled, head) = tokio::join!(
-            reconciler.reconcile(
-                CHUNKER_FINGERPRINT,
-                reconcile::Options { include_ignored },
-                counter,
-            ),
+            reconciler.reconcile(CHUNKER_FINGERPRINT, counter),
             tokio::process::Command::new("git")
                 .arg("-C")
                 .arg(&root)
@@ -1006,20 +999,17 @@ impl<T: Tokens> Owner<T> {
             ));
         }
         let commit = String::from_utf8_lossy(&head.stdout).trim().to_owned();
-        let options = reconcile::Options { include_ignored };
-        // A `Change` is enough when the feeder provably holds this scope's
-        // set: anything else is a resync — the first barrier, a scope flip,
-        // a rechunk or a reopened index. Its set is listed from the books
-        // the pass just brought up to date, here inside the barrier, so it
-        // reads no chunk row and looks up no hash; the feeder rebuilds the
-        // texts.
+        // A `Change` is enough when the feeder provably holds the books'
+        // set: anything else is a resync — the first barrier, a rechunk or
+        // a reopened index. Its set is listed from the books the pass just
+        // brought up to date, here inside the barrier, so it reads no chunk
+        // row and looks up no hash; the feeder rebuilds the texts.
         let feed = match reconciled.changes {
-            Some(changes) if self.sync == Some(options) => Feed::Change(changes),
+            Some(changes) if self.sync => Feed::Change(changes),
             changes => Feed::Resync {
-                options,
                 missing: self
                     .reconciler()
-                    .missing(include_ignored)
+                    .missing()
                     .await
                     .map_err(|e| e.to_string())?,
                 known: changes.map(|changes| changes.added).unwrap_or_default(),
@@ -1042,7 +1032,7 @@ impl<T: Tokens> Owner<T> {
             tracing::error!(%error, root = %self.root.display(), "watcher barrier: shared state failed");
             return;
         }
-        if let Err(error) = self.barrier(&model, false, None).await {
+        if let Err(error) = self.barrier(&model, None).await {
             tracing::error!(%error, root = %self.root.display(), "watcher barrier failed");
         }
     }

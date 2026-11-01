@@ -61,7 +61,8 @@ impl WriterHandle {
     ///
     /// # Errors
     ///
-    /// When `put_many` failed (also reported fatal), or the writer is gone.
+    /// When `put_many` failed — a full disk drops the batch — or the writer
+    /// is gone.
     pub async fn flush(&self) -> Result<(), FlushError> {
         let (reply, rx) = oneshot::channel();
         self.tx
@@ -91,17 +92,40 @@ pub enum FlushError {
 }
 
 /// Spawns the writer task for one repository. `fatal` is the daemon's
-/// shared fatal channel: a `put_many` error is reported there and the task
-/// exits. `busy` is the daemon's idle-exit tracker: the task reports while
-/// vectors sit unflushed, so `source` — the writer's repository id — keeps
-/// the daemon alive until the commit. The returned join handle resolves
-/// after the close-flush once every [`WriterHandle`] is dropped.
+/// shared fatal channel: a `put_many` error other than a full disk is
+/// reported there and the task exits; a full disk drops the batch and the
+/// task keeps running. `busy` is the daemon's idle-exit tracker: the task
+/// reports while vectors sit unflushed, so `source` — the writer's
+/// repository id — keeps the daemon alive until the commit. The returned
+/// join handle resolves after the close-flush once every [`WriterHandle`]
+/// is dropped.
 pub fn spawn(
     cache: VectorCache,
     model_id: String,
     fatal: mpsc::Sender<Error>,
     busy: watch::Sender<bool>,
 ) -> (WriterHandle, tokio::task::JoinHandle<()>) {
+    spawn_with(
+        move |batch| {
+            let (cache, model_id) = (cache.clone(), model_id.clone());
+            async move { cache.put_many(&model_id, batch).await }
+        },
+        fatal,
+        busy,
+    )
+}
+
+/// `spawn` with the commit step injected, so tests answer for failures a
+/// real volume needs no free space to produce.
+fn spawn_with<F, Fut>(
+    mut commit: F,
+    fatal: mpsc::Sender<Error>,
+    busy: watch::Sender<bool>,
+) -> (WriterHandle, tokio::task::JoinHandle<()>)
+where
+    F: FnMut(Vec<(ContentHash, UnitVector)>) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Result<(), StoreError>> + Send,
+{
     let (tx, mut rx) = mpsc::channel::<WriterMsg>(INBOX);
     let task = tokio::spawn(async move {
         let mut buffer: Vec<(ContentHash, UnitVector)> = Vec::new();
@@ -110,7 +134,7 @@ pub fn spawn(
             tokio::select! {
                 msg = rx.recv() => match msg {
                     None => {
-                        let _ = flush(&cache, &model_id, &mut buffer, &fatal, &busy).await;
+                        let _ = flush(&mut buffer, &mut commit, &fatal, &busy).await;
                         break;
                     }
                     Some(WriterMsg::Vector(hash, vector)) => {
@@ -120,18 +144,19 @@ pub fn spawn(
                         }
                         buffer.push((hash, vector));
                         if buffer.len() >= FLUSH_VECTORS
-                            && flush(&cache, &model_id, &mut buffer, &fatal, &busy)
-                                .await
-                                .is_err()
+                            && matches!(
+                                flush(&mut buffer, &mut commit, &fatal, &busy).await,
+                                Err(FlushFail::Fatal(_))
+                            )
                         {
                             break;
                         }
                     }
                     Some(WriterMsg::Flush { reply }) => {
-                        let result = flush(&cache, &model_id, &mut buffer, &fatal, &busy).await;
-                        let failed = result.is_err();
-                        let _ = reply.send(result);
-                        if failed {
+                        let result = flush(&mut buffer, &mut commit, &fatal, &busy).await;
+                        let fatal = matches!(result, Err(FlushFail::Fatal(_)));
+                        let _ = reply.send(result.map_err(FlushFail::store_error));
+                        if fatal {
                             break;
                         }
                     }
@@ -143,10 +168,10 @@ pub fn spawn(
                     }
                 } =>
                 {
-                    if flush(&cache, &model_id, &mut buffer, &fatal, &busy)
-                        .await
-                        .is_err()
-                    {
+                    if matches!(
+                        flush(&mut buffer, &mut commit, &fatal, &busy).await,
+                        Err(FlushFail::Fatal(_))
+                    ) {
                         break;
                     }
                 }
@@ -162,23 +187,119 @@ pub fn spawn(
     (WriterHandle { tx }, task)
 }
 
-/// Commits the buffer; on error it is reported fatal and returned. Empty
-/// buffers are a no-op.
-async fn flush(
-    cache: &VectorCache,
-    model_id: &str,
+/// A failed flush.
+enum FlushFail {
+    /// A write the daemon survives — a full disk drops the batch and the
+    /// writer keeps running.
+    Recoverable(StoreError),
+    /// Reported on the daemon's fatal channel; the writer exits.
+    Fatal(StoreError),
+}
+
+impl FlushFail {
+    /// The store error the reply reports either way.
+    fn store_error(self) -> StoreError {
+        match self {
+            Self::Recoverable(error) | Self::Fatal(error) => error,
+        }
+    }
+}
+
+/// Commits the buffer; a full disk drops the batch and is logged, any other
+/// error is reported fatal. Empty buffers are a no-op.
+async fn flush<F, Fut>(
     buffer: &mut Vec<(ContentHash, UnitVector)>,
+    commit: &mut F,
     fatal: &mpsc::Sender<Error>,
     busy: &watch::Sender<bool>,
-) -> Result<(), StoreError> {
+) -> Result<(), FlushFail>
+where
+    F: FnMut(Vec<(ContentHash, UnitVector)>) -> Fut,
+    Fut: std::future::Future<Output = Result<(), StoreError>>,
+{
     if buffer.is_empty() {
         return Ok(());
     }
     let batch = std::mem::take(buffer);
-    if let Err(error) = cache.put_many(model_id, batch).await {
+    if let Err(error) = commit(batch).await {
+        if error.is_disk_full() {
+            tracing::error!(%error, "vector write dropped: disk is full");
+            busy.send_replace(false);
+            return Err(FlushFail::Recoverable(error));
+        }
         let _ = fatal.send(Error::Writer(error.to_string())).await;
-        return Err(error);
+        return Err(FlushFail::Fatal(error));
     }
     busy.send_replace(false);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use repo_search_core::UnitVector;
+    use repo_search_core::store::{ContentHash, Error as StoreError};
+
+    use super::*;
+
+    /// A full disk drops the write, reports nothing fatal and the writer
+    /// keeps serving once space is back.
+    #[tokio::test]
+    async fn a_full_write_is_dropped_and_the_writer_keeps_serving() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = calls.clone();
+        let commit = move |_| {
+            std::future::ready(if count.fetch_add(1, Ordering::Relaxed) < 1 {
+                Err(StoreError::Io(io::Error::from(io::ErrorKind::StorageFull)))
+            } else {
+                Ok(())
+            })
+        };
+        let (fatal_tx, mut fatal_rx) = mpsc::channel(4);
+        let (busy_tx, _busy_rx) = watch::channel(false);
+        let (writer, _task) = spawn_with(commit, fatal_tx, busy_tx);
+
+        let hash = ContentHash::of_file(b"content");
+        let vector = UnitVector::normalize(vec![1.0, 2.0]);
+        writer.vector(hash, vector.clone()).await.expect("queued");
+        let error = writer.flush().await.expect_err("the write is dropped");
+        assert!(matches!(error, FlushError::Store(_)));
+        assert!(fatal_rx.try_recv().is_err(), "a full disk is not fatal");
+
+        // Space is back: the same writer commits the next batch.
+        writer
+            .vector(hash, vector)
+            .await
+            .expect("the writer serves");
+        writer.flush().await.expect("the writer recovers");
+    }
+
+    /// Any other write failure reports fatal and the writer exits.
+    #[tokio::test]
+    async fn a_fatal_write_error_stops_the_writer() {
+        let commit = |_| {
+            std::future::ready(Err(StoreError::Io(io::Error::from(
+                io::ErrorKind::PermissionDenied,
+            ))))
+        };
+        let (fatal_tx, mut fatal_rx) = mpsc::channel(4);
+        let (busy_tx, _busy_rx) = watch::channel(false);
+        let (writer, _task) = spawn_with(commit, fatal_tx, busy_tx);
+        writer
+            .vector(ContentHash::of_file(b"x"), UnitVector::normalize(vec![1.0]))
+            .await
+            .expect("queued");
+        assert!(writer.flush().await.is_err());
+        assert!(matches!(fatal_rx.try_recv(), Ok(Error::Writer(_))));
+        assert!(
+            writer
+                .vector(ContentHash::of_file(b"y"), UnitVector::normalize(vec![1.0]))
+                .await
+                .is_err(),
+            "the writer is gone"
+        );
+    }
 }

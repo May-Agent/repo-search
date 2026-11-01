@@ -291,10 +291,6 @@ pub struct SearchOptions {
     #[arg(long)]
     pub symbol: Option<String>,
 
-    /// Include files `.gitignore` excludes.
-    #[arg(long)]
-    pub include_ignored: bool,
-
     /// Structured output.
     #[arg(long)]
     pub json: bool,

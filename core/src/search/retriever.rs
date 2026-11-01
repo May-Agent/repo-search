@@ -117,7 +117,7 @@ impl<S: EmbedService> Retriever<S> {
         let use_bm25 = request.mode != Mode::Semantic;
         let use_vector = request.mode != Mode::Lexical;
 
-        let (files, kinds, has_ignored) = tokio::join!(
+        let (files, kinds) = tokio::join!(
             async {
                 if request.filters.paths.is_empty() {
                     Ok(Vec::new())
@@ -132,22 +132,11 @@ impl<S: EmbedService> Retriever<S> {
                     self.index.kinds().await
                 }
             },
-            async {
-                if request.include_ignored {
-                    Ok(true)
-                } else {
-                    self.index.has_ignored().await
-                }
-            },
         );
         let files = files?;
         let kinds = kinds?;
-        // With no ignored file indexed there is nothing to hide, so an
-        // unfiltered search stays unrestricted and needs no mask.
-        let include_ignored = request.include_ignored || !has_ignored?;
-        let scope = Scope::resolve(&request.filters, include_ignored, &files, &kinds)?;
-        // The barrier counted the docs rows of the request's scope; with no
-        // ignored file indexed, the widened scope holds the same rows.
+        let scope = Scope::resolve(&request.filters, &files, &kinds)?;
+        // The barrier counted the docs rows of the request's scope.
         let docs_present = reconciliation.doc_chunks > 0;
         let filters = [scope.code, scope.docs.filter(|_| docs_present)];
 
@@ -185,9 +174,7 @@ impl<S: EmbedService> Retriever<S> {
         let mut embedded = 0;
         if use_vector && use_bm25 && reconciliation.chunks_with_vector < reconciliation.chunks_total
         {
-            embedded = self
-                .embed_on_the_spot(&bm25_lists, &model, include_ignored)
-                .await?;
+            embedded = self.embed_on_the_spot(&bm25_lists, &model).await?;
         }
 
         let (vector_code, vector_docs) = tokio::join!(
@@ -250,7 +237,6 @@ impl<S: EmbedService> Retriever<S> {
         &self,
         bm25_lists: &[Vec<ChunkId>; 2],
         model: &str,
-        include_ignored: bool,
     ) -> Result<u64, Error<S::Error>> {
         let mut missing: Vec<ChunkRow> = Vec::new();
         let mut seen: HashSet<ContentHash> = HashSet::new();
@@ -332,7 +318,6 @@ impl<S: EmbedService> Retriever<S> {
         // embedded hashes, on either side, gained a vector.
         let unrestricted = |side| ChunkFilter {
             side,
-            include_ignored,
             paths: None,
             extensions: Vec::new(),
             kinds: Vec::new(),

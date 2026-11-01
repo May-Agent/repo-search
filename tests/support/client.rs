@@ -48,7 +48,6 @@ pub fn search(worktree: &Path, query: &str) -> Request {
         symbol: None,
         budget: 4000,
         files_only: false,
-        include_ignored: false,
         format: Format::Json,
     })
 }

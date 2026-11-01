@@ -752,6 +752,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "git2"
+version = "0.20.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7b88256088d75a56f8ecfa070513a775dd9107f6530ef14919dac831af9cfe2b"
+dependencies = [
+ "bitflags",
+ "libc",
+ "libgit2-sys",
+ "log",
+ "url",
+]
+
+[[package]]
 name = "globset"
 version = "0.4.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1218,12 +1231,36 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
 
 [[package]]
+name = "libgit2-sys"
+version = "0.18.8+1.9.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7f7c568b25d7489bc3fb2988ed69ab111d2944d2f5fec3d5c987fe545ea97b50"
+dependencies = [
+ "cc",
+ "libc",
+ "libz-sys",
+ "pkg-config",
+]
+
+[[package]]
 name = "libsqlite3-sys"
 version = "0.38.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f1d20bef17f513b9b3004532233187769cd072d790971f4e4da0e346eb6401e8"
 dependencies = [
  "cc",
+ "pkg-config",
+ "vcpkg",
+]
+
+[[package]]
+name = "libz-sys"
+version = "1.1.31"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ff20308ecabd635a2dc1dd5834a86c462cca20efba1d5d3ddab1f8aea3455cb2"
+dependencies = [
+ "cc",
+ "libc",
  "pkg-config",
  "vcpkg",
 ]
@@ -1877,7 +1914,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "repo-search"
-version = "0.0.8"
+version = "0.0.9"
 dependencies = [
  "askama",
  "bytes",
@@ -1913,7 +1950,7 @@ dependencies = [
 
 [[package]]
 name = "repo-search-client"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "askama",
  "etcetera",
@@ -1931,12 +1968,13 @@ dependencies = [
 
 [[package]]
 name = "repo-search-core"
-version = "0.0.6"
+version = "0.0.7"
 dependencies = [
  "askama",
  "base64 0.23.1",
  "blake3",
  "futures-executor",
+ "git2",
  "globset",
  "ignore",
  "jsonc-parser",
@@ -1970,7 +2008,7 @@ dependencies = [
 
 [[package]]
 name = "repo-search-coreml"
-version = "0.0.6"
+version = "0.0.7"
 dependencies = [
  "block2",
  "numkong",
@@ -1988,7 +2026,7 @@ dependencies = [
 
 [[package]]
 name = "repo-search-ort"
-version = "0.0.5"
+version = "0.0.6"
 dependencies = [
  "constant_time_eq",
  "http-body-util",
@@ -2006,7 +2044,7 @@ dependencies = [
 
 [[package]]
 name = "repo-search-server"
-version = "0.0.6"
+version = "0.0.7"
 dependencies = [
  "constant_time_eq",
  "http-body-util",

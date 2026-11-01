@@ -253,6 +253,7 @@ async fn query_preempts_indexing() {
         "src/edit.rs",
         &repo::rust_fn("edited_item_3", LONG_BYTES),
     );
+    repo::track(&repo.root, "src/edit.rs");
     let events = request(
         &d.socket,
         &hello(),
@@ -278,6 +279,7 @@ async fn query_preempts_indexing() {
         "src/spot.rs",
         &repo::rust_fn("edited_spot", SMALL_BYTES),
     );
+    repo::track(&repo.root, "src/spot.rs");
 
     // The query's lexical candidates are the two new, unembedded functions.
     let sent = Instant::now();
@@ -677,6 +679,7 @@ async fn stage_2_runs_at_background_qos() {
         "src/s0.rs",
         &repo::rust_fn("longitem_edit", LONG_BYTES),
     );
+    repo::track(&repo.root, "src/s0.rs");
     let events = request(
         &d.socket,
         &hello(),
@@ -2812,7 +2815,7 @@ async fn sigterm_answers_in_flight_and_flushes() {
 
     let committed = last.unwrap_or(committed);
     let index = Index::open(&state, &repo.root).await.expect("index opens");
-    let hashes = index.chunk_hashes(true).await.expect("chunk hashes");
+    let hashes = index.chunk_hashes().await.expect("chunk hashes");
     let cache = VectorCache::open(&state, &repo.common_dir)
         .await
         .expect("cache opens");
@@ -2878,7 +2881,7 @@ async fn kill_mid_index_resumes() {
     // Whatever the writer's close-flush could not reach is simply absent;
     // what coverage reported as committed is not.
     let index = Index::open(&state, &repo.root).await.expect("index opens");
-    let hashes = index.chunk_hashes(true).await.expect("chunk hashes");
+    let hashes = index.chunk_hashes().await.expect("chunk hashes");
     let cache = VectorCache::open(&state, &repo.common_dir)
         .await
         .expect("cache opens");
@@ -3137,7 +3140,7 @@ async fn background_work_follows_edits_and_deletions() {
     let final_hashes: HashSet<ContentHash> = Index::open(&d.state, &repo.root)
         .await
         .expect("index opens")
-        .chunk_hashes(false)
+        .chunk_hashes()
         .await
         .expect("chunk hashes")
         .into_iter()
@@ -3161,107 +3164,6 @@ async fn background_work_follows_edits_and_deletions() {
     assert_eq!(embedded_set, final_hashes);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_include_ignored_search_and_a_plain_one_resync_the_scope() {
-    // The vendored functions' longer names give their chunks more
-    // `StubCounter` tokens than the `fn_NNNN` chunks, so shortest-first
-    // dispatch reaches them last.
-    let mut files = Vec::new();
-    for f in 0..2 {
-        let mut body = String::new();
-        for j in 0..10 {
-            body.push_str(&repo::rust_fn(
-                &format!("fn_{:04}", f * 10 + j),
-                SMALL_BYTES,
-            ));
-        }
-        if f == 0 {
-            body.push_str(&repo::rust_fn(&format!("{MARKER}_fn"), SMALL_BYTES));
-        }
-        files.push((format!("src/f{f}.rs"), body));
-    }
-    files.push((".gitignore".to_owned(), "vendor/\n".to_owned()));
-    let mut vendored = String::new();
-    for i in 0..10 {
-        vendored.push_str(&repo::rust_fn(&format!("vendored_fn_{i:04}"), SMALL_BYTES));
-    }
-    files.push(("vendor/v.rs".to_owned(), vendored));
-    let repo = repo::repo(&files);
-
-    let (d, gate) = start_index_gated(Duration::from_millis(10)).await;
-    gate.arm();
-    // The window's requests race each other to the server, and the idle
-    // ANE takes whichever lands first, so a filler of the test's own takes
-    // the gated call: the gate then holds no chunk of the window.
-    let filler = d.filler(3).await;
-    let mut log: Vec<Record> = Vec::new();
-    wait_held(&mut log, &d.records);
-
-    let mut ignored = lexical(&repo.root, MARKER);
-    let Request::Search(inner) = &mut ignored else {
-        unreachable!()
-    };
-    inner.include_ignored = true;
-    let events = request(&d.socket, &hello(), ignored).await;
-    assert!(
-        matches!(final_of(&events), Final::Answer(a) if a.has_results),
-        "{events:?}"
-    );
-    // Every chunk — 21 of src, 10 vendored — is queued behind the filler.
-    d.await_server_queued(31).await;
-
-    // The scope flip resyncs: the vendored chunks leave the interest, and
-    // their requests are aborted while queued on the server.
-    let events = request(&d.socket, &hello(), lexical(&repo.root, MARKER)).await;
-    assert!(
-        matches!(final_of(&events), Final::Answer(a) if a.has_results),
-        "{events:?}"
-    );
-    // The cancels landed: only the src chunks are left queued.
-    d.await_server_queued(21).await;
-
-    // Same ordering: the first `Coverage` puts the wait's feed — and so,
-    // FIFO, the scope-false `Resync` — into the scheduler before the gate
-    // frees the ANE.
-    let mut wait = support::model::index_wait(&d.socket, &hello(), &repo.root).await;
-    support::model::await_coverage(&mut wait, 0).await;
-    gate.open();
-    filler.await.expect("the filler task does not panic");
-    match final_event(&mut wait).await {
-        Final::Indexed { with_vector, total } => {
-            assert_eq!(with_vector, total, "every chunk has a vector")
-        }
-        other => panic!("expected Indexed, got {other:?}"),
-    }
-
-    let index = Index::open(&d.state, &repo.root)
-        .await
-        .expect("index opens");
-    let all: HashSet<ContentHash> = index
-        .chunk_hashes(true)
-        .await
-        .expect("chunk hashes")
-        .into_iter()
-        .collect();
-    let visible: HashSet<ContentHash> = index
-        .chunk_hashes(false)
-        .await
-        .expect("chunk hashes")
-        .into_iter()
-        .collect();
-    let vendor_hashes: HashSet<ContentHash> = all.difference(&visible).copied().collect();
-    assert!(!vendor_hashes.is_empty());
-    let embedded: HashSet<ContentHash> = d
-        .records
-        .try_iter()
-        .filter(|r| r.kind == Kind::Index)
-        .filter_map(|r| r.hash)
-        .collect();
-    assert!(
-        vendor_hashes.iter().all(|h| !embedded.contains(h)),
-        "the scope-false resync dropped the vendored chunks before dispatch"
-    );
-}
 /// A daemon whose ANE holds index calls at an [`IndexGate`] once armed,
 /// and whose model counter holds the feeder's next `document_tokens`
 /// call (a non-empty feed, after its cache read) once the handle is armed.
@@ -3340,81 +3242,11 @@ async fn visible_hashes(state: &StateDir, worktree: &Path) -> HashSet<ContentHas
     Index::open(state, worktree)
         .await
         .expect("index opens")
-        .chunk_hashes(false)
+        .chunk_hashes()
         .await
         .expect("chunk hashes")
         .into_iter()
         .collect()
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_scope_flip_resync_skips_chunks_finished_while_it_was_held() {
-    let repo = fn_repo(20, SMALL_BYTES, 10);
-    let (d, gate, hold) = start_feed_held(Duration::from_millis(10)).await;
-    gate.arm();
-
-    // The owner's first barrier: a `Resync` of the include-ignored scope.
-    let mut ignored = lexical(&repo.root, MARKER);
-    let Request::Search(inner) = &mut ignored else {
-        unreachable!("search builds a Search request")
-    };
-    inner.include_ignored = true;
-    let events = request(&d.socket, &hello(), ignored).await;
-    assert!(
-        matches!(final_of(&events), Final::Answer(a) if a.has_results),
-        "{events:?}"
-    );
-    // Its `Replace` is in and the ANE holds the first item.
-    let mut log: Vec<Record> = Vec::new();
-    wait_held(&mut log, &d.records);
-    let _lift = repo_search_server::stub::lift_ane(&d.backend, QosClass::UserInitiated);
-
-    // The plain `index` flips the scope back: a `Resync`, held after its
-    // `missing` read saw nothing cached. The flips are ordered this way so
-    // the final `index --wait` below is a `Change`, not a `Resync` whose
-    // `Replace` would drop the re-queued items before they ran.
-    hold.arm();
-    index_request(&d, &repo.root, false).await;
-    wait_feed_held(&hold);
-    gate.open();
-    let want = visible_hashes(&d.state, &repo.root).await;
-    assert_eq!(want.len(), 21);
-    // Every chunk embeds from the first `Replace` while the resync is held.
-    tokio::task::block_in_place(|| {
-        loop {
-            let have: HashSet<ContentHash> = log
-                .iter()
-                .filter(|r| r.kind == Kind::Index)
-                .filter_map(|r| r.hash)
-                .collect();
-            if want.is_subset(&have) {
-                break;
-            }
-            log.push(
-                d.records
-                    .recv_timeout(TIMEOUT)
-                    .expect("a record must arrive within the timeout"),
-            );
-        }
-    });
-
-    tokio::task::block_in_place(|| hold.open());
-    // This feed is FIFO behind the held resync, so its `Indexed` follows
-    // the resync's `Enqueue`.
-    index_request(&d, &repo.root, true).await;
-
-    let indexed: Vec<ContentHash> = embeds(&mut log, &d.records)
-        .into_iter()
-        .filter(|(kind, _)| *kind == Kind::Index)
-        .map(|(_, hash)| hash)
-        .collect();
-    let distinct: HashSet<ContentHash> = indexed.iter().copied().collect();
-    assert_eq!(
-        distinct.len(),
-        indexed.len(),
-        "a hash was embedded twice: {indexed:?}"
-    );
-    assert_eq!(distinct, want, "{indexed:?}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

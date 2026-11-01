@@ -299,23 +299,27 @@ fn gallop_fit(min: usize, n: usize, guess: usize, fits: &impl Fn(usize) -> bool)
 }
 
 /// `body`'s pieces as byte ranges, after the reference's `fit_tokens`:
-/// every part is the longest prefix of the remaining pieces that stays
-/// under `max_bytes` and whose document — the cap's title, `first_prefix`
-/// on the first part or `rest_prefix` on the rest, then the part's text —
-/// fits the cap. One encode with offsets estimates where the cap runs out;
-/// the piece-count guess it gives is confirmed by [`Cap::fits`] probes —
-/// galloping out, then binary search. A line that does not fit on its own
-/// is halved on char boundaries until its pieces do.
+/// `edges` gives the range a piece keeps of its raw range — an empty one
+/// drops the piece — so a piece is checked at the range it is emitted at.
+/// Every part is the longest prefix of the remaining pieces whose span
+/// stays under `max_bytes` and whose document — the cap's title,
+/// `first_prefix` on the first part or `rest_prefix` on the rest, then the
+/// part's text — fits the cap. One encode with offsets estimates where the
+/// cap runs out; the piece-count guess it gives is confirmed by
+/// [`Cap::fits`] probes — galloping out, then binary search. A line that
+/// does not fit on its own is halved on char boundaries until its pieces
+/// do.
 pub(super) fn token_split(
     cap: &Cap,
     first_prefix: &str,
     rest_prefix: &str,
     body: &str,
     max_bytes: usize,
+    edges: impl Fn(&str, Range<usize>) -> Range<usize> + Copy,
 ) -> Vec<Range<usize>> {
     let mut pieces = Vec::new();
     for line in python_lines(body) {
-        cut_line(body, line, cap, rest_prefix, &mut pieces);
+        cut_line(body, line, cap, rest_prefix, edges, &mut pieces);
     }
     let mut parts = Vec::new();
     let mut pos = 0;
@@ -326,11 +330,10 @@ pub(super) fn token_split(
             rest_prefix
         };
         let start = pieces[pos].start;
-        // The byte limit alone bounds how many pieces the part can hold.
+        // The byte limit alone bounds how many pieces the part can hold;
+        // pieces may carry gaps, so the limit applies to the span.
         let mut bound = pos + 1;
-        let mut bytes = pieces[pos].len();
-        while bound < pieces.len() && bytes + pieces[bound].len() <= max_bytes {
-            bytes += pieces[bound].len();
+        while bound < pieces.len() && pieces[bound].end - start <= max_bytes {
             bound += 1;
         }
         let n = bound - pos;
@@ -383,13 +386,25 @@ fn signature_cut(sig: &str, tokens: &dyn TokenCounter) -> usize {
     gallop_fit(0, total - 1, guess, &fits)
 }
 
-/// Pushes `range`'s pieces into `out`: `range` itself when it fits the cap
-/// under `prefix` or holds fewer than two chars; otherwise the halves of a
-/// split at the middle char, recursively.
-fn cut_line(body: &str, range: Range<usize>, cap: &Cap, prefix: &str, out: &mut Vec<Range<usize>>) {
-    let text = &body[range.clone()];
+/// Pushes `range`'s pieces into `out`: the range `edges` keeps of `range`
+/// — nothing when `edges` keeps an empty range — when it fits the cap
+/// under `prefix` or holds fewer than two chars; otherwise the halves of
+/// a split at the middle char, recursively, each through `edges` again.
+fn cut_line(
+    body: &str,
+    range: Range<usize>,
+    cap: &Cap,
+    prefix: &str,
+    edges: impl Fn(&str, Range<usize>) -> Range<usize> + Copy,
+    out: &mut Vec<Range<usize>>,
+) {
+    let piece = edges(body, range);
+    if piece.is_empty() {
+        return;
+    }
+    let text = &body[piece.clone()];
     if cap.fits(prefix, text) || code_points(text) < 2 {
-        out.push(range);
+        out.push(piece);
         return;
     }
     let chars = code_points(text);
@@ -401,8 +416,15 @@ fn cut_line(body: &str, range: Range<usize>, cap: &Cap, prefix: &str, out: &mut 
             .nth(chars / 2)
             .map_or(text.len(), |(i, _)| i)
     };
-    cut_line(body, range.start..range.start + mid, cap, prefix, out);
-    cut_line(body, range.start + mid..range.end, cap, prefix, out);
+    cut_line(
+        body,
+        piece.start..piece.start + mid,
+        cap,
+        prefix,
+        edges,
+        out,
+    );
+    cut_line(body, piece.start + mid..piece.end, cap, prefix, edges, out);
 }
 
 /// Runs `chunk` on `src` without a leading UTF-8 byte order mark and shifts
@@ -734,7 +756,7 @@ impl<'a> Emitter<'a> {
             // 10^digits parts is redone one digit wider.
             let nines = "9".repeat(digits as usize);
             let cap = Cap::new(self.tokens, &format!("{title} (part {nines}/{nines})"));
-            let parts = token_split(&cap, "", &rest_prefix, body, MAX_BYTES);
+            let parts = token_split(&cap, "", &rest_prefix, body, MAX_BYTES, |_, range| range);
             if parts.len() < 10usize.pow(digits) {
                 break parts;
             }
@@ -867,7 +889,7 @@ mod tests {
 
     use super::{
         Cap, MAX_TOKENS, SIGNATURE_SUFFIX, code_points, collapse, collapse_into, cut_line,
-        python_lines, signature_cut, token_split,
+        python_lines, signature_cut, token_split, trim_range,
     };
     use crate::TokenCounter;
 
@@ -932,10 +954,11 @@ mod tests {
         rest_prefix: &str,
         body: &str,
         max_bytes: usize,
+        edges: impl Fn(&str, Range<usize>) -> Range<usize> + Copy,
     ) -> Vec<Range<usize>> {
         let mut pieces = Vec::new();
         for line in python_lines(body) {
-            cut_line(body, line, cap, rest_prefix, &mut pieces);
+            cut_line(body, line, cap, rest_prefix, edges, &mut pieces);
         }
         let mut parts = Vec::new();
         let mut pos = 0;
@@ -947,12 +970,10 @@ mod tests {
             };
             let start = pieces[pos].start;
             let mut end = pos;
-            let mut bytes = 0;
             while end < pieces.len()
-                && bytes + pieces[end].len() <= max_bytes
+                && pieces[end].end - start <= max_bytes
                 && cap.fits(prefix, &body[start..pieces[end].end])
             {
-                bytes += pieces[end].len();
                 end += 1;
             }
             let end = end.max(pos + 1);
@@ -1006,22 +1027,26 @@ mod tests {
 
     /// `token_split` takes as many pieces as fit, whatever the `fit_end`
     /// estimate claims: the gallop corrects a guess skewed in either
-    /// direction, matching the piece-at-a-time greedy scan.
+    /// direction, matching the piece-at-a-time greedy scan — with pieces
+    /// kept whole (`edges` the identity) or trimmed to `trim_range`.
     #[test]
     fn token_split_matches_greedy_packing() {
-        for skew in [-4096, 0, 4096] {
-            let tokens = SkewedEnd { unit: 4, skew };
-            let cap = Cap::new(&tokens, "src/lib.rs › impl T › fn f (part 999/999)");
-            for body in bodies() {
-                for (first, rest) in [
-                    ("", ""),
-                    ("", "pub fn signature(&mut self, x: u32) -> bool …\n"),
-                ] {
-                    assert_eq!(
-                        token_split(&cap, first, rest, &body, super::MAX_BYTES),
-                        greedy_split(&cap, first, rest, &body, super::MAX_BYTES),
-                        "skew {skew} prefixes {first:?}/{rest:?} body {body:?}"
-                    );
+        let identity: fn(&str, Range<usize>) -> Range<usize> = |_, range| range;
+        for edges in [identity, trim_range] {
+            for skew in [-4096, 0, 4096] {
+                let tokens = SkewedEnd { unit: 4, skew };
+                let cap = Cap::new(&tokens, "src/lib.rs › impl T › fn f (part 999/999)");
+                for body in bodies() {
+                    for (first, rest) in [
+                        ("", ""),
+                        ("", "pub fn signature(&mut self, x: u32) -> bool …\n"),
+                    ] {
+                        assert_eq!(
+                            token_split(&cap, first, rest, &body, super::MAX_BYTES, edges),
+                            greedy_split(&cap, first, rest, &body, super::MAX_BYTES, edges),
+                            "edges {edges:p} skew {skew} prefixes {first:?}/{rest:?} body {body:?}"
+                        );
+                    }
                 }
             }
         }

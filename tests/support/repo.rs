@@ -58,6 +58,12 @@ pub fn append(root: &Path, path: &str, contents: &str) {
     file.write_all(contents.as_bytes()).expect("append");
 }
 
+/// Tracks `root/path`: only tracked files are indexed, so a file a test
+/// creates after the commit must be `git add`ed to be seen.
+pub fn track(root: &Path, path: &str) {
+    git(root, &["add", "--", path]);
+}
+
 /// A Rust function whose chunk lands near `text_bytes` bytes of text under
 /// `StubCounter`. `name` must be a unique identifier: it lands in the
 /// chunk's title and text.
