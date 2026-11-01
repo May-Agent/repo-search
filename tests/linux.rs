@@ -175,6 +175,7 @@ async fn an_edit_is_embedded_in_the_background() {
         "src/edit.rs",
         &repo::rust_fn(&format!("{MARKER}_fn"), 500),
     );
+    repo::track(&repo.root, "src/edit.rs");
     loop {
         let recorded = fake.next();
         if recorded.path == "/v1/embeddings" && recorded.body.to_string().contains(MARKER) {
@@ -301,6 +302,7 @@ async fn search_and_index_through_the_real_binary() {
         "src/edit.rs",
         &repo::rust_fn(&format!("{MARKER}_fn"), 500),
     );
+    repo::track(&installed.repo.root, "src/edit.rs");
     let found = installed.search(&[MARKER]).await;
     assert!(found.status.success(), "{}", text(&found.stderr));
     assert!(
