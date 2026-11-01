@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.6](https://github.com/May-Agent/repo-search/compare/repo-search-ort-v0.0.5...repo-search-ort-v0.0.6) - 2026-11-01
+
+### Other
+
+- updated the following local packages: repo-search-core
+
 ## [0.0.5](https://github.com/May-Agent/repo-search/compare/repo-search-ort-v0.0.4...repo-search-ort-v0.0.5) - 2026-10-31
 
 ### Added

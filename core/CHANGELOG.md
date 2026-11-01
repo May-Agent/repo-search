@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.7](https://github.com/May-Agent/repo-search/compare/core/v0.0.6...core/v0.0.7) - 2026-11-01
+
+### Added
+
+- *(search)* fold identical-content hits into one result
+- *(search)* note the wait command when the index is incomplete
+- *(reconcile)* index only git-tracked files
+
+### Fixed
+
+- *(chunk)* check doc split parts at their emitted range
+- *(writer)* a full disk drops the write instead of killing the daemon
+
+### Other
+
+- Merge pull request #175 from May-Agent/fix/169-incomplete-note
+- Merge pull request #174 from May-Agent/fix/171-writes-dont-crash
+- *(search)* reconcile before embedding a newly tracked file
+
 ## [0.0.6](https://github.com/May-Agent/repo-search/compare/core/v0.0.5...core/v0.0.6) - 2026-10-31
 
 ### Added
