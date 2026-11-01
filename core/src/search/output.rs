@@ -247,6 +247,10 @@ pub struct FileHit<C> {
     /// files-only answer.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub chunks: Vec<C>,
+    /// Other paths this hit's chunks were also found at, when identical
+    /// content folded them in; omitted when empty.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub also_at: Vec<String>,
 }
 
 /// The answer to a query. A list is `None` when it is empty.
@@ -307,6 +311,7 @@ impl Results {
                     .iter()
                     .map(|file| FileView {
                         path: &file.path,
+                        also_at: &file.also_at,
                         chunks: file
                             .chunks
                             .iter()
@@ -328,6 +333,7 @@ impl Results {
                     .iter()
                     .map(|file| FileView {
                         path: &file.path,
+                        also_at: &file.also_at,
                         chunks: file
                             .chunks
                             .iter()
@@ -365,6 +371,7 @@ struct SectionView<'a> {
 
 struct FileView<'a> {
     path: &'a str,
+    also_at: &'a [String],
     chunks: Vec<ChunkView<'a>>,
 }
 
@@ -462,6 +469,9 @@ pub(super) struct Group {
     pub path: String,
     pub score: f64,
     pub chunks: Vec<usize>,
+    /// Other paths whose identical chunk folded into this file's: the hit
+    /// names every path the content lives at.
+    pub also_at: Vec<String>,
 }
 
 /// Where the selection stands.
@@ -509,6 +519,10 @@ pub(super) struct Selector {
     emitted: bool,
     /// The list whose turn it is: 0 code, 1 docs.
     turn: usize,
+    /// Each list's emitted chunks by content hash, to their group: a chunk
+    /// whose content is already emitted folds its path into that group
+    /// instead of taking a turn and spending budget.
+    seen: [HashMap<crate::store::ContentHash, usize>; 2],
 }
 
 const SIDES: [Side; 2] = [Side::Code, Side::Docs];
@@ -560,6 +574,7 @@ impl Selector {
             used: 0,
             emitted: false,
             turn: 0,
+            seen: [HashMap::new(), HashMap::new()],
         }
     }
 
@@ -594,6 +609,12 @@ impl Selector {
                     continue;
                 };
                 let best = &lists[side][file.chunks[0]];
+                if let Some(&group) = self.seen[side].get(&best.row.content_hash) {
+                    fold(&mut self.groups[side][group], &best.row.path);
+                    self.cursor[side] += 1;
+                    self.turn = 1 - side;
+                    continue;
+                }
                 let cost = counter.count(&best.row.path);
                 if self.emitted && self.used + cost > self.budget {
                     self.open[side] = false;
@@ -601,10 +622,12 @@ impl Selector {
                 }
                 self.used += cost;
                 self.emitted = true;
+                self.seen[side].insert(best.row.content_hash, self.groups[side].len());
                 self.groups[side].push(Group {
                     path: best.row.path.clone(),
                     score: best.score,
                     chunks: Vec::new(),
+                    also_at: Vec::new(),
                 });
                 self.cursor[side] += 1;
                 self.turn = 1 - side;
@@ -632,6 +655,16 @@ impl Selector {
             let file = &mut files[g];
             let idx = file.chunks[file.taken];
             let chunk = &lists[side][idx];
+            // A chunk whose content is already emitted folds this file's
+            // path into that content's group and costs the turn nothing —
+            // it is never read.
+            if let Some(&group) = self.seen[side].get(&chunk.row.content_hash) {
+                fold(&mut self.groups[side][group], &chunk.row.path);
+                file.taken += 1;
+                self.cursor[side] = if g + 1 == files.len() { 0 } else { g + 1 };
+                self.turn = 1 - side;
+                continue;
+            }
             // A file's first chunk is also charged the path; a chunk that
             // does not fit ends the list, the chunks already taken stay.
             let mut cost = usize::from(file.taken == 0) * counter.count(&chunk.row.path);
@@ -653,17 +686,24 @@ impl Selector {
             }
             self.used += cost;
             self.emitted = true;
-            match file.group {
-                Some(group) => self.groups[side][group].chunks.push(idx),
+            let group = match file.group {
+                Some(group) => {
+                    self.groups[side][group].chunks.push(idx);
+                    group
+                }
                 None => {
-                    file.group = Some(self.groups[side].len());
+                    let group = self.groups[side].len();
+                    file.group = Some(group);
                     self.groups[side].push(Group {
                         path: chunk.row.path.clone(),
                         score: chunk.score,
                         chunks: vec![idx],
+                        also_at: Vec::new(),
                     });
+                    group
                 }
-            }
+            };
+            self.seen[side].insert(chunk.row.content_hash, group);
             file.taken += 1;
             self.cursor[side] = if g + 1 == files.len() { 0 } else { g + 1 };
             self.turn = 1 - side;
@@ -674,6 +714,14 @@ impl Selector {
     /// The selected files of the code list, then of the docs list.
     pub fn finish(self) -> [Vec<Group>; 2] {
         self.groups
+    }
+}
+
+/// `path` joins `group`'s `also_at` — once, and never when it is the
+/// group's own path (a file may hold the same chunk twice).
+fn fold(group: &mut Group, path: &str) {
+    if group.path != path && !group.also_at.iter().any(|p| p == path) {
+        group.also_at.push(path.to_owned());
     }
 }
 
@@ -716,6 +764,7 @@ fn hits<C>(groups: Vec<Group>, chunk: impl Fn(usize) -> C) -> Option<Vec<FileHit
             path: g.path,
             score: g.score,
             chunks: g.chunks.into_iter().map(&chunk).collect(),
+            also_at: g.also_at,
         })
         .collect();
     (!hits.is_empty()).then_some(hits)
@@ -794,9 +843,9 @@ mod tests {
     #[test]
     fn chunks_of_one_file_group_under_its_first_rank() {
         let code = [
-            ranked("a.rs", "one", "x y", 0.9),
-            ranked("b.rs", "two", "x y", 0.8),
-            ranked("a.rs", "three", "x y", 0.7),
+            ranked("a.rs", "one", "a b", 0.9),
+            ranked("b.rs", "two", "c d", 0.8),
+            ranked("a.rs", "three", "e f", 0.7),
         ];
         let [groups, _] = select([&code, &[]], 1000, false, &Words);
         assert_eq!(groups.len(), 2);
@@ -813,11 +862,11 @@ mod tests {
         // not fit the budget of 11 and ends the whole list — c's second
         // chunk, which would have fit, is never reached.
         let code = [
-            ranked("a.rs", "one", "x", 0.9),
-            ranked("b.rs", "two", "x", 0.8),
+            ranked("a.rs", "one", "a", 0.9),
+            ranked("b.rs", "two", "b", 0.8),
             ranked("b.rs", "big", "w w w w w w w w w w", 0.7),
-            ranked("c.rs", "three", "x", 0.6),
-            ranked("c.rs", "four", "x", 0.5),
+            ranked("c.rs", "three", "c", 0.6),
+            ranked("c.rs", "four", "d", 0.5),
         ];
         let [groups, _] = select([&code, &[]], 11, false, &Words);
         assert_eq!(group_paths(&groups), ["a.rs", "b.rs", "c.rs"]);
@@ -850,10 +899,10 @@ mod tests {
     #[test]
     fn code_and_docs_share_the_budget_alternately() {
         let code = [
-            ranked("a.rs", "one", "x y", 0.9),
-            ranked("b.rs", "two", "x y", 0.8),
+            ranked("a.rs", "one", "a b", 0.9),
+            ranked("b.rs", "two", "c d", 0.8),
         ];
-        let docs = [doc("d.md", "H", "p q", 0.5), doc("e.md", "I", "p q", 0.4)];
+        let docs = [doc("d.md", "H", "e f", 0.5), doc("e.md", "I", "g h", 0.4)];
         // Each unit costs 4 (path, heading/symbol, two words): room for three.
         let [c, d] = select([&code, &docs], 12, false, &Words);
         assert_eq!((c.len(), d.len()), (2, 1));
@@ -870,14 +919,14 @@ mod tests {
         // takes a1, d1, b1, e1 — one chunk per file, code first — and pass
         // two a2, d2.
         let mut code = [
-            ranked("a.rs", "one", "x", 0.9),
-            ranked("b.rs", "two", "x", 0.8),
-            ranked("a.rs", "three", "x", 0.7),
+            ranked("a.rs", "one", "a", 0.9),
+            ranked("b.rs", "two", "b", 0.8),
+            ranked("a.rs", "three", "c", 0.7),
         ];
         let mut docs = [
-            doc("d.md", "H", "p", 0.5),
-            doc("e.md", "I", "p", 0.4),
-            doc("d.md", "J", "p", 0.3),
+            doc("d.md", "H", "d", 0.5),
+            doc("e.md", "I", "e", 0.4),
+            doc("d.md", "J", "f", 0.3),
         ];
         for chunk in code.iter_mut().chain(&mut docs) {
             chunk.text = None;
@@ -921,11 +970,11 @@ mod tests {
         // second pass, after b's first. a1 + d1 + b1 = 9 fills the budget, so
         // a2 is never emitted — a whole-file take of a would have emitted it.
         let code = [
-            ranked("a.rs", "one", "x", 0.9),
-            ranked("b.rs", "two", "x", 0.8),
-            ranked("a.rs", "three", "x", 0.7),
+            ranked("a.rs", "one", "a", 0.9),
+            ranked("b.rs", "two", "b", 0.8),
+            ranked("a.rs", "three", "c", 0.7),
         ];
-        let docs = [doc("d.md", "H", "p", 0.5), doc("e.md", "I", "p", 0.4)];
+        let docs = [doc("d.md", "H", "d", 0.5), doc("e.md", "I", "e", 0.4)];
         let [c, d] = select([&code, &docs], 9, false, &Words);
         assert_eq!(group_paths(&c), ["a.rs", "b.rs"]);
         assert_eq!(c[0].chunks, [0]);
@@ -939,11 +988,11 @@ mod tests {
         // file's chunks in rank order and lists the files in the order they
         // were first chosen.
         let code = [
-            ranked("a.rs", "one", "x", 0.9),
-            ranked("b.rs", "two", "x", 0.8),
-            ranked("a.rs", "three", "x", 0.7),
-            ranked("b.rs", "four", "x", 0.6),
-            ranked("c.rs", "five", "x", 0.5),
+            ranked("a.rs", "one", "a", 0.9),
+            ranked("b.rs", "two", "b", 0.8),
+            ranked("a.rs", "three", "c", 0.7),
+            ranked("b.rs", "four", "d", 0.6),
+            ranked("c.rs", "five", "e", 0.5),
         ];
         let [groups, _] = select([&code, &[]], 1000, false, &Words);
         assert_eq!(group_paths(&groups), ["a.rs", "b.rs", "c.rs"]);
@@ -958,9 +1007,9 @@ mod tests {
         // reaches d's second chunk on its own second pass.
         let code = [ranked("a.rs", "one", "x", 0.9)];
         let docs = [
-            doc("d.md", "H", "p", 0.5),
-            doc("e.md", "I", "p", 0.4),
-            doc("d.md", "J", "p", 0.3),
+            doc("d.md", "H", "d", 0.5),
+            doc("e.md", "I", "e", 0.4),
+            doc("d.md", "J", "f", 0.3),
         ];
         let [c, d] = select([&code, &docs], 1000, false, &Words);
         assert_eq!(group_paths(&c), ["a.rs"]);
@@ -974,11 +1023,11 @@ mod tests {
         // a1 + d1 + b1 = 9 fills the budget inside pass one: e.md is never
         // taken and a's second chunk is never reached.
         let code = [
-            ranked("a.rs", "one", "x", 0.9),
-            ranked("b.rs", "two", "x", 0.8),
-            ranked("a.rs", "three", "x", 0.7),
+            ranked("a.rs", "one", "a", 0.9),
+            ranked("b.rs", "two", "b", 0.8),
+            ranked("a.rs", "three", "c", 0.7),
         ];
-        let docs = [doc("d.md", "H", "p", 0.5), doc("e.md", "I", "p", 0.4)];
+        let docs = [doc("d.md", "H", "d", 0.5), doc("e.md", "I", "e", 0.4)];
         let [c, d] = select([&code, &docs], 9, false, &Words);
         assert_eq!(group_paths(&c), ["a.rs", "b.rs"]);
         assert_eq!(c[0].chunks, [0]);
@@ -1210,8 +1259,8 @@ docs/guide.md
     #[test]
     fn text_omits_an_empty_section_and_lists_files_alone() {
         let code = [
-            ranked("a.rs", "one", "x", 0.9),
-            ranked("b.rs", "two", "x", 0.8),
+            ranked("a.rs", "one", "a", 0.9),
+            ranked("b.rs", "two", "b", 0.8),
         ];
         let [cg, _] = select([&code, &[]], 100, true, &Words);
         let r = Results {
@@ -1293,10 +1342,10 @@ docs/guide.md
     #[test]
     fn the_selection_asks_for_text_only_of_units_it_reaches() {
         let mut code = [
-            ranked("a.rs", "one", "x y", 0.9),
-            ranked("b.rs", "two", "x y", 0.8),
-            ranked("c.rs", "three", "x y", 0.7),
-            ranked("d.rs", "four", "x y", 0.6),
+            ranked("a.rs", "one", "a b", 0.9),
+            ranked("b.rs", "two", "c d", 0.8),
+            ranked("c.rs", "three", "e f", 0.7),
+            ranked("d.rs", "four", "g h", 0.6),
         ];
         for chunk in &mut code {
             chunk.text = None;
@@ -1318,6 +1367,95 @@ docs/guide.md
         assert_eq!(reads, [0, 1, 2]);
         let [groups, _] = selector.finish();
         assert_eq!(groups.len(), 2);
+    }
+
+    #[test]
+    fn identical_content_at_two_paths_folds_into_one_hit() {
+        // The same text at b.rs never emits: a.rs's hit names both paths and
+        // c.rs's distinct chunk still gets its own.
+        let code = [
+            ranked("a.rs", "one", "x y", 0.9),
+            ranked("b.rs", "two", "x y", 0.8),
+            ranked("c.rs", "three", "p q", 0.7),
+        ];
+        let [groups, _] = select([&code, &[]], 1000, false, &Words);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].path, "a.rs");
+        assert_eq!(groups[0].also_at, ["b.rs"]);
+        assert_eq!(groups[1].path, "c.rs");
+        assert!(groups[1].also_at.is_empty());
+    }
+
+    #[test]
+    fn a_folded_chunk_costs_nothing_and_its_text_is_never_read() {
+        // b.rs's copy of a.rs's text is skipped unread; the freed budget
+        // reaches c.rs, which a duplicate chunk's cost would have priced out.
+        let mut code = [
+            ranked("a.rs", "one", "x y", 0.9),
+            ranked("b.rs", "two", "x y", 0.8),
+            ranked("c.rs", "three", "p q", 0.7),
+        ];
+        code[1].text = None;
+        let mut selector = Selector::new(8, false);
+        let mut reads = Vec::new();
+        loop {
+            match selector.advance([&code, &[]], &Words).unwrap() {
+                Step::Done => break,
+                Step::Needs { from, .. } => {
+                    reads.push(from);
+                    code[from].text = Some(Ok("x y".to_owned()));
+                }
+            }
+        }
+        // Only b.rs's text was unread, and folding never reached it.
+        assert!(reads.is_empty());
+        let [groups, _] = selector.finish();
+        assert_eq!(group_paths(&groups), ["a.rs", "c.rs"]);
+        assert_eq!(groups[0].also_at, ["b.rs"]);
+    }
+
+    #[test]
+    fn files_only_folds_identical_files_into_the_kept_hit() {
+        let code = [
+            ranked("a.rs", "one", "x", 0.9),
+            ranked("b.rs", "two", "x", 0.8),
+            ranked("c.rs", "three", "p", 0.7),
+        ];
+        let [groups, _] = select([&code, &[]], 1000, true, &Words);
+        assert_eq!(group_paths(&groups), ["a.rs", "c.rs"]);
+        assert_eq!(groups[0].also_at, ["b.rs"]);
+    }
+
+    #[test]
+    fn a_files_second_identical_chunk_folds_without_repeating_its_path() {
+        let code = [
+            ranked("a.rs", "one", "x", 0.9),
+            ranked("a.rs", "two", "x", 0.8),
+        ];
+        let [groups, _] = select([&code, &[]], 1000, false, &Words);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].chunks, [0]);
+        assert!(groups[0].also_at.is_empty());
+    }
+
+    #[test]
+    fn text_names_every_path_the_content_lives_at() {
+        let code = [
+            ranked("a.rs", "one", "x", 0.9),
+            ranked("b.rs", "two", "x", 0.8),
+        ];
+        let [cg, _] = select([&code, &[]], 100, true, &Words);
+        let r = Results {
+            code: code_hits(&code, cg),
+            docs: None,
+            freshness: freshness(),
+            embedded_on_the_spot: 0,
+            vector_reads: VectorReads::default(),
+        };
+        assert_eq!(
+            r.to_text(),
+            "Code:\na.rs (also at b.rs)\n\n-- fresh @ abc123 +2 changed files reconciled; vectors 90%; index incomplete — run 'search index --wait' for complete results\n"
+        );
     }
 
     #[test]

@@ -1,7 +1,7 @@
 {% for section in sections -%}
 {{ section.title }}:
 {% for file in section.files -%}
-{{ file.path }}
+{{ file.path }}{% if !file.also_at.is_empty() %} (also at {{ file.also_at|join(", ") }}){% endif %}
 {% for chunk in file.chunks %}  {{ chunk.lines[0] }}-{{ chunk.lines[1] }}{% if !chunk.label.is_empty() %}  {{ chunk.label }}{% endif %}  [{% for channel in chunk.channels %}{% if !loop.first %}+{% endif %}{{ channel }}{% endfor %}]
 {{ chunk.text|indent(4, true) }}
 {% endfor -%}
