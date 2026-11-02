@@ -21,8 +21,8 @@ use askama::Template;
 use super::kqueue::{DirWatch, ExitWatch};
 use super::launchd::{LABEL, LaunchAgent, SERVER_LABEL, ServerAgent, ServerConfig, domain};
 use super::paths::{
-    lock_path, log_path, plist_path, server_config_path, server_log_path, server_socket_path,
-    socket_path,
+    UserPaths, lock_path, log_path, plist_path, server_config_path, server_log_path,
+    server_socket_path, socket_path,
 };
 use super::{DAEMON_IDLE_EXIT, SERVER_IDLE_EXIT, SOCKET_TIMEOUT, TEARDOWN_TIMEOUT};
 use crate::protocol::BuildId;
@@ -120,11 +120,13 @@ impl AgentConfig {
         })
     }
 
-    /// The real per-user embedding-server agent: [`SERVER_LABEL`], the
-    /// `search` binary at `program`, `server.toml`'s bind, port and
-    /// token file, and the build identity the `--build` self-heal checks.
+    /// The real per-user embedding-server agent: [`SERVER_LABEL`], a
+    /// per-build alias of the `search` binary at `program`,
+    /// `server.toml`'s bind, port and token file, and the build identity
+    /// the `--build` self-heal checks.
     pub fn server(program: PathBuf) -> io::Result<Self> {
         let config = ServerConfig::load(&server_config_path()?).map_err(io::Error::other)?;
+        let program = program_alias(&UserPaths::user()?.state.join("bin"), &program)?;
         Ok(Self {
             domain: domain(),
             plist: plist_path(SERVER_LABEL)?,
@@ -152,6 +154,61 @@ impl AgentConfig {
     pub fn service(&self) -> String {
         format!("{}/{}", self.domain, self.agent.label())
     }
+}
+
+/// The executable name the server agent runs under: `search-` plus a
+/// stable hex of the build's [`BuildId`]. Core ML's e5rt compile cache
+/// lives under `~/Library/Caches/<process name>`, so a per-build name
+/// gives every build its own compiled-bundles cache — a different
+/// `search` binary, another release or a dev build, can no longer evict
+/// this one's ANE bundles.
+fn server_program_name(build: &BuildId) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in build.to_string().bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("search-{hash:016x}")
+}
+
+/// The program the server agent execs: an alias for `program` under
+/// `bin_dir`, named by [`server_program_name`] of `program`'s build.
+/// The alias is a hard link so the alias and `program` share one
+/// [`BuildId`]; where hard links cannot cross filesystems the binary is
+/// copied and the `--build` identity is taken from the alias itself.
+/// Aliases of other builds are removed.
+fn program_alias(bin_dir: &Path, program: &Path) -> io::Result<PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+
+    const EXDEV: i32 = 18;
+
+    let build = BuildId::of_file(program)?;
+    let alias = bin_dir.join(server_program_name(&build));
+    std::fs::create_dir_all(bin_dir)?;
+    let current = std::fs::metadata(&alias)
+        .map(|meta| meta.dev() == build.dev && meta.ino() == build.ino)
+        .unwrap_or(false);
+    if !current {
+        match std::fs::remove_file(&alias) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            result => result?,
+        }
+        match std::fs::hard_link(program, &alias) {
+            Ok(()) => {}
+            Err(error) if error.raw_os_error() == Some(EXDEV) => {
+                std::fs::copy(program, &alias)?;
+            }
+            result => result?,
+        }
+    }
+    let name = alias.file_name().expect("the alias has a file name");
+    for entry in std::fs::read_dir(bin_dir)? {
+        let entry = entry?;
+        if entry.file_name() != name && entry.file_name().to_string_lossy().starts_with("search-") {
+            std::fs::remove_file(entry.path())?;
+        }
+    }
+    Ok(alias)
 }
 
 /// The `launchctl` operations the install flow needs. Production runs
@@ -506,4 +563,88 @@ pub fn ensure_agent<L: Launchctl>(
         });
     }
     Ok(outcome)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::fs::MetadataExt;
+
+    use super::*;
+
+    fn build_id(ino: u64, mtime_ns: i128) -> BuildId {
+        BuildId {
+            dev: 1,
+            ino,
+            size: 100,
+            mtime_ns,
+        }
+    }
+
+    #[test]
+    fn the_server_program_name_is_a_stable_per_build_hex() {
+        let one = server_program_name(&build_id(7, 8));
+        assert_eq!(one, server_program_name(&build_id(7, 8)));
+        assert_ne!(one, server_program_name(&build_id(7, 9)));
+        assert_ne!(one, server_program_name(&build_id(8, 8)));
+        assert!(one.starts_with("search-"));
+        assert!(one.len() <= 24, "{one} is longer than the e5rt name budget");
+    }
+
+    #[test]
+    fn the_program_alias_links_the_build_and_prunes_older_ones() {
+        let tmp = tempfile::tempdir().expect("a tempdir");
+        let bin_dir = tmp.path().join("bin");
+        let program = tmp.path().join("search");
+        std::fs::write(&program, b"build one").expect("the program writes");
+
+        let alias = program_alias(&bin_dir, &program).expect("the alias links");
+        assert_eq!(
+            alias.file_name().and_then(|n| n.to_str()),
+            Some(server_program_name(&BuildId::of_file(&program).unwrap()).as_str())
+        );
+        assert_eq!(
+            std::fs::metadata(&alias).unwrap().ino(),
+            std::fs::metadata(&program).unwrap().ino(),
+            "the alias shares the program's inode"
+        );
+        assert_eq!(
+            program_alias(&bin_dir, &program).expect("the alias is idempotent"),
+            alias
+        );
+
+        let next = tmp.path().join("search-new");
+        std::fs::write(&next, b"build two").expect("the next build writes");
+        let other = program_alias(&bin_dir, &next).expect("the next alias links");
+        assert_ne!(other, alias);
+        assert!(!alias.exists(), "the old build's alias is removed");
+        assert_eq!(
+            std::fs::metadata(&other).unwrap().ino(),
+            std::fs::metadata(&next).unwrap().ino()
+        );
+    }
+
+    #[test]
+    fn the_alias_lands_in_the_rendered_agent() {
+        let tmp = tempfile::tempdir().expect("a tempdir");
+        let program = tmp.path().join("search");
+        std::fs::write(&program, b"a build").expect("the program writes");
+        let alias = program_alias(&tmp.path().join("bin"), &program).expect("links");
+        let agent = ServerAgent {
+            label: "test".to_owned(),
+            build: BuildId::of_file(&alias).unwrap().to_string(),
+            program: alias.clone(),
+            socket: tmp.path().join("server.sock"),
+            idle_exit: SERVER_IDLE_EXIT,
+            model_cache: None,
+            token_file: None,
+            bind: "127.0.0.1".parse().unwrap(),
+            port: 41827,
+            stderr: tmp.path().join("server.log"),
+        };
+        let plist = agent.render().expect("the plist renders");
+        assert!(
+            plist.contains(&format!("<string>{}</string>", alias.display())),
+            "ProgramArguments[0] is not the alias:\n{plist}"
+        );
+    }
 }
