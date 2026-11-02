@@ -198,8 +198,8 @@ pub struct Config<T: Tokens, L: listen::Listener> {
     /// per-repository vector caches live under it, never under a
     /// worktree.
     pub state: StateDir,
-    /// The identity of the executable file this process runs; a `Hello`
-    /// naming another build is a `ProtocolMismatch`.
+    /// The identity of the executable file this process runs; echoed in
+    /// the daemon's `Hello` and unused for the handshake.
     pub build: BuildId,
 }
 
@@ -476,8 +476,8 @@ async fn connection<T: Tokens>(
 enum Served {
     /// The connection is done.
     Closed,
-    /// The `Hello` named another protocol, version or build; the refusal's
-    /// message, sent by [`connection`] once the listener is closed.
+    /// The `Hello` named another protocol; the refusal's message, sent by
+    /// [`connection`] once the listener is closed.
     Mismatch(String),
 }
 
@@ -510,10 +510,10 @@ async fn serve<T: Tokens>(
         }
     };
     let ours = Hello::new(build);
-    if hello != ours {
+    if hello.protocol != PROTOCOL {
         return Served::Mismatch(format!(
-            "client is protocol {} {} build {}, daemon is {PROTOCOL} {} build {}",
-            hello.protocol, hello.version, hello.build, ours.version, ours.build
+            "client is protocol {}, daemon is {PROTOCOL}",
+            hello.protocol
         ));
     }
     if framed.send(line(&ours)).await.is_err() {

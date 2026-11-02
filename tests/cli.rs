@@ -30,7 +30,7 @@ use support::launchd::{FakeLaunchctl, FakeLaunchd};
 use support::repo;
 
 /// The test binary's `BuildId`, given to the fake's daemons and to the
-/// `Hello` the test sends — they must match for the handshake to pass.
+/// `Hello` the test sends. The handshake compares `PROTOCOL` only.
 fn launchd(config: &AgentConfig) -> FakeLaunchd {
     FakeLaunchd::new(
         config.agent.socket().to_path_buf(),
@@ -373,17 +373,12 @@ async fn index_wait_reaches_full_coverage() {
     );
 }
 
-/// The daemon runs with build A and the client sends build B: the
-/// mismatch shuts the daemon down (`run` returns `Ok`) and the client
-/// exits 2 — nothing relaunches an in-process daemon, so the retry ends
-/// in a connect error. Launchd's relaunch is covered by the launchd
-/// tests.
+/// The daemon runs with another `BuildId` than the client sends: the
+/// handshake still succeeds because only `PROTOCOL` is compared.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn stale_build_shuts_the_daemon_down() {
+async fn another_build_id_still_searches() {
     let tmp = tempfile::tempdir().expect("tmp");
     let config = config(&tmp);
-    // No real file can carry this identity, so it differs from the
-    // test binary's `BuildId` the client sends by construction.
     let stale = BuildId {
         dev: 0,
         ino: 0,
@@ -403,15 +398,14 @@ async fn stale_build_shuts_the_daemon_down() {
     let exit =
         repo_search::cli::run(invocation(&["search", "xylophonemarker"]), env, &mut term).await;
 
-    assert_eq!(exit, Exit::Error, "stderr: {}", text(&term.stderr));
-    let join = launchd
-        .take_daemon_join()
-        .expect("the bootstrap started a daemon");
-    tokio::time::timeout(client::TIMEOUT, join)
-        .await
-        .expect("run returns after the mismatch")
-        .expect("run task does not panic")
-        .expect("a build mismatch is a clean shutdown");
+    assert_eq!(exit, Exit::Ok, "stderr: {}", text(&term.stderr));
+    assert!(
+        !launchd
+            .take_daemon_join()
+            .expect("the bootstrap started a daemon")
+            .is_finished(),
+        "the daemon must stay up"
+    );
 }
 
 /// A `bootstrap` failure is reported verbatim and no connection is

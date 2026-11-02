@@ -52,9 +52,6 @@ struct HostConfig {
     state: PathBuf,
     /// The idle deadline.
     idle_exit: Duration,
-    /// When this file exists the host removes it and runs under a
-    /// `BuildId` no client matches: the first host of an "upgrade".
-    skew_marker: Option<PathBuf>,
     /// A socket the test listens on: once the host has closed its
     /// listener it connects here and lingers, holding the lifetime lock,
     /// until the test hangs up — a shutdown tail of the test's length.
@@ -96,12 +93,7 @@ async fn spawn_host() {
     };
     eprintln!("spawn_host started");
 
-    let mut build = support::client::build();
-    if let Some(marker) = &config.skew_marker
-        && std::fs::remove_file(marker).is_ok()
-    {
-        build.mtime_ns += 1;
-    }
+    let build = support::client::build();
     let bound = Bound::acquire(listen.expect("--listen"))
         .await
         .expect("the host binds");
@@ -233,7 +225,6 @@ impl World {
         let host = HostConfig {
             state: tmp.path().join("state"),
             idle_exit: Duration::from_secs(600),
-            skew_marker: None,
             hold_socket: None,
             close_gate: None,
         };
@@ -527,38 +518,17 @@ async fn a_search_during_the_old_daemons_tail_waits_for_the_new_daemon() {
     assert_eq!(world.starts(), 2);
 }
 
-/// A daemon built from another binary closes on the `Hello`: the client
-/// recovers, spawning the build that is on disk now.
+/// A `Hello` naming another protocol is refused only once the daemon's
+/// socket is gone: the refusal sends the client to its launcher, which
+/// must find no socket, not reconnect to the daemon that is shutting
+/// down. The gate holds the daemon between the end of its accept loop
+/// and the unlink, the moment a refusal sent too early lands in.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_build_mismatch_respawns_the_matching_build() {
-    let mut world = World::new();
-    let marker = world.tmp.path().join("skew");
-    std::fs::write(&marker, "").expect("the skew marker");
-    world.host.skew_marker = Some(marker);
-    let target = world.target();
-
-    let report = world.launcher(&target).recover().await;
-    assert_eq!(report.error, None);
-    let old = world.alive().expect("the skewed daemon is up");
-
-    let answered = world.status_pid(&target).await;
-    assert_ne!(answered, old, "the matching build answered");
-    assert_eq!(world.starts(), 2);
-}
-
-/// A build mismatch is refused only once the daemon's socket is gone: the
-/// refusal sends the client to its launcher, which must find no socket
-/// and spawn the matching build, not reconnect to the daemon that is
-/// shutting down. The gate holds the daemon between the end of its accept
-/// loop and the unlink, the moment a refusal sent too early lands in.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_build_mismatch_is_refused_only_once_the_socket_is_gone() {
+async fn a_protocol_mismatch_is_refused_only_once_the_socket_is_gone() {
     use futures_util::{SinkExt as _, StreamExt as _};
+    use repo_search_client::protocol::{Hello, PROTOCOL};
 
     let mut world = World::new();
-    let marker = world.tmp.path().join("skew");
-    std::fs::write(&marker, "").expect("the skew marker");
-    world.host.skew_marker = Some(marker);
     let gate = world.tmp.path().join("gate.sock");
     world.host.close_gate = Some(gate.clone());
     let gate = UnixListener::bind(&gate).expect("the gate binds");
@@ -571,10 +541,15 @@ async fn a_build_mismatch_is_refused_only_once_the_socket_is_gone() {
     let refused = tokio::spawn(async move {
         let stream = tokio::net::UnixStream::connect(&socket)
             .await
-            .expect("the skewed daemon accepts");
+            .expect("the daemon accepts");
         let mut framed = protocol::framed(stream);
+        let foreign = Hello {
+            protocol: PROTOCOL + 1,
+            version: hello().version,
+            build: hello().build,
+        };
         framed
-            .send(serde_json::to_string(&hello()).expect("the hello serializes"))
+            .send(serde_json::to_string(&foreign).expect("the hello serializes"))
             .await
             .expect("the hello goes out");
         let line = framed
