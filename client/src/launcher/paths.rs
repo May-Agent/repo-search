@@ -33,10 +33,26 @@ pub struct UserPaths {
     pub config: PathBuf,
 }
 
-/// `~`, when it can be known.
+/// `~`, when it can be known. Follows `$HOME`.
 #[cfg(target_os = "macos")]
-fn home() -> io::Result<PathBuf> {
+pub(crate) fn home() -> io::Result<PathBuf> {
     std::env::home_dir().ok_or_else(|| io::Error::other("the home directory is unknown"))
+}
+
+/// The login directory from the passwd database, independent of `$HOME`.
+#[cfg(target_os = "macos")]
+pub(crate) fn login_home() -> io::Result<PathBuf> {
+    // SAFETY: getpwuid returns a pointer into libc storage; `pw_dir` is
+    // copied before any later libc call.
+    let pw = unsafe { libc::getpwuid(libc::getuid()) };
+    if pw.is_null() {
+        return Err(io::Error::other("the login directory is unknown"));
+    }
+    let dir = unsafe { std::ffi::CStr::from_ptr((*pw).pw_dir) };
+    let dir = dir
+        .to_str()
+        .map_err(|_| io::Error::other("the login directory is not UTF-8"))?;
+    Ok(PathBuf::from(dir))
 }
 
 impl UserPaths {

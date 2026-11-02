@@ -19,7 +19,7 @@ use std::time::Duration;
 use askama::Template;
 
 use super::kqueue::{DirWatch, ExitWatch};
-use super::launchd::{LABEL, LaunchAgent, SERVER_LABEL, ServerAgent, ServerConfig, domain};
+use super::launchd::{LaunchAgent, ServerAgent, ServerConfig, domain, user_labels};
 use super::paths::{
     UserPaths, lock_path, log_path, plist_path, server_config_path, server_log_path,
     server_socket_path, socket_path,
@@ -96,15 +96,17 @@ pub struct Timeouts {
 }
 
 impl AgentConfig {
-    /// The real per-user agent: [`LABEL`], the `search` binary at
-    /// `program`, and the production socket, plist, lock and log paths.
+    /// The real per-user agent: the `search` binary at `program`, the
+    /// socket, plist, lock and log paths under `$HOME`, and the launchd
+    /// labels [`super::launchd::user_labels`] chooses for that home.
     pub fn user(program: PathBuf) -> io::Result<Self> {
+        let (label, _) = user_labels()?;
         Ok(Self {
             domain: domain(),
-            plist: plist_path(LABEL)?,
+            plist: plist_path(&label)?,
             lock: lock_path()?,
             agent: Plist::Daemon(LaunchAgent {
-                label: LABEL.to_owned(),
+                label,
                 program,
                 socket: socket_path()?,
                 idle_exit: DAEMON_IDLE_EXIT,
@@ -120,19 +122,20 @@ impl AgentConfig {
         })
     }
 
-    /// The real per-user embedding-server agent: [`SERVER_LABEL`], a
-    /// per-build alias of the `search` binary at `program`,
-    /// `server.toml`'s bind, port and token file, and the build identity
-    /// the `--build` self-heal checks.
+    /// The real per-user embedding-server agent: a per-build alias of the
+    /// `search` binary at `program`, `server.toml`'s bind, port and token
+    /// file, the build identity the `--build` self-heal checks, and the
+    /// launchd labels [`super::launchd::user_labels`] chooses for `$HOME`.
     pub fn server(program: PathBuf) -> io::Result<Self> {
         let config = ServerConfig::load(&server_config_path()?).map_err(io::Error::other)?;
         let program = program_alias(&UserPaths::user()?.state.join("bin"), &program)?;
+        let (_, label) = user_labels()?;
         Ok(Self {
             domain: domain(),
-            plist: plist_path(SERVER_LABEL)?,
+            plist: plist_path(&label)?,
             lock: lock_path()?,
             agent: Plist::Server(ServerAgent {
-                label: SERVER_LABEL.to_owned(),
+                label,
                 build: BuildId::of_file(&program)?.to_string(),
                 program,
                 socket: server_socket_path()?,

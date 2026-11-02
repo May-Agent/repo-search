@@ -22,6 +22,49 @@ pub fn domain() -> String {
     format!("user/{}", unsafe { libc::getuid() })
 }
 
+/// The daemon and server labels [`super::install::AgentConfig::user`]
+/// installs for this process: [`LABEL`] and [`SERVER_LABEL`] when `$HOME`
+/// is the login directory, otherwise the same names with a suffix of that
+/// `$HOME` so a relocated home cannot occupy the production jobs.
+pub fn user_labels() -> io::Result<(String, String)> {
+    Ok(labels_for(
+        &super::paths::home()?,
+        &super::paths::login_home()?,
+    ))
+}
+
+/// Labels for a process whose `$HOME` is `home` and whose passwd home is
+/// `login`.
+pub fn labels_for(home: &Path, login: &Path) -> (String, String) {
+    if same_home(home, login) {
+        (LABEL.to_owned(), SERVER_LABEL.to_owned())
+    } else {
+        let suffix = home_suffix(home);
+        (
+            format!("{LABEL}.h-{suffix}"),
+            format!("{SERVER_LABEL}.h-{suffix}"),
+        )
+    }
+}
+
+fn same_home(home: &Path, login: &Path) -> bool {
+    let one = std::fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
+    let other = std::fs::canonicalize(login).unwrap_or_else(|_| login.to_path_buf());
+    one == other
+}
+
+fn home_suffix(home: &Path) -> String {
+    use std::os::unix::ffi::OsStrExt as _;
+    const OFFSET: u64 = 0xcbf29ce484222325;
+    const PRIME: u64 = 0x100000001b3;
+    let mut hash = OFFSET;
+    for byte in home.as_os_str().as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(PRIME);
+    }
+    format!("{hash:016x}")
+}
+
 /// The LaunchAgent document, rendered through `templates/launch-agent.plist`.
 ///
 /// The plist sets no `KeepAlive`, `RunAtLoad` or `ProcessType`. With no
@@ -369,6 +412,28 @@ mod tests {
                 "missing {fragment:?} in:\n{plist}"
             );
         }
+    }
+
+    #[test]
+    fn login_home_keeps_production_labels() {
+        let home = Path::new("/Users/example");
+        assert_eq!(
+            labels_for(home, home),
+            (LABEL.to_owned(), SERVER_LABEL.to_owned())
+        );
+    }
+
+    #[test]
+    fn a_relocated_home_does_not_use_production_labels() {
+        let login = Path::new("/Users/example");
+        let home = Path::new("/var/folders/xx/T/.tmpUf07X1");
+        let (daemon, server) = labels_for(home, login);
+        assert_ne!(daemon, LABEL);
+        assert_ne!(server, SERVER_LABEL);
+        assert!(daemon.starts_with(&format!("{LABEL}.h-")));
+        assert!(server.starts_with(&format!("{SERVER_LABEL}.h-")));
+        let (other, _) = labels_for(Path::new("/tmp/other"), login);
+        assert_ne!(daemon, other);
     }
 
     fn config_file(text: &str) -> (tempfile::TempDir, PathBuf) {
