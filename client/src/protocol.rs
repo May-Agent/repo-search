@@ -70,8 +70,9 @@ impl fmt::Display for BuildId {
 }
 
 /// The client's first frame. The daemon answers with its own `Hello` when
-/// all three fields are equal, and with `Final::Error` of kind
-/// [`ErrorKind::ProtocolMismatch`] on any difference.
+/// [`Hello::protocol`] equals [`PROTOCOL`], and with `Final::Error` of
+/// kind [`ErrorKind::ProtocolMismatch`] when it does not. `version` and
+/// `build` are diagnostic; they do not take part in the handshake.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Hello {
@@ -340,7 +341,7 @@ pub struct ErrorReport {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ErrorKind {
-    /// `Hello` protocol or version differed; the daemon shuts down so the
+    /// `Hello` named another [`PROTOCOL`]; the daemon shuts down so the
     /// next connection launches the binary on disk.
     ProtocolMismatch,
     /// The request could not be understood.

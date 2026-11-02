@@ -1091,10 +1091,10 @@ fn next_protocol() -> protocol::Hello {
     }
 }
 
-/// A raw client whose `Hello` mismatches: the daemon answers
-/// `ProtocolMismatch` and begins shutdown. Returns the parsed frame.
-fn mismatched_hello(socket: &Path, hello: &protocol::Hello) -> Event {
-    let line = tokio::task::block_in_place(|| {
+/// One line back after sending `hello`: a `Hello` on success, an `Event`
+/// on refusal.
+fn hello_reply(socket: &Path, hello: &protocol::Hello) -> String {
+    tokio::task::block_in_place(|| {
         use std::io::{BufRead, BufReader};
         let socket = socket.to_path_buf();
         let mut stream = std::os::unix::net::UnixStream::connect(&socket).expect("connect");
@@ -1103,8 +1103,13 @@ fn mismatched_hello(socket: &Path, hello: &protocol::Hello) -> Event {
         let mut line = String::new();
         BufReader::new(&stream).read_line(&mut line).unwrap();
         line
-    });
-    serde_json::from_str(&line).expect("a protocol frame")
+    })
+}
+
+/// A raw client whose `Hello` mismatches: the daemon answers
+/// `ProtocolMismatch` and begins shutdown. Returns the parsed frame.
+fn mismatched_hello(socket: &Path, hello: &protocol::Hello) -> Event {
+    serde_json::from_str(&hello_reply(socket, hello)).expect("a protocol frame")
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1133,11 +1138,10 @@ async fn protocol_mismatch_shuts_down() {
         .expect("a protocol mismatch is a clean shutdown");
 }
 
-/// The daemon's protocol and version but another `BuildId` — a daemon
-/// running a binary that has been rebuilt or reinstalled in place — is the
-/// same `ProtocolMismatch`: `run` returns so launchd starts the new file.
+/// Another crate version and `BuildId` with the same [`PROTOCOL`] is
+/// accepted: the daemon answers its own `Hello` and keeps running.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn build_mismatch_shuts_down() {
+async fn version_and_build_do_not_refuse() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let d = daemon(
         tmp,
@@ -1149,25 +1153,21 @@ async fn build_mismatch_shuts_down() {
     )
     .await;
 
-    // No real file can carry this identity, so it differs from the
-    // daemon's `Config::build` by construction.
-    let hello = protocol::Hello::new(protocol::BuildId {
-        dev: 0,
-        ino: 0,
-        size: 0,
-        mtime_ns: 0,
-    });
-    match mismatched_hello(&d.socket, &hello) {
-        Event::Final(Final::Error(report)) => {
-            assert_eq!(report.kind, ErrorKind::ProtocolMismatch)
-        }
-        other => panic!("expected a ProtocolMismatch, got {other:?}"),
-    }
-    tokio::time::timeout(TIMEOUT, d.join)
-        .await
-        .expect("run returns after the mismatch")
-        .expect("run task does not panic")
-        .expect("a build mismatch is a clean shutdown");
+    let hello = protocol::Hello {
+        protocol: protocol::PROTOCOL,
+        version: "0.0.4".into(),
+        build: protocol::BuildId {
+            dev: 0,
+            ino: 0,
+            size: 0,
+            mtime_ns: 0,
+        },
+    };
+    let peer: protocol::Hello =
+        serde_json::from_str(&hello_reply(&d.socket, &hello)).expect("the daemon's Hello");
+    assert_eq!(peer.protocol, protocol::PROTOCOL);
+    assert_ne!(peer.version, hello.version);
+    assert!(!d.join.is_finished(), "the daemon must stay up");
 }
 
 /// A shutdown during a gated `open_ane` must not abandon the ANE thread:

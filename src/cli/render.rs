@@ -392,7 +392,7 @@ where
 pub fn daemon_error(report: &ErrorReport, log: &Path) -> String {
     match report.kind {
         ErrorKind::ProtocolMismatch => format!(
-            "the daemon did not restart into this build: {}; see {}",
+            "the daemon speaks another protocol: {}; see {}",
             report.message,
             log.display()
         ),
@@ -639,7 +639,7 @@ mod tests {
         let cases: [(ErrorKind, &str); 9] = [
             (
                 ErrorKind::ProtocolMismatch,
-                "the daemon did not restart into this build: why; see /log/daemon.log",
+                "the daemon speaks another protocol: why; see /log/daemon.log",
             ),
             (
                 ErrorKind::BadRequest,

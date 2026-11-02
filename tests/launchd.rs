@@ -648,7 +648,7 @@ async fn replaced_binary_restarts_the_daemon() {
         "stderr: {}",
         String::from_utf8_lossy(&term.stderr)
     );
-    // This `Hello` was built for the pre-replacement file identity.
+    // File identity before the replacement; the handshake compares PROTOCOL only.
     let old_hello = hello(&installed_program);
     let first = daemon_pid(&socket, &old_hello, &repo.root).await;
 

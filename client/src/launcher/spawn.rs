@@ -603,8 +603,8 @@ impl Launcher for OnDemand {
 
     /// Every connect failure a fresh daemon can cure: a missing or stale
     /// socket, a connection reset before the handshake, a daemon shutting
-    /// down and a build mismatch. Only an oversized frame and a refusal of
-    /// any other kind are final.
+    /// down and a protocol mismatch. Only an oversized frame and a refusal
+    /// of any other kind are final.
     fn recoverable(&self, error: &ClientError) -> bool {
         match error {
             ClientError::TooLarge => false,
