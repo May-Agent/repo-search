@@ -55,8 +55,8 @@ impl Client {
         }
     }
 
-    /// Send `Hello`, then accept only the peer's identical `Hello` back; a
-    /// `Final` frame means the daemon refused the handshake.
+    /// Send `Hello`, then accept a peer `Hello` whose protocol matches;
+    /// a `Final` frame means the daemon refused the handshake.
     async fn handshake(socket: &Path, hello: &Hello) -> Result<Self, ClientError> {
         let stream = UnixStream::connect(socket)
             .await
@@ -74,9 +74,9 @@ impl Client {
                 "the handshake was answered with a non-error final frame",
             )),
             Err(_) => match serde_json::from_str::<Hello>(&line) {
-                Ok(peer) if peer == *hello => Ok(Self { framed }),
+                Ok(peer) if peer.protocol == hello.protocol => Ok(Self { framed }),
                 Ok(_) => Err(ClientError::Protocol(
-                    "the peer's Hello does not match the client's",
+                    "the peer's Hello named another protocol",
                 )),
                 Err(err) => Err(ClientError::Frame(err)),
             },
@@ -323,6 +323,34 @@ mod tests {
         assert_eq!(hello.protocol, PROTOCOL);
         assert_eq!(hello.version, env!("CARGO_PKG_VERSION"));
         assert_eq!(got, request);
+    }
+
+    #[tokio::test]
+    async fn handshake_accepts_another_version_and_build() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("daemon.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read, mut write) = stream.into_split();
+            let mut buf = String::new();
+            BufReader::new(read).read_line(&mut buf).await.unwrap();
+            let peer = Hello {
+                protocol: PROTOCOL,
+                version: "0.0.9".into(),
+                build: BuildId {
+                    dev: 9,
+                    ino: 9,
+                    size: 9,
+                    mtime_ns: 9,
+                },
+            };
+            write.write_all(line(&peer).as_bytes()).await.unwrap();
+            write.write_all(b"\n").await.unwrap();
+        });
+
+        Client::connect(&socket, &hello()).await.unwrap();
+        server.await.unwrap();
     }
 
     #[tokio::test]
