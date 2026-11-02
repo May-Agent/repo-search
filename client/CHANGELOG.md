@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.6](https://github.com/May-Agent/repo-search/compare/client/v0.0.5...client/v0.0.6) - 2026-11-02
+
+### Fixed
+
+- *(server)* run the agent under a per-build name for its own e5rt cache
+- handshake compares PROTOCOL only
+
+### Other
+
+- Merge pull request #185 from May-Agent/fix/181-per-build-ane-cache
+
 ## [0.0.5](https://github.com/May-Agent/repo-search/compare/client/v0.0.4...client/v0.0.5) - 2026-11-01
 
 ### Added
