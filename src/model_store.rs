@@ -95,12 +95,12 @@ impl ModelSpec {
         }
     }
 
-    /// The fp16 variant, served on NVIDIA GPUs.
+    /// The int8 variant, opted into with `REPO_SEARCH_ORT_ARCHIVE=int8`.
     #[cfg(not(target_os = "macos"))]
-    pub fn embedding_gemma_2_onnx_fp16() -> Self {
+    pub fn embedding_gemma_2_onnx_int8() -> Self {
         Self {
-            url: repo_search_core::model::ONNX_FP16_ARCHIVE.url.to_owned(),
-            sha256: Sha256Digest::from_hex(repo_search_core::model::ONNX_FP16_ARCHIVE.sha256)
+            url: repo_search_core::model::ONNX_INT8_ARCHIVE.url.to_owned(),
+            sha256: Sha256Digest::from_hex(repo_search_core::model::ONNX_INT8_ARCHIVE.sha256)
                 .expect("pinned archive digest is valid hex"),
         }
     }
@@ -146,10 +146,10 @@ impl ModelStore {
         Self::new(user_cache_root()?, ModelSpec::embedding_gemma_2_onnx())
     }
 
-    /// The per-user store serving the fp16 ONNX archive.
+    /// The per-user store serving the int8 ONNX archive.
     #[cfg(not(target_os = "macos"))]
-    pub fn user_cache_onnx_fp16() -> Result<Self, Error> {
-        Self::new(user_cache_root()?, ModelSpec::embedding_gemma_2_onnx_fp16())
+    pub fn user_cache_onnx_int8() -> Result<Self, Error> {
+        Self::new(user_cache_root()?, ModelSpec::embedding_gemma_2_onnx_int8())
     }
 
     /// Directory the archive unpacks to.

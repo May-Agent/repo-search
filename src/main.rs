@@ -738,40 +738,53 @@ fn server_main(
     }
 }
 
-/// The model id the daemon expects the embedding server to list.
-/// `REPO_SEARCH_MODEL_ID` overrides it for deployments whose server
-/// runs a different pinned build — the fp16 ONNX archive on an NVIDIA
-/// host advertises `onnx-a49e227d…`, not the int8 default.
+/// The model id the daemon expects the embedding server to list: the
+/// default fp16 build's, or the int8 build's when [`onnx_int8`] opts into
+/// it. `REPO_SEARCH_MODEL_ID` overrides it for a daemon whose server runs
+/// on another host with a different pinned build.
 fn model_id() -> String {
     #[cfg(not(target_os = "macos"))]
-    if let Ok(id) = std::env::var("REPO_SEARCH_MODEL_ID") {
-        return id;
+    {
+        if let Ok(id) = std::env::var("REPO_SEARCH_MODEL_ID") {
+            return id;
+        }
+        if onnx_int8() {
+            return repo_search_core::model::ONNX_INT8_MODEL_ID.to_owned();
+        }
     }
     repo_search_core::model::MODEL_ID.to_owned()
 }
 
-/// Whether the server should fetch the fp16 ONNX archive (the NVIDIA
-/// build) instead of the int8 default: `REPO_SEARCH_ORT_ARCHIVE=fp16`.
+/// Whether this host runs the int8 ONNX archive instead of the default
+/// fp16 one: `REPO_SEARCH_ORT_ARCHIVE=int8`.
+///
+/// # Panics
+///
+/// When `REPO_SEARCH_ORT_ARCHIVE` is set to anything but `fp16` or `int8`.
 #[cfg(not(target_os = "macos"))]
-fn onnx_fp16() -> bool {
-    std::env::var("REPO_SEARCH_ORT_ARCHIVE").is_ok_and(|a| a == "fp16")
+fn onnx_int8() -> bool {
+    match std::env::var("REPO_SEARCH_ORT_ARCHIVE").as_deref() {
+        Ok("int8") => true,
+        Ok("fp16") | Err(_) => false,
+        Ok(other) => panic!("REPO_SEARCH_ORT_ARCHIVE must be fp16 or int8, got {other:?}"),
+    }
 }
 
-/// The [`ModelSpec`] matching [`onnx_fp16`]'s archive choice.
+/// The [`ModelSpec`] matching [`onnx_int8`]'s archive choice.
 #[cfg(not(target_os = "macos"))]
 fn onnx_spec() -> repo_search::model_store::ModelSpec {
-    if onnx_fp16() {
-        repo_search::model_store::ModelSpec::embedding_gemma_2_onnx_fp16()
+    if onnx_int8() {
+        repo_search::model_store::ModelSpec::embedding_gemma_2_onnx_int8()
     } else {
         repo_search::model_store::ModelSpec::embedding_gemma_2_onnx()
     }
 }
 
-/// The per-user [`ModelStore`] matching [`onnx_fp16`]'s archive choice.
+/// The per-user [`ModelStore`] matching [`onnx_int8`]'s archive choice.
 #[cfg(not(target_os = "macos"))]
 fn onnx_store() -> Result<repo_search::model_store::ModelStore, repo_search::model_store::Error> {
-    if onnx_fp16() {
-        repo_search::model_store::ModelStore::user_cache_onnx_fp16()
+    if onnx_int8() {
+        repo_search::model_store::ModelStore::user_cache_onnx_int8()
     } else {
         repo_search::model_store::ModelStore::user_cache_onnx()
     }

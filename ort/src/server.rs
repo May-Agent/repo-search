@@ -1,13 +1,15 @@
 //! The ONNX embedding server: the same OpenAI-compatible HTTP API the
 //! macOS Core ML server speaks — `POST /v1/embeddings`, `GET /v1/models`,
 //! `GET /status`, the `Priority` header and the `Server-Timing` response —
-//! over one [`OrtEmbedder`] owned by its own thread.
+//! over the [`OrtEmbedder`]s [`OrtEmbedder::open_devices`] opens, one per
+//! device, each owned by its own thread.
 //!
 //! Where the Core ML server splits queries onto the ANE and bulk indexing
-//! onto a power-gated GPU, this server has the one session. Its scheduler
-//! runs at most [`RUN_INPUTS`] of the most urgent pending request per run
-//! and re-picks between runs, so a bulk index batch cannot park a query
-//! behind its full length.
+//! onto a power-gated GPU, this server has interchangeable device
+//! sessions. A dispatcher thread owns the pending requests and hands each
+//! idle device at most [`RUN_INPUTS`] same-bucket inputs of the most urgent
+//! pending request, re-picking between runs, so a bulk index batch cannot
+//! park a query behind its full length.
 //!
 //! The unix socket carries no bearer check — its file permissions are the
 //! check; TCP listeners authenticate when the server was given a token.
@@ -97,17 +99,24 @@ struct Ready {
     encoder: Encoder,
 }
 
-/// One embedding request's work for the worker thread. Runs are consumed
-/// off `inputs` in order, so `vectors` stays in input order.
+/// One embedding request's work for the dispatcher. Runs take same-bucket
+/// inputs from anywhere in `remaining`, each carrying its original index,
+/// and finished vectors return to their `slots`, so the reply is in input
+/// order however the runs were spread over devices.
 struct Job {
+    /// Assigned by the dispatcher when the job arrives.
+    id: u64,
     /// The request's RFC 9218 urgency; lower runs first.
     urgency: Urgency,
     /// When the request was submitted, the `wait` metric's origin.
     queued: Instant,
-    /// Already-tokenized inputs not yet embedded, in input order.
-    inputs: std::collections::VecDeque<Vec<u32>>,
-    /// The finished vectors, in input order.
-    vectors: Vec<UnitVector>,
+    /// Already-tokenized inputs not yet handed to a device, with their
+    /// input indices, in input order.
+    remaining: Vec<(usize, Vec<u32>)>,
+    /// One slot per input, filled as its run finishes.
+    slots: Vec<Option<UnitVector>>,
+    /// Runs handed to a device and not yet finished.
+    outstanding: usize,
     /// The longest wait observed across the job's runs.
     wait: Duration,
     /// The lower-urgency jobs pending when this job first ran, counted
@@ -119,6 +128,122 @@ struct Job {
     reply: oneshot::Sender<Result<(Vec<UnitVector>, ServerTiming), String>>,
 }
 
+impl Job {
+    fn new(
+        urgency: Urgency,
+        ids: Vec<Vec<u32>>,
+        reply: oneshot::Sender<Result<(Vec<UnitVector>, ServerTiming), String>>,
+    ) -> Self {
+        Self {
+            id: 0,
+            urgency,
+            queued: Instant::now(),
+            slots: vec![None; ids.len()],
+            remaining: ids.into_iter().enumerate().collect(),
+            outstanding: 0,
+            wait: Duration::ZERO,
+            overtaken: 0,
+            counted: false,
+            reply,
+        }
+    }
+
+    /// Takes the next run: up to [`RUN_INPUTS`] inputs sharing the bucket
+    /// of the first remaining input, from anywhere in `remaining`, in
+    /// input order.
+    fn take_run(&mut self, buckets: &[usize]) -> Vec<(usize, Vec<u32>)> {
+        let bucket = bucket_of(buckets, self.remaining[0].1.len());
+        let mut run = Vec::with_capacity(RUN_INPUTS);
+        let mut kept = Vec::with_capacity(self.remaining.len());
+        for input in std::mem::take(&mut self.remaining) {
+            if run.len() < RUN_INPUTS && bucket_of(buckets, input.1.len()) == bucket {
+                run.push(input);
+            } else {
+                kept.push(input);
+            }
+        }
+        self.remaining = kept;
+        self.outstanding += 1;
+        run
+    }
+
+    /// Writes a finished run's vectors back to their input positions.
+    fn place(&mut self, indices: &[usize], vectors: Vec<UnitVector>) {
+        assert_eq!(
+            indices.len(),
+            vectors.len(),
+            "a run returns one vector per input"
+        );
+        for (&index, vector) in indices.iter().zip(vectors) {
+            self.slots[index] = Some(vector);
+        }
+        self.outstanding -= 1;
+    }
+
+    /// Whether every input is embedded and placed.
+    fn is_done(&self) -> bool {
+        self.remaining.is_empty() && self.outstanding == 0
+    }
+
+    /// Replies with the vectors in input order.
+    fn finish(self) {
+        let timing = ServerTiming {
+            wait: self.wait,
+            overtaken: self.overtaken,
+        };
+        let vectors = self
+            .slots
+            .into_iter()
+            .map(|slot| slot.expect("a finished job filled every slot"))
+            .collect();
+        let _ = self.reply.send(Ok((vectors, timing)));
+    }
+}
+
+/// The smallest of `buckets` (ascending) that holds `len` tokens.
+fn bucket_of(buckets: &[usize], len: usize) -> usize {
+    buckets
+        .iter()
+        .copied()
+        .find(|&bucket| len <= bucket)
+        .expect("the encoder capped every input")
+}
+
+/// The most urgent, oldest pending job that still has inputs to hand out.
+fn pick(pending: &[Job]) -> Option<usize> {
+    pending
+        .iter()
+        .enumerate()
+        .filter(|(_, job)| !job.remaining.is_empty())
+        .min_by_key(|(_, job)| (job.urgency, job.queued))
+        .map(|(index, _)| index)
+}
+
+/// What the dispatcher receives: new jobs from handlers and finished runs
+/// from device workers.
+enum Msg {
+    /// A request's job.
+    Job(Job),
+    /// A device worker finished a run.
+    Done {
+        /// The worker's index, idle again.
+        worker: usize,
+        /// The job the run belongs to.
+        job: u64,
+        /// The input indices of the run, matching the vectors.
+        indices: Vec<usize>,
+        /// The run's vectors, or its fatal failure.
+        result: Result<Vec<UnitVector>, String>,
+    },
+}
+
+/// One run for a device worker.
+struct Work {
+    job: u64,
+    indices: Vec<usize>,
+    batch: Vec<Vec<u32>>,
+}
+
 /// Everything a connection's handlers share.
 struct Shared {
     /// The model's load state.
@@ -128,8 +253,8 @@ struct Shared {
     /// The loader's retry inbox: a `Failed` load retries on the next
     /// `/v1/` request.
     retry: std_mpsc::SyncSender<()>,
-    /// The worker thread's job inbox.
-    worker: std_mpsc::Sender<Job>,
+    /// The dispatcher's inbox.
+    worker: std_mpsc::Sender<Msg>,
     /// The bearer token TCP listeners require.
     token: Option<String>,
     /// Handlers in flight; the idle exit waits for it to reach zero.
@@ -149,14 +274,15 @@ struct Shared {
 pub async fn run(config: Config) -> Result<(), Error> {
     let (state_tx, state) = watch::channel(Model::Loading);
     let (stage_tx, stage) = watch::channel(LoadStage::Encoder);
-    let (job_tx, job_rx) = std_mpsc::channel::<Job>();
+    let (job_tx, job_rx) = std_mpsc::channel::<Msg>();
     let (retry_tx, retry_rx) = std_mpsc::sync_channel::<()>(1);
     let (fatal_tx, mut fatal_rx) = mpsc::channel::<String>(1);
     let (activity_tx, mut activity) = watch::channel(Instant::now());
 
     let dir = config.model_dir;
+    let events = job_tx.clone();
     std::thread::spawn(move || {
-        worker(dir, state_tx, stage_tx, job_rx, retry_rx, fatal_tx);
+        dispatcher(dir, state_tx, stage_tx, job_rx, events, retry_rx, fatal_tx);
     });
 
     let shared = Arc::new(Shared {
@@ -243,29 +369,32 @@ where
     });
 }
 
-/// The worker thread: loads the model (retrying on request), then runs
-/// jobs in urgency order, splitting each job into same-bucket runs of at
-/// most [`RUN_INPUTS`]. A failed embed is fatal: the job gets the error
-/// and the server exits.
-fn worker(
+/// The dispatcher thread: loads the model on every device (retrying on
+/// request), then hands the most urgent pending job's same-bucket runs of
+/// at most [`RUN_INPUTS`] to idle device workers and collects the finished
+/// runs. A failed embed is fatal: the job gets the error and the server
+/// exits.
+fn dispatcher(
     dir: PathBuf,
     state: watch::Sender<Model>,
     stage: watch::Sender<LoadStage>,
-    jobs: std_mpsc::Receiver<Job>,
+    inbox: std_mpsc::Receiver<Msg>,
+    events: std_mpsc::Sender<Msg>,
     retry: std_mpsc::Receiver<()>,
     fatal: mpsc::Sender<String>,
 ) {
-    let mut embedder = loop {
-        match OrtEmbedder::open(&dir, &stage) {
-            Ok(embedder) => {
+    let embedders = loop {
+        match OrtEmbedder::open_devices(&dir, &stage) {
+            Ok(embedders) => {
+                // The model id and encoder are identical across devices.
                 let ready = Arc::new(Ready {
-                    id: embedder.model_id().to_owned(),
-                    encoder: embedder.encoder(),
+                    id: embedders[0].model_id().to_owned(),
+                    encoder: embedders[0].encoder(),
                 });
                 if state.send(Model::Ready(ready)).is_err() {
                     return;
                 }
-                break embedder;
+                break embedders;
             }
             Err(error) => {
                 tracing::error!(%error, "model load failed");
@@ -280,64 +409,138 @@ fn worker(
         }
     };
 
+    tracing::info!(devices = embedders.len(), "embedding devices serving");
+    let buckets: Vec<usize> = embedders[0].buckets().collect();
+    let workers: Vec<std_mpsc::Sender<Work>> = embedders
+        .into_iter()
+        .enumerate()
+        .map(|(worker, embedder)| {
+            let (work_tx, work_rx) = std_mpsc::channel::<Work>();
+            let events = events.clone();
+            std::thread::spawn(move || device_worker(worker, embedder, work_rx, events));
+            work_tx
+        })
+        .collect();
+    drop(events);
+
+    let mut idle: Vec<usize> = (0..workers.len()).collect();
     let mut pending: Vec<Job> = Vec::new();
+    let mut next_id = 0u64;
     loop {
-        if pending.is_empty() {
-            match jobs.recv() {
-                Ok(job) => pending.push(job),
-                Err(_) => return,
+        // Hand runs to idle devices, most urgent job first.
+        while !idle.is_empty() {
+            let Some(index) = pick(&pending) else { break };
+            let job = &mut pending[index];
+            if !job.counted {
+                job.counted = true;
+                job.wait = job.queued.elapsed();
+                let urgency = job.urgency;
+                let overtaken = pending
+                    .iter()
+                    .enumerate()
+                    .filter(|(other, job)| *other != index && job.urgency > urgency)
+                    .count() as u64;
+                pending[index].overtaken = overtaken;
             }
-        }
-        while let Ok(job) = jobs.try_recv() {
-            pending.push(job);
-        }
-        // The most urgent, oldest pending job.
-        let pick = pending
-            .iter()
-            .enumerate()
-            .min_by_key(|(_, job)| (job.urgency, job.queued))
-            .map(|(index, _)| index)
-            .expect("pending is nonempty");
-        let mut job = pending.swap_remove(pick);
-        if !job.counted {
-            job.counted = true;
-            job.wait = job.queued.elapsed();
-            job.overtaken = pending
-                .iter()
-                .filter(|other| other.urgency > job.urgency)
-                .count() as u64;
-        }
-        // One run: the longest same-bucket prefix of the job's remaining
-        // inputs, capped at RUN_INPUTS.
-        let first = job.inputs.front().expect("jobs hold inputs");
-        let bucket = embedder
-            .bucket_of(first.len())
-            .expect("the encoder capped every input");
-        let mut take = 0usize;
-        for ids in &job.inputs {
-            if take == RUN_INPUTS || embedder.bucket_of(ids.len()).ok() != Some(bucket) {
-                break;
-            }
-            take += 1;
-        }
-        let batch: Vec<Vec<u32>> = job.inputs.drain(..take).collect();
-        match embedder.embed_tokens_batch(&batch) {
-            Ok(vectors) => job.vectors.extend(vectors),
-            Err(error) => {
-                let message = error.to_string();
-                let _ = job.reply.send(Err(message.clone()));
-                let _ = fatal.try_send(message);
+            let job = &mut pending[index];
+            let (indices, batch): (Vec<_>, Vec<_>) = job.take_run(&buckets).into_iter().unzip();
+            let worker = idle.pop().expect("idle is nonempty");
+            let work = Work {
+                job: job.id,
+                indices,
+                batch,
+            };
+            if workers[worker].send(work).is_err() {
+                // The worker thread is gone: its embedder panicked.
+                let _ = fatal.try_send("a device worker is gone".to_owned());
                 return;
             }
         }
-        if job.inputs.is_empty() {
-            let timing = ServerTiming {
-                wait: job.wait,
-                overtaken: job.overtaken,
-            };
-            let _ = job.reply.send(Ok((job.vectors, timing)));
-        } else {
+        match inbox.recv() {
+            Ok(message) => {
+                if !absorb(message, &mut pending, &mut next_id, &mut idle, &fatal) {
+                    return;
+                }
+            }
+            Err(_) => return,
+        }
+        while let Ok(message) = inbox.try_recv() {
+            if !absorb(message, &mut pending, &mut next_id, &mut idle, &fatal) {
+                return;
+            }
+        }
+    }
+}
+
+/// Applies one message to the dispatcher's state. `false` when a run
+/// failed: the job got the error and `fatal` was sent.
+fn absorb(
+    message: Msg,
+    pending: &mut Vec<Job>,
+    next_id: &mut u64,
+    idle: &mut Vec<usize>,
+    fatal: &mpsc::Sender<String>,
+) -> bool {
+    match message {
+        Msg::Job(mut job) => {
+            job.id = *next_id;
+            *next_id += 1;
             pending.push(job);
+        }
+        Msg::Done {
+            worker,
+            job,
+            indices,
+            result,
+        } => {
+            idle.push(worker);
+            let at = pending
+                .iter()
+                .position(|candidate| candidate.id == job)
+                .expect("a job stays pending until its runs finish");
+            match result {
+                Ok(vectors) => {
+                    pending[at].place(&indices, vectors);
+                    if pending[at].is_done() {
+                        pending.swap_remove(at).finish();
+                    }
+                }
+                Err(message) => {
+                    let _ = pending.swap_remove(at).reply.send(Err(message.clone()));
+                    let _ = fatal.try_send(message);
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
+/// A device worker: embeds each run on its own session and reports it.
+fn device_worker(
+    worker: usize,
+    mut embedder: OrtEmbedder,
+    work: std_mpsc::Receiver<Work>,
+    events: std_mpsc::Sender<Msg>,
+) {
+    while let Ok(Work {
+        job,
+        indices,
+        batch,
+    }) = work.recv()
+    {
+        let result = embedder
+            .embed_tokens_batch(&batch)
+            .map_err(|error| error.to_string());
+        let failed = result.is_err();
+        let done = Msg::Done {
+            worker,
+            job,
+            indices,
+            result,
+        };
+        if events.send(done).is_err() || failed {
+            return;
         }
     }
 }
@@ -511,19 +714,9 @@ async fn embeddings(shared: Arc<Shared>, request: Request<Incoming>) -> Response
     };
     let prompt_tokens = ids.iter().map(Vec::len).sum::<usize>() as u32;
     let (reply_tx, reply_rx) = oneshot::channel();
-    let n = ids.len();
     if shared
         .worker
-        .send(Job {
-            urgency,
-            queued: Instant::now(),
-            inputs: ids.into_iter().collect(),
-            vectors: Vec::with_capacity(n),
-            wait: Duration::ZERO,
-            overtaken: 0,
-            counted: false,
-            reply: reply_tx,
-        })
+        .send(Msg::Job(Job::new(urgency, ids, reply_tx)))
         .is_err()
     {
         return reply(
@@ -751,5 +944,80 @@ impl Drop for Busy {
     fn drop(&mut self) {
         self.shared.in_flight.fetch_sub(1, Ordering::Relaxed);
         self.shared.activity.send_replace(Instant::now());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const BUCKETS: [usize; 3] = [4, 8, 16];
+
+    type Reply = oneshot::Receiver<Result<(Vec<UnitVector>, ServerTiming), String>>;
+
+    fn job(urgency: u8, lens: &[usize]) -> (Job, Reply) {
+        let (tx, rx) = oneshot::channel();
+        let ids = lens.iter().map(|&len| vec![1; len]).collect();
+        (Job::new(Urgency::new(urgency), ids, tx), rx)
+    }
+
+    fn vector(value: f32) -> UnitVector {
+        UnitVector::normalize(vec![value, 1.0])
+    }
+
+    fn indices(run: &[(usize, Vec<u32>)]) -> Vec<usize> {
+        run.iter().map(|(index, _)| *index).collect()
+    }
+
+    #[test]
+    fn run_takes_same_bucket_from_anywhere_in_input_order() {
+        let (mut job, _rx) = job(3, &[2, 10, 3, 12, 4, 1]);
+        let run = job.take_run(&BUCKETS);
+        assert_eq!(indices(&run), [0, 2, 4, 5]);
+        assert_eq!(job.outstanding, 1);
+        assert_eq!(indices(&job.remaining), [1, 3]);
+    }
+
+    #[test]
+    fn run_is_capped_at_run_inputs() {
+        let (mut job, _rx) = job(3, &[2; RUN_INPUTS + 5]);
+        assert_eq!(job.take_run(&BUCKETS).len(), RUN_INPUTS);
+        assert_eq!(job.remaining.len(), 5);
+        assert_eq!(job.remaining[0].0, RUN_INPUTS);
+    }
+
+    #[test]
+    fn results_return_to_original_positions() {
+        let (mut job, mut rx) = job(3, &[2, 10, 3]);
+        let first = job.take_run(&BUCKETS);
+        let second = job.take_run(&BUCKETS);
+        assert_eq!(indices(&first), [0, 2]);
+        assert_eq!(indices(&second), [1]);
+        assert!(job.remaining.is_empty() && !job.is_done());
+        // The runs finish out of order.
+        job.place(&indices(&second), vec![vector(2.0)]);
+        assert!(!job.is_done());
+        job.place(&indices(&first), vec![vector(0.0), vector(3.0)]);
+        assert!(job.is_done());
+        job.finish();
+        let (vectors, _) = rx.try_recv().expect("replied").expect("ok");
+        assert_eq!(vectors, [vector(0.0), vector(2.0), vector(3.0)]);
+    }
+
+    #[test]
+    fn pick_prefers_urgency_then_age_and_skips_dispatched_jobs() {
+        let (mut spent, _a) = job(0, &[2]);
+        spent.take_run(&BUCKETS);
+        let (older, _b) = job(2, &[2]);
+        let (mut newer, _c) = job(2, &[2]);
+        newer.queued = older.queued + Duration::from_millis(1);
+        let (urgent, _d) = job(1, &[2]);
+        let mut pending = vec![spent, newer, older, urgent];
+        // Index 0 has nothing left to hand out; index 3 is the most urgent.
+        assert_eq!(pick(&pending), Some(3));
+        pending.pop();
+        // Equal urgency: the earlier-queued job (index 2) wins.
+        assert_eq!(pick(&pending), Some(2));
+        assert_eq!(pick(&[]), None);
     }
 }

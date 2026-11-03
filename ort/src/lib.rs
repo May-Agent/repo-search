@@ -92,6 +92,9 @@ pub enum Error {
     /// runs only when no accelerator is available, never alongside one.
     #[error("cpu cannot share a provider chain with accelerators")]
     CpuMixed,
+    /// `REPO_SEARCH_ORT_DEVICES` is not a positive integer.
+    #[error("REPO_SEARCH_ORT_DEVICES must be a positive integer, got {0:?}")]
+    BadDeviceCap(String),
     /// The ONNX Runtime failure.
     #[error("onnx runtime: {0}")]
     Ort(#[from] ort::Error),
@@ -133,12 +136,14 @@ impl Encoder {
 /// The candidate execution-provider chains, in preference order; the
 /// first that commits a session wins.
 ///
-/// CPU is only ever a chain of its own: a GPU/NPU provider never shares
-/// a chain with `cpu`, because ONNX Runtime would silently land rejected
-/// nodes on it. `REPO_SEARCH_ORT_EP` names one explicit comma-separated
-/// chain — mixing `cpu` with an accelerator there is a startup error —
-/// while the unset default tries each accelerator alone, ending on CPU
-/// only when none of them registered.
+/// CPU is only ever a chain of its own: the `cpu` provider never shares a
+/// chain with an accelerator, so it is the explicit last resort rather than
+/// part of an accelerator's registration. ONNX Runtime's implicit CPU
+/// provider still takes the shape operators no accelerator claims; that is
+/// expected and not a fallback. `REPO_SEARCH_ORT_EP` names one explicit
+/// comma-separated chain — mixing `cpu` with an accelerator there is a
+/// startup error — while the unset default tries each accelerator alone,
+/// ending on CPU only when none of them registered.
 fn ep_chains() -> Result<Vec<Vec<String>>, Error> {
     let spec = match std::env::var("REPO_SEARCH_ORT_EP") {
         Ok(spec) => spec,
@@ -166,29 +171,54 @@ fn ep_chains() -> Result<Vec<Vec<String>>, Error> {
     Ok(vec![chain])
 }
 
+/// Whether the provider `name` selects among several devices by id.
+fn takes_device_id(name: &str) -> bool {
+    matches!(name, "cuda" | "tensorrt" | "nvrtx")
+}
+
+/// The `REPO_SEARCH_ORT_DEVICES` cap on how many devices to serve from;
+/// `None` when unset.
+fn device_cap() -> Result<Option<usize>, Error> {
+    match std::env::var("REPO_SEARCH_ORT_DEVICES") {
+        Err(_) => Ok(None),
+        Ok(spec) => match spec.trim().parse::<usize>() {
+            Ok(cap) if cap > 0 => Ok(Some(cap)),
+            _ => Err(Error::BadDeviceCap(spec)),
+        },
+    }
+}
+
 /// Commits a session over `model`, registering `chain`'s providers in
 /// order — ONNX Runtime runs on the first provider that accepts each
-/// node, so an NPU-capable name placed first prefers the NPU.
+/// node, so an NPU-capable name placed first prefers the NPU. Providers
+/// that select a device are bound to `device`. Every registration is
+/// `error_on_failure`: ONNX Runtime otherwise logs a failed registration
+/// and runs on the CPU, so a failure here is an `Err`.
 fn commit_session(
     environment: &ort::environment::Environment,
     chain: &[String],
+    device: usize,
     model: PathBuf,
 ) -> Result<Session, Error> {
+    let id = i32::try_from(device).expect("device index fits a device id");
     let mut providers: Vec<ort::ep::ExecutionProviderDispatch> = Vec::with_capacity(chain.len());
     for name in chain {
-        providers.push(match name.as_str() {
+        let provider = match name.as_str() {
             "cpu" => ort::ep::CPU::default().build(),
             "openvino" => ort::ep::OpenVINO::default().build(),
             "openvino-npu" => ort::ep::OpenVINO::default().with_device_type("NPU").build(),
             "qnn" => ort::ep::QNN::default().build(),
             "directml" => ort::ep::DirectML::default().build(),
-            "cuda" => ort::ep::CUDA::default().build(),
-            "tensorrt" => ort::ep::TensorRT::default().build(),
-            "nvrtx" => ort::ep::NVRTX::default().build(),
+            "cuda" => ort::ep::CUDA::default().with_device_id(id).build(),
+            "tensorrt" => ort::ep::TensorRT::default().with_device_id(id).build(),
+            "nvrtx" => ort::ep::NVRTX::default()
+                .with_device_id(device as u32)
+                .build(),
             "xnnpack" => ort::ep::XNNPACK::default().build(),
             "onednn" => ort::ep::OneDNN::default().build(),
             other => return Err(Error::UnknownProvider(other.to_owned())),
-        });
+        };
+        providers.push(provider.error_on_failure());
     }
     Ok(Session::builder(environment)?
         .with_execution_providers(providers)
@@ -214,16 +244,26 @@ pub struct OrtEmbedder {
 
 impl OrtEmbedder {
     /// Loads the model directory (`manifest.json`, `tokenizer.json`, the
-    /// named ONNX file and its sidecar data) on the CPU execution provider,
-    /// then runs one warm embed so the first request does not pay the
-    /// initial-run cost. `stage` is already `Encoder` on entry and tracks
-    /// the pipeline's progress for `/status`.
+    /// named ONNX file and its sidecar data) on the first execution-provider
+    /// chain that works, then runs one warm embed per session so the first
+    /// request does not pay the initial-run cost. When that chain's
+    /// accelerator selects among devices (CUDA, TensorRT, NVRTX), the same
+    /// chain is opened on device 1, 2, ... until one fails or
+    /// `REPO_SEARCH_ORT_DEVICES` devices are open; each opened device yields
+    /// one embedder. `stage` is already `Encoder` on entry and tracks the
+    /// pipeline's progress for `/status`.
     ///
     /// # Errors
     ///
-    /// The manifest, tokenizer and model failures in [`Error`].
-    pub fn open(dir: impl AsRef<Path>, stage: &watch::Sender<LoadStage>) -> Result<Self, Error> {
+    /// The manifest, tokenizer and model failures in [`Error`], and
+    /// [`Error::BadDeviceCap`]. A failure on a device beyond the first only
+    /// ends the search.
+    pub fn open_devices(
+        dir: impl AsRef<Path>,
+        stage: &watch::Sender<LoadStage>,
+    ) -> Result<Vec<Self>, Error> {
         let dir = dir.as_ref();
+        let cap = device_cap()?;
         let manifest = Manifest::load(dir)?;
         let tokenizer = Tokenizer::from_file(dir.join("tokenizer.json"))?;
         if tokenizer.get_vocab_size(true) > i64::MAX as usize {
@@ -241,12 +281,13 @@ impl OrtEmbedder {
         // candidate. An explicit `REPO_SEARCH_ORT_EP` is a single chain,
         // so its failure is fatal and never a silent drop to CPU.
         let candidates = ep_chains()?;
-        let mut embedder = None;
+        let mut selected = None;
         let mut last_error = None;
         for chain in &candidates {
             match Self::open_on(
                 &environment,
                 chain,
+                0,
                 dir,
                 &manifest,
                 encoder.clone(),
@@ -255,7 +296,7 @@ impl OrtEmbedder {
             ) {
                 Ok(opened) => {
                     tracing::info!(providers = ?chain, "execution provider selected");
-                    embedder = Some(opened);
+                    selected = Some((chain, opened));
                     break;
                 }
                 Err(error) => {
@@ -264,23 +305,49 @@ impl OrtEmbedder {
                 }
             }
         }
-        embedder.ok_or_else(|| last_error.expect("candidates are nonempty"))
+        let (chain, first) =
+            selected.ok_or_else(|| last_error.expect("candidates are nonempty"))?;
+        let mut embedders = vec![first];
+        if chain.iter().any(|name| takes_device_id(name)) {
+            while cap.is_none_or(|cap| embedders.len() < cap) {
+                let device = embedders.len();
+                match Self::open_on(
+                    &environment,
+                    chain,
+                    device,
+                    dir,
+                    &manifest,
+                    encoder.clone(),
+                    pad,
+                    stage,
+                ) {
+                    Ok(opened) => embedders.push(opened),
+                    Err(error) => {
+                        tracing::debug!(device, %error, "no further device");
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(embedders)
     }
 
     /// One candidate chain's try: commits the session, checks the model
     /// contract, then proves the provider executes with one warm run at
     /// the largest bucket — paying the graph's initial compile and the
     /// allocator's warm-up here, not on the first request.
+    #[allow(clippy::too_many_arguments)]
     fn open_on(
         environment: &ort::environment::Environment,
         chain: &[String],
+        device: usize,
         dir: &Path,
         manifest: &Manifest,
         encoder: Encoder,
         pad: i64,
         stage: &watch::Sender<LoadStage>,
     ) -> Result<Self, Error> {
-        let session = commit_session(environment, chain, dir.join(&manifest.model))?;
+        let session = commit_session(environment, chain, device, dir.join(&manifest.model))?;
         let mut seen = session
             .inputs()
             .iter()
