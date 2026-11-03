@@ -64,6 +64,13 @@ pub const MODEL_ID: &str = ARCHIVE.sha256;
 #[cfg(not(target_os = "macos"))]
 pub const MODEL_ID: &str = "onnx-d06edd601f851c633a2519304cbeb8dc6170d7ceb61b436625c17fb9b6e74953";
 
+/// The model build's identity of [`ONNX_FP16_ARCHIVE`], which its manifest
+/// declares: the fp16 graph is a different build from [`MODEL_ID`]'s, so
+/// their vectors never mix.
+#[cfg(not(target_os = "macos"))]
+pub const ONNX_FP16_MODEL_ID: &str =
+    "onnx-a49e227d7e0e5f4ee606d79879d084264366367bc6318f344ab179e35d4fd6a4";
+
 /// Human-readable name of the embedded model, shown by `search --version`.
 #[cfg(target_os = "macos")]
 pub const MODEL_NAME: &str = "google/embeddinggemma-2 (Core ML conversion)";

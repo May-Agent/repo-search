@@ -738,23 +738,63 @@ fn server_main(
     }
 }
 
-/// The model id the daemon expects the embedding server to list.
-/// `REPO_SEARCH_MODEL_ID` overrides it for deployments whose server
-/// runs a different pinned build — the fp16 ONNX archive on an NVIDIA
-/// host advertises `onnx-a49e227d…`, not the int8 default.
+/// The model id the daemon expects the embedding server to list: the fp16
+/// build's on a host [`onnx_fp16`] picks it for, else the default's.
+/// `REPO_SEARCH_MODEL_ID` overrides it for a daemon whose server runs on
+/// another host with a different pinned build.
 fn model_id() -> String {
     #[cfg(not(target_os = "macos"))]
-    if let Ok(id) = std::env::var("REPO_SEARCH_MODEL_ID") {
-        return id;
+    {
+        if let Ok(id) = std::env::var("REPO_SEARCH_MODEL_ID") {
+            return id;
+        }
+        if onnx_fp16() {
+            return repo_search_core::model::ONNX_FP16_MODEL_ID.to_owned();
+        }
     }
     repo_search_core::model::MODEL_ID.to_owned()
 }
 
-/// Whether the server should fetch the fp16 ONNX archive (the NVIDIA
-/// build) instead of the int8 default: `REPO_SEARCH_ORT_ARCHIVE=fp16`.
+/// Whether this host runs the fp16 ONNX archive instead of the int8 one:
+/// fp16 whenever an NVIDIA GPU is present, where tensor cores run it about
+/// three times faster than int8. `REPO_SEARCH_ORT_ARCHIVE` (`fp16` or
+/// `int8`) overrides the detection.
+///
+/// # Panics
+///
+/// When `REPO_SEARCH_ORT_ARCHIVE` is set to anything else.
 #[cfg(not(target_os = "macos"))]
 fn onnx_fp16() -> bool {
-    std::env::var("REPO_SEARCH_ORT_ARCHIVE").is_ok_and(|a| a == "fp16")
+    match std::env::var("REPO_SEARCH_ORT_ARCHIVE").as_deref() {
+        Ok("fp16") => true,
+        Ok("int8") => false,
+        Ok(other) => panic!("REPO_SEARCH_ORT_ARCHIVE must be fp16 or int8, got {other:?}"),
+        Err(_) => nvidia_present(),
+    }
+}
+
+/// Whether the NVIDIA driver exposes a GPU to this process: the control
+/// device the driver (and a container runtime) creates.
+#[cfg(target_os = "linux")]
+fn nvidia_present() -> bool {
+    std::path::Path::new("/dev/nvidiactl").exists()
+}
+
+/// Whether the NVIDIA driver is installed: its CUDA driver library.
+#[cfg(windows)]
+fn nvidia_present() -> bool {
+    std::env::var_os("SystemRoot").is_some_and(|root| {
+        std::path::Path::new(&root)
+            .join("System32")
+            .join("nvcuda.dll")
+            .exists()
+    })
+}
+
+/// No other platform carries an NVIDIA GPU this build serves.
+#[cfg(not(any(target_os = "linux", windows, target_os = "macos")))]
+fn nvidia_present() -> bool {
+    false
 }
 
 /// The [`ModelSpec`] matching [`onnx_fp16`]'s archive choice.
