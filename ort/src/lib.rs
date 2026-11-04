@@ -6,6 +6,7 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use manifest::Manifest;
 use ort::session::Session;
@@ -101,11 +102,12 @@ pub enum Error {
 }
 
 /// The text encoder request inputs are tokenized with: a clone of the
-/// model's tokenizer plus its largest bucket. Cloned handles share the
-/// tokenizer's tables and are cheap.
+/// model's tokenizer plus its largest bucket. Cloned handles share the one
+/// tokenizer: `Tokenizer` itself deep-copies its vocabulary and merge
+/// tables, so a handle is an `Arc`.
 #[derive(Clone)]
 pub struct Encoder {
-    tokenizer: Tokenizer,
+    tokenizer: Arc<Tokenizer>,
     max_len: usize,
 }
 
@@ -271,7 +273,10 @@ impl OrtEmbedder {
         }
         let pad = tokenizer.token_to_id("<pad>").ok_or(Error::NoPadToken)? as i64;
         let max_len = *manifest.buckets.last().expect("manifest requires buckets");
-        let encoder = Encoder { tokenizer, max_len };
+        let encoder = Encoder {
+            tokenizer: Arc::new(tokenizer),
+            max_len,
+        };
 
         let _ = stage.send(LoadStage::Open);
         let environment = ort::init().with_name("repo-search-ort").build()?;

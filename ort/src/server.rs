@@ -7,8 +7,9 @@
 //! Where the Core ML server splits queries onto the ANE and bulk indexing
 //! onto a power-gated GPU, this server has interchangeable device
 //! sessions. A dispatcher thread owns the pending requests and hands each
-//! idle device at most [`RUN_INPUTS`] same-bucket inputs of the most urgent
-//! pending request, re-picking between runs, so a bulk index batch cannot
+//! idle device at most [`RUN_INPUTS`] same-bucket inputs, taken across the
+//! pending requests of the most urgent class (the daemon sends one input
+//! per request), re-picking between runs, so a bulk index batch cannot
 //! park a query behind its full length.
 //!
 //! The unix socket carries no bearer check — its file permissions are the
@@ -100,9 +101,10 @@ struct Ready {
 }
 
 /// One embedding request's work for the dispatcher. Runs take same-bucket
-/// inputs from anywhere in `remaining`, each carrying its original index,
-/// and finished vectors return to their `slots`, so the reply is in input
-/// order however the runs were spread over devices.
+/// inputs from anywhere in `remaining` — and from other pending jobs of the
+/// same urgency — each carrying its original index, and finished vectors
+/// return to their `slots`, so the reply is in input order however the
+/// runs were spread over devices.
 struct Job {
     /// Assigned by the dispatcher when the job arrives.
     id: u64,
@@ -115,7 +117,7 @@ struct Job {
     remaining: Vec<(usize, Vec<u32>)>,
     /// One slot per input, filled as its run finishes.
     slots: Vec<Option<UnitVector>>,
-    /// Runs handed to a device and not yet finished.
+    /// Inputs handed to a device and not yet placed.
     outstanding: usize,
     /// The longest wait observed across the job's runs.
     wait: Duration,
@@ -148,35 +150,36 @@ impl Job {
         }
     }
 
-    /// Takes the next run: up to [`RUN_INPUTS`] inputs sharing the bucket
-    /// of the first remaining input, from anywhere in `remaining`, in
-    /// input order.
-    fn take_run(&mut self, buckets: &[usize]) -> Vec<(usize, Vec<u32>)> {
-        let bucket = bucket_of(buckets, self.remaining[0].1.len());
-        let mut run = Vec::with_capacity(RUN_INPUTS);
+    /// The bucket of the next input to hand out.
+    fn lead_bucket(&self, buckets: &[usize]) -> usize {
+        bucket_of(buckets, self.remaining[0].1.len())
+    }
+
+    /// Takes up to `room` remaining inputs of `bucket`, from anywhere in
+    /// `remaining`, in input order.
+    fn take_matching(
+        &mut self,
+        buckets: &[usize],
+        bucket: usize,
+        room: usize,
+    ) -> Vec<(usize, Vec<u32>)> {
+        let mut taken = Vec::with_capacity(room.min(self.remaining.len()));
         let mut kept = Vec::with_capacity(self.remaining.len());
         for input in std::mem::take(&mut self.remaining) {
-            if run.len() < RUN_INPUTS && bucket_of(buckets, input.1.len()) == bucket {
-                run.push(input);
+            if taken.len() < room && bucket_of(buckets, input.1.len()) == bucket {
+                taken.push(input);
             } else {
                 kept.push(input);
             }
         }
         self.remaining = kept;
-        self.outstanding += 1;
-        run
+        self.outstanding += taken.len();
+        taken
     }
 
-    /// Writes a finished run's vectors back to their input positions.
-    fn place(&mut self, indices: &[usize], vectors: Vec<UnitVector>) {
-        assert_eq!(
-            indices.len(),
-            vectors.len(),
-            "a run returns one vector per input"
-        );
-        for (&index, vector) in indices.iter().zip(vectors) {
-            self.slots[index] = Some(vector);
-        }
+    /// Writes one finished vector back to its input position.
+    fn place(&mut self, index: usize, vector: UnitVector) {
+        self.slots[index] = Some(vector);
         self.outstanding -= 1;
     }
 
@@ -228,20 +231,62 @@ enum Msg {
     Done {
         /// The worker's index, idle again.
         worker: usize,
-        /// The job the run belongs to.
-        job: u64,
-        /// The input indices of the run, matching the vectors.
-        indices: Vec<usize>,
+        /// The `(job, input index)` of each input of the run, matching
+        /// the vectors.
+        parts: Vec<(u64, usize)>,
         /// The run's vectors, or its fatal failure.
         result: Result<Vec<UnitVector>, String>,
     },
 }
 
-/// One run for a device worker.
+/// One run for a device worker: same-bucket inputs of one urgency, which
+/// may come from several jobs.
 struct Work {
-    job: u64,
-    indices: Vec<usize>,
+    /// The `(job, input index)` of each batch input.
+    parts: Vec<(u64, usize)>,
     batch: Vec<Vec<u32>>,
+}
+
+/// Assembles the next run: the most urgent, oldest job's next bucket,
+/// filled up to [`RUN_INPUTS`] with that bucket's inputs from the jobs of
+/// the same urgency, oldest first. A device is never left on one input
+/// while same-bucket inputs wait in other requests — the daemon sends one
+/// input per request — and a more urgent request still waits at most one
+/// run, since lower urgencies never join its run.
+fn assemble_run(pending: &mut [Job], buckets: &[usize]) -> Option<Work> {
+    let lead = pick(pending)?;
+    let urgency = pending[lead].urgency;
+    let bucket = pending[lead].lead_bucket(buckets);
+    let mut order: Vec<usize> = (0..pending.len())
+        .filter(|&at| pending[at].urgency == urgency && !pending[at].remaining.is_empty())
+        .collect();
+    order.sort_by_key(|&at| pending[at].queued);
+    let overtaken = pending
+        .iter()
+        .filter(|other| other.urgency > urgency)
+        .count() as u64;
+    let mut parts = Vec::with_capacity(RUN_INPUTS);
+    let mut batch = Vec::with_capacity(RUN_INPUTS);
+    for at in order {
+        if batch.len() == RUN_INPUTS {
+            break;
+        }
+        let job = &mut pending[at];
+        let taken = job.take_matching(buckets, bucket, RUN_INPUTS - batch.len());
+        if taken.is_empty() {
+            continue;
+        }
+        if !job.counted {
+            job.counted = true;
+            job.wait = job.queued.elapsed();
+            job.overtaken = overtaken;
+        }
+        for (index, ids) in taken {
+            parts.push((job.id, index));
+            batch.push(ids);
+        }
+    }
+    Some(Work { parts, batch })
 }
 
 /// Everything a connection's handlers share.
@@ -429,27 +474,10 @@ fn dispatcher(
     loop {
         // Hand runs to idle devices, most urgent job first.
         while !idle.is_empty() {
-            let Some(index) = pick(&pending) else { break };
-            let job = &mut pending[index];
-            if !job.counted {
-                job.counted = true;
-                job.wait = job.queued.elapsed();
-                let urgency = job.urgency;
-                let overtaken = pending
-                    .iter()
-                    .enumerate()
-                    .filter(|(other, job)| *other != index && job.urgency > urgency)
-                    .count() as u64;
-                pending[index].overtaken = overtaken;
-            }
-            let job = &mut pending[index];
-            let (indices, batch): (Vec<_>, Vec<_>) = job.take_run(&buckets).into_iter().unzip();
-            let worker = idle.pop().expect("idle is nonempty");
-            let work = Work {
-                job: job.id,
-                indices,
-                batch,
+            let Some(work) = assemble_run(&mut pending, &buckets) else {
+                break;
             };
+            let worker = idle.pop().expect("idle is nonempty");
             if workers[worker].send(work).is_err() {
                 // The worker thread is gone: its embedder panicked.
                 let _ = fatal.try_send("a device worker is gone".to_owned());
@@ -489,24 +517,41 @@ fn absorb(
         }
         Msg::Done {
             worker,
-            job,
-            indices,
+            parts,
             result,
         } => {
             idle.push(worker);
-            let at = pending
-                .iter()
-                .position(|candidate| candidate.id == job)
-                .expect("a job stays pending until its runs finish");
             match result {
                 Ok(vectors) => {
-                    pending[at].place(&indices, vectors);
-                    if pending[at].is_done() {
-                        pending.swap_remove(at).finish();
+                    assert_eq!(
+                        parts.len(),
+                        vectors.len(),
+                        "a run returns one vector per input"
+                    );
+                    for ((id, index), vector) in parts.iter().zip(vectors) {
+                        let position = pending
+                            .iter()
+                            .position(|candidate| candidate.id == *id)
+                            .expect("a job stays pending until its inputs are placed");
+                        pending[position].place(*index, vector);
+                    }
+                    for (id, _) in &parts {
+                        if let Some(position) = pending.iter().position(|job| job.id == *id)
+                            && pending[position].is_done()
+                        {
+                            pending.swap_remove(position).finish();
+                        }
                     }
                 }
                 Err(message) => {
-                    let _ = pending.swap_remove(at).reply.send(Err(message.clone()));
+                    for (id, _) in &parts {
+                        if let Some(position) = pending.iter().position(|job| job.id == *id) {
+                            let _ = pending
+                                .swap_remove(position)
+                                .reply
+                                .send(Err(message.clone()));
+                        }
+                    }
                     let _ = fatal.try_send(message);
                     return false;
                 }
@@ -523,20 +568,14 @@ fn device_worker(
     work: std_mpsc::Receiver<Work>,
     events: std_mpsc::Sender<Msg>,
 ) {
-    while let Ok(Work {
-        job,
-        indices,
-        batch,
-    }) = work.recv()
-    {
+    while let Ok(Work { parts, batch }) = work.recv() {
         let result = embedder
             .embed_tokens_batch(&batch)
             .map_err(|error| error.to_string());
         let failed = result.is_err();
         let done = Msg::Done {
             worker,
-            job,
-            indices,
+            parts,
             result,
         };
         if events.send(done).is_err() || failed {
@@ -969,19 +1008,27 @@ mod tests {
         run.iter().map(|(index, _)| *index).collect()
     }
 
+    /// A job with a fixed id, as the dispatcher numbers them.
+    fn numbered(id: u64, urgency: u8, lens: &[usize]) -> (Job, Reply) {
+        let (mut job, rx) = job(urgency, lens);
+        job.id = id;
+        (job, rx)
+    }
+
     #[test]
-    fn run_takes_same_bucket_from_anywhere_in_input_order() {
+    fn take_matching_takes_one_bucket_from_anywhere_in_input_order() {
         let (mut job, _rx) = job(3, &[2, 10, 3, 12, 4, 1]);
-        let run = job.take_run(&BUCKETS);
-        assert_eq!(indices(&run), [0, 2, 4, 5]);
-        assert_eq!(job.outstanding, 1);
+        let bucket = job.lead_bucket(&BUCKETS);
+        let taken = job.take_matching(&BUCKETS, bucket, RUN_INPUTS);
+        assert_eq!(indices(&taken), [0, 2, 4, 5]);
+        assert_eq!(job.outstanding, 4);
         assert_eq!(indices(&job.remaining), [1, 3]);
     }
 
     #[test]
-    fn run_is_capped_at_run_inputs() {
+    fn take_matching_is_capped_at_room() {
         let (mut job, _rx) = job(3, &[2; RUN_INPUTS + 5]);
-        assert_eq!(job.take_run(&BUCKETS).len(), RUN_INPUTS);
+        assert_eq!(job.take_matching(&BUCKETS, 4, RUN_INPUTS).len(), RUN_INPUTS);
         assert_eq!(job.remaining.len(), 5);
         assert_eq!(job.remaining[0].0, RUN_INPUTS);
     }
@@ -989,15 +1036,16 @@ mod tests {
     #[test]
     fn results_return_to_original_positions() {
         let (mut job, mut rx) = job(3, &[2, 10, 3]);
-        let first = job.take_run(&BUCKETS);
-        let second = job.take_run(&BUCKETS);
+        let first = job.take_matching(&BUCKETS, 4, RUN_INPUTS);
+        let second = job.take_matching(&BUCKETS, 16, RUN_INPUTS);
         assert_eq!(indices(&first), [0, 2]);
         assert_eq!(indices(&second), [1]);
         assert!(job.remaining.is_empty() && !job.is_done());
         // The runs finish out of order.
-        job.place(&indices(&second), vec![vector(2.0)]);
+        job.place(1, vector(2.0));
         assert!(!job.is_done());
-        job.place(&indices(&first), vec![vector(0.0), vector(3.0)]);
+        job.place(0, vector(0.0));
+        job.place(2, vector(3.0));
         assert!(job.is_done());
         job.finish();
         let (vectors, _) = rx.try_recv().expect("replied").expect("ok");
@@ -1005,9 +1053,100 @@ mod tests {
     }
 
     #[test]
+    fn a_run_gathers_single_input_requests() {
+        let mut pending = Vec::new();
+        let mut replies = Vec::new();
+        for id in 0..(RUN_INPUTS + 8) as u64 {
+            let (job, rx) = numbered(id, 3, &[2]);
+            pending.push(job);
+            replies.push(rx);
+        }
+        let first = assemble_run(&mut pending, &BUCKETS).expect("work");
+        assert_eq!(first.batch.len(), RUN_INPUTS);
+        assert_eq!(first.parts.len(), RUN_INPUTS);
+        let second = assemble_run(&mut pending, &BUCKETS).expect("work");
+        assert_eq!(second.batch.len(), 8);
+        assert!(assemble_run(&mut pending, &BUCKETS).is_none());
+    }
+
+    #[test]
+    fn a_run_keeps_to_the_lead_bucket_and_urgency() {
+        let (query, _a) = numbered(0, 0, &[10]);
+        let (mut same_urgency, _b) = numbered(1, 0, &[2, 12]);
+        same_urgency.queued = query.queued + Duration::from_millis(1);
+        let (bulk, _c) = numbered(2, 3, &[12]);
+        let mut pending = vec![bulk, same_urgency, query];
+        // The query leads (bucket 16); the bucket-16 input of the other
+        // urgency-0 request joins, the bucket-4 input and the bulk job
+        // do not.
+        let run = assemble_run(&mut pending, &BUCKETS).expect("work");
+        let mut parts = run.parts.clone();
+        parts.sort_unstable();
+        assert_eq!(parts, [(0, 0), (1, 1)]);
+        assert_eq!(run.batch.len(), 2);
+    }
+
+    #[test]
+    fn a_failed_run_fails_every_job_it_carried() {
+        let (a, mut rx_a) = numbered(0, 3, &[2]);
+        let (b, mut rx_b) = numbered(1, 3, &[2]);
+        let (c, mut rx_c) = numbered(2, 3, &[2, 12]);
+        let mut pending = vec![a, b, c];
+        let run = assemble_run(&mut pending, &BUCKETS).expect("work");
+        let (fatal, mut fatal_rx) = mpsc::channel(1);
+        let keep_going = absorb(
+            Msg::Done {
+                worker: 0,
+                parts: run.parts,
+                result: Err("boom".to_owned()),
+            },
+            &mut pending,
+            &mut 3,
+            &mut Vec::new(),
+            &fatal,
+        );
+        assert!(!keep_going);
+        for rx in [&mut rx_a, &mut rx_b, &mut rx_c] {
+            assert_eq!(
+                rx.try_recv().expect("replied").err(),
+                Some("boom".to_owned())
+            );
+        }
+        assert_eq!(fatal_rx.try_recv().expect("fatal"), "boom");
+    }
+
+    #[test]
+    fn a_finished_run_completes_the_jobs_it_carried() {
+        let (a, mut rx_a) = numbered(0, 3, &[2]);
+        let (b, mut rx_b) = numbered(1, 3, &[2, 12]);
+        let mut pending = vec![a, b];
+        let run = assemble_run(&mut pending, &BUCKETS).expect("work");
+        assert_eq!(run.parts, [(0, 0), (1, 0)]);
+        let (fatal, _fatal_rx) = mpsc::channel(1);
+        let mut idle = Vec::new();
+        assert!(absorb(
+            Msg::Done {
+                worker: 1,
+                parts: run.parts,
+                result: Ok(vec![vector(1.0), vector(2.0)]),
+            },
+            &mut pending,
+            &mut 2,
+            &mut idle,
+            &fatal,
+        ));
+        assert_eq!(idle, [1]);
+        // `a` is whole; `b` still has its bucket-16 input.
+        let (vectors, _) = rx_a.try_recv().expect("replied").expect("ok");
+        assert_eq!(vectors, [vector(1.0)]);
+        assert!(rx_b.try_recv().is_err());
+        assert_eq!(pending.len(), 1);
+    }
+
+    #[test]
     fn pick_prefers_urgency_then_age_and_skips_dispatched_jobs() {
         let (mut spent, _a) = job(0, &[2]);
-        spent.take_run(&BUCKETS);
+        spent.take_matching(&BUCKETS, 4, RUN_INPUTS);
         let (older, _b) = job(2, &[2]);
         let (mut newer, _c) = job(2, &[2]);
         newer.queued = older.queued + Duration::from_millis(1);
