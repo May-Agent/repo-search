@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.8](https://github.com/May-Agent/repo-search/compare/core/v0.0.7...core/v0.0.8) - 2026-11-04
+
+### Added
+
+- *(ort)* make fp16 the default ONNX archive
+- *(ort)* serve the fp16 archive whenever an NVIDIA GPU is present
+
 ## [0.0.7](https://github.com/May-Agent/repo-search/compare/core/v0.0.6...core/v0.0.7) - 2026-11-01
 
 ### Added
