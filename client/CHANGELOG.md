@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.7](https://github.com/May-Agent/repo-search/compare/client/v0.0.6...client/v0.0.7) - 2026-11-04
+
+### Fixed
+
+- do not install production launchd labels under a relocated HOME
+
 ## [0.0.6](https://github.com/May-Agent/repo-search/compare/client/v0.0.5...client/v0.0.6) - 2026-11-02
 
 ### Fixed

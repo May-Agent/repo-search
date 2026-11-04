@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.7](https://github.com/May-Agent/repo-search/compare/repo-search-ort-v0.0.6...repo-search-ort-v0.0.7) - 2026-11-04
+
+### Fixed
+
+- *(ort)* share one tokenizer across requests ([#194](https://github.com/May-Agent/repo-search/pull/194))
+- *(ort)* batch same-bucket inputs across requests ([#194](https://github.com/May-Agent/repo-search/pull/194))
+- *(ort)* fail loudly when an execution provider cannot register and serve every device
+
 ## [0.0.6](https://github.com/May-Agent/repo-search/compare/repo-search-ort-v0.0.5...repo-search-ort-v0.0.6) - 2026-11-01
 
 ### Other

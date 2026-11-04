@@ -24,25 +24,26 @@ pub const ARCHIVE: Pin = Pin {
 };
 
 /// The published EmbeddingGemma 2 ONNX archive served off macOS:
-/// `manifest.json`, `tokenizer.json`, the quantized graph and its
-/// weights, packed as `tar.zst` like the Core ML build.
+/// `manifest.json`, `tokenizer.json`, the fp16 graph and its weights,
+/// packed as `tar.zst` like the Core ML build. fp16 is the default on every
+/// execution provider: CUDA's tensor cores run it about three times faster
+/// than the int8 graph, and on a CPU it is no slower.
 #[cfg(not(target_os = "macos"))]
 #[rustfmt::skip]
 pub const ONNX_ARCHIVE: Pin = Pin {
-    url: "https://huggingface.co/lexoliu/repo-search-embeddinggemma2-onnx/resolve/090c8ce7415de7af5bcb3f8ba106ee6a1cfc2563/eg2-onnx-914f7f89-a4acdbe8.tar.zst",
-    sha256:
-        "a4acdbe8cbcdc2d2a8e95b81317a694c966f2de64a534dda5189b34faad14acf",
-};
-
-/// The fp16 variant of the ONNX archive, served on NVIDIA GPUs: CUDA's
-/// tensor cores run fp16 natively, where the int8 quantization gains
-/// nothing.
-#[cfg(not(target_os = "macos"))]
-#[rustfmt::skip]
-pub const ONNX_FP16_ARCHIVE: Pin = Pin {
     url: "https://huggingface.co/lexoliu/repo-search-embeddinggemma2-onnx/resolve/d4e1b374f97451cf89262d03f4f8e387822511d4/eg2-onnx-fp16-914f7f89-ac32bf70.tar.zst",
     sha256:
         "ac32bf7023a81cf0d58e5f487ecb8e46979898d966f606bc564c5dba8585b414",
+};
+
+/// The int8 (weight-quantized) variant of the ONNX archive, opted into with
+/// `REPO_SEARCH_ORT_ARCHIVE=int8`.
+#[cfg(not(target_os = "macos"))]
+#[rustfmt::skip]
+pub const ONNX_INT8_ARCHIVE: Pin = Pin {
+    url: "https://huggingface.co/lexoliu/repo-search-embeddinggemma2-onnx/resolve/090c8ce7415de7af5bcb3f8ba106ee6a1cfc2563/eg2-onnx-914f7f89-a4acdbe8.tar.zst",
+    sha256:
+        "a4acdbe8cbcdc2d2a8e95b81317a694c966f2de64a534dda5189b34faad14acf",
 };
 
 /// The tokenizer the daemon counts and prefixes chunks with, pinned at the
@@ -62,7 +63,14 @@ pub const MODEL_ID: &str = ARCHIVE.sha256;
 /// ML vectors never mix. The manifest a model directory ships declares
 /// this same id.
 #[cfg(not(target_os = "macos"))]
-pub const MODEL_ID: &str = "onnx-d06edd601f851c633a2519304cbeb8dc6170d7ceb61b436625c17fb9b6e74953";
+pub const MODEL_ID: &str = "onnx-a49e227d7e0e5f4ee606d79879d084264366367bc6318f344ab179e35d4fd6a4";
+
+/// The model build's identity of [`ONNX_INT8_ARCHIVE`], which its manifest
+/// declares: the int8 graph is a different build from [`MODEL_ID`]'s, so
+/// their vectors never mix.
+#[cfg(not(target_os = "macos"))]
+pub const ONNX_INT8_MODEL_ID: &str =
+    "onnx-d06edd601f851c633a2519304cbeb8dc6170d7ceb61b436625c17fb9b6e74953";
 
 /// Human-readable name of the embedded model, shown by `search --version`.
 #[cfg(target_os = "macos")]
