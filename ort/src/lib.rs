@@ -178,6 +178,30 @@ fn takes_device_id(name: &str) -> bool {
     matches!(name, "cuda" | "tensorrt" | "nvrtx")
 }
 
+/// Whether every provider of `chain` runs a graph at any sequence length
+/// without a per-shape cost. The NPU providers compile for fixed shapes and
+/// TensorRT builds an engine per shape, so their batches keep the bucket
+/// length.
+fn takes_any_width(chain: &[String]) -> bool {
+    chain
+        .iter()
+        .all(|name| matches!(name.as_str(), "cuda" | "cpu"))
+}
+
+/// Tensor Cores take fp16 operands in multiples of this many elements, so a
+/// batch narrowed below its bucket rounds its width up to it.
+const WIDTH_ALIGN: usize = 8;
+
+/// The padded sequence length of a batch whose longest input has `longest`
+/// tokens and whose bucket is `bucket`.
+fn batch_width(narrow: bool, longest: usize, bucket: usize) -> usize {
+    if narrow {
+        longest.next_multiple_of(WIDTH_ALIGN).min(bucket)
+    } else {
+        bucket
+    }
+}
+
 /// The `REPO_SEARCH_ORT_DEVICES` cap on how many devices to serve from;
 /// `None` when unset.
 fn device_cap() -> Result<Option<usize>, Error> {
@@ -239,6 +263,10 @@ pub struct OrtEmbedder {
     encoder: Encoder,
     pad: i64,
     buckets: Box<[usize]>,
+    /// Whether a batch is padded to its longest input rather than to its
+    /// bucket: the chain's providers run any sequence length at no
+    /// per-shape cost.
+    narrow: bool,
     dim: usize,
     /// The manifest's declared model id, what `/v1/models` lists.
     model_id: String,
@@ -391,6 +419,7 @@ impl OrtEmbedder {
             encoder,
             pad,
             buckets: manifest.buckets.clone().into_boxed_slice(),
+            narrow: takes_any_width(chain),
             dim: manifest.embedding_dim,
             model_id: manifest.model_id.clone(),
         };
@@ -460,18 +489,22 @@ impl OrtEmbedder {
             return Ok(Vec::new());
         };
         let bucket = self.bucket_of(first.len())?;
-        let mut input_ids = Vec::with_capacity(ids.len() * bucket);
-        let mut mask = Vec::with_capacity(ids.len() * bucket);
         for ids in ids {
             if self.bucket_of(ids.len())? != bucket {
                 return Err(Error::MixedBucket);
             }
-            input_ids.extend(ids.iter().map(|&id| id as i64));
-            input_ids.extend(std::iter::repeat_n(self.pad, bucket - ids.len()));
-            mask.extend(std::iter::repeat_n(1i64, ids.len()));
-            mask.extend(std::iter::repeat_n(0i64, bucket - ids.len()));
         }
-        let shape = vec![ids.len() as i64, bucket as i64];
+        let longest = ids.iter().map(Vec::len).max().expect("ids is nonempty");
+        let width = batch_width(self.narrow, longest, bucket);
+        let mut input_ids = Vec::with_capacity(ids.len() * width);
+        let mut mask = Vec::with_capacity(ids.len() * width);
+        for ids in ids {
+            input_ids.extend(ids.iter().map(|&id| id as i64));
+            input_ids.extend(std::iter::repeat_n(self.pad, width - ids.len()));
+            mask.extend(std::iter::repeat_n(1i64, ids.len()));
+            mask.extend(std::iter::repeat_n(0i64, width - ids.len()));
+        }
+        let shape = vec![ids.len() as i64, width as i64];
         let mut inputs: Vec<(String, ort::session::SessionInputValue)> = vec![
             (
                 "input_ids".to_owned(),
@@ -507,5 +540,35 @@ impl OrtEmbedder {
             vectors.push(UnitVector::normalize(row.to_vec()));
         }
         Ok(vectors)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn chain(names: &[&str]) -> Vec<String> {
+        names.iter().map(|name| (*name).to_owned()).collect()
+    }
+
+    #[test]
+    fn only_shape_free_providers_narrow_a_batch() {
+        assert!(takes_any_width(&chain(&["cuda"])));
+        assert!(takes_any_width(&chain(&["cpu"])));
+        assert!(!takes_any_width(&chain(&["tensorrt"])));
+        assert!(!takes_any_width(&chain(&["qnn"])));
+        assert!(!takes_any_width(&chain(&["openvino-npu"])));
+        assert!(!takes_any_width(&chain(&["cuda", "tensorrt"])));
+    }
+
+    #[test]
+    fn a_narrow_batch_pads_to_its_longest_input_in_tensor_core_steps() {
+        assert_eq!(batch_width(true, 129, 256), 136);
+        assert_eq!(batch_width(true, 136, 256), 136);
+        assert_eq!(batch_width(true, 1, 128), 8);
+        // Never past the bucket.
+        assert_eq!(batch_width(true, 256, 256), 256);
+        // A fixed-shape provider keeps the bucket.
+        assert_eq!(batch_width(false, 129, 256), 256);
     }
 }
