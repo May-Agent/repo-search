@@ -7,7 +7,8 @@ use rusqlite::{Connection, named_params};
 
 use crate::chunk::ChunkKind;
 
-use super::{ContentHash, Error, StoredMemberKind};
+use super::index::file_state;
+use super::{ContentHash, Error, FileState, StoredMemberKind};
 
 /// The kind string of a documentation chunk: the one chunker kind the store
 /// itself gives meaning to. It is the one source of the `doc` string; SQL
@@ -135,6 +136,10 @@ pub struct ChunkRow {
     pub content_hash: ContentHash,
     /// The members, in order.
     pub members: Vec<MemberRow>,
+    /// The file as it was when this row was cut from it: the row describes
+    /// the file's current content only while the file still has these
+    /// bytes.
+    pub file: FileState,
 }
 
 /// BM25 order, best first, of the chunks matching the FTS5 `query`.
@@ -211,24 +216,31 @@ pub(super) fn by_hashes(
 /// The rows of `ids`, in the order given; an id the index does not hold is
 /// absent.
 pub(super) fn chunks(conn: &Connection, ids: &[ChunkId]) -> Result<Vec<ChunkRow>, Error> {
-    let mut chunk_stmt = conn.prepare(
-        "SELECT path, title, kind, start_line, end_line, content_hash FROM chunks WHERE id = ?1",
+    // One read transaction: each row, its members and its file's state are
+    // read from the same commit.
+    let read = conn.unchecked_transaction()?;
+    let mut chunk_stmt = read.prepare(
+        "SELECT f.path, f.size, f.mtime_ns, f.inode, f.content_hash, \
+                c.title, c.kind, c.start_line, c.end_line, c.content_hash \
+         FROM chunks c JOIN files f ON f.path = c.path WHERE c.id = ?1",
     )?;
-    let mut member_stmt = conn.prepare(
+    let mut member_stmt = read.prepare(
         "SELECT start_byte, end_byte, kind, cut, symbol FROM chunk_members \
          WHERE chunk_id = ?1 ORDER BY ord",
     )?;
     let mut out = Vec::with_capacity(ids.len());
     for &id in ids {
         let row = chunk_stmt.query_row([id.0], |row| {
+            let file = file_state(row)?;
             Ok(ChunkRow {
                 id,
-                path: row.get(0)?,
-                title: row.get(1)?,
-                kind: row.get(2)?,
-                lines: row.get(3)?..=row.get(4)?,
-                content_hash: row.get(5)?,
+                path: file.path.clone(),
+                title: row.get(5)?,
+                kind: row.get(6)?,
+                lines: row.get(7)?..=row.get(8)?,
+                content_hash: row.get(9)?,
                 members: Vec::new(),
+                file,
             })
         });
         let mut row = match row {

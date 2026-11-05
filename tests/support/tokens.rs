@@ -162,6 +162,15 @@ impl StubTokens {
         handle
     }
 
+    /// Installs a disarmed hold on every token count: once the handle is
+    /// armed, the next `count`, `fits`, `fit_end` or `document_tokens`
+    /// call signals `entered` and blocks until [`HoldHandle::open`].
+    pub fn hold_next_count(&mut self) -> HoldHandle {
+        let (hold, handle) = Hold::install(false);
+        self.counter_hold = Some(hold);
+        handle
+    }
+
     /// Installs a disarmed hold on the counter's `document_tokens`: once
     /// the handle is armed, the next call (the feeder counting a
     /// non-empty feed, after its cache read) signals `entered` and blocks

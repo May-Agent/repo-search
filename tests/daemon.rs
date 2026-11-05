@@ -2042,9 +2042,9 @@ async fn case_spellings_of_one_worktree_share_an_owner_and_index() {
 }
 
 /// A worktree added next to an indexed sibling copies the sibling's index
-/// instead of rebuilding: its first barrier re-chunks only the edited
-/// files and restamps the rest, and the seeded index searches as a freshly
-/// built one does.
+/// instead of rebuilding: its first search answers from the copy while its
+/// first pass runs, the pass re-chunks only the edited files and restamps
+/// the rest, and the seeded index searches as a freshly built one does.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_new_worktree_seeds_its_index_from_a_sibling() {
     let repo = fn_repo(20, SMALL_BYTES, 5);
@@ -2066,29 +2066,33 @@ async fn a_new_worktree_seeds_its_index_from_a_sibling() {
     }
     index_request(&d, &scratch, true).await;
 
-    // `linked`'s first request seeds, then its barrier restamps the fresh
-    // checkout — a new file can never carry the stored inode — and
-    // re-chunks only the two edited files: the report's `changed_files`,
-    // which the answer's freshness carries, counts exactly them.
+    // `linked`'s first request seeds from `repo.root` and answers without
+    // waiting for its first pass, reporting indexing in progress; whether
+    // or not the pass has re-chunked the two edited files by the time the
+    // answer reads them, no chunk it returns is stale.
     gate.arm();
     let events = answer_search(&d, &linked, MARKER).await;
     let answer = match final_of(&events) {
         Final::Answer(answer) => answer,
         other => panic!("expected an Answer, got {other:?}"),
     };
-    assert!(answer.has_results, "{events:?}");
-    let output: serde_json::Value =
+    let early: serde_json::Value =
         serde_json::from_str(&answer.output).expect("the answer is JSON");
-    assert_eq!(
-        output["freshness"]["changed_files"], 2,
-        "the seeded barrier re-chunks only the two edited files: {output}"
-    );
+    assert_eq!(early["freshness"]["reconciling"], true, "{early}");
+    assert_current(&linked, &early);
+
+    // The first pass restamped the fresh checkout — a new file can never
+    // carry the stored inode — keeping the copy's rows of every unchanged
+    // file, and re-chunked only the two edited files.
+    index_request(&d, &linked, true).await;
+    assert_rechunked(&d.state, &repo.root, &linked, &["src/f0.rs", "src/f1.rs"]);
 
     // The seeded index starts first-index, but its chunks are all in the
-    // shared vector cache: the seeded barrier's stage-1 interest is
-    // empty, nothing embeds, and the phase flips to `Maintained` at once.
-    // The armed gate keeps a from-scratch index first-index, so
-    // `Maintained` here can only come from the seed.
+    // shared vector cache: the seeded pass's stage-1 interest is empty,
+    // nothing embeds, and the phase flips to `Maintained` at once — the
+    // wait above ended although the gate is armed. The armed gate keeps a
+    // from-scratch index first-index, so `Maintained` here can only come
+    // from the seed.
     let events = request(
         &d.socket,
         &hello(),
@@ -2115,6 +2119,15 @@ async fn a_new_worktree_seeds_its_index_from_a_sibling() {
     gate.open();
 
     // The seeded index searches as `scratch`'s freshly built one does.
+    let events = answer_search(&d, &linked, MARKER).await;
+    let answer = match final_of(&events) {
+        Final::Answer(answer) => answer,
+        other => panic!("expected an Answer, got {other:?}"),
+    };
+    assert!(answer.has_results, "{events:?}");
+    let output: serde_json::Value =
+        serde_json::from_str(&answer.output).expect("the answer is JSON");
+    assert_eq!(output["freshness"]["reconciling"], false, "{output}");
     let events = answer_search(&d, &scratch, MARKER).await;
     let fresh = match final_of(&events) {
         Final::Answer(answer) => answer,
@@ -2200,6 +2213,137 @@ async fn two_daemons_over_one_index_agree_on_tied_results() {
     }
     assert_eq!(outputs[0], outputs[1]);
     join.abort();
+}
+
+/// A full clone of an indexed checkout — `git clone --local`, a repository
+/// of its own that `git worktree list` does not name — starts from a copy
+/// of its origin's index and vector cache. Its first search answers from
+/// the copy while its first pass is still running: the edited files'
+/// indexed chunks are left out and the answer reports indexing in
+/// progress. The pass re-chunks only the edited files, and only their new
+/// chunk embeds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_clone_starts_from_its_origins_index_and_answers_while_reconciling() {
+    let repo = fn_repo(20, SMALL_BYTES, 5);
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let mut tokens = StubTokens::default();
+    let hold = tokens.hold_next_count();
+    let d = daemon(
+        tmp,
+        StubBackend::new(mpsc::channel().0),
+        Model::Cached,
+        tokens,
+        Duration::from_secs(600),
+        daemon::LOAD_BOUND,
+    )
+    .await;
+    index_request(&d, &repo.root, true).await;
+    let origin: Vec<Record> = d.records.try_iter().collect();
+    assert!(
+        origin.iter().any(|r| r.kind == Kind::Index),
+        "the origin embedded its chunks"
+    );
+
+    // The clone drops the marker's function from `f0` and adds one to `f1`.
+    let clone = repo::clone_local(&repo, "clone");
+    let f0 = clone.join("src/f0.rs");
+    let text = std::fs::read_to_string(&f0).expect("f0 reads");
+    let marker = text
+        .find(&format!("pub fn {MARKER}_fn"))
+        .expect("f0 holds the marker");
+    std::fs::write(&f0, text.split_at(marker).0).expect("f0 rewrites");
+    repo::append(
+        &clone,
+        "src/f1.rs",
+        &repo::rust_fn("clone_edit", SMALL_BYTES),
+    );
+
+    // The next token count is the clone's first pass chunking an edited
+    // file: the pass stays there until the hold opens. A lexical search
+    // whose only hit is left out counts no tokens, so the answer can only
+    // come while the pass is held.
+    hold.arm();
+    let events = request(&d.socket, &hello(), lexical(&clone, MARKER)).await;
+    let answer = match final_of(&events) {
+        Final::Answer(answer) => answer,
+        other => panic!("expected an Answer, got {other:?}"),
+    };
+    let output: serde_json::Value =
+        serde_json::from_str(&answer.output).expect("the answer is JSON");
+    assert!(
+        !answer.has_results,
+        "the marker's indexed chunk, whose file changed, answered: {output}"
+    );
+    assert_eq!(output["freshness"]["reconciling"], true, "{output}");
+    tokio::task::block_in_place(|| {
+        hold.entered
+            .recv_timeout(TIMEOUT)
+            .expect("the clone's first pass is chunking an edited file")
+    });
+
+    // While the pass is held, the unchanged files answer from the copy and
+    // the two edited ones, whose indexed chunks every function matches,
+    // are left out.
+    let events = request(&d.socket, &hello(), lexical(&clone, "fn_0012")).await;
+    let answer = match final_of(&events) {
+        Final::Answer(answer) => answer,
+        other => panic!("expected an Answer, got {other:?}"),
+    };
+    let output: serde_json::Value =
+        serde_json::from_str(&answer.output).expect("the answer is JSON");
+    let paths = answer_paths(&output);
+    assert!(paths.contains(&"src/f2.rs".to_owned()), "{output}");
+    assert!(
+        !paths
+            .iter()
+            .any(|path| path == "src/f0.rs" || path == "src/f1.rs"),
+        "an edited file's indexed chunk answered: {output}"
+    );
+    assert_current(&clone, &output);
+    assert_eq!(output["freshness"]["reconciling"], true, "{output}");
+
+    // The pass restamps every unchanged file and re-chunks the two edited
+    // ones; only the one new chunk embeds, the rest came with the copied
+    // vector cache.
+    tokio::task::block_in_place(|| hold.open());
+    index_request(&d, &clone, true).await;
+    assert_rechunked(&d.state, &repo.root, &clone, &["src/f0.rs", "src/f1.rs"]);
+    let added: HashSet<ContentHash> = visible_hashes(&d.state, &clone)
+        .await
+        .difference(&visible_hashes(&d.state, &repo.root).await)
+        .copied()
+        .collect();
+    assert_eq!(added.len(), 1, "only `clone_edit` is new: {added:?}");
+    let embedded: HashSet<ContentHash> = d
+        .records
+        .try_iter()
+        .filter(|r| r.kind == Kind::Index)
+        .filter_map(|r| r.hash)
+        .collect();
+    assert_eq!(embedded, added, "only the new chunk embedded");
+
+    // Reconciled: the marker is gone from the clone, its edit answers, and
+    // nothing is in progress; the origin still holds the marker.
+    for (worktree, query, expect) in [
+        (&clone, MARKER, None),
+        (&clone, "clone_edit", Some("src/f1.rs")),
+        (&repo.root, MARKER, Some("src/f0.rs")),
+    ] {
+        let events = request(&d.socket, &hello(), lexical(worktree, query)).await;
+        let answer = match final_of(&events) {
+            Final::Answer(answer) => answer,
+            other => panic!("expected an Answer, got {other:?}"),
+        };
+        let output: serde_json::Value =
+            serde_json::from_str(&answer.output).expect("the answer is JSON");
+        assert_eq!(
+            answer_paths(&output),
+            expect.into_iter().collect::<Vec<_>>(),
+            "{query:?} in {}: {output}",
+            worktree.display()
+        );
+        assert_eq!(output["freshness"]["reconciling"], false, "{output}");
+    }
 }
 
 /// A seeded index starts first-index: the files a seeded worktree
@@ -2361,8 +2505,8 @@ async fn a_worktree_without_an_indexed_sibling_builds_from_scratch() {
 }
 
 /// A sibling holding a write transaction seeds a consistent copy: the
-/// `VACUUM INTO` read serializes behind the commit under `busy_timeout`,
-/// and the marker the transaction commits is in the copy.
+/// copy's read transaction serializes behind the commit under
+/// `busy_timeout`, and the marker the transaction commits is in the copy.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_sibling_holding_a_write_transaction_seeds_a_committed_copy() {
     let repo = fn_repo(10, SMALL_BYTES, 5);
@@ -3247,6 +3391,79 @@ async fn visible_hashes(state: &StateDir, worktree: &Path) -> HashSet<ContentHas
         .expect("chunk hashes")
         .into_iter()
         .collect()
+}
+
+/// The paths a JSON answer lists, code and docs.
+fn answer_paths(output: &serde_json::Value) -> Vec<String> {
+    ["code", "docs"]
+        .iter()
+        .filter_map(|list| output[list].as_array())
+        .flatten()
+        .map(|hit| hit["path"].as_str().expect("a hit has a path").to_owned())
+        .collect()
+}
+
+/// Every chunk a JSON answer for `worktree` returns is text its file holds
+/// now: an answer may miss results, never return stale ones.
+fn assert_current(worktree: &Path, output: &serde_json::Value) {
+    for list in ["code", "docs"] {
+        for hit in output[list].as_array().into_iter().flatten() {
+            let path = hit["path"].as_str().expect("a hit has a path");
+            let file = std::fs::read_to_string(worktree.join(path)).expect("the hit's file reads");
+            for chunk in hit["chunks"].as_array().into_iter().flatten() {
+                let text = chunk["text"].as_str().expect("a chunk has text");
+                assert!(file.contains(text), "{path} no longer holds {text:?}");
+            }
+        }
+    }
+}
+
+/// Every chunk row of `worktree`'s index as its id and path, by id.
+fn chunk_ids(state: &StateDir, worktree: &Path) -> Vec<(i64, String)> {
+    let conn = rusqlite::Connection::open_with_flags(
+        state.worktree_index(worktree),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .expect("the index opens");
+    let mut rows = conn
+        .prepare("SELECT id, path FROM chunks ORDER BY id")
+        .expect("the read prepares");
+    rows.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .expect("the rows read")
+        .collect::<Result<_, _>>()
+        .expect("the rows decode")
+}
+
+/// `copy`, seeded from `source`'s index, kept `source`'s rows of every
+/// file but `edited` — restamped, never re-chunked — and replaced every
+/// row of each `edited` file. A re-chunked row takes an id past the
+/// highest one, so it never reuses an id it replaced.
+fn assert_rechunked(state: &StateDir, source: &Path, copy: &Path, edited: &[&str]) {
+    let (source, copy) = (chunk_ids(state, source), chunk_ids(state, copy));
+    let kept = |rows: &[(i64, String)]| -> Vec<(i64, String)> {
+        rows.iter()
+            .filter(|(_, path)| !edited.contains(&path.as_str()))
+            .cloned()
+            .collect()
+    };
+    assert_eq!(
+        kept(&source),
+        kept(&copy),
+        "the unchanged files keep their rows"
+    );
+    for path in edited {
+        let ids = |rows: &[(i64, String)]| -> HashSet<i64> {
+            rows.iter()
+                .filter(|(_, p)| p == path)
+                .map(|(id, _)| *id)
+                .collect()
+        };
+        let (before, after) = (ids(&source), ids(&copy));
+        assert!(
+            !after.is_empty() && before.is_disjoint(&after),
+            "{path} was re-chunked: {before:?} -> {after:?}"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

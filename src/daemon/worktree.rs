@@ -16,9 +16,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::wire::{ToCore, ToWire};
-use repo_search_core::reconcile::{Counts, PendingChunk, Reconciler, Report};
+use repo_search_core::reconcile::{Counts, PendingChunk, Reconciled, Reconciler, Report, Skipped};
 use repo_search_core::search::{self, EmbedService, Reconciliation, Retriever};
-use repo_search_core::store::{self, Index, Phase, VectorCache};
+use repo_search_core::store::{self, ContentHash, Index, Phase, Side, VectorCache};
 use repo_search_core::{CHUNKER_FINGERPRINT, QueryTask, StateDir, TokenCounter, UnitVector};
 use tokio::sync::{mpsc, oneshot, watch};
 
@@ -138,6 +138,16 @@ struct Owner<T: Tokens> {
     /// index once, so a failed copy fails one request and the next builds
     /// from scratch.
     seed_tried: bool,
+    /// The open index was copied from another checkout and no pass has
+    /// begun on it: the next search primes from the copy and runs the first
+    /// pass off the owner (see [`Owner::prime`]).
+    seeded: bool,
+    /// The pass running off the owner, holding the reconciler; one pass
+    /// runs at a time.
+    pass: Option<InFlight<T>>,
+    /// A watcher burst arrived while a pass ran off the owner: a barrier
+    /// follows once it lands.
+    pending_change: bool,
     phase: Phase,
     retriever: Option<Retriever<AneHandle>>,
     report: Option<Report>,
@@ -150,7 +160,8 @@ struct Owner<T: Tokens> {
     sync: bool,
     /// Reconciles `index`, keeping its books between barriers; built at
     /// the first barrier or `Status` and dropped with the index handle it
-    /// holds. Its books answer the coverage of `Status` and of
+    /// holds; away with the pass while one runs off the owner. Its books
+    /// answer the coverage of `Status` and of
     /// `index --wait`'s frames and every resync's set, and every barrier's
     /// presence is passed on to the retriever, which never reads the
     /// index's hashes itself.
@@ -197,6 +208,9 @@ impl<T: Tokens> Owner<T> {
             index: None,
             index_id: None,
             seed_tried: false,
+            seeded: false,
+            pass: None,
+            pending_change: false,
             phase: Phase::FirstIndex,
             retriever: None,
             report: None,
@@ -216,6 +230,10 @@ impl<T: Tokens> Owner<T> {
 
     async fn run(mut self) {
         'run: loop {
+            if self.pending_change && self.pass.is_none() {
+                self.pending_change = false;
+                self.changed().await;
+            }
             let mut stopping = self.stopping.clone();
             tokio::select! {
                 biased;
@@ -226,8 +244,21 @@ impl<T: Tokens> Owner<T> {
                     self.apply_stage1_done().await;
                 }
                 // Before the inbox: a frame's ask is cheap, and a stream of
-                // requests must not hold a wait's frames back.
-                Some(ask) = self.asks.recv() => self.answer(ask).await,
+                // requests must not hold a wait's frames back. The books
+                // answer only while the reconciler is home; asks made while
+                // a pass runs off the owner wait for it to land.
+                Some(ask) = self.asks.recv(), if self.pass.is_none() => self.answer(ask).await,
+                done = async {
+                    match &mut self.pass {
+                        Some(pass) => (&mut pass.done).await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    let pass = self.pass.take().expect("the pass just finished");
+                    if let Err(error) = self.finish(&pass.model, joined(done), None).await {
+                        tracing::error!(%error, root = %self.root.display(), "reconcile pass failed");
+                    }
+                }
                 msg = self.rx.recv() => {
                     let Some(msg) = msg else { break 'run };
                     let events = msg.events();
@@ -278,6 +309,15 @@ impl<T: Tokens> Owner<T> {
                 }
                 _ = self.stopping.changed() => break 'run,
             }
+        }
+        // A pass still running off the owner is waited for and left unfed:
+        // its index changes are committed, its barrier closes, and the
+        // next owner of the worktree resyncs. The reconciler comes home
+        // for the waits' asks below.
+        if let Some(pass) = self.pass.take() {
+            let done = joined(pass.done.await);
+            self.reconciler = Some(done.reconciler);
+            pass.model.scheduler.barrier(self.repo, false).await;
         }
         // The owner does not leave while a spawned `index --wait` is still
         // answering. A wait parked on the phase watch completes only once
@@ -338,14 +378,14 @@ impl<T: Tokens> Owner<T> {
     /// Opens the index on first use, reading the stored phase and the file's
     /// identity; a `Status` on a worktree with no index file never reaches
     /// here. When the worktree has no index file, [`Owner::seed_index`] first
-    /// tries a sibling's index.
+    /// tries another checkout's index.
     async fn ensure_index(&mut self) -> Result<(), String> {
         if self.index.is_none() {
             if !tokio::fs::try_exists(self.index_path())
                 .await
                 .map_err(|e| e.to_string())?
             {
-                self.seed_index().await?;
+                self.seeded = self.seed_index().await?;
             }
             let index = Index::open(&self.state, &self.root)
                 .await
@@ -361,52 +401,45 @@ impl<T: Tokens> Owner<T> {
         Ok(())
     }
 
-    /// When `index.db` does not exist, copies a sibling worktree's index
+    /// When `index.db` does not exist, copies another checkout's index
     /// that this build's schema, chunker and model recorded — `Maintained`
-    /// preferred — into the worktree's state dir, the copy stamped
-    /// `FirstIndex` whatever the sibling's phase was: the files the
+    /// preferred — into the worktree's state dir, copy-on-write, the copy
+    /// stamped `FirstIndex` whatever the source's phase was: the files the
     /// worktree differs in embed as stage-1 work and the phase flips to
-    /// `Maintained` once they are done. Index rows are worktree-relative
-    /// and `meta` holds no path, so a sibling's index is valid as it is:
-    /// the first barrier restamps every file whose bytes are unchanged
-    /// and re-chunks the rest. No matching sibling means a fresh index,
-    /// as before. Runs once per owner: a failed copy fails this request,
-    /// leaves no `index.db`, and the next request builds from scratch.
-    async fn seed_index(&mut self) -> Result<(), String> {
+    /// `Maintained` once they are done. The sources are the sibling
+    /// worktrees `git worktree list` names, then the checkouts the
+    /// worktree's remotes name by local path — what a `git clone` of a
+    /// local checkout records as its origin. A source in another
+    /// repository also gives this repository its vector cache, when it has
+    /// none yet. Index rows are worktree-relative and `meta` holds no path,
+    /// so a source's index is valid as it is: the first pass restamps
+    /// every file whose bytes are unchanged and re-chunks the rest. No
+    /// matching source means a fresh index, as before. Runs once per
+    /// owner: a failed copy fails this request, leaves no `index.db`, and
+    /// the next request builds from scratch. Returns whether it copied.
+    async fn seed_index(&mut self) -> Result<bool, String> {
         if self.seed_tried {
-            return Ok(());
+            return Ok(false);
         }
         self.seed_tried = true;
-        let output = tokio::process::Command::new("git")
-            .arg("-C")
-            .arg(&self.root)
-            .args(["worktree", "list", "--porcelain", "-z"])
-            .output()
-            .await
-            .map_err(|e| format!("git worktree list: {e}"))?;
-        if !output.status.success() {
-            return Err(format!(
-                "git worktree list failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            ));
-        }
-        let listed: Vec<PathBuf> = output
-            .stdout
-            .split(|&byte| byte == 0)
-            .filter_map(|field| field.strip_prefix(b"worktree "))
-            .map(|path| PathBuf::from(OsStr::from_bytes(path)))
-            .collect();
+        let (listed, remotes) =
+            tokio::join!(sibling_worktrees(&self.root), local_remotes(&self.root));
         let seed = Seed {
             state: self.state.clone(),
             root: self.root.clone(),
             dest: self.index_path(),
+            cache: self.state.repo_cache(&self.common_dir),
             model_id: self.model_id.clone(),
         };
-        let seeded = tokio::task::spawn_blocking(move || seed.copy(&listed))
-            .await
-            .map_err(|e| e.to_string())?;
+        let seeded = async {
+            let (listed, remotes) = (listed?, remotes?);
+            tokio::task::spawn_blocking(move || seed.copy(&listed, &remotes))
+                .await
+                .map_err(|e| e.to_string())?
+        }
+        .await;
         if let Err(error) = &seeded {
-            tracing::error!(%error, root = %self.root.display(), "seeding the index from a sibling failed");
+            tracing::error!(%error, root = %self.root.display(), "seeding the index from another checkout failed");
         }
         seeded
     }
@@ -480,9 +513,6 @@ impl<T: Tokens> Owner<T> {
             .await;
             return;
         }
-        if !send(events, Event::Progress(Progress::Reconciling)).await {
-            return;
-        }
         let core_request = search::Request {
             query: request.query,
             mode: request.mode.to_core(),
@@ -497,9 +527,10 @@ impl<T: Tokens> Owner<T> {
         };
         let sched = model.scheduler.clone();
         // The search's window: it opens before the freshness barrier's
-        // writer flush, so a vector the retrieval's cache reads miss is
-        // remembered until the retrieval's `Documents` job lands, and it
-        // closes after that job is answered (see `DocumentsJob`).
+        // writer flush and a seeded index's priming reads, so a vector the
+        // retrieval's cache reads miss is remembered until the retrieval's
+        // `Documents` job lands, and it closes after that job is answered
+        // (see `DocumentsJob`).
         sched.barrier(self.repo, true).await;
         let retrieved = self
             .barrier_and_retrieve(&model, &core_request, events)
@@ -551,7 +582,11 @@ impl<T: Tokens> Owner<T> {
     }
 
     /// The freshness barrier, then the retrieval, inside the search's
-    /// window the caller holds open. `None` when an error event was
+    /// window the caller holds open. While a pass runs off the owner — a
+    /// seeded index's first, which [`Owner::prime`] starts — the search
+    /// does not wait for it: it answers from the index as it stands and
+    /// reports the pass running, and the retriever leaves out every file
+    /// that changed since it was indexed. `None` when an error event was
     /// already sent.
     async fn barrier_and_retrieve(
         &mut self,
@@ -559,6 +594,26 @@ impl<T: Tokens> Owner<T> {
         request: &search::Request,
         events: &mpsc::Sender<Event>,
     ) -> Option<Retrieved> {
+        if self.seeded
+            && let Err(message) = self.prime(model).await
+        {
+            send(events, error(ErrorKind::Internal, message)).await;
+            return None;
+        }
+        if self.pass.is_some() && self.retriever.is_some() {
+            let report = self
+                .report
+                .as_ref()
+                .expect("a built retriever had a report");
+            let reconciliation =
+                Reconciliation::new(self.commit.clone(), report).while_reconciling();
+            return self
+                .retrieve(model, request, reconciliation, 0, events)
+                .await;
+        }
+        if !send(events, Event::Progress(Progress::Reconciling)).await {
+            return None;
+        }
         let barrier_start = Instant::now();
         let (report, commit) = match self.barrier(model, None).await {
             Ok(done) => done,
@@ -568,45 +623,105 @@ impl<T: Tokens> Owner<T> {
             }
         };
         let barrier_us = barrier_start.elapsed().as_micros() as u64;
-
         if self.retriever.is_none() {
-            let knn_threads = match std::thread::available_parallelism() {
-                Ok(threads) => threads,
-                Err(e) => {
-                    send(events, error(ErrorKind::Internal, e.to_string())).await;
-                    return None;
-                }
-            };
-            let handle = AneHandle {
-                worktree: self.id,
-                repo: self.repo,
-                model_id: model.id.clone(),
-                sched: model.scheduler.tx(),
-                writer: self.writer.clone().expect("opened by shared"),
-            };
             // Seeded from the books the barrier just left; every later
-            // barrier's presence follows (see `barrier_steps`).
+            // pass's presence follows (see `Owner::passed`).
             let pairs = self
                 .reconciler
                 .as_ref()
                 .and_then(Reconciler::books)
                 .expect("a barrier that succeeded leaves books")
                 .pairs();
-            match Retriever::new(
-                self.index.as_ref().expect("opened").clone(),
-                self.cache.clone().expect("opened above"),
-                handle,
-                self.root.clone(),
-                knn_threads,
-                pairs,
-            ) {
-                Ok(retriever) => self.retriever = Some(retriever),
-                Err(e) => {
-                    send(events, error(ErrorKind::Internal, e.to_string())).await;
-                    return None;
-                }
+            if let Err(message) = self.build_retriever(model, pairs) {
+                send(events, error(ErrorKind::Internal, message)).await;
+                return None;
             }
         }
+        self.retrieve(
+            model,
+            request,
+            Reconciliation::new(commit, &report),
+            barrier_us,
+            events,
+        )
+        .await
+    }
+
+    /// Builds the retriever over the open index from `pairs`, the books'
+    /// pairs every later pass's presence follows.
+    fn build_retriever(
+        &mut self,
+        model: &Arc<Embedding<T>>,
+        pairs: Vec<(ContentHash, Side)>,
+    ) -> Result<(), String> {
+        let knn_threads = std::thread::available_parallelism().map_err(|e| e.to_string())?;
+        let handle = AneHandle {
+            worktree: self.id,
+            repo: self.repo,
+            model_id: model.id.clone(),
+            sched: model.scheduler.tx(),
+            writer: self.writer.clone().expect("opened by shared"),
+        };
+        let retriever = Retriever::new(
+            self.index.as_ref().expect("opened").clone(),
+            self.cache.clone().expect("opened by shared"),
+            handle,
+            self.root.clone(),
+            knn_threads,
+            pairs,
+        )
+        .map_err(|e| e.to_string())?;
+        self.retriever = Some(retriever);
+        Ok(())
+    }
+
+    /// Before the first pass over a seeded index: its books are read
+    /// whole, and the retriever and the searches' freshness input are
+    /// taken from them; then the first pass starts off the owner. That
+    /// pass reads every file whose stat moved — every file of a fresh
+    /// checkout — so searches answer from the copy meanwhile; the
+    /// retriever follows the pass's whole presence once it lands. Runs
+    /// inside the search's window, which covers the books' cache reads.
+    async fn prime(&mut self, model: &Arc<Embedding<T>>) -> Result<(), String> {
+        let index = self.index.clone().expect("opened");
+        let root = self.root.clone();
+        let reconciler = self.reconciler();
+        let (counts, head, unchunkables) =
+            tokio::join!(reconciler.counts(), git_head(&root), index.unchunkables());
+        counts.map_err(|e| e.to_string())?;
+        let unchunkables = unchunkables.map_err(|e| e.to_string())?;
+        let books = reconciler.books().expect("counting loaded the books");
+        let report = Report {
+            chunks_total: books.chunks_total(),
+            chunks_with_vector: books.chunks_with_vector(),
+            doc_chunks: books.doc_chunks(),
+            skipped: unchunkables
+                .into_iter()
+                .map(|record| Skipped {
+                    path: record.state.path,
+                    reason: record.reason.into(),
+                })
+                .collect(),
+            ..Report::default()
+        };
+        let pairs = books.pairs();
+        self.build_retriever(model, pairs)?;
+        self.report = Some(report);
+        self.commit = head?;
+        self.begin_pass(model).await
+    }
+
+    /// The retrieval, after the barrier or while a pass runs, inside the
+    /// search's window the caller holds open. `None` when an error event
+    /// was already sent.
+    async fn retrieve(
+        &mut self,
+        model: &Arc<Embedding<T>>,
+        request: &search::Request,
+        reconciliation: Reconciliation,
+        barrier_us: u64,
+        events: &mpsc::Sender<Event>,
+    ) -> Option<Retrieved> {
         // Reset the accumulated query stats so a search reports only its own.
         if let Err(()) = self.reset_stats(model).await {
             send(
@@ -617,18 +732,14 @@ impl<T: Tokens> Owner<T> {
             return None;
         }
         let counter = BudgetCounter::<T>(model.counter.clone());
-        // Only the retrieval cancels on a hang-up: the barrier above always
-        // runs to completion.
+        // Only the retrieval cancels on a hang-up: a barrier always runs to
+        // completion.
         let result = tokio::select! {
             result = self
                 .retriever
                 .as_mut()
-                .expect("built above")
-                .search(
-                    request,
-                    Reconciliation::new(commit, &report),
-                    &counter,
-                ) => Some(result),
+                .expect("built before the retrieval")
+                .search(request, reconciliation, &counter) => Some(result),
             _ = events.closed() => None,
         };
         Some(Retrieved { barrier_us, result })
@@ -720,6 +831,8 @@ impl<T: Tokens> Owner<T> {
     }
 
     async fn status(&mut self, events: &mpsc::Sender<Event>) {
+        // The coverage is counted off the books, which a running pass holds.
+        self.settle().await;
         let db = self.index_path();
         let index_exists = match tokio::fs::try_exists(&db).await {
             Ok(exists) => exists,
@@ -858,23 +971,78 @@ impl<T: Tokens> Owner<T> {
         let _ = send(events, Event::Final(Final::Status(report))).await;
     }
 
-    /// The freshness barrier: flush the writer, then `reconcile` and
-    /// `git rev-parse HEAD` concurrently, then hand the pass's outcome to
-    /// the feeder, which orders it into the scheduler. It never cancels:
-    /// its busy marker is cleared by the feeder, or here on failure.
-    /// `Barrier { running: true }` goes out before the writer flush, so a
-    /// vector the flush leaves uncommitted is reported to the scheduler
-    /// after the barrier began, and the scheduler drops it from this
-    /// barrier's `Enqueue` if the read missed it.
+    /// The freshness barrier: a pass still running off the owner lands
+    /// first, then a pass of its own runs and lands (see
+    /// [`Owner::begin_pass`] and [`Owner::finish`]). It never cancels.
     async fn barrier(
         &mut self,
         model: &Arc<Embedding<T>>,
         ack: Option<oneshot::Sender<Result<(), String>>>,
     ) -> Result<(Report, String), String> {
+        self.settle().await;
+        self.begin_pass(model).await?;
+        self.land(ack).await
+    }
+
+    /// Lands the pass running off the owner, if any; its failure is
+    /// logged, as a watcher barrier's is.
+    async fn settle(&mut self) {
+        if self.pass.is_some()
+            && let Err(error) = self.land(None).await
+        {
+            tracing::error!(%error, root = %self.root.display(), "reconcile pass failed");
+        }
+    }
+
+    /// Starts a pass on a task of its own, which takes the reconciler: the
+    /// writer flush, then `reconcile` and `git rev-parse HEAD`
+    /// concurrently. `Barrier { running: true }` goes out before the
+    /// writer flush, so a vector the flush leaves uncommitted is reported
+    /// to the scheduler after the barrier began, and the scheduler drops
+    /// it from this barrier's `Enqueue` if the read missed it. The pass's
+    /// busy marker is cleared by the feeder once it lands, or on failure.
+    async fn begin_pass(&mut self, model: &Arc<Embedding<T>>) -> Result<(), String> {
+        assert!(self.pass.is_none(), "one reconcile pass runs at a time");
         self.verify_index().await?;
-        let sched = model.scheduler.clone();
-        sched.barrier(self.repo, true).await;
-        match self.barrier_steps(model).await {
+        self.seeded = false;
+        model.scheduler.barrier(self.repo, true).await;
+        self.reconciler();
+        let reconciler = self.reconciler.take().expect("built above");
+        let done = tokio::spawn(run_pass(
+            reconciler,
+            self.writer.clone().expect("opened"),
+            model.counter.clone(),
+            self.root.clone(),
+        ));
+        self.pass = Some(InFlight {
+            done,
+            model: model.clone(),
+        });
+        Ok(())
+    }
+
+    /// Waits for the running pass and takes its outcome (see
+    /// [`Owner::finish`]).
+    async fn land(
+        &mut self,
+        ack: Option<oneshot::Sender<Result<(), String>>>,
+    ) -> Result<(Report, String), String> {
+        let pass = self.pass.take().expect("a pass is running");
+        let done = joined(pass.done.await);
+        self.finish(&pass.model, done, ack).await
+    }
+
+    /// A finished pass: the reconciler comes home, the retriever follows
+    /// the pass, and its outcome goes to the feeder, which orders it into
+    /// the scheduler.
+    async fn finish(
+        &mut self,
+        model: &Arc<Embedding<T>>,
+        done: PassDone,
+        ack: Option<oneshot::Sender<Result<(), String>>>,
+    ) -> Result<(Report, String), String> {
+        self.reconciler = Some(done.reconciler);
+        match self.passed(done.outcome).await {
             Ok((report, commit, feed)) => {
                 self.report = Some(report.clone());
                 self.commit = commit.clone();
@@ -895,7 +1063,7 @@ impl<T: Tokens> Owner<T> {
             Err(message) => {
                 self.sync = false;
                 drop(ack);
-                sched.barrier(self.repo, false).await;
+                model.scheduler.barrier(self.repo, false).await;
                 Err(message)
             }
         }
@@ -959,30 +1127,13 @@ impl<T: Tokens> Owner<T> {
         })
     }
 
-    /// The barrier's writer flush, pass and `git rev-parse`, and the feed
-    /// the pass leaves for the feeder.
-    async fn barrier_steps(
+    /// A landed pass's outcome: the retriever follows it, and the feed it
+    /// leaves for the feeder is listed, with the report and `HEAD`.
+    async fn passed(
         &mut self,
-        model: &Arc<Embedding<T>>,
+        outcome: Result<Passed, String>,
     ) -> Result<(Report, String, Feed), String> {
-        self.writer
-            .as_ref()
-            .expect("opened")
-            .flush()
-            .await
-            .map_err(|e| format!("vector writer flush: {e}"))?;
-        let counter = model.counter.clone();
-        let root = self.root.clone();
-        let reconciler = self.reconciler();
-        let (reconciled, head) = tokio::join!(
-            reconciler.reconcile(CHUNKER_FINGERPRINT, counter),
-            tokio::process::Command::new("git")
-                .arg("-C")
-                .arg(&root)
-                .args(["rev-parse", "HEAD"])
-                .output(),
-        );
-        let reconciled = reconciled.map_err(|e| e.to_string())?;
+        let Passed { reconciled, head } = outcome?;
         // The pass is committed: the retriever follows it whatever happens
         // next, or its vector indexes would part from the books.
         if let Some(retriever) = &self.retriever {
@@ -991,14 +1142,7 @@ impl<T: Tokens> Owner<T> {
                 .await
                 .map_err(|e| e.to_string())?;
         }
-        let head = head.map_err(|e| e.to_string())?;
-        if !head.status.success() {
-            return Err(format!(
-                "git rev-parse HEAD failed: {}",
-                String::from_utf8_lossy(&head.stderr)
-            ));
-        }
-        let commit = String::from_utf8_lossy(&head.stdout).trim().to_owned();
+        let commit = head?;
         // A `Change` is enough when the feeder provably holds the books'
         // set: anything else is a resync — the first barrier, a rechunk or
         // a reopened index. Its set is listed from the books the pass just
@@ -1019,8 +1163,14 @@ impl<T: Tokens> Owner<T> {
     }
 
     /// A watcher burst: the same barrier as a query, answered nowhere and
-    /// always without ignored files.
+    /// always without ignored files. While a pass runs off the owner the
+    /// burst waits for it to land: that pass may have read the files
+    /// before they changed.
     async fn changed(&mut self) {
+        if self.pass.is_some() {
+            self.pending_change = true;
+            return;
+        }
         let Some(model) = self.ready() else {
             return;
         };
@@ -1254,6 +1404,142 @@ async fn stopped(stopping: &mut watch::Receiver<bool>) {
     let _ = stopping.wait_for(|stopping| *stopping).await;
 }
 
+/// A reconcile pass running off the owner: a seeded index's first pass,
+/// which reads every file of a fresh checkout while searches answer from
+/// the copy.
+struct InFlight<T: Tokens> {
+    /// Hands the reconciler back with the pass's outcome.
+    done: tokio::task::JoinHandle<PassDone>,
+    /// The model the pass runs under; its scheduler takes the pass's feed.
+    model: Arc<Embedding<T>>,
+}
+
+/// A finished pass: the reconciler it took, and what it did.
+struct PassDone {
+    reconciler: Reconciler,
+    /// The committed pass, or why the writer flush or the pass failed.
+    outcome: Result<Passed, String>,
+}
+
+/// A committed pass and `HEAD`, read alongside it.
+struct Passed {
+    reconciled: Reconciled,
+    /// `git rev-parse HEAD`, or why it failed.
+    head: Result<String, String>,
+}
+
+/// A pass: the writer flush, then `reconcile` and `git rev-parse HEAD`
+/// concurrently. The reconciler comes back whatever happened.
+async fn run_pass(
+    mut reconciler: Reconciler,
+    writer: WriterHandle,
+    counter: Arc<dyn TokenCounter>,
+    root: PathBuf,
+) -> PassDone {
+    if let Err(e) = writer.flush().await {
+        return PassDone {
+            reconciler,
+            outcome: Err(format!("vector writer flush: {e}")),
+        };
+    }
+    let (reconciled, head) = tokio::join!(
+        reconciler.reconcile(CHUNKER_FINGERPRINT, counter),
+        git_head(&root),
+    );
+    let outcome = reconciled
+        .map(|reconciled| Passed { reconciled, head })
+        .map_err(|e| e.to_string());
+    PassDone {
+        reconciler,
+        outcome,
+    }
+}
+
+/// A pass task's result; a panic on it panics here. The owner never
+/// aborts a pass.
+fn joined(done: Result<PassDone, tokio::task::JoinError>) -> PassDone {
+    match done {
+        Ok(done) => done,
+        Err(error) => std::panic::resume_unwind(error.into_panic()),
+    }
+}
+
+/// The commit `HEAD` of the worktree at `root` names.
+async fn git_head(root: &Path) -> Result<String, String> {
+    let head = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .await
+        .map_err(|e| e.to_string())?;
+    if !head.status.success() {
+        return Err(format!(
+            "git rev-parse HEAD failed: {}",
+            String::from_utf8_lossy(&head.stderr)
+        ));
+    }
+    Ok(String::from_utf8_lossy(&head.stdout).trim().to_owned())
+}
+
+/// Every worktree of the repository `git worktree list` names, as listed.
+async fn sibling_worktrees(root: &Path) -> Result<Vec<PathBuf>, String> {
+    let output = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["worktree", "list", "--porcelain", "-z"])
+        .output()
+        .await
+        .map_err(|e| format!("git worktree list: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "git worktree list failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    Ok(output
+        .stdout
+        .split(|&byte| byte == 0)
+        .filter_map(|field| field.strip_prefix(b"worktree "))
+        .map(|path| PathBuf::from(OsStr::from_bytes(path)))
+        .collect())
+}
+
+/// The checkouts the worktree's remotes name by local path — an absolute
+/// path or a `file://` URL — as `git clone` of a local checkout records
+/// its origin.
+async fn local_remotes(root: &Path) -> Result<Vec<PathBuf>, String> {
+    let output = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["config", "-z", "--get-regexp", r"^remote\..*\.url$"])
+        .output()
+        .await
+        .map_err(|e| format!("git config: {e}"))?;
+    // Status 1: no remote has a URL.
+    if output.status.code() == Some(1) {
+        return Ok(Vec::new());
+    }
+    if !output.status.success() {
+        return Err(format!(
+            "git config --get-regexp failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    // `-z`: each entry is the key, a newline, the value, then a NUL.
+    Ok(output
+        .stdout
+        .split(|&byte| byte == 0)
+        .filter_map(|entry| {
+            let newline = entry.iter().position(|&byte| byte == b'\n')?;
+            let url = &entry[newline + 1..];
+            let path = url.strip_prefix(b"file://").unwrap_or(url);
+            path.starts_with(b"/")
+                .then(|| PathBuf::from(OsStr::from_bytes(path)))
+        })
+        .collect())
+}
+
 /// What a seed copy needs, moved onto a blocking thread.
 struct Seed {
     state: StateDir,
@@ -1261,27 +1547,45 @@ struct Seed {
     root: PathBuf,
     /// Its `index.db`.
     dest: PathBuf,
+    /// Its repository's vector cache directory.
+    cache: PathBuf,
     model_id: String,
 }
 
+/// A checkout a seed may copy from.
+struct Source {
+    /// Its index.
+    index: PathBuf,
+    /// Its canonical root, when it is a remote's checkout rather than a
+    /// listed sibling: its repository may have a vector cache of its own.
+    remote: Option<PathBuf>,
+}
+
 impl Seed {
-    /// Canonicalizes each worktree `git worktree list` named to its
-    /// on-disk spelling, reads the `meta` of each sibling's index on a
-    /// read-only connection — a writer serializes the read behind its
-    /// commit under the busy timeout — and
-    /// takes one matching this build's chunker and model, `Maintained`
-    /// preferred. That index is `VACUUM INTO`'d to a temporary file beside
-    /// `dest`, stamped `FirstIndex` and linked to `dest`; a `dest` that
-    /// appeared while the copy ran is left to its opener. A listed
-    /// worktree whose directory is gone is no sibling; every other error
-    /// fails the seed.
-    fn copy(&self, listed: &[PathBuf]) -> Result<(), String> {
-        let mut source: Option<PathBuf> = None;
-        for listed in listed {
-            let path = match spelling::canonical(listed) {
+    /// Canonicalizes each sibling `git worktree list` named, then each
+    /// checkout a remote names, to its on-disk spelling, reads the `meta`
+    /// of each one's index on a read-only connection — a writer serializes
+    /// the read behind its commit under the busy timeout — and takes one
+    /// matching this build's chunker and model, `Maintained` preferred and
+    /// siblings first. A remote's checkout in another repository first
+    /// gives its vector cache to this repository's, when this one has
+    /// none ([`store::clone_cache`]); the index is then copied
+    /// ([`store::clone_index`]) to a temporary file beside `dest`, stamped
+    /// `FirstIndex` and linked to `dest`. A `dest` that appeared while the
+    /// copy ran is left to its opener. A candidate whose directory is gone
+    /// is no source; every other error fails the seed. Returns whether
+    /// `dest` is the copy.
+    fn copy(&self, listed: &[PathBuf], remotes: &[PathBuf]) -> Result<bool, String> {
+        let mut source: Option<Source> = None;
+        let candidates = listed
+            .iter()
+            .map(|path| (path, false))
+            .chain(remotes.iter().map(|path| (path, true)));
+        for (candidate, remote) in candidates {
+            let path = match spelling::canonical(candidate) {
                 Ok(path) => path,
                 Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
-                Err(e) => return Err(format!("{}: {e}", listed.display())),
+                Err(e) => return Err(format!("{}: {e}", candidate.display())),
             };
             if path == self.root {
                 continue;
@@ -1299,21 +1603,33 @@ impl Seed {
                 continue;
             };
             if meta.chunker == CHUNKER_FINGERPRINT && meta.model_id == self.model_id {
-                source = Some(index);
+                source = Some(Source {
+                    index,
+                    remote: remote.then_some(path),
+                });
                 if meta.phase == Phase::Maintained {
                     break;
                 }
             }
         }
-        let Some(source) = source else { return Ok(()) };
+        let Some(source) = source else {
+            return Ok(false);
+        };
+        if let Some(root) = &source.remote {
+            let cache = self.state.repo_cache(&common_dir(root)?);
+            if cache != self.cache {
+                store::clone_cache(&cache, &self.cache)
+                    .map_err(|e| format!("copying {}: {e}", cache.display()))?;
+            }
+        }
         let dir = self.dest.parent().expect("worktree_index names index.db");
         fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
         let mut tmp = self.dest.clone().into_os_string();
         tmp.push(".seed");
         let tmp = PathBuf::from(tmp);
         remove_if_present(&tmp)?;
-        let seeded = store::vacuum_into(&source, &tmp)
-            .map_err(|e| format!("copying {}: {e}", source.display()))
+        let seeded = store::clone_index(&source.index, &tmp)
+            .map_err(|e| format!("copying {}: {e}", source.index.display()))
             .and_then(|()| {
                 // The copy starts first-index: its differing files embed
                 // as stage-1 work and the worktree turns `Maintained`
@@ -1322,13 +1638,35 @@ impl Seed {
                     .map_err(|e| format!("{}: {e}", tmp.display()))
             })
             .and_then(|()| match fs::hard_link(&tmp, &self.dest) {
-                Ok(()) => Ok(()),
-                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+                Ok(()) => Ok(true),
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(false),
                 Err(e) => Err(format!("{}: {e}", self.dest.display())),
             });
         let removed = remove_if_present(&tmp);
-        seeded.and(removed)
+        let seeded = seeded?;
+        removed?;
+        Ok(seeded)
     }
+}
+
+/// The canonical git common dir of the worktree at `root`, which keys its
+/// repository's vector cache.
+fn common_dir(root: &Path) -> Result<PathBuf, String> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
+        .output()
+        .map_err(|e| format!("git rev-parse: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "git rev-parse --git-common-dir failed in {}: {}",
+            root.display(),
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    let dir = OsStr::from_bytes(output.stdout.trim_ascii_end());
+    spelling::canonical(Path::new(dir)).map_err(|e| format!("{}: {e}", dir.display()))
 }
 
 /// Removes the file at `path`; one already gone is no error.
