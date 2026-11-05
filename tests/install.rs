@@ -32,6 +32,7 @@ fn test_config(tmp: &tempfile::TempDir, program: &Path) -> AgentConfig {
             program: program.to_path_buf(),
             socket: root.join("support/daemon.sock"),
             idle_exit: Duration::from_secs(600),
+            build: "1@2".to_owned(),
             model_cache: None,
             server_socket: root.join("support/server.sock"),
             state_dir: None,
@@ -165,6 +166,38 @@ async fn moved_binary_replaces_after_teardown() {
     assert!(
         matches!(calls[2], Call::Bootstrap { .. }),
         "the bootstrap ran, so the stand-in's exit was awaited first"
+    );
+}
+
+/// The daemon's half of the `--build` self-heal: started under a
+/// `--build` its binary does not have — a plist written before the binary
+/// was replaced — the daemon refuses to run and names both builds. It
+/// binds its own socket in the tempdir, so no launchd is involved.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_daemon_refuses_another_build() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let mut daemon = tokio::process::Command::new(program());
+    daemon
+        .args(["--daemon", "--build", "1@2", "--listen"])
+        .arg(tmp.path().join("daemon.sock"))
+        .arg("--server-socket")
+        .arg(tmp.path().join("server.sock"))
+        .arg("--state-dir")
+        .arg(tmp.path().join("state"))
+        .arg("--model-cache")
+        .arg(tmp.path().join("models"))
+        .env("HOME", tmp.path())
+        .kill_on_drop(true);
+    let output = tokio::time::timeout(Duration::from_secs(60), daemon.output())
+        .await
+        .expect("the daemon exits")
+        .expect("the daemon runs");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    let actual = client::hello_for(&program()).build;
+    assert!(
+        stderr.contains(&format!("--build 1@2 does not match this binary {actual}")),
+        "{stderr}"
     );
 }
 

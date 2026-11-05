@@ -97,8 +97,9 @@ pub struct Timeouts {
 
 impl AgentConfig {
     /// The real per-user agent: the `search` binary at `program`, the
-    /// socket, plist, lock and log paths under `$HOME`, and the launchd
-    /// labels [`super::launchd::user_labels`] chooses for that home.
+    /// build identity the `--build` self-heal checks, the socket, plist,
+    /// lock and log paths under `$HOME`, and the launchd labels
+    /// [`super::launchd::user_labels`] chooses for that home.
     pub fn user(program: PathBuf) -> io::Result<Self> {
         let (label, _) = user_labels()?;
         Ok(Self {
@@ -107,6 +108,7 @@ impl AgentConfig {
             lock: lock_path()?,
             agent: Plist::Daemon(LaunchAgent {
                 label,
+                build: BuildId::of_file(&program)?.to_string(),
                 program,
                 socket: socket_path()?,
                 idle_exit: DAEMON_IDLE_EXIT,
@@ -649,5 +651,35 @@ mod tests {
             plist.contains(&format!("<string>{}</string>", alias.display())),
             "ProgramArguments[0] is not the alias:\n{plist}"
         );
+    }
+
+    /// A binary replaced at the same path, by renaming a new file over
+    /// it as installers do, renders another daemon agent: `ensure_agent`
+    /// replaces the daemon as it does the server.
+    #[test]
+    fn a_replaced_program_changes_the_daemon_agent() {
+        let tmp = tempfile::tempdir().expect("a tempdir");
+        let program = tmp.path().join("search");
+        std::fs::write(&program, b"build one").expect("the program writes");
+        let render = |program: &Path| {
+            AgentConfig::user(program.to_path_buf())
+                .expect("the user agent resolves")
+                .agent
+                .render()
+                .expect("the plist renders")
+        };
+        let before = render(&program);
+        assert!(
+            before.contains(&format!(
+                "<string>--build</string>\n\t\t<string>{}</string>",
+                BuildId::of_file(&program).unwrap()
+            )),
+            "the daemon agent does not name the program's build:\n{before}"
+        );
+
+        let next = tmp.path().join("search-new");
+        std::fs::write(&next, b"build two").expect("the next build writes");
+        std::fs::rename(&next, &program).expect("the next build renames");
+        assert_ne!(before, render(&program));
     }
 }

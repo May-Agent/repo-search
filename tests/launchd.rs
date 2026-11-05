@@ -109,7 +109,8 @@ fn server_config(
 
 /// The test config: label `<LABEL>.test-<pid>-<name>` — per test and per
 /// process, because a stray agent from another run cannot collide with it —
-/// and the plist, lock, socket and log all inside `dir`.
+/// the plist, lock, socket and log all inside `dir`, and `--build` naming
+/// `program` as it stands now, as `AgentConfig::user` does.
 fn config(
     name: &str,
     dir: &Path,
@@ -123,6 +124,7 @@ fn config(
         lock: dir.join("install.lock"),
         agent: Plist::Daemon(LaunchAgent {
             label: format!("{LABEL}.test-{}-{name}", std::process::id()),
+            build: client::hello_for(&program).build.to_string(),
             program,
             socket: dir.join("daemon.sock"),
             server_socket: server_socket(dir),
@@ -396,6 +398,7 @@ async fn reinstall_waits_for_a_running_daemon() {
     let Plist::Daemon(daemon_agent) = &mut config.agent else {
         unreachable!("the test config is a daemon agent")
     };
+    daemon_agent.build = client::hello_for(&copy).build.to_string();
     daemon_agent.program = copy.clone();
     let outcome =
         tokio::task::block_in_place(|| ensure_agent(&config, &mut launchctl, Check::Fast))
@@ -449,6 +452,7 @@ async fn reinstall_of_an_idle_agent() {
     let Plist::Daemon(daemon_agent) = &mut config.agent else {
         unreachable!("the test config is a daemon agent")
     };
+    daemon_agent.build = client::hello_for(&copy).build.to_string();
     daemon_agent.program = copy;
     let outcome =
         tokio::task::block_in_place(|| ensure_agent(&config, &mut launchctl, Check::Fast))
@@ -596,10 +600,10 @@ async fn install_answers_through_cli_run() {
 /// Install and search so the daemon runs, record its pid, then replace
 /// the installed program file by renaming a fresh copy over it — a new
 /// inode and mtime, as installers do (never write into the running
-/// executable, which macOS may kill). The next `cli::run` carries the new
-/// `BuildId`: the mismatched daemon shuts down, launchd restarts the
-/// binary on disk, the query answers and `Status` reports a new pid. The
-/// retry may wait out launchd's `ThrottleInterval`; that is expected.
+/// executable, which macOS may kill). The next `cli::run` renders both
+/// agents with the new `BuildId` in `--build`, so it replaces the server
+/// agent and the daemon agent: launchd runs the binary on disk for both,
+/// the query answers and `Status` reports a new pid.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "real launchd and model; the release gate runs it"]
 async fn replaced_binary_restarts_the_daemon() {

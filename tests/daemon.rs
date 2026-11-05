@@ -2494,6 +2494,60 @@ async fn a_search_whose_pass_lands_within_the_bound_answers_reconciled() {
     }
 }
 
+/// A fresh worktree's index holds no chunk until its first pass lands, so
+/// its first search has nothing to answer from at the bound: it waits for
+/// that pass however long the pass takes, then answers from it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fresh_worktree_s_first_search_waits_for_its_first_pass() {
+    let repo = fn_repo(20, SMALL_BYTES, 5);
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let mut tokens = StubTokens::default();
+    let hold = tokens.hold_next_count();
+    let d = daemon_waiting(
+        tmp,
+        StubBackend::new(mpsc::channel().0),
+        Model::Cached,
+        tokens,
+        Duration::from_secs(600),
+        daemon::LOAD_BOUND,
+        SHORT_WAIT,
+    )
+    .await;
+
+    hold.arm();
+    let search = tokio::spawn({
+        let socket = d.socket.clone();
+        let root = repo.root.clone();
+        async move { request(&socket, &hello(), lexical(&root, MARKER)).await }
+    });
+    tokio::task::block_in_place(|| {
+        hold.entered
+            .recv_timeout(TIMEOUT)
+            .expect("the first pass is chunking")
+    });
+    // Held well past the bound, the first pass keeps the search waiting.
+    tokio::time::sleep(SHORT_WAIT * 4).await;
+    assert!(
+        !search.is_finished(),
+        "the first search answered before its first pass landed"
+    );
+
+    tokio::task::block_in_place(|| hold.open());
+    let events = tokio::time::timeout(TIMEOUT, search)
+        .await
+        .expect("the search answers once its first pass lands")
+        .expect("the search task completes");
+    let answer = match final_of(&events) {
+        Final::Answer(answer) => answer,
+        other => panic!("expected an Answer, got {other:?}"),
+    };
+    let output: serde_json::Value =
+        serde_json::from_str(&answer.output).expect("the answer is JSON");
+    assert!(answer.has_results, "{output}");
+    assert_eq!(answer_paths(&output), ["src/f0.rs"], "{output}");
+    assert_eq!(output["freshness"]["reconciling"], false, "{output}");
+}
+
 /// A seeded index starts first-index: the files a seeded worktree
 /// differs from its sibling in embed at stage-1 urgency — a kept
 /// `Maintained` phase would run them at background QoS, which a loaded

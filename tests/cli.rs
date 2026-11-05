@@ -89,6 +89,7 @@ fn config(tmp: &tempfile::TempDir) -> AgentConfig {
             program: root.join("search"),
             socket: root.join("support/daemon.sock"),
             idle_exit: Duration::from_secs(600),
+            build: "1@2".to_owned(),
             model_cache: None,
             server_socket: root.join("support/server.sock"),
             state_dir: None,

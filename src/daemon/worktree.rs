@@ -590,14 +590,17 @@ impl<T: Tokens> Owner<T> {
     /// deadline the pass is left running off the owner and the search
     /// answers from the index as it stands, reporting the pass running;
     /// the retriever leaves out every file that changed since it was
-    /// indexed. `None` when an error event was already sent.
+    /// indexed. An index that holds no chunk — a fresh worktree's before
+    /// its first pass lands — has no answer to give, so the search waits
+    /// for the pass without a deadline. `None` when an error event was
+    /// already sent.
     async fn barrier_and_retrieve(
         &mut self,
         model: &Arc<Embedding<T>>,
         request: &search::Request,
         events: &mpsc::Sender<Event>,
     ) -> Option<Retrieved> {
-        let deadline = tokio::time::Instant::now() + self.reconcile_wait;
+        let start = tokio::time::Instant::now();
         if !send(events, Event::Progress(Progress::Reconciling)).await {
             return None;
         }
@@ -616,6 +619,13 @@ impl<T: Tokens> Owner<T> {
             send(events, error(ErrorKind::Internal, message)).await;
             return None;
         }
+        let answerable = self
+            .report
+            .as_ref()
+            .expect("a built retriever had a report")
+            .chunks_total
+            > 0;
+        let deadline = answerable.then(|| start + self.reconcile_wait);
         let landed = match self.reach(model, primed, deadline).await {
             Ok(landed) => landed,
             Err(message) => {
@@ -638,15 +648,16 @@ impl<T: Tokens> Owner<T> {
             .await
     }
 
-    /// Brings a pass to land before `deadline`: a pass this search began
-    /// (`began`) is the one waited for; otherwise a pass already running
-    /// lands first and a pass of the search's own follows. `None` at the
-    /// deadline, the pass still running.
+    /// Brings a pass to land before `deadline`, or to land at all without
+    /// one: a pass this search began (`began`) is the one waited for;
+    /// otherwise a pass already running lands first and a pass of the
+    /// search's own follows. `None` at the deadline, the pass still
+    /// running.
     async fn reach(
         &mut self,
         model: &Arc<Embedding<T>>,
         began: bool,
-        deadline: tokio::time::Instant,
+        deadline: Option<tokio::time::Instant>,
     ) -> Result<Option<(Report, String)>, String> {
         if !began {
             if self.pass.is_some() {
@@ -663,12 +674,15 @@ impl<T: Tokens> Owner<T> {
         self.land_by(deadline).await
     }
 
-    /// [`Owner::land`] with a deadline: `None` when the pass is still
-    /// running at `deadline`, which does not cancel it.
+    /// [`Owner::land`] with an optional deadline: `None` when the pass is
+    /// still running at `deadline`, which does not cancel it.
     async fn land_by(
         &mut self,
-        deadline: tokio::time::Instant,
+        deadline: Option<tokio::time::Instant>,
     ) -> Result<Option<(Report, String)>, String> {
+        let Some(deadline) = deadline else {
+            return self.land(None).await.map(Some);
+        };
         let pass = self.pass.as_mut().expect("a pass is running");
         let Ok(done) = tokio::time::timeout_at(deadline, &mut pass.done).await else {
             return Ok(None);
