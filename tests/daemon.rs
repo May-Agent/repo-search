@@ -24,7 +24,7 @@ use repo_search_coreml::GpuBlocked;
 use repo_search_server::chip::ChipClass;
 use repo_search_server::stub::{IndexGate, Instance, Kind, Record, StubBackend};
 use support::client::{final_event, final_of, hello, next_event, request, search, stream_request};
-use support::daemon::{Daemon, Model, daemon, digest_of, model_store, sha_7};
+use support::daemon::{Daemon, Model, daemon, daemon_waiting, digest_of, model_store, sha_7};
 use support::repo::{self, TestRepo};
 use support::tokens::{HoldHandle, StubTokens};
 use tokio::net::UnixListener;
@@ -1673,6 +1673,7 @@ async fn a_daemon_with_an_unreachable_server_fails_the_request_with_model() {
             model_id: sha_7().hex(),
             state: StateDir::new(tmp.path().join("state")),
             idle_exit: Duration::from_secs(600),
+            reconcile_wait: daemon::RECONCILE_WAIT,
             load_bound: daemon::LOAD_BOUND,
             build: support::client::build(),
         },
@@ -1721,6 +1722,7 @@ impl MismatchedDaemon {
                 model_id: "ff".repeat(64),
                 state: StateDir::new(tmp.path().join("state")),
                 idle_exit: Duration::from_secs(600),
+                reconcile_wait: daemon::RECONCILE_WAIT,
                 load_bound: daemon::LOAD_BOUND,
                 build: support::client::build(),
             },
@@ -2042,9 +2044,9 @@ async fn case_spellings_of_one_worktree_share_an_owner_and_index() {
 }
 
 /// A worktree added next to an indexed sibling copies the sibling's index
-/// instead of rebuilding: its first barrier re-chunks only the edited
-/// files and restamps the rest, and the seeded index searches as a freshly
-/// built one does.
+/// instead of rebuilding: its first search answers from the copy while its
+/// first pass runs, the pass re-chunks only the edited files and restamps
+/// the rest, and the seeded index searches as a freshly built one does.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_new_worktree_seeds_its_index_from_a_sibling() {
     let repo = fn_repo(20, SMALL_BYTES, 5);
@@ -2066,29 +2068,31 @@ async fn a_new_worktree_seeds_its_index_from_a_sibling() {
     }
     index_request(&d, &scratch, true).await;
 
-    // `linked`'s first request seeds, then its barrier restamps the fresh
-    // checkout — a new file can never carry the stored inode — and
-    // re-chunks only the two edited files: the report's `changed_files`,
-    // which the answer's freshness carries, counts exactly them.
+    // `linked`'s first request seeds from `repo.root`; its first pass lands
+    // within the reconcile wait, so the answer is the reconciled one.
     gate.arm();
     let events = answer_search(&d, &linked, MARKER).await;
     let answer = match final_of(&events) {
         Final::Answer(answer) => answer,
         other => panic!("expected an Answer, got {other:?}"),
     };
-    assert!(answer.has_results, "{events:?}");
-    let output: serde_json::Value =
+    let early: serde_json::Value =
         serde_json::from_str(&answer.output).expect("the answer is JSON");
-    assert_eq!(
-        output["freshness"]["changed_files"], 2,
-        "the seeded barrier re-chunks only the two edited files: {output}"
-    );
+    assert_eq!(early["freshness"]["reconciling"], false, "{early}");
+    assert_current(&linked, &early);
+
+    // The first pass restamped the fresh checkout — a new file can never
+    // carry the stored inode — keeping the copy's rows of every unchanged
+    // file, and re-chunked only the two edited files.
+    index_request(&d, &linked, true).await;
+    assert_rechunked(&d.state, &repo.root, &linked, &["src/f0.rs", "src/f1.rs"]);
 
     // The seeded index starts first-index, but its chunks are all in the
-    // shared vector cache: the seeded barrier's stage-1 interest is
-    // empty, nothing embeds, and the phase flips to `Maintained` at once.
-    // The armed gate keeps a from-scratch index first-index, so
-    // `Maintained` here can only come from the seed.
+    // shared vector cache: the seeded pass's stage-1 interest is empty,
+    // nothing embeds, and the phase flips to `Maintained` at once — the
+    // wait above ended although the gate is armed. The armed gate keeps a
+    // from-scratch index first-index, so `Maintained` here can only come
+    // from the seed.
     let events = request(
         &d.socket,
         &hello(),
@@ -2115,6 +2119,15 @@ async fn a_new_worktree_seeds_its_index_from_a_sibling() {
     gate.open();
 
     // The seeded index searches as `scratch`'s freshly built one does.
+    let events = answer_search(&d, &linked, MARKER).await;
+    let answer = match final_of(&events) {
+        Final::Answer(answer) => answer,
+        other => panic!("expected an Answer, got {other:?}"),
+    };
+    assert!(answer.has_results, "{events:?}");
+    let output: serde_json::Value =
+        serde_json::from_str(&answer.output).expect("the answer is JSON");
+    assert_eq!(output["freshness"]["reconciling"], false, "{output}");
     let events = answer_search(&d, &scratch, MARKER).await;
     let fresh = match final_of(&events) {
         Final::Answer(answer) => answer,
@@ -2183,6 +2196,7 @@ async fn two_daemons_over_one_index_agree_on_tied_results() {
             model_id: repo_search_core::model::MODEL_ID.to_owned(),
             state: d.state.clone(),
             idle_exit: Duration::from_secs(600),
+            reconcile_wait: daemon::RECONCILE_WAIT,
             load_bound: daemon::LOAD_BOUND,
             build: support::client::build(),
         },
@@ -2200,6 +2214,284 @@ async fn two_daemons_over_one_index_agree_on_tied_results() {
     }
     assert_eq!(outputs[0], outputs[1]);
     join.abort();
+}
+
+/// A full clone of an indexed checkout — `git clone --local`, a repository
+/// of its own that `git worktree list` does not name — starts from a copy
+/// of its origin's index and vector cache. Its first search answers from
+/// the copy while its first pass is still running: the edited files'
+/// indexed chunks are left out and the answer reports indexing in
+/// progress. The pass re-chunks only the edited files, and only their new
+/// chunk embeds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_clone_starts_from_its_origins_index_and_answers_while_reconciling() {
+    let repo = fn_repo(20, SMALL_BYTES, 5);
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let mut tokens = StubTokens::default();
+    let hold = tokens.hold_next_count();
+    let d = daemon_waiting(
+        tmp,
+        StubBackend::new(mpsc::channel().0),
+        Model::Cached,
+        tokens,
+        Duration::from_secs(600),
+        daemon::LOAD_BOUND,
+        SHORT_WAIT,
+    )
+    .await;
+    index_request(&d, &repo.root, true).await;
+    let origin: Vec<Record> = d.records.try_iter().collect();
+    assert!(
+        origin.iter().any(|r| r.kind == Kind::Index),
+        "the origin embedded its chunks"
+    );
+
+    // The clone drops the marker's function from `f0` and adds one to `f1`.
+    let clone = repo::clone_local(&repo, "clone");
+    let f0 = clone.join("src/f0.rs");
+    let text = std::fs::read_to_string(&f0).expect("f0 reads");
+    let marker = text
+        .find(&format!("pub fn {MARKER}_fn"))
+        .expect("f0 holds the marker");
+    std::fs::write(&f0, text.split_at(marker).0).expect("f0 rewrites");
+    repo::append(
+        &clone,
+        "src/f1.rs",
+        &repo::rust_fn("clone_edit", SMALL_BYTES),
+    );
+
+    // The next token count is the clone's first pass chunking an edited
+    // file: the pass stays there until the hold opens. A lexical search
+    // whose only hit is left out counts no tokens, so the answer can only
+    // come while the pass is held.
+    hold.arm();
+    let events = request(&d.socket, &hello(), lexical(&clone, MARKER)).await;
+    let answer = match final_of(&events) {
+        Final::Answer(answer) => answer,
+        other => panic!("expected an Answer, got {other:?}"),
+    };
+    let output: serde_json::Value =
+        serde_json::from_str(&answer.output).expect("the answer is JSON");
+    assert!(
+        !answer.has_results,
+        "the marker's indexed chunk, whose file changed, answered: {output}"
+    );
+    assert_eq!(output["freshness"]["reconciling"], true, "{output}");
+    tokio::task::block_in_place(|| {
+        hold.entered
+            .recv_timeout(TIMEOUT)
+            .expect("the clone's first pass is chunking an edited file")
+    });
+
+    // While the pass is held, the unchanged files answer from the copy and
+    // the two edited ones, whose indexed chunks every function matches,
+    // are left out.
+    let events = request(&d.socket, &hello(), lexical(&clone, "fn_0012")).await;
+    let answer = match final_of(&events) {
+        Final::Answer(answer) => answer,
+        other => panic!("expected an Answer, got {other:?}"),
+    };
+    let output: serde_json::Value =
+        serde_json::from_str(&answer.output).expect("the answer is JSON");
+    let paths = answer_paths(&output);
+    assert!(paths.contains(&"src/f2.rs".to_owned()), "{output}");
+    assert!(
+        !paths
+            .iter()
+            .any(|path| path == "src/f0.rs" || path == "src/f1.rs"),
+        "an edited file's indexed chunk answered: {output}"
+    );
+    assert_current(&clone, &output);
+    assert_eq!(output["freshness"]["reconciling"], true, "{output}");
+
+    // The pass restamps every unchanged file and re-chunks the two edited
+    // ones; only the one new chunk embeds, the rest came with the copied
+    // vector cache.
+    tokio::task::block_in_place(|| hold.open());
+    index_request(&d, &clone, true).await;
+    assert_rechunked(&d.state, &repo.root, &clone, &["src/f0.rs", "src/f1.rs"]);
+    let added: HashSet<ContentHash> = visible_hashes(&d.state, &clone)
+        .await
+        .difference(&visible_hashes(&d.state, &repo.root).await)
+        .copied()
+        .collect();
+    assert_eq!(added.len(), 1, "only `clone_edit` is new: {added:?}");
+    let embedded: HashSet<ContentHash> = d
+        .records
+        .try_iter()
+        .filter(|r| r.kind == Kind::Index)
+        .filter_map(|r| r.hash)
+        .collect();
+    assert_eq!(embedded, added, "only the new chunk embedded");
+
+    // Reconciled: the marker is gone from the clone, its edit answers, and
+    // nothing is in progress; the origin still holds the marker.
+    for (worktree, query, expect) in [
+        (&clone, MARKER, None),
+        (&clone, "clone_edit", Some("src/f1.rs")),
+        (&repo.root, MARKER, Some("src/f0.rs")),
+    ] {
+        let events = request(&d.socket, &hello(), lexical(worktree, query)).await;
+        let answer = match final_of(&events) {
+            Final::Answer(answer) => answer,
+            other => panic!("expected an Answer, got {other:?}"),
+        };
+        let output: serde_json::Value =
+            serde_json::from_str(&answer.output).expect("the answer is JSON");
+        assert_eq!(
+            answer_paths(&output),
+            expect.into_iter().collect::<Vec<_>>(),
+            "{query:?} in {}: {output}",
+            worktree.display()
+        );
+        assert_eq!(output["freshness"]["reconciling"], false, "{output}");
+    }
+}
+
+/// The reconcile wait the bounded-wait tests set on the daemon.
+const SHORT_WAIT: Duration = Duration::from_millis(500);
+
+/// A lexical search of `worktree`, its answer as JSON, and how long the
+/// request took; the request is abandoned past `TIMEOUT`.
+async fn timed_answer(
+    d: &Daemon,
+    worktree: &Path,
+    query: &str,
+) -> (bool, serde_json::Value, Duration) {
+    let start = Instant::now();
+    let events = tokio::time::timeout(
+        TIMEOUT,
+        request(&d.socket, &hello(), lexical(worktree, query)),
+    )
+    .await
+    .expect("the search answers without waiting for the whole pass");
+    let elapsed = start.elapsed();
+    let answer = match final_of(&events) {
+        Final::Answer(answer) => answer,
+        other => panic!("expected an Answer, got {other:?}"),
+    };
+    let output = serde_json::from_str(&answer.output).expect("the answer is JSON");
+    (answer.has_results, output, elapsed)
+}
+
+/// A search waits for the pass it triggers, or one already running, for
+/// at most the configured bound. Past it, it answers from the index as it
+/// stands — the edited file's indexed chunk left out — reports indexing in
+/// progress, and leaves the pass running; a search after the pass sees the
+/// edit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_search_answers_at_the_bound_while_its_pass_is_held() {
+    let repo = fn_repo(20, SMALL_BYTES, 5);
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let mut tokens = StubTokens::default();
+    let hold = tokens.hold_next_count();
+    let d = daemon_waiting(
+        tmp,
+        StubBackend::new(mpsc::channel().0),
+        Model::Cached,
+        tokens,
+        Duration::from_secs(600),
+        daemon::LOAD_BOUND,
+        SHORT_WAIT,
+    )
+    .await;
+    index_request(&d, &repo.root, true).await;
+    let (has_results, output, _) = timed_answer(&d, &repo.root, MARKER).await;
+    assert!(has_results, "{output}");
+    assert_eq!(output["freshness"]["reconciling"], false, "{output}");
+
+    // The edit drops the marker's function and adds one to `f1`; the pass
+    // that picks it up stays in the chunker until the hold opens.
+    hold.arm();
+    let f0 = repo.root.join("src/f0.rs");
+    let text = std::fs::read_to_string(&f0).expect("f0 reads");
+    let marker = text
+        .find(&format!("pub fn {MARKER}_fn"))
+        .expect("f0 holds the marker");
+    std::fs::write(&f0, text.split_at(marker).0).expect("f0 rewrites");
+    repo::append(
+        &repo.root,
+        "src/f1.rs",
+        &repo::rust_fn("bounded_edit", SMALL_BYTES),
+    );
+
+    let (has_results, output, elapsed) = timed_answer(&d, &repo.root, MARKER).await;
+    assert!(
+        elapsed >= SHORT_WAIT,
+        "the search did not wait for the pass: {elapsed:?}"
+    );
+    assert!(
+        !has_results,
+        "the marker's indexed chunk, whose file changed, answered: {output}"
+    );
+    assert_eq!(output["freshness"]["reconciling"], true, "{output}");
+    tokio::task::block_in_place(|| {
+        hold.entered
+            .recv_timeout(TIMEOUT)
+            .expect("the pass is chunking an edited file")
+    });
+
+    // The pass still runs: a second search is bound again and answers.
+    let (_, output, elapsed) = timed_answer(&d, &repo.root, "fn_0012").await;
+    assert!(elapsed >= SHORT_WAIT, "{elapsed:?}");
+    assert_eq!(output["freshness"]["reconciling"], true, "{output}");
+    assert_current(&repo.root, &output);
+
+    tokio::task::block_in_place(|| hold.open());
+    index_request(&d, &repo.root, true).await;
+    for (query, expect) in [(MARKER, None), ("bounded_edit", Some("src/f1.rs"))] {
+        let (_, output, _) = timed_answer(&d, &repo.root, query).await;
+        assert_eq!(
+            answer_paths(&output),
+            expect.into_iter().collect::<Vec<_>>(),
+            "{query:?}: {output}"
+        );
+        assert_eq!(output["freshness"]["reconciling"], false, "{output}");
+    }
+}
+
+/// A pass that lands within the bound gives a reconciled answer, not one
+/// reported as in progress.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_search_whose_pass_lands_within_the_bound_answers_reconciled() {
+    let repo = fn_repo(20, SMALL_BYTES, 5);
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let d = daemon_waiting(
+        tmp,
+        StubBackend::new(mpsc::channel().0),
+        Model::Cached,
+        StubTokens::default(),
+        Duration::from_secs(600),
+        daemon::LOAD_BOUND,
+        TIMEOUT,
+    )
+    .await;
+    index_request(&d, &repo.root, true).await;
+    let (has_results, output, _) = timed_answer(&d, &repo.root, MARKER).await;
+    assert!(has_results, "{output}");
+
+    let f0 = repo.root.join("src/f0.rs");
+    let text = std::fs::read_to_string(&f0).expect("f0 reads");
+    let marker = text
+        .find(&format!("pub fn {MARKER}_fn"))
+        .expect("f0 holds the marker");
+    std::fs::write(&f0, text.split_at(marker).0).expect("f0 rewrites");
+    repo::append(
+        &repo.root,
+        "src/f1.rs",
+        &repo::rust_fn("bounded_edit", SMALL_BYTES),
+    );
+
+    for (query, expect) in [(MARKER, None), ("bounded_edit", Some("src/f1.rs"))] {
+        let (_, output, elapsed) = timed_answer(&d, &repo.root, query).await;
+        assert!(elapsed < TIMEOUT, "{elapsed:?}");
+        assert_eq!(
+            answer_paths(&output),
+            expect.into_iter().collect::<Vec<_>>(),
+            "{query:?}: {output}"
+        );
+        assert_eq!(output["freshness"]["reconciling"], false, "{output}");
+    }
 }
 
 /// A seeded index starts first-index: the files a seeded worktree
@@ -2361,8 +2653,8 @@ async fn a_worktree_without_an_indexed_sibling_builds_from_scratch() {
 }
 
 /// A sibling holding a write transaction seeds a consistent copy: the
-/// `VACUUM INTO` read serializes behind the commit under `busy_timeout`,
-/// and the marker the transaction commits is in the copy.
+/// copy's read transaction serializes behind the commit under
+/// `busy_timeout`, and the marker the transaction commits is in the copy.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_sibling_holding_a_write_transaction_seeds_a_committed_copy() {
     let repo = fn_repo(10, SMALL_BYTES, 5);
@@ -2562,6 +2854,7 @@ async fn daemon_host() {
         listener: daemon::listen::Activated(listener),
         signal,
         idle_exit: Duration::from_secs(3600),
+        reconcile_wait: daemon::RECONCILE_WAIT,
         load_bound: daemon::LOAD_BOUND,
         tokens: StubTokens::default(),
         server: repo_search::daemon::server::Endpoint::Unix(config.server_socket),
@@ -3247,6 +3540,79 @@ async fn visible_hashes(state: &StateDir, worktree: &Path) -> HashSet<ContentHas
         .expect("chunk hashes")
         .into_iter()
         .collect()
+}
+
+/// The paths a JSON answer lists, code and docs.
+fn answer_paths(output: &serde_json::Value) -> Vec<String> {
+    ["code", "docs"]
+        .iter()
+        .filter_map(|list| output[list].as_array())
+        .flatten()
+        .map(|hit| hit["path"].as_str().expect("a hit has a path").to_owned())
+        .collect()
+}
+
+/// Every chunk a JSON answer for `worktree` returns is text its file holds
+/// now: an answer may miss results, never return stale ones.
+fn assert_current(worktree: &Path, output: &serde_json::Value) {
+    for list in ["code", "docs"] {
+        for hit in output[list].as_array().into_iter().flatten() {
+            let path = hit["path"].as_str().expect("a hit has a path");
+            let file = std::fs::read_to_string(worktree.join(path)).expect("the hit's file reads");
+            for chunk in hit["chunks"].as_array().into_iter().flatten() {
+                let text = chunk["text"].as_str().expect("a chunk has text");
+                assert!(file.contains(text), "{path} no longer holds {text:?}");
+            }
+        }
+    }
+}
+
+/// Every chunk row of `worktree`'s index as its id and path, by id.
+fn chunk_ids(state: &StateDir, worktree: &Path) -> Vec<(i64, String)> {
+    let conn = rusqlite::Connection::open_with_flags(
+        state.worktree_index(worktree),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .expect("the index opens");
+    let mut rows = conn
+        .prepare("SELECT id, path FROM chunks ORDER BY id")
+        .expect("the read prepares");
+    rows.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .expect("the rows read")
+        .collect::<Result<_, _>>()
+        .expect("the rows decode")
+}
+
+/// `copy`, seeded from `source`'s index, kept `source`'s rows of every
+/// file but `edited` — restamped, never re-chunked — and replaced every
+/// row of each `edited` file. A re-chunked row takes an id past the
+/// highest one, so it never reuses an id it replaced.
+fn assert_rechunked(state: &StateDir, source: &Path, copy: &Path, edited: &[&str]) {
+    let (source, copy) = (chunk_ids(state, source), chunk_ids(state, copy));
+    let kept = |rows: &[(i64, String)]| -> Vec<(i64, String)> {
+        rows.iter()
+            .filter(|(_, path)| !edited.contains(&path.as_str()))
+            .cloned()
+            .collect()
+    };
+    assert_eq!(
+        kept(&source),
+        kept(&copy),
+        "the unchanged files keep their rows"
+    );
+    for path in edited {
+        let ids = |rows: &[(i64, String)]| -> HashSet<i64> {
+            rows.iter()
+                .filter(|(_, p)| p == path)
+                .map(|(id, _)| *id)
+                .collect()
+        };
+        let (before, after) = (ids(&source), ids(&copy));
+        assert!(
+            !after.is_empty() && before.is_disjoint(&after),
+            "{path} was re-chunked: {before:?} -> {after:?}"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

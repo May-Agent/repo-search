@@ -12,13 +12,16 @@ use tokio::sync::oneshot;
 
 use crate::qos::{QosClass, set_current_thread};
 use crate::reconcile::{PendingChunk, Presence};
-use crate::store::{ChunkFilter, ChunkId, ChunkRow, ContentHash, Index, Side, VectorCache};
+use crate::store::{
+    ChunkFilter, ChunkId, ChunkRow, ContentHash, FileState, Index, Side, VectorCache,
+};
 use crate::{QueryTask, UnitVector};
 
 use super::EmbedService;
 use super::fuse::{Fused, fuse};
 use super::output::{
-    self, Freshness, RankedChunk, ReadError, Reconciliation, Results, Selector, Step, VectorReads,
+    self, Freshness, RankedChunk, ReadError, ReadFailure, Reconciliation, Results, Selector, Step,
+    VectorReads,
 };
 use super::scope::Scope;
 use super::terms::{QueryTerms, SymbolName};
@@ -93,16 +96,20 @@ impl<S: EmbedService> Retriever<S> {
         self.vectors.follow(presence).await
     }
 
-    /// Answers `request`. `reconciliation` is what the caller's freshness
-    /// barrier just did; every chunk returned is read from the working tree
-    /// and checked against its indexed hash. Searches are one at a time
-    /// (`&mut self`): each brings the vector indexes up to date first.
+    /// Answers `request`. `reconciliation` is what the caller's last
+    /// reconcile pass did, and whether one is still running. A chunk is
+    /// returned only while its file has the bytes the chunk was cut from:
+    /// a ranked file whose stat moved since it was indexed is hashed, and
+    /// one whose bytes changed or that is gone is left out, as is a chunk
+    /// whose file changes before its text is read; the answer then reports
+    /// indexing in progress. Results may be missing, never stale. Searches
+    /// are one at a time (`&mut self`): each brings the vector indexes up
+    /// to date first.
     ///
     /// # Errors
     ///
-    /// When the query is empty, a filter is invalid, the index, cache,
-    /// embedder or filesystem fails, or a file changed after the barrier
-    /// ([`Error::Stale`], reported only for a chunk the answer reaches).
+    /// When the query is empty, a filter is invalid, or the index, cache,
+    /// embedder or filesystem fails.
     pub async fn search(
         &mut self,
         request: &Request,
@@ -187,7 +194,7 @@ impl<S: EmbedService> Retriever<S> {
         ];
 
         let mut ranked = self.rank(fused, terms.symbols()).await?;
-        let freshness = Freshness::new(reconciliation, embedded);
+        let changed = self.leave_out_changed(&mut ranked).await?;
 
         let mut selector = Selector::new(request.budget, request.files_only);
         loop {
@@ -198,6 +205,7 @@ impl<S: EmbedService> Retriever<S> {
                 }
             }
         }
+        let freshness = Freshness::new(reconciliation, embedded, changed || selector.left_out());
         let [code_groups, doc_groups] = selector.finish();
         Ok(Results {
             code: output::code_hits(&ranked[0], code_groups),
@@ -421,6 +429,42 @@ impl<S: EmbedService> Retriever<S> {
         Ok(lists)
     }
 
+    /// Leaves out of both lists every chunk whose file no longer has the
+    /// bytes the chunk was cut from: the file's stat is compared with the
+    /// one recorded, and a file whose stat moved is read and its hash
+    /// compared, as reconcile does. Returns whether any file was left out.
+    /// Texts are still read lazily; [`read_text`] checks each again.
+    async fn leave_out_changed(
+        &self,
+        ranked: &mut [Vec<RankedChunk>; 2],
+    ) -> Result<bool, Error<S::Error>> {
+        // One `chunks` read loaded every ranked row, so all rows of a path
+        // carry the same recorded state.
+        let files: HashMap<String, FileState> = ranked
+            .iter()
+            .flatten()
+            .map(|chunk| (chunk.row.path.clone(), chunk.row.file.clone()))
+            .collect();
+        let root = self.worktree.clone();
+        let changed = run_blocking::<_, S::Error>(move || {
+            let mut changed = HashSet::new();
+            for file in files.into_values() {
+                if !is_current(&root, &file)? {
+                    changed.insert(file.path);
+                }
+            }
+            Ok::<_, ReadFailure>(changed)
+        })
+        .await??;
+        if changed.is_empty() {
+            return Ok(false);
+        }
+        for list in ranked.iter_mut() {
+            list.retain(|chunk| !changed.contains(&chunk.row.path));
+        }
+        Ok(true)
+    }
+
     /// Reads the texts of the units from `from` on in the next window of
     /// `list`. A failure to read one unit is kept with it: it is an error
     /// only if the selection reaches that unit.
@@ -502,15 +546,16 @@ async fn bm25<E: std::error::Error + 'static>(
 }
 
 /// The text of each of `rows` in order, read from the working tree on a
-/// worker thread and checked against the indexed hash. A row that cannot be
-/// read has its own error.
+/// worker thread. A row whose file no longer has the bytes the row was cut
+/// from is [`ReadError::Stale`]; a row that cannot be read has its own
+/// error.
 async fn read_texts<E: std::error::Error + 'static>(
     root: &Path,
     rows: Vec<ChunkRow>,
 ) -> Result<Vec<Result<String, ReadError>>, Error<E>> {
     let root = root.to_path_buf();
     run_blocking(move || {
-        let mut files: HashMap<&str, Option<String>> = HashMap::new();
+        let mut files: HashMap<&str, Option<(ContentHash, Option<String>)>> = HashMap::new();
         rows.iter()
             .map(|row| read_text(&root, row, &mut files))
             .collect()
@@ -518,42 +563,59 @@ async fn read_texts<E: std::error::Error + 'static>(
     .await
 }
 
+/// `row`'s text, rebuilt from its file read once per path into `files` —
+/// the file's hash and, when UTF-8, its text; `None` when it is gone —
+/// provided the file's bytes hash as when the row was cut.
 fn read_text<'a>(
     root: &Path,
     row: &'a ChunkRow,
-    files: &mut HashMap<&'a str, Option<String>>,
+    files: &mut HashMap<&'a str, Option<(ContentHash, Option<String>)>>,
 ) -> Result<String, ReadError> {
-    let stale = || ReadError::Stale {
-        path: row.path.clone(),
-        start: *row.lines.start(),
-        end: *row.lines.end(),
-    };
     if !files.contains_key(row.path.as_str()) {
-        let bytes = match fs::read(root.join(&row.path)) {
-            Ok(bytes) => bytes,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Err(stale()),
-            Err(e) => {
-                return Err(ReadError::Io {
-                    path: row.path.clone(),
-                    kind: e.kind(),
-                    message: e.to_string(),
-                });
-            }
+        let read = match fs::read(root.join(&row.path)) {
+            Ok(bytes) => Some((ContentHash::of_file(&bytes), String::from_utf8(bytes).ok())),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+            Err(e) => return Err(ReadError::Io(ReadFailure::new(&row.path, &e))),
         };
-        files.insert(&row.path, String::from_utf8(bytes).ok());
+        files.insert(&row.path, read);
     }
-    let Some(src) = files[row.path.as_str()].as_deref() else {
-        return Err(stale());
+    let Some((hash, src)) = &files[row.path.as_str()] else {
+        return Err(ReadError::Stale);
     };
-    let Some(text) =
+    if *hash != row.file.content_hash {
+        return Err(ReadError::Stale);
+    }
+    // The bytes the row was cut from: they decoded and held its ranges.
+    let src = src
+        .as_deref()
+        .expect("a file with the bytes it was chunked from is UTF-8");
+    Ok(
         crate::chunk::rebuild_text(src, row.members.iter().map(|m| (m.bytes.clone(), m.emit)))
-    else {
-        return Err(stale());
+            .expect("a file with the bytes it was chunked from holds its chunks' ranges"),
+    )
+}
+
+/// Whether `file` still has the bytes it was indexed with: its stat is the
+/// one recorded, or it is still a regular file whose bytes hash as
+/// recorded.
+fn is_current(root: &Path, file: &FileState) -> Result<bool, ReadFailure> {
+    let path = root.join(&file.path);
+    let meta = match fs::symlink_metadata(&path) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(ReadFailure::new(&file.path, &e)),
     };
-    if ContentHash::of_chunk(&row.title, &text) != row.content_hash {
-        return Err(stale());
+    if !meta.is_file() {
+        return Ok(false);
     }
-    Ok(text)
+    if file.stat_matches(&meta) {
+        return Ok(true);
+    }
+    match fs::read(&path) {
+        Ok(bytes) => Ok(ContentHash::of_file(&bytes) == file.content_hash),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(ReadFailure::new(&file.path, &e)),
+    }
 }
 
 /// Runs blocking `work` on its own thread and awaits the result.
@@ -592,6 +654,13 @@ mod tests {
                     emit: StoredMemberKind::Text,
                     symbol: symbol.to_owned(),
                 }],
+                file: FileState {
+                    path: format!("f{id}.rs"),
+                    size: 0,
+                    mtime_ns: 0,
+                    inode: 0,
+                    content_hash: ContentHash::of_file(&[]),
+                },
             },
             score,
             channels: vec![Channel::Bm25],

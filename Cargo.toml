@@ -37,7 +37,7 @@ path = "src/main.rs"
 
 [dependencies]
 repo-search-client = { workspace = true, features = ["launcher"] }
-repo-search-core.workspace = true
+repo-search-core = { workspace = true, features = ["seed"] }
 askama = { version = "0.16.1", default-features = false, features = [
     "derive",
     "std",

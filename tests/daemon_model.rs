@@ -73,6 +73,7 @@ async fn stage_1_query_on_the_ane() {
         signal: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
             .expect("the SIGTERM stream installs"),
         idle_exit: Duration::from_secs(600),
+        reconcile_wait: daemon::RECONCILE_WAIT,
         load_bound: daemon::LOAD_BOUND,
         tokens: model::tokenizer_store(tmp.path().join("models")),
         server: Endpoint::Unix(server_socket),
@@ -219,6 +220,7 @@ async fn daemon_host_coreml() {
         listener: daemon::listen::Activated(listener),
         signal,
         idle_exit: Duration::from_secs(3600),
+        reconcile_wait: daemon::RECONCILE_WAIT,
         load_bound: daemon::LOAD_BOUND,
         tokens: model::tokenizer_store(config.model_cache.join("tokenizer")),
         server: Endpoint::Unix(config.server_socket),

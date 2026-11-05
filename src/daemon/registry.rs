@@ -298,6 +298,8 @@ pub struct RegistryConfig<T: Tokens> {
     pub state: StateDir,
     /// The model-id vectors are stored under.
     pub model_id: String,
+    /// How long a search waits for a reconcile pass, handed to every owner.
+    pub reconcile_wait: std::time::Duration,
     /// The model readiness watch, handed to every owner.
     pub model: watch::Receiver<EmbeddingState<T>>,
     /// Daemon start, handed to every owner.
@@ -431,6 +433,7 @@ impl<T: Tokens> Registry<T> {
                 started: self.config.started,
                 stopping: self.config.stopping.clone(),
                 server: self.config.server.clone(),
+                reconcile_wait: self.config.reconcile_wait,
             });
             self.owners.insert(
                 w.toplevel.clone(),

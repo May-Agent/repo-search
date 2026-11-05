@@ -398,7 +398,7 @@ fn init(git_common_dir: &Path, dir: &Path) -> Result<Connection, Error> {
         return Err(Error::NotDirectory(git_common_dir.to_path_buf()));
     }
     fs::create_dir_all(dir)?;
-    let path = dir.join(format!("vectors.v{SCHEMA_VERSION}.db"));
+    let path = dir.join(db_name());
     let mut conn = open_conn(&path)?;
     if let Some(found) = ensure_version(&mut conn, SCHEMA_VERSION, include_str!("vectors.sql"))? {
         return Err(Error::BadSchemaVersion {
@@ -472,6 +472,76 @@ fn serve(mut conn: Connection, dir: &Path, mut rx: mpsc::Receiver<Request>) {
             }
         }
     }
+}
+
+/// Copies the cache in `src` to the directory `dst`: the database as one
+/// committed state (copy-on-write with `clonefile` on macOS, `VACUUM INTO`
+/// elsewhere), then every fp16 file of this schema version, copy-on-write
+/// where the volume supports it. A row is written and synced before the
+/// transaction that references it commits, so each fp16 file, copied after
+/// the database, holds every slot the copied database references; bytes
+/// past them are unreferenced. The copy is made beside `dst` and renamed
+/// onto it.
+///
+/// Returns whether it copied: `false` when `src` holds no cache, or when
+/// `dst` already exists or appeared while the copy ran, which is then
+/// discarded.
+///
+/// # Errors
+///
+/// When `src` cannot be read or the copy cannot be written; no partial copy
+/// is left at `dst`.
+#[cfg(feature = "seed")]
+pub fn clone_cache(src: &Path, dst: &Path) -> Result<bool, Error> {
+    let db = src.join(db_name());
+    if !db.try_exists()? || dst.try_exists()? {
+        return Ok(false);
+    }
+    let tmp = super::sidecar(dst, ".seed");
+    match fs::remove_dir_all(&tmp) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
+    fs::create_dir_all(&tmp)?;
+    let copied = (|| {
+        super::copy_db(&mut open_conn(&db)?, &db, &tmp.join(db_name()))?;
+        let prefix = format!("vectors.v{SCHEMA_VERSION}.");
+        for entry in fs::read_dir(src)? {
+            let name = entry?.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if name.starts_with(&prefix) && name.ends_with(".f16") {
+                super::copy_file(&src.join(name), &tmp.join(name))?;
+            }
+        }
+        Ok::<_, Error>(())
+    })();
+    let landed = copied.and_then(|()| match fs::rename(&tmp, dst) {
+        Ok(()) => Ok(true),
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::DirectoryNotEmpty | std::io::ErrorKind::AlreadyExists
+            ) =>
+        {
+            Ok(false)
+        }
+        Err(e) => Err(e.into()),
+    });
+    if matches!(landed, Ok(true)) {
+        return landed;
+    }
+    // The copy failed or lost to an existing `dst`; the copy's own error,
+    // if any, is the one reported.
+    let removed = fs::remove_dir_all(&tmp);
+    let landed = landed?;
+    removed?;
+    Ok(landed)
+}
+
+/// The cache database's file name in its directory.
+fn db_name() -> String {
+    format!("vectors.v{SCHEMA_VERSION}.db")
 }
 
 /// The fp16 file of `model_id`: the first 16 hex characters of the BLAKE3 of
