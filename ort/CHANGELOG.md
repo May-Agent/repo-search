@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.8](https://github.com/May-Agent/repo-search/compare/repo-search-ort-v0.0.7...repo-search-ort-v0.0.8) - 2026-11-05
+
+### Other
+
+- *(ort)* pad a batch to its longest input on CUDA and CPU ([#199](https://github.com/May-Agent/repo-search/pull/199))
+
 ## [0.0.7](https://github.com/May-Agent/repo-search/compare/repo-search-ort-v0.0.6...repo-search-ort-v0.0.7) - 2026-11-04
 
 ### Fixed

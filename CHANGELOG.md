@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.12](https://github.com/May-Agent/repo-search/compare/v0.0.11...v0.0.12) - 2026-11-05
+
+### Added
+
+- bound a search's wait on a reconcile pass
+- seed a clone's index from its origin and never return stale chunks
+
 ## [0.0.11](https://github.com/May-Agent/repo-search/compare/v0.0.10...v0.0.11) - 2026-11-04
 
 ### Added
