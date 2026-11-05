@@ -104,6 +104,7 @@ tokio = { version = "1.54.1", default-features = false, features = ["test-util"]
 repo-search-coreml.workspace = true
 repo-search-server = { workspace = true, features = ["stub"] }
 rusqlite = { version = "0.40.2", default-features = false }
+socket2 = { version = "0.6.5", default-features = false }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 repo-search-server.workspace = true

@@ -701,7 +701,7 @@ struct ListenerAgent {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "real launchd and model; the release gate runs it"]
 async fn startup_failure_reaches_the_client() {
-    use repo_search_client::client::{Client, ClientError};
+    use repo_search_client::client::ClientError;
     use repo_search_client::launcher::kqueue::DirWatch;
     use repo_search_client::protocol::{ErrorKind, ErrorReport};
 
@@ -738,9 +738,10 @@ async fn startup_failure_reaches_the_client() {
         "launchd binds the socket"
     );
 
+    // The path appears at launchd's `bind`, before its `listen`.
     let result = tokio::time::timeout(
         Duration::from_secs(30),
-        Client::connect(&agent.socket, &hello(&program())),
+        client::connect_once_listening(&agent.socket, &hello(&program()), SOCKET_TIMEOUT),
     )
     .await
     .expect("the client is answered instead of hanging");
