@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use clap::{ArgMatches, Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 
+use crate::daemon::RECONCILE_WAIT;
 use repo_search_client::launcher::DAEMON_IDLE_EXIT;
 use repo_search_client::protocol::WireMode;
 
@@ -123,6 +124,16 @@ struct RawCli {
         value_name = "SECS"
     )]
     idle_exit_secs: Option<u64>,
+
+    /// The longest a search waits for a reconcile pass, in milliseconds.
+    #[arg(
+        long,
+        hide = true,
+        requires = "daemon",
+        conflicts_with = "query",
+        value_name = "MS"
+    )]
+    reconcile_wait_ms: Option<u64>,
 
     /// The model cache root, defaulting to the per-user cache.
     #[arg(
@@ -364,6 +375,9 @@ pub enum Invocation {
     Daemon {
         /// Idle deadline; [`DAEMON_IDLE_EXIT`] unless `--idle-exit-secs`.
         idle_exit: Duration,
+        /// How long a search waits for a reconcile pass;
+        /// [`RECONCILE_WAIT`] unless `--reconcile-wait-ms`.
+        reconcile_wait: Duration,
         /// `--model-cache`, when given.
         model_cache: Option<PathBuf>,
         /// `--state-dir`, when given.
@@ -428,6 +442,9 @@ impl Cli {
                 idle_exit: raw
                     .idle_exit_secs
                     .map_or(DAEMON_IDLE_EXIT, Duration::from_secs),
+                reconcile_wait: raw
+                    .reconcile_wait_ms
+                    .map_or(RECONCILE_WAIT, Duration::from_millis),
                 model_cache: raw.model_cache,
                 state_dir: raw.state_dir,
                 server_socket: raw.server_socket,
@@ -598,6 +615,7 @@ mod tests {
         match parsed(&["search", "--daemon"]) {
             Invocation::Daemon {
                 idle_exit,
+                reconcile_wait,
                 model_cache,
                 state_dir,
                 server_socket,
@@ -607,6 +625,7 @@ mod tests {
                 server_token_file,
             } => {
                 assert_eq!(idle_exit, DAEMON_IDLE_EXIT);
+                assert_eq!(reconcile_wait, RECONCILE_WAIT);
                 assert_eq!(model_cache, None);
                 assert_eq!(state_dir, None);
                 assert_eq!(server_socket, None);
@@ -649,6 +668,17 @@ mod tests {
             }
             other => panic!("expected Daemon, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn daemon_reconcile_wait_flag_sets_the_bound() {
+        match parsed(&["search", "--daemon", "--reconcile-wait-ms", "250"]) {
+            Invocation::Daemon { reconcile_wait, .. } => {
+                assert_eq!(reconcile_wait, Duration::from_millis(250));
+            }
+            other => panic!("expected Daemon, got {other:?}"),
+        }
+        assert!(Cli::try_parse_from(["search", "q", "--reconcile-wait-ms", "1"]).is_err());
     }
 
     #[test]

@@ -30,6 +30,7 @@ pub async fn spawn(
         signal: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
             .expect("the SIGTERM stream installs"),
         idle_exit,
+        reconcile_wait: daemon::RECONCILE_WAIT,
         load_bound: daemon::LOAD_BOUND,
         tokens,
         server: endpoint,

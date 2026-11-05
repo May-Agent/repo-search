@@ -16,6 +16,7 @@ fn main() -> ExitCode {
     match Cli::parse().invocation() {
         Invocation::Daemon {
             idle_exit,
+            reconcile_wait,
             model_cache,
             state_dir,
             server_socket,
@@ -24,7 +25,10 @@ fn main() -> ExitCode {
             server_addr,
             server_token_file,
         } => daemon_main(
-            idle_exit,
+            Timing {
+                idle_exit,
+                reconcile_wait,
+            },
             model_cache,
             state_dir,
             listen,
@@ -104,7 +108,7 @@ fn client_main(invocation: Invocation) -> ExitCode {
 /// Off macOS there is no launchd: `--listen` is required, and its absence
 /// is a startup error reported on the ready fd.
 fn daemon_main(
-    idle_exit: Duration,
+    timing: Timing,
     model_cache: Option<PathBuf>,
     state_dir: Option<PathBuf>,
     listen: Option<PathBuf>,
@@ -141,7 +145,7 @@ fn daemon_main(
     if let Some(path) = listen {
         return bound_main(
             runtime,
-            idle_exit,
+            timing,
             model_cache,
             state_dir,
             ready_fd,
@@ -152,7 +156,7 @@ fn daemon_main(
 
     #[cfg(target_os = "macos")]
     {
-        activated_main(runtime, idle_exit, model_cache, state_dir, ready_fd, server)
+        activated_main(runtime, timing, model_cache, state_dir, ready_fd, server)
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -167,7 +171,7 @@ fn daemon_main(
 #[cfg(target_os = "macos")]
 fn activated_main(
     runtime: tokio::runtime::Runtime,
-    idle_exit: Duration,
+    timing: Timing,
     model_cache: Option<PathBuf>,
     state_dir: Option<PathBuf>,
     ready_fd: Option<std::os::fd::RawFd>,
@@ -223,7 +227,8 @@ fn activated_main(
             match runtime.block_on(daemon::run(Config {
                 listener: Activated(listener),
                 signal,
-                idle_exit,
+                idle_exit: timing.idle_exit,
+                reconcile_wait: timing.reconcile_wait,
                 load_bound: daemon::LOAD_BOUND,
                 tokens,
                 server,
@@ -257,7 +262,7 @@ fn activated_main(
 /// and exercised on macOS.
 fn bound_main(
     runtime: tokio::runtime::Runtime,
-    idle_exit: Duration,
+    timing: Timing,
     model_cache: Option<PathBuf>,
     state_dir: Option<PathBuf>,
     ready_fd: Option<std::os::fd::RawFd>,
@@ -310,7 +315,8 @@ fn bound_main(
     match runtime.block_on(repo_search::daemon::run(Config {
         listener: bound,
         signal,
-        idle_exit,
+        idle_exit: timing.idle_exit,
+        reconcile_wait: timing.reconcile_wait,
         load_bound: LOAD_BOUND,
         tokens,
         server,
@@ -442,6 +448,14 @@ fn checks(
     };
     let server = endpoint(server)?;
     Ok((tokens, server, state, build))
+}
+
+/// The daemon's time settings from its flags.
+struct Timing {
+    /// `--idle-exit-secs`.
+    idle_exit: Duration,
+    /// `--reconcile-wait-ms`.
+    reconcile_wait: Duration,
 }
 
 /// The `--server-*` flags: where the embedding server listens and the

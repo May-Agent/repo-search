@@ -106,6 +106,9 @@ pub struct OwnerConfig<T: Tokens> {
     /// The embedding server's client: `GET /status` carries its GPU
     /// report, before and after the link reaches Ready.
     pub server: Arc<ServerClient>,
+    /// The longest a search waits for a reconcile pass (see
+    /// [`Owner::barrier_and_retrieve`]).
+    pub reconcile_wait: Duration,
 }
 
 /// Spawns the owner task; the returned sender is its inbox.
@@ -138,12 +141,10 @@ struct Owner<T: Tokens> {
     /// index once, so a failed copy fails one request and the next builds
     /// from scratch.
     seed_tried: bool,
-    /// The open index was copied from another checkout and no pass has
-    /// begun on it: the next search primes from the copy and runs the first
-    /// pass off the owner (see [`Owner::prime`]).
-    seeded: bool,
+    /// The longest a search waits for a reconcile pass.
+    reconcile_wait: Duration,
     /// The pass running off the owner, holding the reconciler; one pass
-    /// runs at a time.
+    /// runs at a time. A search that stops waiting for it leaves it here.
     pass: Option<InFlight<T>>,
     /// A watcher burst arrived while a pass ran off the owner: a barrier
     /// follows once it lands.
@@ -208,7 +209,7 @@ impl<T: Tokens> Owner<T> {
             index: None,
             index_id: None,
             seed_tried: false,
-            seeded: false,
+            reconcile_wait: config.reconcile_wait,
             pass: None,
             pending_change: false,
             phase: Phase::FirstIndex,
@@ -385,7 +386,7 @@ impl<T: Tokens> Owner<T> {
                 .await
                 .map_err(|e| e.to_string())?
             {
-                self.seeded = self.seed_index().await?;
+                self.seed_index().await?;
             }
             let index = Index::open(&self.state, &self.root)
                 .await
@@ -416,10 +417,10 @@ impl<T: Tokens> Owner<T> {
     /// every file whose bytes are unchanged and re-chunks the rest. No
     /// matching source means a fresh index, as before. Runs once per
     /// owner: a failed copy fails this request, leaves no `index.db`, and
-    /// the next request builds from scratch. Returns whether it copied.
-    async fn seed_index(&mut self) -> Result<bool, String> {
+    /// the next request builds from scratch.
+    async fn seed_index(&mut self) -> Result<(), String> {
         if self.seed_tried {
-            return Ok(false);
+            return Ok(());
         }
         self.seed_tried = true;
         let (listed, remotes) =
@@ -441,7 +442,7 @@ impl<T: Tokens> Owner<T> {
         if let Err(error) = &seeded {
             tracing::error!(%error, root = %self.root.display(), "seeding the index from another checkout failed");
         }
-        seeded
+        seeded.map(|_| ())
     }
 
     /// Before every barrier: the index file must still be the inode it was
@@ -527,7 +528,7 @@ impl<T: Tokens> Owner<T> {
         };
         let sched = model.scheduler.clone();
         // The search's window: it opens before the freshness barrier's
-        // writer flush and a seeded index's priming reads, so a vector the
+        // writer flush and an index's priming reads, so a vector the
         // retrieval's cache reads miss is remembered until the retrieval's
         // `Documents` job lands, and it closes after that job is answered
         // (see `DocumentsJob`).
@@ -582,69 +583,98 @@ impl<T: Tokens> Owner<T> {
     }
 
     /// The freshness barrier, then the retrieval, inside the search's
-    /// window the caller holds open. While a pass runs off the owner — a
-    /// seeded index's first, which [`Owner::prime`] starts — the search
-    /// does not wait for it: it answers from the index as it stands and
-    /// reports the pass running, and the retriever leaves out every file
-    /// that changed since it was indexed. `None` when an error event was
-    /// already sent.
+    /// window the caller holds open. The search waits for the pass it
+    /// triggers, or for one already running, for at most
+    /// `reconcile_wait`, one deadline for the whole barrier. A pass that
+    /// lands in time gives an answer from the reconciled index. Past the
+    /// deadline the pass is left running off the owner and the search
+    /// answers from the index as it stands, reporting the pass running;
+    /// the retriever leaves out every file that changed since it was
+    /// indexed. `None` when an error event was already sent.
     async fn barrier_and_retrieve(
         &mut self,
         model: &Arc<Embedding<T>>,
         request: &search::Request,
         events: &mpsc::Sender<Event>,
     ) -> Option<Retrieved> {
-        if self.seeded
-            && let Err(message) = self.prime(model).await
-        {
-            send(events, error(ErrorKind::Internal, message)).await;
-            return None;
-        }
-        if self.pass.is_some() && self.retriever.is_some() {
-            let report = self
-                .report
-                .as_ref()
-                .expect("a built retriever had a report");
-            let reconciliation =
-                Reconciliation::new(self.commit.clone(), report).while_reconciling();
-            return self
-                .retrieve(model, request, reconciliation, 0, events)
-                .await;
-        }
+        let deadline = tokio::time::Instant::now() + self.reconcile_wait;
         if !send(events, Event::Progress(Progress::Reconciling)).await {
             return None;
         }
         let barrier_start = Instant::now();
-        let (report, commit) = match self.barrier(model, None).await {
-            Ok(done) => done,
+        // A retriever is built over the books before the first pass, so
+        // that a search which stops waiting has an index to answer from.
+        // A pass is running only when a retriever exists.
+        if self.pass.is_none()
+            && let Err(message) = self.verify_index().await
+        {
+            send(events, error(ErrorKind::Internal, message)).await;
+            return None;
+        }
+        let primed = self.retriever.is_none();
+        if primed && let Err(message) = self.prime(model).await {
+            send(events, error(ErrorKind::Internal, message)).await;
+            return None;
+        }
+        let landed = match self.reach(model, primed, deadline).await {
+            Ok(landed) => landed,
             Err(message) => {
                 send(events, error(ErrorKind::Search, message)).await;
                 return None;
             }
         };
         let barrier_us = barrier_start.elapsed().as_micros() as u64;
-        if self.retriever.is_none() {
-            // Seeded from the books the barrier just left; every later
-            // pass's presence follows (see `Owner::passed`).
-            let pairs = self
-                .reconciler
-                .as_ref()
-                .and_then(Reconciler::books)
-                .expect("a barrier that succeeded leaves books")
-                .pairs();
-            if let Err(message) = self.build_retriever(model, pairs) {
-                send(events, error(ErrorKind::Internal, message)).await;
-                return None;
+        let reconciliation = match landed {
+            Some((report, commit)) => Reconciliation::new(commit, &report),
+            None => {
+                let report = self
+                    .report
+                    .as_ref()
+                    .expect("a built retriever had a report");
+                Reconciliation::new(self.commit.clone(), report).while_reconciling()
             }
+        };
+        self.retrieve(model, request, reconciliation, barrier_us, events)
+            .await
+    }
+
+    /// Brings a pass to land before `deadline`: a pass this search began
+    /// (`began`) is the one waited for; otherwise a pass already running
+    /// lands first and a pass of the search's own follows. `None` at the
+    /// deadline, the pass still running.
+    async fn reach(
+        &mut self,
+        model: &Arc<Embedding<T>>,
+        began: bool,
+        deadline: tokio::time::Instant,
+    ) -> Result<Option<(Report, String)>, String> {
+        if !began {
+            if self.pass.is_some() {
+                match self.land_by(deadline).await {
+                    Ok(Some(_)) => {}
+                    Ok(None) => return Ok(None),
+                    Err(error) => {
+                        tracing::error!(%error, root = %self.root.display(), "reconcile pass failed");
+                    }
+                }
+            }
+            self.begin_pass(model).await?;
         }
-        self.retrieve(
-            model,
-            request,
-            Reconciliation::new(commit, &report),
-            barrier_us,
-            events,
-        )
-        .await
+        self.land_by(deadline).await
+    }
+
+    /// [`Owner::land`] with a deadline: `None` when the pass is still
+    /// running at `deadline`, which does not cancel it.
+    async fn land_by(
+        &mut self,
+        deadline: tokio::time::Instant,
+    ) -> Result<Option<(Report, String)>, String> {
+        let pass = self.pass.as_mut().expect("a pass is running");
+        let Ok(done) = tokio::time::timeout_at(deadline, &mut pass.done).await else {
+            return Ok(None);
+        };
+        let pass = self.pass.take().expect("the pass just finished");
+        self.finish(&pass.model, joined(done), None).await.map(Some)
     }
 
     /// Builds the retriever over the open index from `pairs`, the books'
@@ -675,13 +705,14 @@ impl<T: Tokens> Owner<T> {
         Ok(())
     }
 
-    /// Before the first pass over a seeded index: its books are read
-    /// whole, and the retriever and the searches' freshness input are
-    /// taken from them; then the first pass starts off the owner. That
-    /// pass reads every file whose stat moved — every file of a fresh
-    /// checkout — so searches answer from the copy meanwhile; the
-    /// retriever follows the pass's whole presence once it lands. Runs
-    /// inside the search's window, which covers the books' cache reads.
+    /// Before the first pass over an open index, seeded or fresh: its
+    /// books are read whole, and the retriever and the searches' freshness
+    /// input are taken from them; then the first pass starts off the
+    /// owner. That pass reads every file whose stat moved — every file of
+    /// a fresh checkout — so a search that stops waiting for it answers
+    /// from the copy; the retriever follows the pass's whole presence once
+    /// it lands. Runs inside the search's window, which covers the books'
+    /// cache reads.
     async fn prime(&mut self, model: &Arc<Embedding<T>>) -> Result<(), String> {
         let index = self.index.clone().expect("opened");
         let root = self.root.clone();
@@ -1004,7 +1035,6 @@ impl<T: Tokens> Owner<T> {
     async fn begin_pass(&mut self, model: &Arc<Embedding<T>>) -> Result<(), String> {
         assert!(self.pass.is_none(), "one reconcile pass runs at a time");
         self.verify_index().await?;
-        self.seeded = false;
         model.scheduler.barrier(self.repo, true).await;
         self.reconciler();
         let reconciler = self.reconciler.take().expect("built above");
@@ -1162,10 +1192,13 @@ impl<T: Tokens> Owner<T> {
         Ok((reconciled.report, commit, feed))
     }
 
-    /// A watcher burst: the same barrier as a query, answered nowhere and
+    /// A watcher burst: the same pass as a query's, answered nowhere and
     /// always without ignored files. While a pass runs off the owner the
     /// burst waits for it to land: that pass may have read the files
-    /// before they changed.
+    /// before they changed. Once a search has built the retriever the
+    /// pass runs off the owner, so no pass holds the inbox past a search's
+    /// wait; before that it runs inline, as no search can answer without
+    /// the retriever.
     async fn changed(&mut self) {
         if self.pass.is_some() {
             self.pending_change = true;
@@ -1182,7 +1215,18 @@ impl<T: Tokens> Owner<T> {
             tracing::error!(%error, root = %self.root.display(), "watcher barrier: shared state failed");
             return;
         }
-        if let Err(error) = self.barrier(&model, None).await {
+        // A reopened index drops the retriever: settled before the choice
+        // below, so a pass off the owner always has one to answer from.
+        if let Err(error) = self.verify_index().await {
+            tracing::error!(%error, root = %self.root.display(), "watcher barrier: index failed");
+            return;
+        }
+        let begun = if self.retriever.is_some() {
+            self.begin_pass(&model).await
+        } else {
+            self.barrier(&model, None).await.map(|_| ())
+        };
+        if let Err(error) = begun {
             tracing::error!(%error, root = %self.root.display(), "watcher barrier failed");
         }
     }
@@ -1404,9 +1448,9 @@ async fn stopped(stopping: &mut watch::Receiver<bool>) {
     let _ = stopping.wait_for(|stopping| *stopping).await;
 }
 
-/// A reconcile pass running off the owner: a seeded index's first pass,
-/// which reads every file of a fresh checkout while searches answer from
-/// the copy.
+/// A reconcile pass running off the owner: one a search stopped waiting
+/// for at its deadline, or the first pass over an index, while searches
+/// answer from the index as it stands.
 struct InFlight<T: Tokens> {
     /// Hands the reconciler back with the pass's outcome.
     done: tokio::task::JoinHandle<PassDone>,
