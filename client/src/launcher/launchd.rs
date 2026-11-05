@@ -77,11 +77,17 @@ fn home_suffix(home: &Path) -> String {
 ///
 /// Note that launchd's default `ThrottleInterval` (10 s) can delay a
 /// relaunch that follows an exit less than 10 s after launch; only the
-/// protocol-mismatch exit hits this.
+/// protocol-mismatch and `--build` mismatch exits hit this.
 ///
 /// A daemon that fails after socket activation answers every queued
 /// connection with `Startup` before exiting, so no connection is left to
 /// drive a relaunch loop.
+///
+/// `--build` replaces a daemon whose binary was rebuilt or reinstalled
+/// at the same path, as it does the server ([`ServerAgent`]): the plist
+/// changes, so `ensure_agent` replaces the agent, and the daemon itself
+/// refuses to run when the argument does not match its own build. The
+/// handshake does not compare builds.
 #[derive(askama::Template)]
 #[template(path = "launch-agent.plist", escape = "html")]
 pub struct LaunchAgent {
@@ -93,6 +99,8 @@ pub struct LaunchAgent {
     pub socket: PathBuf,
     /// The `--idle-exit-secs` argument.
     pub idle_exit: Duration,
+    /// The `--build` argument: the binary's identity at install time.
+    pub build: String,
     /// The `--model-cache` argument, when a non-default cache is used.
     pub model_cache: Option<PathBuf>,
     /// The `--state-dir` argument, when a non-default state dir is used.
@@ -305,6 +313,7 @@ mod tests {
             program: PathBuf::from("/usr/local/bin/search"),
             socket: PathBuf::from("/tmp/daemon.sock"),
             idle_exit: Duration::from_secs(600),
+            build: "123@456".to_owned(),
             model_cache: None,
             state_dir: None,
             server_socket: PathBuf::from("/tmp/server.sock"),
@@ -320,6 +329,7 @@ mod tests {
             "<key>LimitLoadToSessionType</key>\n\t<string>Background</string>",
             "<string>/usr/local/bin/search</string>",
             "<string>--idle-exit-secs</string>\n\t\t<string>600</string>",
+            "<string>--build</string>\n\t\t<string>123@456</string>",
             "<string>--server-socket</string>\n\t\t<string>/tmp/server.sock</string>",
             "<key>SockPathName</key>\n\t\t\t<string>/tmp/daemon.sock</string>",
             "<key>SockPathMode</key>\n\t\t\t<integer>384</integer>",

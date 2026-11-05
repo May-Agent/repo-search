@@ -68,6 +68,15 @@ pub enum StartupError {
     /// The running binary could not be identified.
     #[error("could not identify the running binary: {0}")]
     Build(#[source] io::Error),
+    /// The agent registered another build than the one running: the
+    /// binary on disk was replaced since the plist was written.
+    #[error("--build {expected} does not match this binary {actual}")]
+    BuildMismatch {
+        /// The `--build` argument.
+        expected: String,
+        /// The running binary's identity.
+        actual: BuildId,
+    },
     /// The tokenizer cache could not be opened.
     #[error("could not open the model cache: {0}")]
     ModelStore(#[source] crate::model_store::Error),

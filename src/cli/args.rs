@@ -69,12 +69,12 @@ struct RawCli {
     )]
     token_file: Option<PathBuf>,
 
-    /// The build this agent registered; the server refuses to run any
-    /// other.
+    /// The build this agent registered; the server or daemon refuses to
+    /// run any other.
     #[arg(
         long,
         hide = true,
-        requires = "server",
+        requires = "agent",
         conflicts_with = "query",
         value_name = "ID"
     )]
@@ -378,6 +378,9 @@ pub enum Invocation {
         /// How long a search waits for a reconcile pass;
         /// [`RECONCILE_WAIT`] unless `--reconcile-wait-ms`.
         reconcile_wait: Duration,
+        /// `--build`, when given: the daemon refuses to run as any other
+        /// build.
+        build: Option<String>,
         /// `--model-cache`, when given.
         model_cache: Option<PathBuf>,
         /// `--state-dir`, when given.
@@ -445,6 +448,7 @@ impl Cli {
                 reconcile_wait: raw
                     .reconcile_wait_ms
                     .map_or(RECONCILE_WAIT, Duration::from_millis),
+                build: raw.build,
                 model_cache: raw.model_cache,
                 state_dir: raw.state_dir,
                 server_socket: raw.server_socket,
@@ -616,6 +620,7 @@ mod tests {
             Invocation::Daemon {
                 idle_exit,
                 reconcile_wait,
+                build,
                 model_cache,
                 state_dir,
                 server_socket,
@@ -626,6 +631,7 @@ mod tests {
             } => {
                 assert_eq!(idle_exit, DAEMON_IDLE_EXIT);
                 assert_eq!(reconcile_wait, RECONCILE_WAIT);
+                assert_eq!(build, None);
                 assert_eq!(model_cache, None);
                 assert_eq!(state_dir, None);
                 assert_eq!(server_socket, None);
@@ -679,6 +685,14 @@ mod tests {
             other => panic!("expected Daemon, got {other:?}"),
         }
         assert!(Cli::try_parse_from(["search", "q", "--reconcile-wait-ms", "1"]).is_err());
+    }
+
+    #[test]
+    fn daemon_build_flag_names_the_registered_build() {
+        match parsed(&["search", "--daemon", "--build", "1@2"]) {
+            Invocation::Daemon { build, .. } => assert_eq!(build.as_deref(), Some("1@2")),
+            other => panic!("expected Daemon, got {other:?}"),
+        }
     }
 
     #[test]
