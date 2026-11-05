@@ -56,6 +56,9 @@ enum Process {
 }
 
 struct Loaded {
+    /// The plist path the job was bootstrapped from; empty for a job a
+    /// control loaded.
+    path: PathBuf,
     /// The plist contents the bootstrap read.
     #[allow(dead_code)]
     plist: String,
@@ -84,6 +87,9 @@ enum Request {
     Service {
         service: String,
         reply: mpsc::Sender<Result<Option<Service>, LaunchctlError>>,
+    },
+    Labels {
+        reply: mpsc::Sender<Result<Vec<String>, LaunchctlError>>,
     },
     Bootout {
         service: String,
@@ -143,7 +149,18 @@ impl Owner {
                 Process::StandIn(child) => Some(child.id()),
                 _ => None,
             },
+            path: Some(loaded.path.clone()).filter(|path| !path.as_os_str().is_empty()),
         })
+    }
+
+    /// The loaded job's label: its plist's file stem, as the launcher
+    /// names plists.
+    fn labels(&self) -> Vec<String> {
+        self.loaded
+            .iter()
+            .filter_map(|loaded| loaded.path.file_stem())
+            .map(|stem| stem.to_string_lossy().into_owned())
+            .collect()
     }
 
     fn bootout(&mut self, args: String) -> Result<(), LaunchctlError> {
@@ -176,7 +193,12 @@ impl Owner {
         }
     }
 
-    fn bootstrap(&mut self, args: String, plist_contents: String) -> Result<(), LaunchctlError> {
+    fn bootstrap(
+        &mut self,
+        args: String,
+        plist: PathBuf,
+        plist_contents: String,
+    ) -> Result<(), LaunchctlError> {
         if let Some(child) = &mut self.tearing_down {
             match child.try_wait() {
                 Ok(Some(_)) => self.tearing_down = None,
@@ -259,6 +281,7 @@ impl Owner {
             }
         };
         self.loaded = Some(Loaded {
+            path: plist,
             plist: plist_contents,
             process,
         });
@@ -309,6 +332,9 @@ impl Owner {
                     let _ = reply.send(Ok(self.service()));
                     let _ = service;
                 }
+                Request::Labels { reply } => {
+                    let _ = reply.send(Ok(self.labels()));
+                }
                 Request::Bootout { service, reply } => {
                     let _ = calls.send(Call::Bootout);
                     let _ = reply.send(self.bootout(format!("bootout {service}")));
@@ -325,6 +351,7 @@ impl Owner {
                     });
                     let _ = reply.send(self.bootstrap(
                         format!("bootstrap {domain} {}", plist.display()),
+                        plist,
                         plist_contents,
                     ));
                 }
@@ -348,12 +375,14 @@ impl Owner {
                             .spawn()
                             .expect("the stand-in cat spawns");
                         self.loaded = Some(Loaded {
+                            path: PathBuf::new(),
                             plist: String::new(),
                             process: Process::StandIn(child),
                         });
                     }
                     Control::LoadWithoutProcess => {
                         self.loaded = Some(Loaded {
+                            path: PathBuf::new(),
                             plist: String::new(),
                             process: Process::None,
                         });
@@ -566,6 +595,10 @@ impl Launchctl for FakeLaunchctl {
     fn service(&mut self, service: &str) -> Result<Option<Service>, LaunchctlError> {
         let service = service.to_owned();
         self.call(|reply| Request::Service { service, reply })
+    }
+
+    fn labels(&mut self, _domain: &str) -> Result<Vec<String>, LaunchctlError> {
+        self.call(|reply| Request::Labels { reply })
     }
 
     fn bootout(&mut self, service: &str) -> Result<(), LaunchctlError> {
