@@ -3888,3 +3888,64 @@ async fn refuse_answers_every_queued_connection() {
         assert_eq!(reader.read_line(&mut line).expect("eof"), 0, "then EOF");
     }
 }
+
+/// launchd creates a `Listener` socket's path with `bind` and calls
+/// `listen` only after setting its owner and mode, so a client woken by
+/// the path's creation can connect before the socket accepts. Its connect
+/// is refused and queues nothing, and it must still end with the failing
+/// daemon's `Startup` refusal. The socket here is held in that state for
+/// the client's first attempt; then it listens, and the daemon's refusal
+/// runs once a connection is queued, as launchd launches it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_client_connecting_before_launchd_listens_gets_the_startup_refusal() {
+    use socket2::{Domain, SockAddr, Socket, Type};
+    use std::future::Future as _;
+    use std::task::Poll;
+    use support::client::connect_once_listening;
+    use tokio::io::Interest;
+    use tokio::io::unix::AsyncFd;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let path = tmp.path().join("daemon.sock");
+    let socket = Socket::new(Domain::UNIX, Type::STREAM, None).expect("socket");
+    socket
+        .bind(&SockAddr::unix(&path).expect("a unix address"))
+        .expect("bind");
+
+    let hello = hello();
+    let mut connect = std::pin::pin!(connect_once_listening(&path, &hello, TIMEOUT));
+    let first = std::future::poll_fn(|cx| Poll::Ready(connect.as_mut().poll(cx))).await;
+
+    socket.listen(128).expect("listen");
+    let listener = std::os::unix::net::UnixListener::from(socket);
+    listener.set_nonblocking(true).expect("nonblocking");
+    let error = daemon::StartupError::ListenerCount(2);
+    let result = match first {
+        Poll::Ready(result) => result,
+        Poll::Pending => {
+            // SAFETY: the listener owns its fd, and nothing closes or
+            // replaces it while `queued` holds it.
+            let queued = unsafe { AsyncFd::register_with_interest(listener, Interest::READABLE) }
+                .expect("the listener registers");
+            let daemon = async {
+                queued
+                    .readable()
+                    .await
+                    .expect("a connection queues")
+                    .retain_ready();
+                daemon::refuse(queued.into_inner(), &error).await;
+            };
+            tokio::time::timeout(TIMEOUT, async { tokio::join!(connect, daemon).0 })
+                .await
+                .expect("the client is answered")
+        }
+    };
+    match result {
+        Err(repo_search_client::client::ClientError::Refused(report)) => {
+            assert_eq!(report.kind, ErrorKind::Startup);
+            assert_eq!(report.message, error.to_string());
+        }
+        Err(other) => panic!("expected a Startup refusal, got {other:?}"),
+        Ok(_) => panic!("expected a Startup refusal, the handshake succeeded"),
+    }
+}
