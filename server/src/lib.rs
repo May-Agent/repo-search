@@ -101,9 +101,12 @@ pub async fn refuse_http(listeners: Vec<Listener>, error: &str) {
     for listener in listeners {
         let body = body.clone();
         tasks.spawn(async move {
-            match listener {
+            let outcome = match listener {
                 Listener::Unix(listener) => refuse_loop(listener, body).await,
                 Listener::Tcp(listener) => refuse_loop(listener, body).await,
+            };
+            if let Err(error) = outcome {
+                tracing::error!(%error, "a listener failed while refusing its queue");
             }
         });
     }
@@ -146,22 +149,57 @@ impl Accept for std::net::TcpListener {
     }
 }
 
+/// How long the drain pauses after `accept` fails for want of
+/// descriptors or memory, so the retry does not spin while the shortage
+/// lasts.
+const ACCEPT_BACKOFF: Duration = Duration::from_millis(10);
+
+/// Decides what a failed `accept` means, for every accept loop.
+///
+/// Returns `Ok` when the loop should accept again: the failure was one
+/// connection's (aborted, reset, interrupted, a failed handshake), or
+/// the process is out of descriptors or memory, which clears when
+/// resources are freed, so this pauses first. Returns the error when
+/// the listener itself is broken (`EINVAL` on a socket that is not
+/// listening, `EBADF`, `ENOTSOCK`, …): no retry can succeed.
+pub(crate) async fn survive_accept_error(error: io::Error) -> Result<(), io::Error> {
+    use io::ErrorKind::{ConnectionAborted, ConnectionReset, Interrupted, TimedOut};
+    let retry = match error.kind() {
+        ConnectionAborted | ConnectionReset | Interrupted | TimedOut => true,
+        _ => match error.raw_os_error() {
+            Some(libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM) => {
+                tokio::time::sleep(ACCEPT_BACKOFF).await;
+                true
+            }
+            // The BSD `accept` reports a connection that failed its
+            // handshake as a protocol error.
+            Some(libc::EPROTO) => true,
+            _ => false,
+        },
+    };
+    if retry {
+        tracing::error!(%error, "could not accept a connection");
+        Ok(())
+    } else {
+        Err(error)
+    }
+}
+
 /// Drains `listener`'s queue — `WouldBlock` ends it — and serves each
 /// connection one bounded 503. A per-connection failure is logged and
-/// skipped; only an empty queue or an `accept` failure ends the drain,
-/// so one bad fd never leaves later queued clients unanswered.
-async fn refuse_loop<L: Accept>(listener: L, body: String) {
+/// skipped, so one bad fd never leaves later queued clients unanswered;
+/// a failure of the listener itself ends the drain with that error,
+/// after the connections already accepted are answered.
+async fn refuse_loop<L: Accept>(listener: L, body: String) -> io::Result<()> {
     let mut conns = tokio::task::JoinSet::new();
-    loop {
+    let outcome = loop {
         let raw = match listener.accept() {
             Ok(raw) => raw,
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
-            // A per-connection failure — one fd's — never ends the
-            // drain: every later queued client is still answered.
-            Err(error) => {
-                tracing::error!(%error, "could not accept a pending connection");
-                continue;
-            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => break Ok(()),
+            Err(error) => match survive_accept_error(error).await {
+                Ok(()) => continue,
+                Err(error) => break Err(error),
+            },
         };
         let stream = match L::from_std(raw) {
             Ok(stream) => stream,
@@ -172,8 +210,9 @@ async fn refuse_loop<L: Accept>(listener: L, body: String) {
         };
         let body = body.clone();
         conns.spawn(async move { serve_refusal(stream, body).await });
-    }
+    };
     conns.join_all().await;
+    outcome
 }
 
 /// Serves `stream` one 503 `connection: close` reply through hyper. The
@@ -228,6 +267,34 @@ pub async fn run<B: Backend, M: ModelSource>(config: Config<B, M>) -> Result<(),
         .expect("the server task panicked")
 }
 
+/// Completes the bind of `listener` with the `listen` call that makes it
+/// own its port. The sockets arrive from launchd, which binds them; one
+/// handed over bound but never listening fails every `accept` with
+/// `EINVAL`. `listen` is idempotent on a listening socket (macOS has no
+/// readable `SO_ACCEPTCONN`), and on any other it either starts
+/// listening or fails, in which case the server cannot own its port and
+/// exits naming it.
+fn ensure_listening(listener: &tokio::net::TcpListener) -> Result<(), Error> {
+    use std::os::fd::AsRawFd as _;
+    let addr = listener.local_addr()?;
+    // `listen` on a socket that was never bound binds it to an ephemeral
+    // port; the server would then serve on a port nobody dials.
+    if addr.port() == 0 {
+        return Err(Error::Listener(format!(
+            "tcp listener {addr} is not bound to a port, so it does not own the port it was given"
+        )));
+    }
+    // SAFETY: the fd is live for the borrow; `listen` takes no pointers.
+    if unsafe { libc::listen(listener.as_raw_fd(), libc::SOMAXCONN) } != 0 {
+        let error = io::Error::last_os_error();
+        return Err(Error::Listener(format!(
+            "tcp listener {addr} cannot listen, so port {} is not this server's: {error}",
+            addr.port()
+        )));
+    }
+    Ok(())
+}
+
 /// Starts the server and returns the watches its handlers serve;
 /// [`Running::task`] drives it to the exit [`run`] awaits.
 ///
@@ -237,6 +304,9 @@ pub async fn run<B: Backend, M: ModelSource>(config: Config<B, M>) -> Result<(),
 /// loopback — its queued connections are refused first — and
 /// [`Error::Io`] on listener or signal-handler failures.
 pub async fn spawn<B: Backend, M: ModelSource>(config: Config<B, M>) -> Result<Running<B>, Error> {
+    for listener in &config.tcp {
+        ensure_listening(listener)?;
+    }
     if config.token.is_none() {
         let mut non_loopback = Vec::new();
         for listener in &config.tcp {
@@ -328,7 +398,7 @@ pub async fn spawn<B: Backend, M: ModelSource>(config: Config<B, M>) -> Result<R
         next_request: std::sync::atomic::AtomicU64::new(0),
         in_flight: Arc::new(in_flight),
     });
-    let accepts = conns.run(shared.clone());
+    let accepts = conns.run(shared.clone(), fatal_tx);
     let task = tokio::spawn(drive(
         monitor,
         accepts,
@@ -448,5 +518,149 @@ async fn wait_any(sources: &mut Vec<watch::Receiver<bool>>) {
     };
     if out.is_err() {
         sources.remove(i);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::{Cell, RefCell};
+    use std::collections::VecDeque;
+    use std::os::fd::FromRawFd as _;
+    use std::rc::Rc;
+
+    use super::*;
+
+    /// An `Accept` yielding scripted results, then `WouldBlock`,
+    /// counting its calls.
+    struct Scripted {
+        script: RefCell<VecDeque<io::Error>>,
+        calls: Rc<Cell<usize>>,
+    }
+
+    impl Accept for Scripted {
+        type Raw = ();
+        type Stream = tokio::net::TcpStream;
+        fn accept(&self) -> io::Result<()> {
+            self.calls.set(self.calls.get() + 1);
+            Err(self
+                .script
+                .borrow_mut()
+                .pop_front()
+                .unwrap_or_else(|| io::ErrorKind::WouldBlock.into()))
+        }
+        fn from_std((): ()) -> io::Result<Self::Stream> {
+            unreachable!("the script never yields a connection")
+        }
+    }
+
+    fn scripted(codes: &[i32]) -> (Scripted, Rc<Cell<usize>>) {
+        let calls = Rc::new(Cell::new(0));
+        let script = codes
+            .iter()
+            .map(|&c| io::Error::from_raw_os_error(c))
+            .collect();
+        (
+            Scripted {
+                script: RefCell::new(script),
+                calls: calls.clone(),
+            },
+            calls,
+        )
+    }
+
+    /// A std listener bound to an ephemeral loopback port and nonblocking,
+    /// on a socket of `kind` that was never put into the listening state.
+    fn unlistened(kind: libc::c_int) -> std::net::TcpListener {
+        // SAFETY: a fresh socket fd, owned by the listener built from it;
+        // `addr` is a valid `sockaddr_in` for the length passed.
+        unsafe {
+            let fd = libc::socket(libc::AF_INET, kind, 0);
+            assert!(fd >= 0, "{}", io::Error::last_os_error());
+            let mut addr: libc::sockaddr_in = std::mem::zeroed();
+            addr.sin_len = size_of::<libc::sockaddr_in>() as u8;
+            addr.sin_family = libc::AF_INET as libc::sa_family_t;
+            addr.sin_addr.s_addr = u32::from_ne_bytes([127, 0, 0, 1]);
+            let rc = libc::bind(
+                fd,
+                (&raw const addr).cast(),
+                size_of::<libc::sockaddr_in>() as libc::socklen_t,
+            );
+            assert_eq!(rc, 0, "{}", io::Error::last_os_error());
+            let listener = std::net::TcpListener::from_raw_fd(fd);
+            listener.set_nonblocking(true).unwrap();
+            listener
+        }
+    }
+
+    #[tokio::test]
+    async fn a_listener_error_ends_the_drain_unretried() {
+        for code in [libc::EINVAL, libc::EBADF, libc::ENOTSOCK] {
+            let (listener, calls) = scripted(&[code, code]);
+            let error = refuse_loop(listener, String::new())
+                .await
+                .expect_err("a listener error ends the drain");
+            assert_eq!(error.raw_os_error(), Some(code));
+            assert_eq!(calls.get(), 1, "the error is not retried");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_connection_error_is_skipped() {
+        let (listener, calls) = scripted(&[libc::ECONNABORTED, libc::EINTR, libc::EMFILE]);
+        refuse_loop(listener, String::new())
+            .await
+            .expect("per-connection errors do not end the drain");
+        assert_eq!(calls.get(), 4, "each skipped, then the empty queue");
+    }
+
+    #[tokio::test]
+    async fn accept_on_a_socket_that_never_listened_ends_the_drain() {
+        // The state that spun the drain: `accept` on a bound socket that
+        // is not listening fails with EINVAL.
+        let error = refuse_loop(unlistened(libc::SOCK_STREAM), String::new())
+            .await
+            .expect_err("EINVAL is the listener's");
+        assert_eq!(error.raw_os_error(), Some(libc::EINVAL));
+    }
+
+    #[tokio::test]
+    async fn startup_completes_the_listen_of_a_bound_socket() {
+        let std = unlistened(libc::SOCK_STREAM);
+        let listener = tokio::net::TcpListener::from_std(std).unwrap();
+        ensure_listening(&listener).expect("a bound stream socket can listen");
+        let addr = listener.local_addr().unwrap();
+        std::net::TcpStream::connect(addr).expect("it now accepts connections");
+        // Idempotent on a socket that already listens.
+        ensure_listening(&listener).expect("listen again");
+    }
+
+    #[tokio::test]
+    async fn startup_refuses_a_socket_that_was_never_bound() {
+        // `listen` would bind it to an ephemeral port nobody dials.
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        use std::os::fd::IntoRawFd as _;
+        // SAFETY: the raw fd was just released by the socket, which
+        // gives up ownership.
+        let std = unsafe { std::net::TcpListener::from_raw_fd(socket.into_raw_fd()) };
+        std.set_nonblocking(true).unwrap();
+        let listener = tokio::net::TcpListener::from_std(std).unwrap();
+        let Err(Error::Listener(message)) = ensure_listening(&listener) else {
+            panic!("an unbound socket does not own a port");
+        };
+        assert!(message.contains("not bound"), "{message}");
+        assert_eq!(listener.local_addr().unwrap().port(), 0, "never listened");
+    }
+
+    #[tokio::test]
+    async fn startup_fails_naming_the_port_when_the_socket_cannot_listen() {
+        // A datagram socket bound to the port is a stand-in for a socket
+        // the kernel refuses to listen on.
+        let std = unlistened(libc::SOCK_DGRAM);
+        let port = std.local_addr().unwrap().port();
+        let listener = tokio::net::TcpListener::from_std(std).unwrap();
+        let Err(Error::Listener(message)) = ensure_listening(&listener) else {
+            panic!("a socket that cannot listen cannot own its port");
+        };
+        assert!(message.contains(&port.to_string()), "{message}");
     }
 }
