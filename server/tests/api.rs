@@ -734,7 +734,8 @@ async fn a_closed_connection_embeds_nothing() {
         in_flight: Arc::new(in_flight),
     });
     let unix = tokio::net::UnixListener::bind(dir.path().join("s.sock")).expect("bind");
-    let accepts = http::serve(unix, Vec::new()).run(shared);
+    let (accept_fatal, _accept_fatal_rx) = tokio::sync::mpsc::channel(1);
+    let accepts = http::serve(unix, Vec::new()).run(shared, accept_fatal);
     // Wait until the model answers ready, and take the scheduler's
     // queued-item watch: the signal that proves the raw request's item
     // was submitted and later left the queue unembedded.
@@ -890,6 +891,68 @@ async fn tcp_without_a_token_must_bind_loopback() {
     let text = String::from_utf8(response).expect("utf8");
     assert!(text.starts_with("HTTP/1.1 503"), "{text}");
     assert!(text.contains("server_start_failed"), "{text}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_listener_that_cannot_accept_ends_the_server_with_an_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let (records_tx, _records) = mpsc::channel();
+    let (_headroom_tx, headroom_rx) = watch::channel(Err(GpuBlocked::PowerSourceUnknown));
+    let (loader_busy, _busy_rx) = watch::channel(false);
+    let (busy_reg, _busy_reg_rx) = tokio::sync::mpsc::channel::<BusySource>(16);
+    let (loader_fatal, _loader_fatal_rx) = tokio::sync::mpsc::channel(64);
+    let (gpu_tx, gpu_rx) = watch::channel(GpuState::Absent { blocked: None });
+    let loader = loader::spawn(LoaderConfig {
+        backend: Arc::new(StubBackend::new(records_tx)),
+        model: Arc::new(TempModel {
+            dir: dir.path().to_path_buf(),
+            progress: None,
+            gate: None,
+        }),
+        bound: Duration::from_secs(60),
+        chip: ChipClass::Wide,
+        headroom: headroom_rx,
+        busy: loader_busy,
+        busy_reg,
+        fatal: loader_fatal,
+        gpu_state: gpu_tx,
+    });
+    let (in_flight, _busy, _count) = http::InFlight::new();
+    let shared = Arc::new(http::Shared {
+        state: loader.state.clone(),
+        loader: loader.tx.clone(),
+        gpu: gpu_rx,
+        stage: loader.stage.clone(),
+        token: None,
+        next_request: AtomicU64::new(0),
+        in_flight: Arc::new(in_flight),
+    });
+    // A socket that is not listening — here a connected stream's fd:
+    // `accept` on it fails with EINVAL, an error no retry clears. A
+    // byte from the peer makes the runtime try the `accept`.
+    let hold = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let mut peer = std::net::TcpStream::connect(hold.local_addr().unwrap()).expect("connect");
+    let (accepted, _) = hold.accept().expect("accept");
+    // SAFETY: the raw fd was just released by the stream, which gives
+    // up ownership.
+    let std = unsafe {
+        use std::os::fd::{FromRawFd as _, IntoRawFd as _};
+        std::net::TcpListener::from_raw_fd(accepted.into_raw_fd())
+    };
+    std.set_nonblocking(true).expect("nonblocking");
+    let tcp = tokio::net::TcpListener::from_std(std).expect("adopt");
+    peer.write_all(b"x").expect("write");
+    let unix = tokio::net::UnixListener::bind(dir.path().join("s.sock")).expect("bind");
+    let (fatal, mut fatal_rx) = tokio::sync::mpsc::channel(8);
+    let _accepts = http::serve(unix, vec![tcp]).run(shared, fatal);
+    let error = tokio::time::timeout(TIMEOUT, fatal_rx.recv())
+        .await
+        .expect("the server learns of the broken listener")
+        .expect("the accept loop reports before it ends");
+    let repo_search_server::Error::Io(error) = error else {
+        panic!("a listener failure is an I/O error");
+    };
+    assert_eq!(error.raw_os_error(), Some(22), "EINVAL");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

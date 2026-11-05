@@ -123,18 +123,27 @@ pub struct Accepts {
 impl Conns {
     /// Starts the accept loops against `shared`; returns the shutdown
     /// handle and the task handles `run` aborts on exit.
-    pub fn run<B: Backend>(self, shared: Arc<Shared<B>>) -> Accepts {
+    ///
+    /// A listener error that no retry clears is sent on `fatal`, which
+    /// ends the server so its supervisor restarts it.
+    pub fn run<B: Backend>(
+        self,
+        shared: Arc<Shared<B>>,
+        fatal: mpsc::Sender<crate::Error>,
+    ) -> Accepts {
         let mut tasks = Vec::with_capacity(1 + self.tcp.len());
         tasks.push(tokio::spawn(accept_unix(
             self.unix,
             shared.clone(),
             self.graceful.clone(),
+            fatal.clone(),
         )));
         for listener in self.tcp {
             tasks.push(tokio::spawn(accept_tcp(
                 listener,
                 shared.clone(),
                 self.graceful.clone(),
+                fatal.clone(),
             )));
         }
         Accepts {
@@ -165,6 +174,7 @@ async fn accept_unix<B: Backend>(
     listener: tokio::net::UnixListener,
     shared: Arc<Shared<B>>,
     graceful: Arc<GracefulShutdown>,
+    fatal: mpsc::Sender<crate::Error>,
 ) {
     loop {
         match listener.accept().await {
@@ -175,8 +185,11 @@ async fn accept_unix<B: Backend>(
                 graceful.clone(),
             ),
             Err(error) => {
-                tracing::error!(%error, "unix accept failed");
-                return;
+                if let Err(error) = crate::survive_accept_error(error).await {
+                    tracing::error!(%error, "unix listener failed");
+                    let _ = fatal.send(crate::Error::Io(error)).await;
+                    return;
+                }
             }
         }
     }
@@ -188,6 +201,7 @@ async fn accept_tcp<B: Backend>(
     listener: tokio::net::TcpListener,
     shared: Arc<Shared<B>>,
     graceful: Arc<GracefulShutdown>,
+    fatal: mpsc::Sender<crate::Error>,
 ) {
     loop {
         match listener.accept().await {
@@ -195,8 +209,11 @@ async fn accept_tcp<B: Backend>(
                 connect(TokioIo::new(stream), true, shared.clone(), graceful.clone())
             }
             Err(error) => {
-                tracing::error!(%error, "tcp accept failed");
-                return;
+                if let Err(error) = crate::survive_accept_error(error).await {
+                    tracing::error!(%error, "tcp listener failed");
+                    let _ = fatal.send(crate::Error::Io(error)).await;
+                    return;
+                }
             }
         }
     }

@@ -154,35 +154,34 @@ impl Accept for std::net::TcpListener {
 /// lasts.
 const ACCEPT_BACKOFF: Duration = Duration::from_millis(10);
 
-/// What an `accept` failure says about the listener.
-enum AcceptFault {
-    /// One queued connection failed (aborted, reset, interrupted); the
-    /// next `accept` is unaffected.
-    Connection,
-    /// The process is out of descriptors or memory; it clears when
-    /// resources are freed, so the drain pauses and retries.
-    Resources,
-    /// The listener itself is broken (`EINVAL` on a socket that is not
-    /// listening, `EBADF`, `ENOTSOCK`, …); no retry can succeed.
-    Listener,
-}
-
-impl AcceptFault {
-    fn classify(error: &io::Error) -> Self {
-        use io::ErrorKind::{ConnectionAborted, ConnectionReset, Interrupted, TimedOut};
-        match error.kind() {
-            ConnectionAborted | ConnectionReset | Interrupted | TimedOut => {
-                return Self::Connection;
+/// Decides what a failed `accept` means, for every accept loop.
+///
+/// Returns `Ok` when the loop should accept again: the failure was one
+/// connection's (aborted, reset, interrupted, a failed handshake), or
+/// the process is out of descriptors or memory, which clears when
+/// resources are freed, so this pauses first. Returns the error when
+/// the listener itself is broken (`EINVAL` on a socket that is not
+/// listening, `EBADF`, `ENOTSOCK`, …): no retry can succeed.
+pub(crate) async fn survive_accept_error(error: io::Error) -> Result<(), io::Error> {
+    use io::ErrorKind::{ConnectionAborted, ConnectionReset, Interrupted, TimedOut};
+    let retry = match error.kind() {
+        ConnectionAborted | ConnectionReset | Interrupted | TimedOut => true,
+        _ => match error.raw_os_error() {
+            Some(libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM) => {
+                tokio::time::sleep(ACCEPT_BACKOFF).await;
+                true
             }
-            _ => {}
-        }
-        match error.raw_os_error() {
-            Some(libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM) => Self::Resources,
             // The BSD `accept` reports a connection that failed its
             // handshake as a protocol error.
-            Some(libc::EPROTO) => Self::Connection,
-            _ => Self::Listener,
-        }
+            Some(libc::EPROTO) => true,
+            _ => false,
+        },
+    };
+    if retry {
+        tracing::error!(%error, "could not accept a connection");
+        Ok(())
+    } else {
+        Err(error)
     }
 }
 
@@ -197,17 +196,9 @@ async fn refuse_loop<L: Accept>(listener: L, body: String) -> io::Result<()> {
         let raw = match listener.accept() {
             Ok(raw) => raw,
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => break Ok(()),
-            Err(error) => match AcceptFault::classify(&error) {
-                AcceptFault::Connection => {
-                    tracing::error!(%error, "could not accept a pending connection");
-                    continue;
-                }
-                AcceptFault::Resources => {
-                    tracing::error!(%error, "could not accept a pending connection");
-                    tokio::time::sleep(ACCEPT_BACKOFF).await;
-                    continue;
-                }
-                AcceptFault::Listener => break Err(error),
+            Err(error) => match survive_accept_error(error).await {
+                Ok(()) => continue,
+                Err(error) => break Err(error),
             },
         };
         let stream = match L::from_std(raw) {
@@ -286,6 +277,13 @@ pub async fn run<B: Backend, M: ModelSource>(config: Config<B, M>) -> Result<(),
 fn ensure_listening(listener: &tokio::net::TcpListener) -> Result<(), Error> {
     use std::os::fd::AsRawFd as _;
     let addr = listener.local_addr()?;
+    // `listen` on a socket that was never bound binds it to an ephemeral
+    // port; the server would then serve on a port nobody dials.
+    if addr.port() == 0 {
+        return Err(Error::Listener(format!(
+            "tcp listener {addr} is not bound to a port, so it does not own the port it was given"
+        )));
+    }
     // SAFETY: the fd is live for the borrow; `listen` takes no pointers.
     if unsafe { libc::listen(listener.as_raw_fd(), libc::SOMAXCONN) } != 0 {
         let error = io::Error::last_os_error();
@@ -400,7 +398,7 @@ pub async fn spawn<B: Backend, M: ModelSource>(config: Config<B, M>) -> Result<R
         next_request: std::sync::atomic::AtomicU64::new(0),
         in_flight: Arc::new(in_flight),
     });
-    let accepts = conns.run(shared.clone());
+    let accepts = conns.run(shared.clone(), fatal_tx);
     let task = tokio::spawn(drive(
         monitor,
         accepts,
@@ -634,6 +632,23 @@ mod tests {
         std::net::TcpStream::connect(addr).expect("it now accepts connections");
         // Idempotent on a socket that already listens.
         ensure_listening(&listener).expect("listen again");
+    }
+
+    #[tokio::test]
+    async fn startup_refuses_a_socket_that_was_never_bound() {
+        // `listen` would bind it to an ephemeral port nobody dials.
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        use std::os::fd::IntoRawFd as _;
+        // SAFETY: the raw fd was just released by the socket, which
+        // gives up ownership.
+        let std = unsafe { std::net::TcpListener::from_raw_fd(socket.into_raw_fd()) };
+        std.set_nonblocking(true).unwrap();
+        let listener = tokio::net::TcpListener::from_std(std).unwrap();
+        let Err(Error::Listener(message)) = ensure_listening(&listener) else {
+            panic!("an unbound socket does not own a port");
+        };
+        assert!(message.contains("not bound"), "{message}");
+        assert_eq!(listener.local_addr().unwrap().port(), 0, "never listened");
     }
 
     #[tokio::test]
