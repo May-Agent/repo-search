@@ -68,6 +68,15 @@ pub enum StartupError {
     /// The running binary could not be identified.
     #[error("could not identify the running binary: {0}")]
     Build(#[source] io::Error),
+    /// The agent registered another build than the one running: the
+    /// binary on disk was replaced since the plist was written.
+    #[error("--build {expected} does not match this binary {actual}")]
+    BuildMismatch {
+        /// The `--build` argument.
+        expected: String,
+        /// The running binary's identity.
+        actual: BuildId,
+    },
     /// The tokenizer cache could not be opened.
     #[error("could not open the model cache: {0}")]
     ModelStore(#[source] crate::model_store::Error),
@@ -163,6 +172,9 @@ const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 pub const LOAD_BOUND: Duration =
     Duration::from_secs(repo_search_core::embed_api::LOAD_BOUND.as_secs() + 30);
 
+/// The default for [`Config::reconcile_wait`].
+pub const RECONCILE_WAIT: Duration = Duration::from_secs(5);
+
 /// A busy-source registration for the idle-exit tracker. Each source owns
 /// its `watch::Sender<bool>` — state, not transitions, so nothing is lost —
 /// and the aggregator receives the receiver once over this channel.
@@ -183,6 +195,10 @@ pub struct Config<T: Tokens, L: listen::Listener> {
     pub signal: tokio::signal::unix::Signal,
     /// Exit after this long with no connections and no work.
     pub idle_exit: Duration,
+    /// The longest a search waits for a reconcile pass; past it the
+    /// search answers from the index as it stands and the pass keeps
+    /// running. [`RECONCILE_WAIT`] unless `--reconcile-wait-ms`.
+    pub reconcile_wait: Duration,
     /// Fail the link — tokenizer download plus the server-readiness wait
     /// — past this bound; [`LOAD_BOUND`] in production.
     pub load_bound: Duration,
@@ -267,6 +283,7 @@ pub async fn run<T: Tokens, L: listen::Listener>(config: Config<T, L>) -> Result
     let registry = registry::spawn(registry::RegistryConfig {
         state: config.state,
         model_id: config.model_id,
+        reconcile_wait: config.reconcile_wait,
         model: loader.state.clone(),
         started,
         stopping: stopping_rx.clone(),

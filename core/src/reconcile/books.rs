@@ -116,17 +116,20 @@ impl Books {
     }
 
     /// Stored chunk rows.
-    pub(super) fn chunks_total(&self) -> u64 {
+    #[must_use]
+    pub fn chunks_total(&self) -> u64 {
         self.rows
     }
 
     /// Stored chunk rows whose hash has a vector.
-    pub(super) fn chunks_with_vector(&self) -> u64 {
+    #[must_use]
+    pub fn chunks_with_vector(&self) -> u64 {
         self.with_vector
     }
 
     /// Stored chunk rows on the docs side.
-    pub(super) fn doc_chunks(&self) -> u64 {
+    #[must_use]
+    pub fn doc_chunks(&self) -> u64 {
         self.docs
     }
 

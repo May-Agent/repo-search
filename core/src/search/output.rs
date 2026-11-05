@@ -37,6 +37,10 @@ pub struct Reconciliation {
     pub doc_chunks: u64,
     /// Files the index holds but could not chunk.
     pub unparsable: Vec<Unparsable>,
+    /// A reconcile pass is still running: files it has not reached yet
+    /// answer from what was indexed before, and those that changed are
+    /// left out.
+    pub reconciling: bool,
 }
 
 /// Why an unparsable file could not be chunked.
@@ -88,6 +92,16 @@ impl Reconciliation {
                     })
                 })
                 .collect(),
+            reconciling: false,
+        }
+    }
+
+    /// The same input while a later reconcile pass is still running.
+    #[must_use]
+    pub fn while_reconciling(self) -> Self {
+        Self {
+            reconciling: true,
+            ..self
         }
     }
 }
@@ -166,10 +180,20 @@ pub struct Freshness {
     pub note: Option<String>,
     /// Files the index holds but could not chunk.
     pub unparsable: Vec<Unparsable>,
+    /// Indexing is in progress: a reconcile pass was still running, or a
+    /// file changed since it was indexed. Chunks of changed files are left
+    /// out, so the answer may be missing results, never stale ones.
+    pub reconciling: bool,
 }
 
 impl Freshness {
-    pub(super) fn new(reconciliation: Reconciliation, embedded_on_the_spot: u64) -> Self {
+    /// `left_out` is whether the search left out a chunk whose file
+    /// changed since it was indexed.
+    pub(super) fn new(
+        reconciliation: Reconciliation,
+        embedded_on_the_spot: u64,
+        left_out: bool,
+    ) -> Self {
         let vectors = Coverage::new(
             reconciliation.chunks_with_vector + embedded_on_the_spot,
             reconciliation.chunks_total,
@@ -182,6 +206,17 @@ impl Freshness {
                 "index incomplete — run 'search index --wait' for complete results".to_owned()
             }),
             unparsable: reconciliation.unparsable,
+            reconciling: reconciliation.reconciling || left_out,
+        }
+    }
+
+    /// The text line's in-progress suffix: empty when nothing was
+    /// reconciling.
+    fn reconciling_note(&self) -> &'static str {
+        if self.reconciling {
+            "; indexing in progress — files changed since they were indexed are left out"
+        } else {
+            ""
         }
     }
 
@@ -385,28 +420,36 @@ struct ChunkView<'a> {
 /// Why a chunk's text could not be read from the working tree.
 #[derive(Debug, Clone)]
 pub(super) enum ReadError {
-    /// The file is gone or no longer holds the indexed chunk.
-    Stale { path: String, start: u32, end: u32 },
+    /// The file is gone or no longer has the bytes the chunk was cut from:
+    /// the chunk is left out of the answer.
+    Stale,
     /// The file could not be read.
-    Io {
-        path: String,
-        kind: io::ErrorKind,
-        message: String,
-    },
+    Io(ReadFailure),
 }
 
-impl<E: std::error::Error + 'static> From<ReadError> for Error<E> {
-    fn from(e: ReadError) -> Self {
-        match e {
-            ReadError::Stale { path, start, end } => Error::Stale { path, start, end },
-            ReadError::Io {
-                path,
-                kind,
-                message,
-            } => Error::Io {
-                path,
-                source: io::Error::new(kind, message),
-            },
+/// A file that could not be read, kept until the selection reaches it.
+#[derive(Debug, Clone)]
+pub(super) struct ReadFailure {
+    path: String,
+    kind: io::ErrorKind,
+    message: String,
+}
+
+impl ReadFailure {
+    pub(super) fn new(path: &str, error: &io::Error) -> Self {
+        Self {
+            path: path.to_owned(),
+            kind: error.kind(),
+            message: error.to_string(),
+        }
+    }
+}
+
+impl<E: std::error::Error + 'static> From<ReadFailure> for Error<E> {
+    fn from(e: ReadFailure) -> Self {
+        Error::Io {
+            path: e.path,
+            source: io::Error::new(e.kind, e.message),
         }
     }
 }
@@ -523,6 +566,9 @@ pub(super) struct Selector {
     /// whose content is already emitted folds its path into that group
     /// instead of taking a turn and spending budget.
     seen: [HashMap<crate::store::ContentHash, usize>; 2],
+    /// A chunk the selection reached was left out: its file changed since
+    /// the chunk was cut.
+    left_out: bool,
 }
 
 const SIDES: [Side; 2] = [Side::Code, Side::Docs];
@@ -575,20 +621,28 @@ impl Selector {
             emitted: false,
             turn: 0,
             seen: [HashMap::new(), HashMap::new()],
+            left_out: false,
         }
     }
 
+    /// Whether a chunk the selection reached was left out because its file
+    /// changed since the chunk was cut.
+    pub fn left_out(&self) -> bool {
+        self.left_out
+    }
+
     /// Takes chunks until the next one needs its text, the budget is filled
-    /// or the lists end.
+    /// or the lists end. A chunk whose file changed since it was cut is
+    /// skipped.
     ///
     /// # Errors
     ///
-    /// When the text of a chunk the selection reaches could not be read.
+    /// When the file of a chunk the selection reaches could not be read.
     pub fn advance(
         &mut self,
         lists: [&[RankedChunk]; 2],
         counter: &impl TokenCounter,
-    ) -> Result<Step, ReadError> {
+    ) -> Result<Step, ReadFailure> {
         for (side, list) in lists.iter().enumerate() {
             if self.files[side].is_none() {
                 self.files[side] = Some(file_order(list));
@@ -667,7 +721,7 @@ impl Selector {
             }
             // A file's first chunk is also charged the path; a chunk that
             // does not fit ends the list, the chunks already taken stay.
-            let mut cost = usize::from(file.taken == 0) * counter.count(&chunk.row.path);
+            let mut cost = usize::from(file.group.is_none()) * counter.count(&chunk.row.path);
             match &chunk.text {
                 None => {
                     return Ok(Step::Needs {
@@ -675,7 +729,16 @@ impl Selector {
                         from: idx,
                     });
                 }
-                Some(Err(e)) => return Err(e.clone()),
+                // The file changed since the chunk was cut: the chunk is
+                // left out and costs the turn nothing.
+                Some(Err(ReadError::Stale)) => {
+                    self.left_out = true;
+                    file.taken += 1;
+                    self.cursor[side] = if g + 1 == files.len() { 0 } else { g + 1 };
+                    self.turn = 1 - side;
+                    continue;
+                }
+                Some(Err(ReadError::Io(failure))) => return Err(failure.clone()),
                 Some(Ok(text)) => {
                     cost += counter.count(&chunk.label(SIDES[side])) + counter.count(text);
                 }
@@ -773,7 +836,7 @@ fn hits<C>(groups: Vec<Group>, chunk: impl Fn(usize) -> C) -> Option<Vec<FileHit
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::{ChunkId, ContentHash, MemberRow, StoredMemberKind};
+    use crate::store::{ChunkId, ContentHash, FileState, MemberRow, StoredMemberKind};
 
     /// Runs the whole selection; every text is already read.
     fn select(
@@ -810,6 +873,13 @@ mod tests {
                     emit: StoredMemberKind::Text,
                     symbol: symbol.to_owned(),
                 }],
+                file: FileState {
+                    path: path.to_owned(),
+                    size: text.len() as u64,
+                    mtime_ns: 0,
+                    inode: 0,
+                    content_hash: ContentHash::of_file(text.as_bytes()),
+                },
             },
             score,
             channels: vec![Channel::Bm25, Channel::Vector],
@@ -835,8 +905,10 @@ mod tests {
                 chunks_with_vector: 9,
                 doc_chunks: 0,
                 unparsable: Vec::new(),
+                reconciling: false,
             },
             0,
+            false,
         )
     }
 
@@ -1149,8 +1221,10 @@ mod tests {
                 chunks_with_vector: 10,
                 doc_chunks: 0,
                 unparsable: Vec::new(),
+                reconciling: false,
             },
             0,
+            false,
         );
         assert!(r.freshness.note.is_none());
         let json: serde_json::Value = serde_json::from_str(&r.to_json()).unwrap();
@@ -1287,8 +1361,10 @@ docs/guide.md
                     chunks_with_vector: with_vector,
                     doc_chunks: 0,
                     unparsable: Vec::new(),
+                    reconciling: false,
                 },
                 embedded,
+                false,
             )
             .percent()
         };
@@ -1304,8 +1380,10 @@ docs/guide.md
                 chunks_with_vector: 0,
                 doc_chunks: 0,
                 unparsable: Vec::new(),
+                reconciling: false,
             },
             0,
+            false,
         );
         assert_eq!(empty.percent(), 100);
     }
@@ -1472,23 +1550,36 @@ docs/guide.md
         let mut code = [
             ranked("a.rs", "one", "x y", 0.9),
             ranked("b.rs", "big", "w w w w w w w w w w", 0.8),
-            ranked("c.rs", "gone", "x", 0.7),
+            ranked("c.rs", "denied", "x", 0.7),
         ];
-        code[2].text = Some(Err(ReadError::Stale {
-            path: "c.rs".to_owned(),
-            start: 3,
-            end: 9,
-        }));
+        code[2].text = Some(Err(ReadError::Io(ReadFailure::new(
+            "c.rs",
+            &io::Error::from(io::ErrorKind::PermissionDenied),
+        ))));
         // The second unit does not fit and ends the list: the third is never
         // reached.
         let mut selector = Selector::new(8, false);
         assert_eq!(selector.advance([&code, &[]], &Words).unwrap(), Step::Done);
         // With room for the second, the selection reaches the third.
         let mut selector = Selector::new(100, false);
-        assert!(matches!(
-            selector.advance([&code, &[]], &Words),
-            Err(ReadError::Stale { .. })
-        ));
+        let failure = selector.advance([&code, &[]], &Words).unwrap_err();
+        assert_eq!(failure.path, "c.rs");
+    }
+
+    #[test]
+    fn a_unit_whose_file_changed_is_left_out_and_the_selection_goes_on() {
+        let mut code = [
+            ranked("a.rs", "one", "x y", 0.9),
+            ranked("b.rs", "changed", "x", 0.8),
+            ranked("c.rs", "three", "z", 0.7),
+        ];
+        code[1].text = Some(Err(ReadError::Stale));
+        let mut selector = Selector::new(100, false);
+        assert_eq!(selector.advance([&code, &[]], &Words).unwrap(), Step::Done);
+        assert!(selector.left_out());
+        let [groups, _] = selector.finish();
+        let paths: Vec<&str> = groups.iter().map(|g| g.path.as_str()).collect();
+        assert_eq!(paths, ["a.rs", "c.rs"]);
     }
 
     #[test]

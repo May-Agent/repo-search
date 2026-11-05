@@ -326,6 +326,7 @@ impl Fixture {
             chunks_with_vector: embedded.min(total),
             doc_chunks,
             unparsable: Vec::new(),
+            reconciling: false,
         };
         let embedder = FakeEmbedder::default();
         let seen = Arc::clone(&embedder.seen);
@@ -646,18 +647,69 @@ fn the_budget_limits_output_and_files_only_lists_paths() {
     assert!(!text.contains("pub fn"), "{text}");
 }
 
+/// A file changed since the index's last pass — the state a query meets
+/// while reconcile is still running — is left out of every list, the
+/// files-only one included, and the answer reports indexing in progress;
+/// the files that did not change still answer.
 #[test]
-fn a_file_changed_after_the_barrier_is_an_error() {
+fn a_file_changed_since_it_was_indexed_is_left_out_and_reported() {
     let mut fixture = Fixture::new(&Vectors::All, false);
-    fs::write(
-        fixture.tree.path().join("src").join("layout.rs"),
-        "// rewritten\n",
-    )
-    .unwrap();
-    let err = fixture
-        .try_search(&Request::new("stack alignment"))
-        .unwrap_err();
-    assert!(matches!(err, Error::Stale { .. }), "{err}");
+    let query = "stack alignment children";
+    let before = fixture.search(&Request::new(query));
+    assert!(!before.freshness.reconciling);
+    assert!(
+        paths(&before.code).contains(&"src/layout.rs"),
+        "{:?}",
+        paths(&before.code)
+    );
+    let unchanged: Vec<String> = paths(&before.code)
+        .into_iter()
+        .filter(|path| *path != "src/layout.rs")
+        .map(str::to_owned)
+        .collect();
+    assert!(!unchanged.is_empty());
+
+    // The same length, so only the bytes say the file changed — with the
+    // indexed words still in it, so BM25 still ranks its stale chunks.
+    let layout = fixture.tree.path().join("src").join("layout.rs");
+    let old = fs::read_to_string(&layout).unwrap();
+    let edited = old.replacen("vertical", "vertikal", 1);
+    assert_ne!(edited, old);
+    fs::write(&layout, edited).unwrap();
+
+    for files_only in [false, true] {
+        let after = fixture.search(&Request {
+            files_only,
+            ..Request::new(query)
+        });
+        assert!(
+            !paths(&after.code).contains(&"src/layout.rs"),
+            "files_only {files_only}: {:?}",
+            paths(&after.code)
+        );
+        for path in &unchanged {
+            assert!(
+                paths(&after.code).contains(&path.as_str()),
+                "files_only {files_only}: {path} still answers"
+            );
+        }
+        assert!(after.freshness.reconciling);
+        assert!(
+            after.to_text().contains(
+                "indexing in progress — files changed since they were indexed are left out"
+            ),
+            "{}",
+            after.to_text()
+        );
+        let json: serde_json::Value = serde_json::from_str(&after.to_json()).unwrap();
+        assert_eq!(json["freshness"]["reconciling"], true);
+    }
+
+    // A file that returns to its indexed bytes answers again.
+    fs::write(&layout, old).unwrap();
+    let restored = fixture.search(&Request::new(query));
+    assert!(paths(&restored.code).contains(&"src/layout.rs"));
+    assert!(!restored.freshness.reconciling);
 }
 
 #[test]
@@ -712,9 +764,13 @@ fn only_the_units_the_answer_reaches_are_read() {
     let first = paths(&all.code)[0].to_owned();
     assert_ne!(first, last);
 
-    // The last-ranked file changes: a small budget never reaches its chunk,
-    // although the chunk was a candidate; a large one does.
-    fs::write(fixture.tree.path().join(&last), "// rewritten\n").unwrap();
+    // The last-ranked file becomes unreadable, its stat otherwise as
+    // indexed, so only a text read touches it: a small budget never
+    // reaches its chunk, although the chunk was a candidate; a large one
+    // does.
+    let path = fixture.tree.path().join(&last);
+    let mode = fs::metadata(&path).unwrap().permissions();
+    fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o000)).unwrap();
     let small = fixture.search(&Request {
         budget: 5,
         ..Request::new(query)
@@ -727,7 +783,7 @@ fn only_the_units_the_answer_reaches_are_read() {
         })
         .unwrap_err();
     assert!(
-        matches!(err, Error::Stale { ref path, .. } if *path == last),
+        matches!(err, Error::Io { ref path, .. } if *path == last),
         "{err}"
     );
 
@@ -738,6 +794,7 @@ fn only_the_units_the_answer_reaches_are_read() {
         ..Request::new(query)
     });
     assert!(paths(&files.code).contains(&last.as_str()));
+    fs::set_permissions(&path, mode).unwrap();
 }
 
 #[test]
@@ -953,8 +1010,9 @@ fn a_content_hash_shared_by_code_and_docs_is_searched_on_both_sides() {
 fn a_stale_on_the_spot_candidate_stays_lexical_only() {
     let mut fixture = Fixture::new(&Vectors::None, false);
     // A top lexical candidate's file changed after the barrier: its text
-    // cannot be read for on-the-spot embedding. The query must still answer
-    // and the other candidates still get embedded.
+    // cannot be read for on-the-spot embedding. The query must still answer,
+    // the other candidates still get embedded, and the changed file is left
+    // out of the answer.
     fs::write(
         fixture.tree.path().join("src").join("layout.rs"),
         "// rewritten\n",
@@ -964,10 +1022,8 @@ fn a_stale_on_the_spot_candidate_stays_lexical_only() {
         files_only: true,
         ..Request::new("stack environment")
     });
-    assert_eq!(
-        paths(&results.code),
-        ["src/environment.rs", "src/layout.rs"]
-    );
+    assert_eq!(paths(&results.code), ["src/environment.rs"]);
+    assert!(results.freshness.reconciling);
     assert!(fixture.retriever_embedder_documents() > 0);
 }
 

@@ -19,15 +19,20 @@ use std::time::Duration;
 use rusqlite::{Connection, OpenFlags, TransactionBehavior};
 use tokio::sync::{mpsc, oneshot};
 
+#[cfg(feature = "seed")]
+pub use index::clone_index;
 pub use index::{
     Applied, FileChange, Index, Phase, RowHash, StoredChunk, StoredMember, StoredMemberKind,
-    StoredMeta, set_stored_phase, stored_meta, vacuum_into,
+    StoredMeta, set_stored_phase, stored_meta,
 };
 pub use query::{ChunkFilter, ChunkId, ChunkRow, MemberRow, Side};
+pub(crate) use records::mtime_ns;
 pub use records::{
     ChunkRecord, ContentHash, FileState, MemberRecord, Unchunkable, UnchunkableReason, fts_body,
     split_identifiers,
 };
+#[cfg(feature = "seed")]
+pub use vectors::clone_cache;
 pub use vectors::{CachedSlot, CachedVector, ModelInfo, StoredCalibration, VectorCache};
 
 /// Bound on each actor's request queue.
@@ -215,12 +220,83 @@ fn ensure_version(conn: &mut Connection, version: i64, schema: &str) -> Result<O
     Ok(Some(found))
 }
 
+/// Copies the file `from`, which is no database, to the new file `to`:
+/// copy-on-write where the volume supports it (APFS `clonefile`, a Linux
+/// reflink), byte for byte where it does not. A database goes through
+/// [`copy_db`]: this may open the file, and closing a descriptor of a
+/// database drops the POSIX locks SQLite holds for every connection of the
+/// process.
+#[cfg(feature = "seed")]
+fn copy_file(from: &Path, to: &Path) -> Result<(), Error> {
+    reflink_copy::reflink_or_copy(from, to)?;
+    Ok(())
+}
+
+/// Copies the database `src`, which `conn` has open, to the new file `dst`
+/// as one committed state: cloned copy-on-write with `clonefile`, its WAL
+/// with it, inside a read transaction on `conn`. A writer serializes behind
+/// the transaction under the busy timeout; with a rollback journal none
+/// commits past it, and in WAL mode every frame it reads stays in the WAL,
+/// which the copy recovers when first opened. `clonefile` takes paths, so
+/// no descriptor of the database is opened outside SQLite. On a volume
+/// without clones, `VACUUM INTO` writes the copy.
+#[cfg(all(feature = "seed", target_os = "macos"))]
+fn copy_db(conn: &mut Connection, src: &Path, dst: &Path) -> Result<(), Error> {
+    let read = conn.transaction()?;
+    read.query_row("SELECT count(*) FROM sqlite_schema", [], |_| Ok(()))?;
+    match reflink_copy::reflink(src, dst) {
+        Ok(()) => {
+            let wal = sidecar(src, "-wal");
+            if wal.try_exists()? {
+                reflink_copy::reflink(&wal, sidecar(dst, "-wal"))?;
+            }
+            read.rollback()?;
+            Ok(())
+        }
+        Err(e)
+            if matches!(
+                e.kind(),
+                io::ErrorKind::Unsupported | io::ErrorKind::CrossesDevices
+            ) =>
+        {
+            read.rollback()?;
+            vacuum_into(conn, dst)
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Copies the database `src`, which `conn` has open, to the new file `dst`
+/// as one committed state, with `VACUUM INTO`: SQLite writes the copy, so
+/// no descriptor of the database is opened outside it.
+#[cfg(all(feature = "seed", not(target_os = "macos")))]
+fn copy_db(conn: &mut Connection, _src: &Path, dst: &Path) -> Result<(), Error> {
+    vacuum_into(conn, dst)
+}
+
+/// `VACUUM INTO dst` on `conn`: one read transaction against its database;
+/// a writer serializes the copy behind its commit under the busy timeout.
+#[cfg(feature = "seed")]
+fn vacuum_into(conn: &Connection, dst: &Path) -> Result<(), Error> {
+    let dst = dst
+        .to_str()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path is not UTF-8"))?;
+    conn.execute("VACUUM INTO ?1", [dst])?;
+    Ok(())
+}
+
+/// `path` with `suffix` appended to its last component, as SQLite names a
+/// database's sidecars.
+fn sidecar(path: &Path, suffix: &str) -> PathBuf {
+    let mut side = path.as_os_str().to_os_string();
+    side.push(suffix);
+    PathBuf::from(side)
+}
+
 /// Removes a database file and its `-wal`/`-shm`/`-journal` sidecars.
 fn remove_db_files(path: &Path) -> Result<(), Error> {
     for suffix in ["", "-wal", "-shm", "-journal"] {
-        let mut side = path.as_os_str().to_os_string();
-        side.push(suffix);
-        match fs::remove_file(PathBuf::from(side)) {
+        match fs::remove_file(sidecar(path, suffix)) {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => return Err(e.into()),

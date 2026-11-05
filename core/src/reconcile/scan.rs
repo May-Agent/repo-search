@@ -41,7 +41,7 @@ use crate::chunk::{self, ConfigChunker, DocChunker, FileChunker, Language};
 use crate::chunk::{Tsx, TypeScript};
 use crate::store::{
     ChunkRecord, ContentHash, FileChange, FileState, MemberRecord, StoredChunk, Unchunkable,
-    UnchunkableReason, fts_body,
+    UnchunkableReason, fts_body, mtime_ns,
 };
 
 /// Directories that are never part of the indexed tree, even when ignore rules
@@ -611,14 +611,10 @@ fn candidate(root: &Path, rel: &str) -> Result<Option<Candidate>, Error> {
     let Some(language) = Language::of_path(Path::new(rel)) else {
         return Ok(None);
     };
-    let mtime_ns = meta
-        .mtime()
-        .checked_mul(1_000_000_000)
-        .and_then(|ns| ns.checked_add(meta.mtime_nsec()))
-        .ok_or_else(|| Error::Mtime {
-            path: rel.to_owned(),
-            secs: meta.mtime(),
-        })?;
+    let mtime_ns = mtime_ns(&meta).ok_or_else(|| Error::Mtime {
+        path: rel.to_owned(),
+        secs: meta.mtime(),
+    })?;
     Ok(Some(Candidate {
         rel: rel.to_owned(),
         language,
@@ -675,14 +671,10 @@ fn walk_once(root: &Path) -> Result<Walked, Error> {
             Err(e) if is_vanished(&e) => continue,
             Err(e) => return Err(e.into()),
         };
-        let mtime_ns = meta
-            .mtime()
-            .checked_mul(1_000_000_000)
-            .and_then(|ns| ns.checked_add(meta.mtime_nsec()))
-            .ok_or_else(|| Error::Mtime {
-                path: rel_utf8.clone(),
-                secs: meta.mtime(),
-            })?;
+        let mtime_ns = mtime_ns(&meta).ok_or_else(|| Error::Mtime {
+            path: rel_utf8.clone(),
+            secs: meta.mtime(),
+        })?;
         candidates.push(Candidate {
             rel: rel_utf8,
             language,

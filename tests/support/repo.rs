@@ -117,6 +117,26 @@ pub fn add_worktree(repo: &TestRepo, name: &str, branch: &str) -> PathBuf {
     path
 }
 
+/// Clones `repo` next to it as `name` with `git clone --local
+/// --no-hardlinks`, as May clones a session's repository: a repository of
+/// its own whose `origin` is `repo`'s path. Returns the clone's root.
+pub fn clone_local(repo: &TestRepo, name: &str) -> PathBuf {
+    let parent = repo.root.parent().expect("the repo root has a parent");
+    let path = parent.join(name);
+    git(
+        parent,
+        &[
+            "clone",
+            "-q",
+            "--local",
+            "--no-hardlinks",
+            repo.root.to_str().expect("utf-8 path"),
+            path.to_str().expect("utf-8 path"),
+        ],
+    );
+    path
+}
+
 /// Removes the linked worktree at `path`, directory included.
 pub fn remove_worktree(repo: &TestRepo, path: &Path) {
     git(

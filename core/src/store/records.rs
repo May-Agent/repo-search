@@ -140,6 +140,25 @@ pub struct FileState {
     pub content_hash: ContentHash,
 }
 
+impl FileState {
+    /// Whether `meta`, the file's stat now, is the fingerprint recorded:
+    /// reconcile takes such a file as unchanged without reading it.
+    #[must_use]
+    pub fn stat_matches(&self, meta: &std::fs::Metadata) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        meta.len() == self.size && meta.ino() == self.inode && mtime_ns(meta) == Some(self.mtime_ns)
+    }
+}
+
+/// `meta`'s modification time in nanoseconds since the epoch; `None` when
+/// it does not fit in 64 bits.
+pub(crate) fn mtime_ns(meta: &std::fs::Metadata) -> Option<i64> {
+    use std::os::unix::fs::MetadataExt;
+    meta.mtime()
+        .checked_mul(1_000_000_000)
+        .and_then(|ns| ns.checked_add(meta.mtime_nsec()))
+}
+
 /// A chunk of a file: one or more byte ranges under one title.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChunkRecord {

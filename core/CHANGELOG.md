@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.9](https://github.com/May-Agent/repo-search/compare/core/v0.0.8...core/v0.0.9) - 2026-11-05
+
+### Added
+
+- seed a clone's index from its origin and never return stale chunks
+
 ## [0.0.8](https://github.com/May-Agent/repo-search/compare/core/v0.0.7...core/v0.0.8) - 2026-11-04
 
 ### Added

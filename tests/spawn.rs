@@ -142,6 +142,7 @@ async fn spawn_host() {
         },
         signal,
         idle_exit: config.idle_exit,
+        reconcile_wait: daemon::RECONCILE_WAIT,
         load_bound: daemon::LOAD_BOUND,
         tokens: StubTokens::default(),
         server: endpoint,

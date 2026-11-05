@@ -249,6 +249,7 @@ impl Owner {
                             model_id: repo_search_core::model::MODEL_ID.to_owned(),
                             state: StateDir::new(self.state.path().to_path_buf()),
                             idle_exit: Duration::from_secs(600),
+                            reconcile_wait: repo_search::daemon::RECONCILE_WAIT,
                             load_bound: repo_search::daemon::LOAD_BOUND,
                             build: self.build,
                         },

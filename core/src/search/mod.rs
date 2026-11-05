@@ -3,10 +3,11 @@
 //! token budget, and the text and JSON renderings.
 //!
 //! A [`Retriever`] answers [`Request`]s against one worktree's [`Index`] and
-//! the repository's vector cache. The caller runs the freshness barrier
-//! (reconcile) first and passes its outcome in; the retriever embeds the
-//! query, and on the spot the best lexical candidates that still lack a
-//! vector, through the caller's [`EmbedService`].
+//! the repository's vector cache. The caller passes in the outcome of its
+//! last reconcile pass and whether one is still running; the retriever
+//! leaves out every chunk whose file changed since it was indexed, and
+//! embeds the query, and on the spot the best lexical candidates that
+//! still lack a vector, through the caller's [`EmbedService`].
 
 mod embedder;
 mod fuse;
@@ -155,18 +156,6 @@ pub enum Error<E: std::error::Error + 'static> {
         path: String,
         /// The underlying failure.
         source: std::io::Error,
-    },
-
-    /// A chunk no longer matches the working tree: the file changed after the
-    /// freshness barrier, which must run before every query.
-    #[error("{path}:{start}-{end} no longer matches the indexed chunk; reconcile before searching")]
-    Stale {
-        /// Worktree-relative path.
-        path: String,
-        /// First line of the chunk.
-        start: u32,
-        /// Last line of the chunk.
-        end: u32,
     },
 
     /// The blocking worker thread could not be started.

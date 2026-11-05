@@ -16,6 +16,8 @@ fn main() -> ExitCode {
     match Cli::parse().invocation() {
         Invocation::Daemon {
             idle_exit,
+            reconcile_wait,
+            build,
             model_cache,
             state_dir,
             server_socket,
@@ -24,15 +26,21 @@ fn main() -> ExitCode {
             server_addr,
             server_token_file,
         } => daemon_main(
-            idle_exit,
-            model_cache,
-            state_dir,
+            Timing {
+                idle_exit,
+                reconcile_wait,
+            },
             listen,
             ready_fd,
-            ServerArgs {
-                socket: server_socket,
-                addr: server_addr,
-                token_file: server_token_file,
+            DaemonArgs {
+                build,
+                model_cache,
+                state_dir,
+                server: ServerArgs {
+                    socket: server_socket,
+                    addr: server_addr,
+                    token_file: server_token_file,
+                },
             },
         ),
         #[cfg(target_os = "macos")]
@@ -104,12 +112,10 @@ fn client_main(invocation: Invocation) -> ExitCode {
 /// Off macOS there is no launchd: `--listen` is required, and its absence
 /// is a startup error reported on the ready fd.
 fn daemon_main(
-    idle_exit: Duration,
-    model_cache: Option<PathBuf>,
-    state_dir: Option<PathBuf>,
+    timing: Timing,
     listen: Option<PathBuf>,
     ready_fd: Option<std::os::fd::RawFd>,
-    server: ServerArgs,
+    args: DaemonArgs,
 ) -> ExitCode {
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
@@ -139,20 +145,12 @@ fn daemon_main(
     // `--listen` hands the daemon a socket it owns; its absence keeps
     // launchd activation on macOS.
     if let Some(path) = listen {
-        return bound_main(
-            runtime,
-            idle_exit,
-            model_cache,
-            state_dir,
-            ready_fd,
-            server,
-            path,
-        );
+        return bound_main(runtime, timing, ready_fd, args, path);
     }
 
     #[cfg(target_os = "macos")]
     {
-        activated_main(runtime, idle_exit, model_cache, state_dir, ready_fd, server)
+        activated_main(runtime, timing, ready_fd, args)
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -167,11 +165,9 @@ fn daemon_main(
 #[cfg(target_os = "macos")]
 fn activated_main(
     runtime: tokio::runtime::Runtime,
-    idle_exit: Duration,
-    model_cache: Option<PathBuf>,
-    state_dir: Option<PathBuf>,
+    timing: Timing,
     ready_fd: Option<std::os::fd::RawFd>,
-    server: ServerArgs,
+    args: DaemonArgs,
 ) -> ExitCode {
     use futures_util::future::join_all;
     use repo_search::daemon::listen::Activated;
@@ -214,7 +210,7 @@ fn activated_main(
     // `from_std` registers the fd with this runtime's driver, so `startup`
     // runs inside the runtime's context.
     let _guard = runtime.enter();
-    match startup(listeners, model_cache, state_dir, server) {
+    match startup(listeners, args) {
         Ok((listener, signal, tokens, server, state, build)) => {
             if let Err(error) = report_ready(ready_fd, "ready\n") {
                 tracing::error!(%error, "could not report readiness");
@@ -223,7 +219,8 @@ fn activated_main(
             match runtime.block_on(daemon::run(Config {
                 listener: Activated(listener),
                 signal,
-                idle_exit,
+                idle_exit: timing.idle_exit,
+                reconcile_wait: timing.reconcile_wait,
                 load_bound: daemon::LOAD_BOUND,
                 tokens,
                 server,
@@ -257,11 +254,9 @@ fn activated_main(
 /// and exercised on macOS.
 fn bound_main(
     runtime: tokio::runtime::Runtime,
-    idle_exit: Duration,
-    model_cache: Option<PathBuf>,
-    state_dir: Option<PathBuf>,
+    timing: Timing,
     ready_fd: Option<std::os::fd::RawFd>,
-    server: ServerArgs,
+    args: DaemonArgs,
     path: PathBuf,
 ) -> ExitCode {
     use repo_search::daemon::listen::{Bound, Listener as _};
@@ -293,7 +288,7 @@ fn bound_main(
             return fail_ready(ready_fd, &message);
         }
     };
-    let (tokens, server, state, build) = match checks(model_cache, state_dir, server) {
+    let (tokens, server, state, build) = match checks(args) {
         Ok(started) => started,
         Err(error) => {
             tracing::error!(%error, "the daemon failed to start");
@@ -310,7 +305,8 @@ fn bound_main(
     match runtime.block_on(repo_search::daemon::run(Config {
         listener: bound,
         signal,
-        idle_exit,
+        idle_exit: timing.idle_exit,
+        reconcile_wait: timing.reconcile_wait,
         load_bound: LOAD_BOUND,
         tokens,
         server,
@@ -364,9 +360,7 @@ type Started = (
 #[cfg(target_os = "macos")]
 fn startup(
     mut listeners: Vec<std::os::unix::net::UnixListener>,
-    model_cache: Option<PathBuf>,
-    state_dir: Option<PathBuf>,
-    server: ServerArgs,
+    args: DaemonArgs,
 ) -> Result<
     Started,
     (
@@ -385,7 +379,7 @@ fn startup(
         Ok(signal) => signal,
         Err(error) => return Err((StartupError::Signal(error), listeners)),
     };
-    let (tokens, server, state, build) = match checks(model_cache, state_dir, server) {
+    let (tokens, server, state, build) = match checks(args) {
         Ok(checked) => checked,
         Err(error) => return Err((error, listeners)),
     };
@@ -402,13 +396,11 @@ fn startup(
 }
 
 /// The startup checks the two listener kinds share: the running binary's
-/// id, the tokenizer store, the state dir and the server endpoint —
-/// including the `--server-token-file` read, so a failure there reaches
-/// the ready line.
+/// id against `--build`, the tokenizer store, the state dir and the
+/// server endpoint — including the `--server-token-file` read, so a
+/// failure there reaches the ready line.
 fn checks(
-    model_cache: Option<PathBuf>,
-    state_dir: Option<PathBuf>,
-    server: ServerArgs,
+    args: DaemonArgs,
 ) -> Result<
     (
         repo_search::model_store::TokenizerStore,
@@ -423,7 +415,21 @@ fn checks(
     use repo_search_client::protocol::BuildId;
     use repo_search_core::StateDir;
 
+    let DaemonArgs {
+        build: expected,
+        model_cache,
+        state_dir,
+        server,
+    } = args;
     let build = BuildId::of_current_exe().map_err(StartupError::Build)?;
+    if let Some(expected) = expected
+        && expected != build.to_string()
+    {
+        return Err(StartupError::BuildMismatch {
+            expected,
+            actual: build,
+        });
+    }
     let tokens = match &model_cache {
         Some(root) => TokenizerStore::new(
             root.clone(),
@@ -442,6 +448,26 @@ fn checks(
     };
     let server = endpoint(server)?;
     Ok((tokens, server, state, build))
+}
+
+/// The daemon flags its startup checks read.
+struct DaemonArgs {
+    /// `--build`, when given: the build the agent registered.
+    build: Option<String>,
+    /// `--model-cache`, when given.
+    model_cache: Option<PathBuf>,
+    /// `--state-dir`, when given.
+    state_dir: Option<PathBuf>,
+    /// The `--server-*` flags.
+    server: ServerArgs,
+}
+
+/// The daemon's time settings from its flags.
+struct Timing {
+    /// `--idle-exit-secs`.
+    idle_exit: Duration,
+    /// `--reconcile-wait-ms`.
+    reconcile_wait: Duration,
 }
 
 /// The `--server-*` flags: where the embedding server listens and the

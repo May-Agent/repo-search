@@ -148,6 +148,8 @@ pub struct Setup<T: Tokens> {
     pub state: StateDir,
     /// Idle exit.
     pub idle_exit: Duration,
+    /// How long a search waits for a reconcile pass.
+    pub reconcile_wait: Duration,
     /// The link bound.
     pub load_bound: Duration,
     /// The daemon's build identity.
@@ -184,6 +186,7 @@ pub fn spawn_on<T: Tokens>(
         model_id,
         state,
         idle_exit,
+        reconcile_wait,
         load_bound,
         build,
     } = setup;
@@ -197,6 +200,7 @@ pub fn spawn_on<T: Tokens>(
             signal: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
                 .expect("the SIGTERM stream installs"),
             idle_exit,
+            reconcile_wait,
             load_bound,
             tokens,
             server,
@@ -251,11 +255,33 @@ fn server_config(
 /// The daemon's build is the test binary's, matching `client::hello()`.
 pub async fn daemon<T: Tokens>(
     tmp: tempfile::TempDir,
+    backend: StubBackend,
+    model: Model,
+    tokens: T,
+    idle_exit: Duration,
+    load_bound: Duration,
+) -> Daemon {
+    daemon_waiting(
+        tmp,
+        backend,
+        model,
+        tokens,
+        idle_exit,
+        load_bound,
+        daemon::RECONCILE_WAIT,
+    )
+    .await
+}
+
+/// [`daemon`] with a search's reconcile wait set to `reconcile_wait`.
+pub async fn daemon_waiting<T: Tokens>(
+    tmp: tempfile::TempDir,
     mut backend: StubBackend,
     model: Model,
     tokens: T,
     idle_exit: Duration,
     load_bound: Duration,
+    reconcile_wait: Duration,
 ) -> Daemon {
     let store = model_store(tmp.path().join("models"), &model);
     let model_dir = store.dir();
@@ -294,6 +320,7 @@ pub async fn daemon<T: Tokens>(
             model_id: repo_search_core::model::MODEL_ID.to_owned(),
             state: state.clone(),
             idle_exit,
+            reconcile_wait,
             load_bound,
             build: client::build(),
         },

@@ -4,7 +4,6 @@
 
 use std::collections::HashSet;
 use std::fs;
-use std::io;
 use std::ops::{Range, RangeInclusive};
 use std::path::{Path, PathBuf};
 
@@ -166,23 +165,19 @@ pub fn stored_meta(path: &Path) -> Result<Option<StoredMeta>, Error> {
     }
 }
 
-/// Copies the database at `src` to `dst` with `VACUUM INTO` over a
-/// read-only connection, one consistent transaction against the source: a
-/// writer on `src` serializes the copy behind its commit under the busy
-/// timeout. `dst` must not exist; on error a partial destination may be
-/// left for the caller to remove.
+/// Copies the index at `src` to the new file `dst` as one committed state,
+/// over a read-only connection: copy-on-write with `clonefile` on macOS,
+/// with `VACUUM INTO` elsewhere and on a volume without clones. A writer on
+/// `src` serializes the copy behind its commit under the busy timeout. On
+/// error a partial destination may be left for the caller to remove.
 ///
 /// # Errors
 ///
-/// When `src` cannot be read, `dst` exists or cannot be written, or `dst`
-/// is not UTF-8.
-pub fn vacuum_into(src: &Path, dst: &Path) -> Result<(), Error> {
-    let conn = open_read_only(src)?;
-    let dst = dst
-        .to_str()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path is not UTF-8"))?;
-    conn.execute("VACUUM INTO ?1", params![dst])?;
-    Ok(())
+/// When `src` cannot be read, or `dst` exists or cannot be written.
+#[cfg(feature = "seed")]
+pub fn clone_index(src: &Path, dst: &Path) -> Result<(), Error> {
+    let mut conn = open_read_only(src)?;
+    super::copy_db(&mut conn, src, dst)
 }
 
 /// Stores `phase` in the `meta` row of the index at `path` on its own
@@ -1099,7 +1094,7 @@ fn row_hashes(conn: &Connection) -> Result<Vec<RowHash>, Error> {
 }
 
 /// Reads the five fingerprint columns starting at column 0.
-fn file_state(row: &rusqlite::Row<'_>) -> rusqlite::Result<FileState> {
+pub(super) fn file_state(row: &rusqlite::Row<'_>) -> rusqlite::Result<FileState> {
     let size = row.get::<_, i64>(1)?;
     let inode = row.get::<_, i64>(3)?;
     Ok(FileState {
