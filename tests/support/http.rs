@@ -1,5 +1,5 @@
-//! A one-shot HTTP server and model-archive builders for tests that drive
-//! `ModelStore` without the network.
+//! Scripted HTTP servers and a model-archive builder for the daemon tests
+//! that download the model without the network.
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -17,38 +17,6 @@ pub fn archive(entries: &[(&str, &[u8])]) -> Vec<u8> {
         builder.append_data(&mut header, name, *bytes).unwrap();
     }
     builder.into_inner().unwrap().finish().unwrap()
-}
-
-/// A tar.zst archive whose only entry is a symlink.
-#[allow(dead_code)] // used by the model-store unit tests
-pub fn symlink_archive() -> Vec<u8> {
-    let encoder = zstd::stream::write::Encoder::new(Vec::new(), 0).unwrap();
-    let mut builder = tar::Builder::new(encoder);
-    let mut header = tar::Header::new_gnu();
-    header.set_entry_type(tar::EntryType::Symlink);
-    header.set_size(0);
-    header.set_mode(0o777);
-    builder
-        .append_link(&mut header, "evil", "/etc/passwd")
-        .unwrap();
-    builder.into_inner().unwrap().finish().unwrap()
-}
-
-/// One-shot HTTP/1.1 server: replies `status` and declares
-/// `content_length`, then writes `body` and closes the connection.
-#[allow(dead_code)] // used by the model_store lib tests, not every target
-pub fn serve_once(
-    status: &str,
-    content_length: u64,
-    body: Vec<u8>,
-) -> (String, thread::JoinHandle<()>) {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let url = format!("http://{}/model.tar.zst", listener.local_addr().unwrap());
-    let status = status.to_string();
-    let handle = thread::spawn(move || {
-        serve(&listener, &status, content_length, &body);
-    });
-    (url, handle)
 }
 
 /// A server that writes the head and half the body, then holds the

@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
 use repo_search::daemon::{self, Config, Error};
-use repo_search::model_store::{ModelSpec, ModelStore};
+use repo_search::model_store::ModelStore;
 use repo_search_client::protocol::{self, ErrorKind, Event, Final, Request, WirePhase};
 use repo_search_core::StateDir;
 use repo_search_core::qos::QosClass;
@@ -24,7 +24,9 @@ use repo_search_coreml::GpuBlocked;
 use repo_search_server::chip::ChipClass;
 use repo_search_server::stub::{IndexGate, Instance, Kind, Record, StubBackend};
 use support::client::{final_event, final_of, hello, next_event, request, search, stream_request};
-use support::daemon::{Daemon, Model, daemon, daemon_waiting, digest_of, model_store, sha_7};
+use support::daemon::{
+    Daemon, Model, cached_pin, daemon, daemon_waiting, digest_of, model_store, sha_7,
+};
 use support::repo::{self, TestRepo};
 use support::tokens::{HoldHandle, StubTokens};
 use tokio::net::UnixListener;
@@ -1219,7 +1221,7 @@ async fn shutdown_during_server_download_answers_shutting_down() {
         StubBackend::new(mpsc::channel().0),
         Model::Served {
             url,
-            sha: digest_of(&body),
+            pinned: body.clone(),
         },
         StubTokens::default(),
         Duration::from_secs(600),
@@ -1482,7 +1484,7 @@ async fn model_download_streams_progress() {
         StubBackend::new(mpsc::channel().0),
         Model::Served {
             url,
-            sha: digest_of(&body),
+            pinned: body.clone(),
         },
         StubTokens::default(),
         Duration::from_secs(600),
@@ -1518,7 +1520,10 @@ async fn model_download_streams_progress() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn corrupt_model_download_is_rejected() {
     let good = support::http::archive(&[("manifest.json", b"{}")]);
-    let corrupt = support::http::archive(&[("manifest.json", b"corrupted")]);
+    // Same length as `good`, so the pinned size passes and the sha is what
+    // refuses it.
+    let corrupt = support::http::archive(&[("manifest.json", b"[]")]);
+    assert_eq!(corrupt.len(), good.len());
     // Three bodies: the first two fail the sha, so the `Failed` the
     // probe answers after them is still standing when the request
     // re-probes; the server's retry on that probe fetches the third,
@@ -1535,7 +1540,7 @@ async fn corrupt_model_download_is_rejected() {
         StubBackend::new(mpsc::channel().0),
         Model::Served {
             url,
-            sha: digest_of(&good),
+            pinned: good.clone(),
         },
         StubTokens::default(),
         Duration::from_secs(600),
@@ -1557,7 +1562,7 @@ async fn corrupt_model_download_is_rejected() {
         other => panic!("expected a Model error, got {other:?}"),
     }
     assert!(
-        !root.join(digest_of(&good).hex()).exists(),
+        !root.join(digest_of(&good).to_string()).exists(),
         "no model directory remains"
     );
 
@@ -1589,7 +1594,7 @@ async fn a_status_reports_server_loading_detail() {
         backend,
         Model::Served {
             url,
-            sha: digest_of(&body),
+            pinned: body.clone(),
         },
         StubTokens::default(),
         Duration::from_secs(600),
@@ -1670,7 +1675,7 @@ async fn a_daemon_with_an_unreachable_server_fails_the_request_with_model() {
         support::daemon::Setup {
             tokens: StubTokens::default(),
             server: repo_search::daemon::server::Endpoint::Unix(tmp.path().join("no-server.sock")),
-            model_id: sha_7().hex(),
+            model_id: sha_7().to_string(),
             state: StateDir::new(tmp.path().join("state")),
             idle_exit: Duration::from_secs(600),
             reconcile_wait: daemon::RECONCILE_WAIT,
@@ -2880,10 +2885,7 @@ async fn daemon_host() {
             println!("RECORD {json}");
         }
     });
-    let spec = ModelSpec {
-        url: "http://127.0.0.1:1/unused".into(),
-        sha256: sha_7(),
-    };
+    let spec = cached_pin();
     let store = ModelStore::new(config.model_cache, spec).expect("model store");
     std::fs::create_dir_all(store.dir()).expect("the host's model dir");
     let listener = UnixListener::bind(&config.socket).expect("socket binds");
@@ -3104,10 +3106,7 @@ async fn sigterm_answers_in_flight_and_flushes() {
     let tmp = tempfile::tempdir().expect("tmp");
     let state = StateDir::new(tmp.path().join("state"));
     let model_cache = tmp.path().join("models");
-    let spec = ModelSpec {
-        url: "http://127.0.0.1:1/unused".into(),
-        sha256: sha_7(),
-    };
+    let spec = cached_pin();
     let store = ModelStore::new(model_cache.clone(), spec).expect("model store");
     std::fs::create_dir_all(store.dir()).expect("cached model dir");
     let model_id = repo_search_core::model::MODEL_ID.to_owned();
@@ -3183,10 +3182,7 @@ async fn kill_mid_index_resumes() {
     let tmp = tempfile::tempdir().expect("tmp");
     let state = StateDir::new(tmp.path().join("state"));
     let model_cache = tmp.path().join("models");
-    let spec = ModelSpec {
-        url: "http://127.0.0.1:1/unused".into(),
-        sha256: sha_7(),
-    };
+    let spec = cached_pin();
     let store = ModelStore::new(model_cache.clone(), spec).expect("model store");
     std::fs::create_dir_all(store.dir()).expect("cached model dir");
     let model_id = repo_search_core::model::MODEL_ID.to_owned();
@@ -3336,10 +3332,7 @@ async fn kill_mid_index_resumes() {
 fn host_exits_when_its_parent_is_killed() {
     let tmp = tempfile::tempdir().expect("tmp");
     let model_cache = tmp.path().join("models");
-    let spec = ModelSpec {
-        url: "http://127.0.0.1:1/unused".into(),
-        sha256: sha_7(),
-    };
+    let spec = cached_pin();
     let store = ModelStore::new(model_cache.clone(), spec).expect("model store");
     std::fs::create_dir_all(store.dir()).expect("cached model dir");
     let mut parent = Intermediate::spawn(&HostConfig {

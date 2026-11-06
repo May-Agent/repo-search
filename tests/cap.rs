@@ -13,7 +13,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use repo_search::daemon::counter::PromptCounter;
-use repo_search::model_store::Sha256Digest;
 use repo_search_core::TokenCounter;
 use repo_search_core::chunk::{
     Chunk, Chunker, ConfigChunker, DocChunker, FileChunker, JavaScript, Language,
@@ -42,8 +41,8 @@ fn the_bundled_tokenizer_matches_the_pin() {
     let dir = std::env::var("REPO_SEARCH_MODEL_DIR").expect("REPO_SEARCH_MODEL_DIR is unset");
     let bytes = std::fs::read(Path::new(&dir).join("tokenizer.json")).unwrap();
     assert_eq!(
-        Sha256Digest::of(&bytes).hex(),
-        TOKENIZER.sha256,
+        (ondevice::Sha256::of(&bytes), bytes.len() as u64),
+        (TOKENIZER.sha256, TOKENIZER.size),
         "the archive's tokenizer.json does not match the upstream pin"
     );
 }
