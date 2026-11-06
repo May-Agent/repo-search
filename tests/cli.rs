@@ -525,7 +525,7 @@ async fn non_tty_shows_only_announcements() {
         client::build(),
         Model::Served {
             url,
-            sha: support::daemon::digest_of(&body),
+            pinned: body.clone(),
         },
         StubBackend::new(mpsc::channel().0),
     );

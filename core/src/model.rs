@@ -6,21 +6,17 @@
 //! literal — so [`ARCHIVE`] stays above [`TOKENIZER`] and keeps its
 //! sha256 literal on a line of its own.
 
-/// A pinned download: the URL it comes from and the sha256 its bytes
-/// verify against.
-pub struct Pin {
-    /// Download URL, pinned to an immutable upstream revision.
-    pub url: &'static str,
-    /// Expected sha256 of the downloaded bytes, lowercase hex.
-    pub sha256: &'static str,
-}
+use ondevice::{Archive, File, Pin, Sha256};
 
 /// The published EmbeddingGemma 2 Core ML archive.
 #[rustfmt::skip]
-pub const ARCHIVE: Pin = Pin {
+pub const ARCHIVE: Pin<'static, Archive> = Pin {
     url: "https://huggingface.co/lexoliu/repo-search-embeddinggemma2-coreml/resolve/5bb9f08270c0e2968d048a0a35e120863f32962c/eg2-coreml-914f7f89-57287aaa.tar.zst",
-    sha256:
+    sha256: Sha256::from_hex(
         "57287aaa3fea181447dd2bd378d064aeef77684da0c722302e893dd95e43ab2c",
+    ),
+    size: 417_260_546,
+    kind: Archive,
 };
 
 /// The published EmbeddingGemma 2 ONNX archive served off macOS:
@@ -30,33 +26,48 @@ pub const ARCHIVE: Pin = Pin {
 /// than the int8 graph, and on a CPU it is no slower.
 #[cfg(not(target_os = "macos"))]
 #[rustfmt::skip]
-pub const ONNX_ARCHIVE: Pin = Pin {
+pub const ONNX_ARCHIVE: Pin<'static, Archive> = Pin {
     url: "https://huggingface.co/lexoliu/repo-search-embeddinggemma2-onnx/resolve/d4e1b374f97451cf89262d03f4f8e387822511d4/eg2-onnx-fp16-914f7f89-ac32bf70.tar.zst",
-    sha256:
+    sha256: Sha256::from_hex(
         "ac32bf7023a81cf0d58e5f487ecb8e46979898d966f606bc564c5dba8585b414",
+    ),
+    size: 444_342_448,
+    kind: Archive,
 };
 
 /// The int8 (weight-quantized) variant of the ONNX archive, opted into with
 /// `REPO_SEARCH_ORT_ARCHIVE=int8`.
 #[cfg(not(target_os = "macos"))]
 #[rustfmt::skip]
-pub const ONNX_INT8_ARCHIVE: Pin = Pin {
+pub const ONNX_INT8_ARCHIVE: Pin<'static, Archive> = Pin {
     url: "https://huggingface.co/lexoliu/repo-search-embeddinggemma2-onnx/resolve/090c8ce7415de7af5bcb3f8ba106ee6a1cfc2563/eg2-onnx-914f7f89-a4acdbe8.tar.zst",
-    sha256:
+    sha256: Sha256::from_hex(
         "a4acdbe8cbcdc2d2a8e95b81317a694c966f2de64a534dda5189b34faad14acf",
+    ),
+    size: 291_242_960,
+    kind: Archive,
 };
 
 /// The tokenizer the daemon counts and prefixes chunks with, pinned at the
 /// model's upstream revision; the archive ships the same bytes.
-pub const TOKENIZER: Pin = Pin {
+#[rustfmt::skip]
+pub const TOKENIZER: Pin<'static, File> = Pin {
     url: "https://huggingface.co/google/embeddinggemma-2/resolve/914f7f89142e33e77833254d9c9b90c3cef7303b/tokenizer.json",
-    sha256: "4d777ef5bdc1aa36227abdfb77c3e49e7b9c892d16e1b6bda41c393504828be4",
+    sha256: Sha256::from_hex(
+        "4d777ef5bdc1aa36227abdfb77c3e49e7b9c892d16e1b6bda41c393504828be4",
+    ),
+    size: 32_170_510,
+    kind: File,
 };
+
+/// [`ARCHIVE`]'s digest in hex, the storage [`MODEL_ID`] borrows.
+#[cfg(target_os = "macos")]
+const ARCHIVE_HEX: &ondevice::Hex = &ARCHIVE.sha256.hex();
 
 /// The model build's identity, on `/v1/models` and in the vector cache:
 /// the archive's sha256, so vectors from different builds never mix.
 #[cfg(target_os = "macos")]
-pub const MODEL_ID: &str = ARCHIVE.sha256;
+pub const MODEL_ID: &str = ARCHIVE_HEX.as_str();
 
 /// The model build's identity off macOS: `onnx-` plus the sha256 of the
 /// pinned ONNX graph file the server's manifest names, so ONNX and Core
@@ -165,7 +176,7 @@ impl QueryTask {
 pub struct Fetch {
     /// Bytes received so far.
     pub received: u64,
-    /// The server's declared length, when known.
+    /// The file's pinned length; `None` before the download starts.
     pub total: Option<u64>,
 }
 

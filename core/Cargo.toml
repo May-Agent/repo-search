@@ -44,6 +44,7 @@ ignore = { version = "0.4.33", default-features = false }
 jsonc-parser = { version = "0.34.0", default-features = false }
 memmap2 = { version = "0.9.11", default-features = false }
 numkong = { version = "7.8.5", default-features = false }
+ondevice.workspace = true
 pulldown-cmark = { version = "0.13.5", default-features = false }
 reflink-copy = { version = "0.1.32", default-features = false, optional = true }
 rusqlite = { version = "0.40.2", default-features = false, features = ["bundled"] }
