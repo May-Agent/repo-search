@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.13](https://github.com/May-Agent/repo-search/compare/v0.0.12...v0.0.13) - 2026-11-07
+
+### Added
+
+- *(embed)* [**breaking**] size the indexing window and runs from the server's devices
+
+### Fixed
+
+- *(daemon)* name the configured model id in embedding requests
+- keep socket paths within sun_path for any home
+- *(launcher)* list a domain's loaded labels and read a service's plist path
+- *(release)* tag repo-search-ort as ort/v<version>
+- *(test)* connect to launchd's socket once it listens
+
+### Other
+
+- *(convert)* build the ONNX archive with every MatMul -> Split unfused
+- move the model store and Core ML runtime onto ondevice
+
 ## [0.0.12](https://github.com/May-Agent/repo-search/compare/v0.0.11...v0.0.12) - 2026-11-05
 
 ### Added
