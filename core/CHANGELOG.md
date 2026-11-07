@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.10](https://github.com/May-Agent/repo-search/compare/core/v0.0.9...core/v0.0.10) - 2026-11-07
+
+### Added
+
+- *(embed)* [**breaking**] size the indexing window and runs from the server's devices
+
+### Other
+
+- *(core)* pin the ONNX archive with MatMul -> Split unfused
+- move the model store and Core ML runtime onto ondevice
+
 ## [0.0.9](https://github.com/May-Agent/repo-search/compare/core/v0.0.8...core/v0.0.9) - 2026-11-05
 
 ### Added

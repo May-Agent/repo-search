@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.10](https://github.com/May-Agent/repo-search/compare/coreml/v0.0.9...coreml/v0.0.10) - 2026-11-07
+
+### Other
+
+- move the model store and Core ML runtime onto ondevice
+
 ## [0.0.9](https://github.com/May-Agent/repo-search/compare/coreml/v0.0.8...coreml/v0.0.9) - 2026-11-05
 
 ### Other

@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.8](https://github.com/May-Agent/repo-search/compare/client/v0.0.7...client/v0.0.8) - 2026-11-07
+
+### Fixed
+
+- keep socket paths within sun_path for any home
+- *(launcher)* list a domain's loaded labels and read a service's plist path
+- *(launcher)* replace the daemon agent when its binary is replaced
+
 ## [0.0.7](https://github.com/May-Agent/repo-search/compare/client/v0.0.6...client/v0.0.7) - 2026-11-04
 
 ### Fixed
