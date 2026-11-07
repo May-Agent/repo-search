@@ -255,7 +255,7 @@ pub async fn run<T: Tokens, L: listen::Listener>(config: Config<T, L>) -> Result
     let (conn_tx, mut conn_rx) = mpsc::channel::<ConnMsg>(64);
     let build = config.build;
 
-    let server = match ServerClient::new(&config.server) {
+    let server = match ServerClient::new(&config.server, config.model_id.clone()) {
         Ok(client) => Arc::new(client),
         Err(error) => {
             let error = StartupError::ServerClient(error);
