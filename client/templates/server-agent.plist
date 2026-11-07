@@ -32,15 +32,17 @@
 			<key>SockPathMode</key>
 			<integer>384</integer>
 		</dict>
+		{%- if let Some(tcp) = tcp %}
 		<key>Tcp</key>
 		<dict>
 			<key>SockNodeName</key>
-			<string>{{ bind }}</string>
+			<string>{{ tcp.bind }}</string>
 			<key>SockServiceName</key>
-			<string>{{ port }}</string>
+			<string>{{ tcp.port }}</string>
 			<key>SockFamily</key>
-			<string>{% if bind.is_ipv4() %}IPv4{% else %}IPv6{% endif %}</string>
+			<string>{% if tcp.bind.is_ipv4() %}IPv4{% else %}IPv6{% endif %}</string>
 		</dict>
+		{%- endif %}
 	</dict>
 	<key>StandardErrorPath</key>
 	<string>{{ stderr.display() }}</string>

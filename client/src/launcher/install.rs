@@ -19,7 +19,9 @@ use std::time::Duration;
 use askama::Template;
 
 use super::kqueue::{DirWatch, ExitWatch};
-use super::launchd::{LaunchAgent, ServerAgent, ServerConfig, domain, user_labels};
+use super::launchd::{
+    LaunchAgent, ServerAgent, ServerConfig, domain, user_default_tcp, user_labels,
+};
 use super::paths::{
     UserPaths, lock_path, log_path, plist_path, server_config_path, server_log_path,
     server_socket_path, socket_path,
@@ -57,8 +59,8 @@ impl Plist {
     /// wait verify.
     pub fn socket(&self) -> &Path {
         match self {
-            Self::Daemon(agent) => &agent.socket,
-            Self::Server(agent) => &agent.socket,
+            Self::Daemon(agent) => agent.socket.as_path(),
+            Self::Server(agent) => agent.socket.as_path(),
         }
     }
 
@@ -126,10 +128,13 @@ impl AgentConfig {
 
     /// The real per-user embedding-server agent: a per-build alias of the
     /// `search` binary at `program`, `server.toml`'s bind, port and token
-    /// file, the build identity the `--build` self-heal checks, and the
-    /// launchd labels [`super::launchd::user_labels`] chooses for `$HOME`.
+    /// file over the TCP default [`super::launchd::user_default_tcp`]
+    /// gives `$HOME`, the build identity the `--build` self-heal checks,
+    /// and the launchd labels [`super::launchd::user_labels`] chooses for
+    /// `$HOME`.
     pub fn server(program: PathBuf) -> io::Result<Self> {
-        let config = ServerConfig::load(&server_config_path()?).map_err(io::Error::other)?;
+        let config = ServerConfig::load(&server_config_path()?, user_default_tcp()?)
+            .map_err(io::Error::other)?;
         let program = program_alias(&UserPaths::user()?.state.join("bin"), &program)?;
         let (_, label) = user_labels()?;
         Ok(Self {
@@ -144,8 +149,7 @@ impl AgentConfig {
                 idle_exit: SERVER_IDLE_EXIT,
                 model_cache: None,
                 token_file: config.token_file,
-                bind: config.bind,
-                port: config.port,
+                tcp: config.tcp,
                 stderr: server_log_path()?,
             }),
             timeouts: Timeouts {
@@ -222,6 +226,9 @@ pub trait Launchctl {
     /// `launchctl print <service>`: `None` when launchd does not know the
     /// service.
     fn service(&mut self, service: &str) -> Result<Option<Service>, LaunchctlError>;
+    /// `launchctl print <domain>`: the labels of the services loaded in
+    /// the domain.
+    fn labels(&mut self, domain: &str) -> Result<Vec<String>, LaunchctlError>;
     /// `launchctl bootout <service>`.
     fn bootout(&mut self, service: &str) -> Result<(), LaunchctlError>;
     /// `launchctl bootstrap <domain> <plist>`.
@@ -233,6 +240,49 @@ pub struct Service {
     /// The running process's pid; `None` when the job is loaded but no
     /// process runs (a socket-activated agent between runs).
     pub pid: Option<u32>,
+    /// The plist launchd loaded the service from (`path = `); `None` for
+    /// a service launchd reports no file for.
+    pub path: Option<PathBuf>,
+}
+
+impl Service {
+    /// The service `launchctl print <service>` printed as `stdout`.
+    fn parse(stdout: &str) -> Self {
+        // The service's own attributes sit one tab deep; the same keys
+        // recur deeper in nested blocks (sockets, endpoints).
+        let attribute = |key: &str| {
+            stdout
+                .lines()
+                .find_map(|line| line.strip_prefix('\t')?.strip_prefix(key))
+                .map(str::trim)
+        };
+        Self {
+            pid: attribute("pid = ").map(|value| {
+                value
+                    .parse::<u32>()
+                    .expect("`launchctl print`'s pid parses")
+            }),
+            path: attribute("path = ").map(PathBuf::from),
+        }
+    }
+}
+
+/// The labels in the `services = { ... }` block of `launchctl print
+/// <domain>`'s `stdout`: one `<pid> <last exit status> <label>` row per
+/// service.
+fn parse_labels(stdout: &str) -> Vec<String> {
+    stdout
+        .lines()
+        .skip_while(|line| *line != "\tservices = {")
+        .skip(1)
+        .take_while(|line| *line != "\t}")
+        .map(|row| {
+            row.split_whitespace()
+                .nth(2)
+                .unwrap_or_else(|| panic!("`launchctl print`'s service row {row:?} has no label"))
+                .to_owned()
+        })
+        .collect()
 }
 
 /// `/bin/launchctl` itself.
@@ -272,23 +322,22 @@ impl Launchctl for SystemLaunchctl {
         let (output, args) = Self::run(&[OsStr::new("print"), OsStr::new(service)])?;
         if output.status.success() {
             let stdout = String::from_utf8_lossy(&output.stdout);
-            let pid = stdout
-                .lines()
-                .map(str::trim)
-                .find_map(|line| line.strip_prefix("pid = "))
-                .map(|value| {
-                    value
-                        .trim()
-                        .parse::<u32>()
-                        .expect("`launchctl print`'s pid parses")
-                });
-            return Ok(Some(Service { pid }));
+            return Ok(Some(Service::parse(&stdout)));
         }
         // Exit 113 is "Could not find service".
         if output.status.code() == Some(113) {
             return Ok(None);
         }
         Err(Self::failed(args, output))
+    }
+
+    fn labels(&mut self, domain: &str) -> Result<Vec<String>, LaunchctlError> {
+        let (output, args) = Self::run(&[OsStr::new("print"), OsStr::new(domain)])?;
+        if output.status.success() {
+            Ok(parse_labels(&String::from_utf8_lossy(&output.stdout)))
+        } else {
+            Err(Self::failed(args, output))
+        }
     }
 
     fn bootout(&mut self, service: &str) -> Result<(), LaunchctlError> {
@@ -500,7 +549,7 @@ pub fn ensure_agent<L: Launchctl>(
     // service has a process its exit is the event that ends it. With no
     // process there is nothing asynchronous left and `bootstrap` can
     // follow `bootout` directly.
-    if let Some(Service { pid }) = state {
+    if let Some(Service { pid, .. }) = state {
         let exit = pid
             .map(|pid| {
                 ExitWatch::register(pid)
@@ -585,6 +634,87 @@ mod tests {
         }
     }
 
+    /// Captured from `launchctl print user/501/com.apple.trustd.agent`,
+    /// trimmed; the nested `path` and `pid` are a socket block's.
+    const SERVICE_PRINT: &str = "user/501/com.apple.trustd.agent = {
+\tactive count = 2
+\tpath = /System/Library/LaunchAgents/com.apple.trustd.agent.plist
+\ttype = LaunchAgent
+\tstate = running
+
+\tprogram = /usr/libexec/trustd
+\tsockets = {
+\t\t\"x\" = {
+\t\t\tpath = /var/run/not-the-plist
+\t\t\tpid = 1
+\t\t}
+\t}
+
+\tdomain = user/501
+\tpid = 963
+\tproperties = supports transactions
+}
+";
+
+    /// Captured from `launchctl print user/501`, trimmed to its sections'
+    /// shape.
+    const DOMAIN_PRINT: &str = "user/501 = {
+\ttype = user
+\thandle = 501
+
+\tservices = {
+\t\t   35704      - \tcom.apple.CoreSimulator.SimulatorTrampoline
+\t\t       0      - \tcom.apple.DistributionKit.DistributionHelper
+\t\t   32094      0 \tcom.apple.iCloudHelper
+\t\t       0      - \tcom.github.may-agent.repo-search.h-0123456789abcdef
+\t}
+
+\tunmanaged processes = {
+\t}
+
+\tdisabled services = {
+\t\t\"com.apple.other\" => disabled
+\t}
+}
+";
+
+    #[test]
+    fn a_service_print_gives_the_pid_and_the_plist_path() {
+        let service = Service::parse(SERVICE_PRINT);
+        assert_eq!(service.pid, Some(963));
+        assert_eq!(
+            service.path.as_deref(),
+            Some(Path::new(
+                "/System/Library/LaunchAgents/com.apple.trustd.agent.plist"
+            ))
+        );
+    }
+
+    #[test]
+    fn a_service_print_without_a_process_or_file_has_neither() {
+        let service = Service::parse("user/501/x = {\n\tstate = not running\n}\n");
+        assert_eq!(service.pid, None);
+        assert_eq!(service.path, None);
+    }
+
+    #[test]
+    fn a_domain_print_lists_the_loaded_labels() {
+        assert_eq!(
+            parse_labels(DOMAIN_PRINT),
+            [
+                "com.apple.CoreSimulator.SimulatorTrampoline",
+                "com.apple.DistributionKit.DistributionHelper",
+                "com.apple.iCloudHelper",
+                "com.github.may-agent.repo-search.h-0123456789abcdef",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_domain_print_without_services_lists_none() {
+        assert!(parse_labels("user/501 = {\n\tservices = {\n\t}\n}\n").is_empty());
+    }
+
     #[test]
     fn the_server_program_name_is_a_stable_per_build_hex() {
         let one = server_program_name(&build_id(7, 8));
@@ -638,12 +768,11 @@ mod tests {
             label: "test".to_owned(),
             build: BuildId::of_file(&alias).unwrap().to_string(),
             program: alias.clone(),
-            socket: tmp.path().join("server.sock"),
+            socket: super::super::paths::SocketPath::new(tmp.path().join("server.sock")).unwrap(),
             idle_exit: SERVER_IDLE_EXIT,
             model_cache: None,
             token_file: None,
-            bind: "127.0.0.1".parse().unwrap(),
-            port: 41827,
+            tcp: Some(super::super::launchd::TcpListen::DEFAULT),
             stderr: tmp.path().join("server.log"),
         };
         let plist = agent.render().expect("the plist renders");

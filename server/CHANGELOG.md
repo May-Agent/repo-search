@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.10](https://github.com/May-Agent/repo-search/compare/server/v0.0.9...server/v0.0.10) - 2026-11-07
+
+### Added
+
+- *(embed)* [**breaking**] size the indexing window and runs from the server's devices
+
+### Fixed
+
+- keep socket paths within sun_path for any home
+
 ## [0.0.9](https://github.com/May-Agent/repo-search/compare/server/v0.0.8...server/v0.0.9) - 2026-11-05
 
 ### Fixed

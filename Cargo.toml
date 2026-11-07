@@ -9,12 +9,14 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/May-Agent/repo-search"
 
 [workspace.dependencies]
-repo-search-client = { path = "client", version = "0.0.7" }
-repo-search-core = { path = "core", version = "0.0.9" }
-repo-search-coreml = { path = "coreml", version = "0.0.9" }
-repo-search-ort = { path = "ort", version = "0.0.8" }
-repo-search-server = { path = "server", version = "0.0.9" }
-clap = { version = "4.6.7", default-features = false, features = [
+repo-search-client = { path = "client", version = "0.0.8" }
+repo-search-core = { path = "core", version = "0.0.10" }
+repo-search-coreml = { path = "coreml", version = "0.0.10" }
+repo-search-ort = { path = "ort", version = "0.0.9" }
+repo-search-server = { path = "server", version = "0.0.10" }
+ondevice = { version = "0.0.1", default-features = false }
+ondevice-coreml = { version = "0.0.1", default-features = false }
+clap ={ version = "4.6.7", default-features = false, features = [
     "std",
     "derive",
     "help",
@@ -24,7 +26,7 @@ clap = { version = "4.6.7", default-features = false, features = [
 
 [package]
 name = "repo-search"
-version = "0.0.12"
+version = "0.0.13"
 description = "Search a repository for code you can describe but cannot name"
 edition.workspace = true
 rust-version.workspace = true
@@ -42,6 +44,7 @@ askama = { version = "0.16.1", default-features = false, features = [
     "derive",
     "std",
 ] }
+bytes = { version = "1.11.0", default-features = false }
 clap.workspace = true
 const_format = { version = "0.2.36", default-features = false }
 futures-util = { version = "0.3.34", default-features = false, features = [
@@ -53,6 +56,7 @@ libc = { version = "0.2.191", default-features = false, features = ["std"] }
 notify = { version = "8.2.0", default-features = false, features = [
     "macos_fsevent",
 ] }
+ondevice = { workspace = true, features = ["archive"] }
 reqwest = { version = "0.13.5", default-features = false, features = ["json"] }
 serde = { version = "1.0.229", default-features = false, features = [
     "derive",
@@ -60,8 +64,6 @@ serde = { version = "1.0.229", default-features = false, features = [
 ] }
 serde_json = { version = "1.0.154", default-features = false, features = ["std"] }
 sha2 = { version = "0.11.1", default-features = false }
-tar = { version = "0.4.46", default-features = false }
-tempfile = { version = "3.27.0", default-features = false }
 thiserror = { version = "2.0.21", default-features = false }
 tokenizers = { version = "0.23.2", default-features = false, features = ["fancy-regex"] }
 tokio = { version = "1.54.1", default-features = false, features = [
@@ -85,10 +87,8 @@ tracing-subscriber = { version = "0.3.23", default-features = false, features = 
     "fmt",
     "std",
 ] }
-zstd = { version = "0.14.3", default-features = false }
 
 [dev-dependencies]
-bytes = { version = "1.11.0", default-features = false }
 http-body-util = { version = "0.1.5", default-features = false }
 hyper = { version = "1.12.0", default-features = false, features = [
     "http1",
@@ -98,12 +98,16 @@ hyper-util = { version = "0.1.21", default-features = false, features = [
     "http1",
     "tokio",
 ] }
+tar = { version = "0.4.46", default-features = false }
+tempfile = { version = "3.27.0", default-features = false }
 tokio = { version = "1.54.1", default-features = false, features = ["test-util"] }
+zstd = { version = "0.14.3", default-features = false }
 
 [target.'cfg(target_os = "macos")'.dev-dependencies]
 repo-search-coreml.workspace = true
 repo-search-server = { workspace = true, features = ["stub"] }
 rusqlite = { version = "0.40.2", default-features = false }
+socket2 = { version = "0.6.5", default-features = false }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 repo-search-server.workspace = true

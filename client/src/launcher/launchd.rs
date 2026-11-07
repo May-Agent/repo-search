@@ -9,6 +9,8 @@ use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use super::paths::SocketPath;
+
 /// The launchd label of the `search` daemon's agent.
 pub const LABEL: &str = "com.github.may-agent.repo-search";
 
@@ -39,7 +41,7 @@ pub fn labels_for(home: &Path, login: &Path) -> (String, String) {
     if same_home(home, login) {
         (LABEL.to_owned(), SERVER_LABEL.to_owned())
     } else {
-        let suffix = home_suffix(home);
+        let suffix = super::paths::home_key(home);
         (
             format!("{LABEL}.h-{suffix}"),
             format!("{SERVER_LABEL}.h-{suffix}"),
@@ -47,22 +49,28 @@ pub fn labels_for(home: &Path, login: &Path) -> (String, String) {
     }
 }
 
+/// The server's TCP listener when `server.toml` sets neither `bind` nor
+/// `port`: [`TcpListen::DEFAULT`] when `$HOME` is the login directory,
+/// none for a relocated home. The default port is one per machine and
+/// belongs to the production agent, as its labels do; a relocated home's
+/// agent asking for it gets a socket launchd could not bind.
+pub fn user_default_tcp() -> io::Result<Option<TcpListen>> {
+    Ok(default_tcp_for(
+        &super::paths::home()?,
+        &super::paths::login_home()?,
+    ))
+}
+
+/// [`user_default_tcp`] for a process whose `$HOME` is `home` and whose
+/// passwd home is `login`.
+pub fn default_tcp_for(home: &Path, login: &Path) -> Option<TcpListen> {
+    same_home(home, login).then_some(TcpListen::DEFAULT)
+}
+
 fn same_home(home: &Path, login: &Path) -> bool {
     let one = std::fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
     let other = std::fs::canonicalize(login).unwrap_or_else(|_| login.to_path_buf());
     one == other
-}
-
-fn home_suffix(home: &Path) -> String {
-    use std::os::unix::ffi::OsStrExt as _;
-    const OFFSET: u64 = 0xcbf29ce484222325;
-    const PRIME: u64 = 0x100000001b3;
-    let mut hash = OFFSET;
-    for byte in home.as_os_str().as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(PRIME);
-    }
-    format!("{hash:016x}")
 }
 
 /// The LaunchAgent document, rendered through `templates/launch-agent.plist`.
@@ -96,7 +104,7 @@ pub struct LaunchAgent {
     /// The `search` binary to run.
     pub program: PathBuf,
     /// The `Listener` socket's path.
-    pub socket: PathBuf,
+    pub socket: SocketPath,
     /// The `--idle-exit-secs` argument.
     pub idle_exit: Duration,
     /// The `--build` argument: the binary's identity at install time.
@@ -106,7 +114,7 @@ pub struct LaunchAgent {
     /// The `--state-dir` argument, when a non-default state dir is used.
     pub state_dir: Option<PathBuf>,
     /// The `--server-socket` argument: where the embedding server listens.
-    pub server_socket: PathBuf,
+    pub server_socket: SocketPath,
     /// The `StandardErrorPath` log file.
     pub stderr: PathBuf,
 }
@@ -118,15 +126,32 @@ pub const DEFAULT_BIND: IpAddr = IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
 /// The default `SockServiceName`.
 pub const DEFAULT_PORT: u16 = 41827;
 
+/// The server agent's TCP socket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TcpListen {
+    /// `SockNodeName`: the address the socket binds.
+    pub bind: IpAddr,
+    /// `SockServiceName`: the port.
+    pub port: u16,
+}
+
+impl TcpListen {
+    /// [`DEFAULT_BIND`] and [`DEFAULT_PORT`].
+    pub const DEFAULT: Self = Self {
+        bind: DEFAULT_BIND,
+        port: DEFAULT_PORT,
+    };
+}
+
 /// The server agent's `server.toml`: the TCP listener's bind and port and
 /// the bearer token's file. Every key is optional; unknown keys are an
 /// error.
 #[derive(Debug, PartialEq, Eq)]
 pub struct ServerConfig {
-    /// `SockNodeName`: the address the TCP socket binds.
-    pub bind: IpAddr,
-    /// `SockServiceName`: the port.
-    pub port: u16,
+    /// The TCP socket: the default the home gets ([`user_default_tcp`])
+    /// unless `bind` or `port` is set, which give one whose other field
+    /// is the [`TcpListen::DEFAULT`]'s.
+    pub tcp: Option<TcpListen>,
     /// The bearer token's file, passed as `--token-file`; the token
     /// itself never enters the plist.
     pub token_file: Option<PathBuf>,
@@ -179,25 +204,14 @@ pub enum ServerConfigError {
     },
 }
 
-impl Default for ServerConfig {
-    fn default() -> Self {
-        Self {
-            bind: DEFAULT_BIND,
-            port: DEFAULT_PORT,
-            token_file: None,
-        }
-    }
-}
-
 impl ServerConfig {
     /// The config at `path`, or the defaults when the file does not
-    /// exist.
-    pub fn load(path: &Path) -> Result<Self, ServerConfigError> {
+    /// exist; `default_tcp` is the TCP socket when the file sets neither
+    /// `bind` nor `port`.
+    pub fn load(path: &Path, default_tcp: Option<TcpListen>) -> Result<Self, ServerConfigError> {
         let text = match std::fs::read_to_string(path) {
             Ok(text) => text,
-            Err(source) if source.kind() == io::ErrorKind::NotFound => {
-                return Ok(Self::default());
-            }
+            Err(source) if source.kind() == io::ErrorKind::NotFound => String::new(),
             Err(source) => {
                 return Err(ServerConfigError::Io {
                     path: path.to_path_buf(),
@@ -205,18 +219,25 @@ impl ServerConfig {
                 });
             }
         };
-        Self::parse(path, &text)
+        Self::parse(path, &text, default_tcp)
     }
 
     /// The config `text` parses to, with `path` naming errors.
-    fn parse(path: &Path, text: &str) -> Result<Self, ServerConfigError> {
+    fn parse(
+        path: &Path,
+        text: &str,
+        default_tcp: Option<TcpListen>,
+    ) -> Result<Self, ServerConfigError> {
         let doc =
             text.parse::<toml_edit::DocumentMut>()
                 .map_err(|source| ServerConfigError::Parse {
                     path: path.to_path_buf(),
                     source,
                 })?;
-        let mut config = Self::default();
+        let mut config = Self {
+            tcp: default_tcp,
+            token_file: None,
+        };
         for (key, item) in doc.as_table().iter() {
             match key {
                 "bind" => {
@@ -225,11 +246,12 @@ impl ServerConfig {
                         key: "bind",
                         expected: "a string address",
                     })?;
-                    config.bind = value.parse().map_err(|_| ServerConfigError::Type {
-                        path: path.to_path_buf(),
-                        key: "bind",
-                        expected: "a string address",
-                    })?;
+                    config.tcp.get_or_insert(TcpListen::DEFAULT).bind =
+                        value.parse().map_err(|_| ServerConfigError::Type {
+                            path: path.to_path_buf(),
+                            key: "bind",
+                            expected: "a string address",
+                        })?;
                 }
                 "port" => {
                     let value = item.as_integer().ok_or_else(|| ServerConfigError::Type {
@@ -237,11 +259,12 @@ impl ServerConfig {
                         key: "port",
                         expected: "a port number",
                     })?;
-                    config.port = u16::try_from(value).map_err(|_| ServerConfigError::Type {
-                        path: path.to_path_buf(),
-                        key: "port",
-                        expected: "a port number",
-                    })?;
+                    config.tcp.get_or_insert(TcpListen::DEFAULT).port = u16::try_from(value)
+                        .map_err(|_| ServerConfigError::Type {
+                            path: path.to_path_buf(),
+                            key: "port",
+                            expected: "a port number",
+                        })?;
                 }
                 "token_file" => {
                     let value = item.as_str().ok_or_else(|| ServerConfigError::Type {
@@ -259,10 +282,13 @@ impl ServerConfig {
                 }
             }
         }
-        if !config.bind.is_loopback() && config.token_file.is_none() {
+        if let Some(tcp) = config.tcp
+            && !tcp.bind.is_loopback()
+            && config.token_file.is_none()
+        {
             return Err(ServerConfigError::NonLoopback {
                 path: path.to_path_buf(),
-                bind: config.bind,
+                bind: tcp.bind,
             });
         }
         Ok(config)
@@ -273,8 +299,8 @@ impl ServerConfig {
 /// `templates/server-agent.plist`.
 ///
 /// Like [`LaunchAgent`] it sets no `KeepAlive`, `RunAtLoad` or
-/// `ProcessType`: launchd holds the `Unix` and `Tcp` sockets while no
-/// server runs and starts it when a connection arrives. `--build` is the
+/// `ProcessType`: launchd holds the `Unix` and, when set, `Tcp` sockets
+/// while no server runs and starts it when a connection arrives. `--build` is the
 /// self-heal: a binary rebuilt at the same path changes the plist, so
 /// `ensure_agent` replaces the agent, and the server itself refuses to
 /// run when the argument does not match its own build.
@@ -286,7 +312,7 @@ pub struct ServerAgent {
     /// The `search` binary to run.
     pub program: PathBuf,
     /// The `Unix` socket's path.
-    pub socket: PathBuf,
+    pub socket: SocketPath,
     /// The `--idle-exit-secs` argument.
     pub idle_exit: Duration,
     /// The `--build` argument: the binary's identity at install time.
@@ -295,10 +321,8 @@ pub struct ServerAgent {
     pub model_cache: Option<PathBuf>,
     /// The `--token-file` argument, when `server.toml` names one.
     pub token_file: Option<PathBuf>,
-    /// `SockNodeName`: the TCP socket's bind address.
-    pub bind: IpAddr,
-    /// `SockServiceName`: the TCP socket's port.
-    pub port: u16,
+    /// The `Tcp` socket, when the agent has one.
+    pub tcp: Option<TcpListen>,
     /// The `StandardErrorPath` log file.
     pub stderr: PathBuf,
 }
@@ -307,16 +331,20 @@ pub struct ServerAgent {
 mod tests {
     use super::*;
 
+    fn socket(path: &str) -> SocketPath {
+        SocketPath::new(PathBuf::from(path)).unwrap()
+    }
+
     fn agent() -> LaunchAgent {
         LaunchAgent {
             label: LABEL.to_owned(),
             program: PathBuf::from("/usr/local/bin/search"),
-            socket: PathBuf::from("/tmp/daemon.sock"),
+            socket: socket("/tmp/daemon.sock"),
             idle_exit: Duration::from_secs(600),
             build: "123@456".to_owned(),
             model_cache: None,
             state_dir: None,
-            server_socket: PathBuf::from("/tmp/server.sock"),
+            server_socket: socket("/tmp/server.sock"),
             stderr: PathBuf::from("/tmp/daemon.log"),
         }
     }
@@ -364,13 +392,12 @@ mod tests {
         ServerAgent {
             label: SERVER_LABEL.to_owned(),
             program: PathBuf::from("/usr/local/bin/search"),
-            socket: PathBuf::from("/tmp/server.sock"),
+            socket: socket("/tmp/server.sock"),
             idle_exit: Duration::from_secs(600),
             build: "123@456".to_owned(),
             model_cache: None,
             token_file: None,
-            bind: DEFAULT_BIND,
-            port: DEFAULT_PORT,
+            tcp: Some(TcpListen::DEFAULT),
             stderr: PathBuf::from("/tmp/server.log"),
         }
     }
@@ -408,8 +435,10 @@ mod tests {
         let mut agent = server_agent();
         agent.model_cache = Some(PathBuf::from("/tmp/models"));
         agent.token_file = Some(PathBuf::from("/tmp/token"));
-        agent.bind = "0.0.0.0".parse().unwrap();
-        agent.port = 443;
+        agent.tcp = Some(TcpListen {
+            bind: "0.0.0.0".parse().unwrap(),
+            port: 443,
+        });
         let plist = askama::Template::render(&agent).expect("the template renders");
         for fragment in [
             "<string>--model-cache</string>\n\t\t<string>/tmp/models</string>",
@@ -422,6 +451,26 @@ mod tests {
                 "missing {fragment:?} in:\n{plist}"
             );
         }
+    }
+
+    #[test]
+    fn the_server_plist_without_tcp_has_only_the_unix_socket() {
+        let mut agent = server_agent();
+        agent.tcp = None;
+        let plist = askama::Template::render(&agent).expect("the template renders");
+        assert!(plist.contains("<key>Unix</key>"), "{plist}");
+        assert!(!plist.contains("<key>Tcp</key>"), "{plist}");
+        assert!(!plist.contains("SockServiceName"), "{plist}");
+    }
+
+    #[test]
+    fn only_the_login_home_takes_the_default_port() {
+        let login = Path::new("/Users/example");
+        assert_eq!(default_tcp_for(login, login), Some(TcpListen::DEFAULT));
+        assert_eq!(
+            default_tcp_for(Path::new("/var/folders/xx/T/.tmpUf07X1"), login),
+            None
+        );
     }
 
     #[test]
@@ -456,26 +505,57 @@ mod tests {
     #[test]
     fn a_missing_server_toml_is_the_defaults() {
         let dir = tempfile::tempdir().unwrap();
-        let config = ServerConfig::load(&dir.path().join("server.toml")).unwrap();
-        assert_eq!(config, ServerConfig::default());
-        assert_eq!(config.bind, IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
-        assert_eq!(config.port, DEFAULT_PORT);
+        let path = dir.path().join("server.toml");
+        let config = ServerConfig::load(&path, Some(TcpListen::DEFAULT)).unwrap();
+        assert_eq!(config.tcp, Some(TcpListen::DEFAULT));
+        assert_eq!(config.token_file, None);
+        assert_eq!(
+            TcpListen::DEFAULT.bind,
+            IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+        );
+        assert_eq!(TcpListen::DEFAULT.port, DEFAULT_PORT);
+        assert_eq!(ServerConfig::load(&path, None).unwrap().tcp, None);
     }
 
     #[test]
     fn a_server_toml_overrides_the_defaults() {
         let (_dir, path) =
             config_file("bind = \"10.0.0.5\"\nport = 8080\ntoken_file = \"/tmp/token\"\n");
-        let config = ServerConfig::load(&path).unwrap();
-        assert_eq!(config.bind, "10.0.0.5".parse::<IpAddr>().unwrap());
-        assert_eq!(config.port, 8080);
+        let config = ServerConfig::load(&path, Some(TcpListen::DEFAULT)).unwrap();
+        assert_eq!(
+            config.tcp,
+            Some(TcpListen {
+                bind: "10.0.0.5".parse().unwrap(),
+                port: 8080,
+            })
+        );
         assert_eq!(config.token_file, Some(PathBuf::from("/tmp/token")));
+    }
+
+    #[test]
+    fn a_port_or_bind_gives_a_relocated_home_a_tcp_socket() {
+        let (_dir, path) = config_file("port = 8080\n");
+        assert_eq!(
+            ServerConfig::load(&path, None).unwrap().tcp,
+            Some(TcpListen {
+                bind: DEFAULT_BIND,
+                port: 8080,
+            })
+        );
+        let (_dir, path) = config_file("bind = \"::1\"\n");
+        assert_eq!(
+            ServerConfig::load(&path, None).unwrap().tcp,
+            Some(TcpListen {
+                bind: "::1".parse().unwrap(),
+                port: DEFAULT_PORT,
+            })
+        );
     }
 
     #[test]
     fn an_unknown_key_is_an_error() {
         let (_dir, path) = config_file("bind = \"127.0.0.1\"\nidle = 3\n");
-        let Err(ServerConfigError::UnknownKey { key, .. }) = ServerConfig::load(&path) else {
+        let Err(ServerConfigError::UnknownKey { key, .. }) = ServerConfig::load(&path, None) else {
             panic!("an unknown key is rejected");
         };
         assert_eq!(key, "idle");
@@ -484,19 +564,23 @@ mod tests {
     #[test]
     fn a_non_loopback_bind_needs_a_token() {
         let (_dir, path) = config_file("bind = \"0.0.0.0\"\n");
-        let Err(ServerConfigError::NonLoopback { bind, .. }) = ServerConfig::load(&path) else {
+        let Err(ServerConfigError::NonLoopback { bind, .. }) = ServerConfig::load(&path, None)
+        else {
             panic!("a non-loopback bind without a token is rejected");
         };
         assert_eq!(bind, "0.0.0.0".parse::<IpAddr>().unwrap());
 
         let (_dir, path) = config_file("bind = \"0.0.0.0\"\ntoken_file = \"/t\"\n");
-        ServerConfig::load(&path).expect("a token file allows a non-loopback bind");
+        ServerConfig::load(&path, None).expect("a token file allows a non-loopback bind");
     }
 
     #[test]
     fn the_server_plist_takes_its_socket_family_from_the_bind() {
         let mut agent = server_agent();
-        agent.bind = IpAddr::V6(std::net::Ipv6Addr::LOCALHOST);
+        agent.tcp = Some(TcpListen {
+            bind: IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+            port: DEFAULT_PORT,
+        });
         let plist = askama::Template::render(&agent).expect("the template renders");
         assert!(plist.contains("<key>SockNodeName</key>\n\t\t\t<string>::1</string>"));
         assert!(plist.contains("<key>SockFamily</key>\n\t\t\t<string>IPv6</string>"));

@@ -10,10 +10,11 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use repo_search::model_store::{ModelSpec, ModelStore, TokenizerSpec, TokenizerStore};
+use repo_search::model_store::{ModelStore, TokenizerStore};
 use repo_search_client::client::Responses;
 use repo_search_client::protocol::{Event, Final, Hello, Progress, Request, WirePhase};
 use repo_search_core::StateDir;
+use repo_search_core::model::{ARCHIVE, TOKENIZER};
 use repo_search_core::store::{Index, VectorCache};
 
 use super::client;
@@ -67,18 +68,16 @@ pub fn clone_corpus(tmp: &tempfile::TempDir) -> PathBuf {
 /// A `ModelStore` rooted at `root` whose `<sha256>/` entry is a symlink to
 /// `REPO_SEARCH_MODEL_DIR`, so `ensure` returns at once.
 pub fn model_store(root: PathBuf) -> ModelStore {
-    let spec = ModelSpec::embedding_gemma_2();
     std::fs::create_dir_all(&root).expect("the model cache root");
-    std::os::unix::fs::symlink(model_dir(), root.join(spec.sha256.hex()))
+    std::os::unix::fs::symlink(model_dir(), root.join(ARCHIVE.sha256.to_string()))
         .expect("the model dir symlink");
-    ModelStore::new(root, spec).expect("model store")
+    ModelStore::new(root, ARCHIVE).expect("model store")
 }
 
 /// A `TokenizerStore` rooted at `root` whose cached path is a copy of the
 /// archive's `tokenizer.json`, so `load` returns at once.
 pub fn tokenizer_store(root: PathBuf) -> TokenizerStore {
-    let spec = TokenizerSpec::embedding_gemma_2();
-    let store = TokenizerStore::new(root, spec).expect("tokenizer store");
+    let store = TokenizerStore::new(root, TOKENIZER).expect("tokenizer store");
     let path = store.path();
     std::fs::create_dir_all(path.parent().unwrap()).expect("the tokenizer dir");
     std::fs::copy(model_dir().join("tokenizer.json"), &path).expect("the tokenizer copy lands");

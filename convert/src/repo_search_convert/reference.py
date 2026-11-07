@@ -13,9 +13,7 @@ from pathlib import Path
 
 import coremltools as ct
 import numpy as np
-from tokenizers import Tokenizer
-
-from .samples import fixed_samples
+from .samples import SampleTokenizer, fixed_samples
 from .spec import BUCKETS, DOCUMENT_FORMAT, FUNCTION_PREFIX, QUERY_FORMAT
 
 QUERIES = [
@@ -26,24 +24,6 @@ QUERIES = [
     "how does the indexer schedule embedding work across every repository "
     * 60,
 ]
-
-
-class _Tokenizer:
-    """The HF-shaped interface ``fixed_samples`` wants, over tokenizer.json."""
-
-    def __init__(self, path: Path, truncate: int | None = None):
-        self._t = Tokenizer.from_file(str(path))
-        if truncate is not None:
-            self._t.enable_truncation(truncate)
-        self.pad_token_id = self._t.token_to_id("<pad>")
-        if self.pad_token_id is None:
-            raise RuntimeError("tokenizer has no <pad> token")
-
-    def __call__(self, text: str) -> dict:
-        return {"input_ids": self._t.encode(text).ids}
-
-    def decode(self, ids, skip_special_tokens: bool = True) -> str:
-        return self._t.decode(list(ids), skip_special_tokens=skip_special_tokens)
 
 
 def _unit(v: np.ndarray) -> np.ndarray:
@@ -60,7 +40,7 @@ def main() -> None:
     if mlmodelc is None:
         raise RuntimeError(f"no .mlmodelc in {model_dir}")
 
-    tok = _Tokenizer(model_dir / "tokenizer.json")
+    tok = SampleTokenizer(model_dir / "tokenizer.json")
     pad = tok.pad_token_id
     samples = fixed_samples(tok, BUCKETS)
     keepalive = []
@@ -113,7 +93,7 @@ def main() -> None:
                 )
     # Queries truncate at the largest bucket inside the tokenizer, the same
     # path the Rust query tokenizer takes.
-    qtok = _Tokenizer(model_dir / "tokenizer.json", truncate=max(BUCKETS))
+    qtok = SampleTokenizer(model_dir / "tokenizer.json", truncate=max(BUCKETS))
     for q in QUERIES:
         prompt = QUERY_FORMAT.format(query=q)
         ids = qtok(prompt)["input_ids"]

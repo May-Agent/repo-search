@@ -431,10 +431,7 @@ fn checks(
         });
     }
     let tokens = match &model_cache {
-        Some(root) => TokenizerStore::new(
-            root.clone(),
-            repo_search::model_store::TokenizerSpec::embedding_gemma_2(),
-        ),
+        Some(root) => TokenizerStore::new(root.clone(), repo_search_core::model::TOKENIZER),
         None => TokenizerStore::user_cache(),
     }
     .map_err(StartupError::ModelStore)?;
@@ -507,7 +504,8 @@ fn endpoint(
         (None, Some(addr)) => Ok(Endpoint::Tcp { addr, token }),
         (None, None) => Ok(Endpoint::Unix(
             repo_search_client::launcher::paths::server_socket_path()
-                .map_err(StartupError::StateDir)?,
+                .map_err(StartupError::StateDir)?
+                .into_path_buf(),
         )),
         (Some(_), Some(_)) => unreachable!("clap marks the flags conflicting"),
     }
@@ -627,9 +625,13 @@ fn server_main(
             }
             // No socket of this name is registered: zero `Tcp` listeners
             // is a valid configuration; a missing `Unix` is caught by the
-            // count check below.
+            // count check below. For a name the plist lacks, launchd
+            // answers `ESRCH` rather than the documented `ENOENT` — once
+            // `Unix` has activated, the process is launchd's, so `ESRCH`
+            // for `Tcp` can only mean the agent has no TCP socket.
             Err(launchd::ActivateError::Launchd { source, .. })
-                if source.kind() == std::io::ErrorKind::NotFound => {}
+                if source.kind() == std::io::ErrorKind::NotFound
+                    || (name == "Tcp" && source.raw_os_error() == Some(libc::ESRCH)) => {}
             Err(error) => {
                 tracing::error!(%error, %name, "launchd socket activation failed");
                 return fail_all(
@@ -669,10 +671,7 @@ fn server_main(
         }
     }
     let model_store = match &model_cache {
-        Some(root) => ModelStore::new(
-            root.clone(),
-            repo_search::model_store::ModelSpec::embedding_gemma_2(),
-        ),
+        Some(root) => ModelStore::new(root.clone(), repo_search_core::model::ARCHIVE),
         None => ModelStore::user_cache(),
     };
     let model_store = match model_store {
@@ -796,19 +795,20 @@ fn onnx_int8() -> bool {
     }
 }
 
-/// The [`ModelSpec`] matching [`onnx_int8`]'s archive choice.
+/// The archive pin matching [`onnx_int8`]'s choice.
 #[cfg(not(target_os = "macos"))]
-fn onnx_spec() -> repo_search::model_store::ModelSpec {
+fn onnx_pin() -> ondevice::Pin<'static, ondevice::Archive> {
     if onnx_int8() {
-        repo_search::model_store::ModelSpec::embedding_gemma_2_onnx_int8()
+        repo_search_core::model::ONNX_INT8_ARCHIVE
     } else {
-        repo_search::model_store::ModelSpec::embedding_gemma_2_onnx()
+        repo_search_core::model::ONNX_ARCHIVE
     }
 }
 
 /// The per-user [`ModelStore`] matching [`onnx_int8`]'s archive choice.
 #[cfg(not(target_os = "macos"))]
-fn onnx_store() -> Result<repo_search::model_store::ModelStore, repo_search::model_store::Error> {
+fn onnx_store() -> Result<repo_search::model_store::ModelStore, repo_search::model_store::OpenError>
+{
     if onnx_int8() {
         repo_search::model_store::ModelStore::user_cache_onnx_int8()
     } else {
@@ -894,7 +894,7 @@ fn ort_server_main(
         let path = match socket {
             Some(path) => path,
             None => match repo_search_client::launcher::paths::server_socket_path() {
-                Ok(path) => path,
+                Ok(path) => path.into_path_buf(),
                 Err(error) => {
                     tracing::error!(%error, "could not resolve the server socket path");
                     return ExitCode::FAILURE;
@@ -990,7 +990,7 @@ fn ort_server_main(
             None => {
                 use repo_search::model_store::ModelStore;
                 let store = match model_cache {
-                    Some(root) => ModelStore::new(root, onnx_spec()),
+                    Some(root) => ModelStore::new(root, onnx_pin()),
                     None => onnx_store(),
                 }
                 .map_err(|error| format!("model store: {error}"))?;

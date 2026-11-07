@@ -79,7 +79,7 @@ pub enum StartupError {
     },
     /// The tokenizer cache could not be opened.
     #[error("could not open the model cache: {0}")]
-    ModelStore(#[source] crate::model_store::Error),
+    ModelStore(#[source] crate::model_store::OpenError),
     /// The server client could not be built.
     #[error("could not build the embedding server client: {0}")]
     ServerClient(#[source] reqwest::Error),
@@ -255,7 +255,7 @@ pub async fn run<T: Tokens, L: listen::Listener>(config: Config<T, L>) -> Result
     let (conn_tx, mut conn_rx) = mpsc::channel::<ConnMsg>(64);
     let build = config.build;
 
-    let server = match ServerClient::new(&config.server) {
+    let server = match ServerClient::new(&config.server, config.model_id.clone()) {
         Ok(client) => Arc::new(client),
         Err(error) => {
             let error = StartupError::ServerClient(error);

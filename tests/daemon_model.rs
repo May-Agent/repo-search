@@ -22,7 +22,7 @@ use std::time::Duration;
 
 use repo_search::daemon::server::Endpoint;
 use repo_search::daemon::{self, Config};
-use repo_search::model_store::{ModelSpec, ModelStore};
+use repo_search::model_store::ModelStore;
 use repo_search_client::protocol::{Final, Request};
 use repo_search_core::StateDir;
 use repo_search_server::chip::ChipClass;
@@ -195,7 +195,7 @@ async fn daemon_host_coreml() {
         .expect("REPO_SEARCH_TEST_HOST is set by kill_and_resume_on_the_model");
     let config: HostConfig = serde_json::from_str(&raw).expect("HostConfig json");
     host::watch_stdin();
-    let store = ModelStore::new(config.model_cache.clone(), ModelSpec::embedding_gemma_2())
+    let store = ModelStore::new(config.model_cache.clone(), repo_search_core::model::ARCHIVE)
         .expect("model store");
     let model_id = repo_search_core::model::MODEL_ID.to_owned();
     let listener = UnixListener::bind(&config.socket).expect("socket binds");

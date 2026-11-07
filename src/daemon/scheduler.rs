@@ -5,14 +5,16 @@
 //! and background classes, `(repo, hash)` de-duplication, worktree
 //! interest, freshness barriers — and hands the server a bounded window
 //! of in-flight requests instead of embedding on its own threads. The
-//! window holds the 8 shortest and the 24 longest remaining items, filled
-//! from the stage-1 queue before background, one input per request:
-//! the server's ANE then sees the true global shortest and its GPU the
-//! true global longest. Stage-1 items go at `u=3`, background at `u=7`;
+//! ready server reports the window it wants: how many of the shortest and
+//! how many of the longest remaining items, filled from the stage-1 queue
+//! before background, one input per request. The Core ML server's ANE
+//! then sees the true global shortest and its GPU the true global
+//! longest; the ONNX server's devices get length-ordered runs. Stage-1 items go at `u=3`, background at `u=7`;
 //! queries and a search's `Documents` job preempt indexing at `u=0`.
 //! HTTP/1.1 cannot change a request's priority, so a `Background`→`Stage1`
 //! class flip of an in-flight item aborts its request and requeues it;
-//! the reverse is left alone — at most 32 items finish slightly early.
+//! the reverse is left alone — at most a window of items finish slightly
+//! early.
 //! While an `index --wait` client is attached to a worktree — it holds a
 //! counts watch — every `Background` item that worktree wants is classed
 //! `Stage1` the same way; the last detach drops the remaining ones back.
@@ -27,7 +29,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use repo_search_core::embed_api::{ServerTiming, Urgency};
+use repo_search_core::embed_api::{ServerTiming, Urgency, Window};
 use repo_search_core::model::{BUCKETS, DOCUMENT};
 use repo_search_core::reconcile::PendingChunk;
 use repo_search_core::store::ContentHash;
@@ -47,17 +49,6 @@ const INBOX: usize = 64;
 /// Stage 1 embeds only chunks up to this many tokens; larger chunks wait
 /// for stage 2 at background urgency.
 pub const STAGE1_MAX_TOKENS: usize = BUCKETS[1];
-
-/// Short-end flights: the server's ANE embeds one item at a time, so a
-/// few queued items cover daemon stalls and forwarded-socket round trips.
-const SHORT_SLOTS: usize = 8;
-
-/// Long-end flights: one running GPU batch of 8, a full same-bucket batch
-/// of 8 queued, and slack for a batch to form near bucket boundaries.
-const LONG_SLOTS: usize = 24;
-
-/// The daemon's bound of embedding requests in flight.
-const IN_FLIGHT: usize = SHORT_SLOTS + LONG_SLOTS;
 
 /// The `Priority` urgency stage-1 items embed at.
 const URGENCY_STAGE1: u8 = 3;
@@ -635,8 +626,10 @@ struct Scheduler<E: Embeddings, Q: QueryInput> {
     worktrees: HashMap<WorktreeId, Worktree>,
     writers: HashMap<RepoId, WriterHandle>,
     next_item: ItemId,
-    /// The indexing requests in flight: at most `SHORT_SLOTS` short-end
-    /// and `LONG_SLOTS` long-end items.
+    /// The window the server asked for.
+    window: Window,
+    /// The indexing requests in flight: at most `window.short` short-end
+    /// and `window.long` long-end items.
     flights: HashMap<ItemId, Flight>,
     /// The flight generation counter: a redispatched item gets a new one.
     next_generation: u64,
@@ -677,6 +670,8 @@ pub struct SchedulerConfig<E: Embeddings, Q: QueryInput> {
     pub fatal: mpsc::Sender<Error>,
     /// The scheduler's busy state for the idle-exit tracker.
     pub busy: watch::Sender<bool>,
+    /// The indexing window the ready server reported.
+    pub window: Window,
 }
 
 /// Spawns the scheduler task; nothing leaves it until `Enqueue`s arrive.
@@ -686,6 +681,7 @@ pub fn spawn<E: Embeddings, Q: QueryInput>(config: SchedulerConfig<E, Q>) -> Sch
         query_input,
         fatal,
         busy,
+        window,
     } = config;
     let (tx, rx) = mpsc::channel(INBOX);
     let scheduler = Scheduler {
@@ -701,6 +697,7 @@ pub fn spawn<E: Embeddings, Q: QueryInput>(config: SchedulerConfig<E, Q>) -> Sch
         worktrees: HashMap::new(),
         writers: HashMap::new(),
         next_item: 0,
+        window,
         flights: HashMap::new(),
         next_generation: 0,
         spots: HashMap::new(),
@@ -823,7 +820,7 @@ impl<E: Embeddings, Q: QueryInput> Scheduler<E, Q> {
     }
 
     /// Refills the in-flight window after every message: up to
-    /// `SHORT_SLOTS` flights off the short end and `LONG_SLOTS` off the
+    /// `window.short` flights off the short end and `window.long` off the
     /// long end, each queue taken from stage 1 before background.
     fn fill(&mut self) {
         if self.stopping {
@@ -835,9 +832,9 @@ impl<E: Embeddings, Q: QueryInput> Scheduler<E, Q> {
         };
         for end in [End::Short, End::Long] {
             let slots = match end {
-                End::Short => SHORT_SLOTS,
-                End::Long => LONG_SLOTS,
-            };
+                End::Short => self.window.short,
+                End::Long => self.window.long,
+            } as usize;
             while self.flights.values().filter(|f| f.end == end).count() < slots {
                 let Some(item) = self.pop_queued(end) else {
                     break;
@@ -846,7 +843,7 @@ impl<E: Embeddings, Q: QueryInput> Scheduler<E, Q> {
             }
         }
         debug_assert!(
-            self.flights.len() <= IN_FLIGHT,
+            self.flights.len() <= (self.window.short + self.window.long) as usize,
             "the in-flight window overran its bound"
         );
     }

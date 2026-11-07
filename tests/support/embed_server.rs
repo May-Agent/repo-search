@@ -20,7 +20,7 @@ use std::time::Duration;
 use repo_search_core::embed_api::{
     Embedding, EmbeddingData, EmbeddingRequest, EmbeddingResponse, EmbeddingTag, ErrorBody,
     ErrorDetail, GpuStatus, Input, ListTag, ModelEntry, ModelStatus, ModelTag, ModelsResponse,
-    StatusBody, Usage, encode_vector,
+    StatusBody, Usage, Window, encode_vector,
 };
 
 const TIMEOUT: Duration = Duration::from_secs(30);
@@ -312,6 +312,9 @@ pub fn error_body(message: &str) -> serde_json::Value {
     .expect("the envelope serializes")
 }
 
+/// The indexing window the fake reports once ready.
+pub const FAKE_WINDOW: Window = Window { short: 8, long: 24 };
+
 /// What the fake serves: a fixed model id and an optional required
 /// bearer token.
 pub struct FakeConfig {
@@ -394,6 +397,7 @@ fn standard(config: FakeConfig) -> impl Fn(usize, &Call) -> Option<Response> {
                 serde_json::to_value(StatusBody {
                     model: ModelStatus::Ready {
                         id: config.model_id.clone(),
+                        window: FAKE_WINDOW,
                     },
                     gpu: GpuStatus::Running,
                 })

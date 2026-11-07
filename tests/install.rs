@@ -14,8 +14,8 @@ use std::time::Duration;
 use repo_search_client::launcher::install::{
     Agent, AgentConfig, Check, InstallError, Plist, Reason, Timeouts, ensure_agent,
 };
-use repo_search_client::launcher::launchd::{DEFAULT_PORT, LaunchAgent, ServerAgent};
-use std::net::{IpAddr, Ipv4Addr};
+use repo_search_client::launcher::launchd::{LaunchAgent, ServerAgent, TcpListen};
+use repo_search_client::launcher::paths::SocketPath;
 use support::client;
 use support::launchd::{Call, FakeLaunchd};
 
@@ -30,11 +30,11 @@ fn test_config(tmp: &tempfile::TempDir, program: &Path) -> AgentConfig {
         agent: Plist::Daemon(LaunchAgent {
             label: "com.github.may-agent.repo-search.test".to_owned(),
             program: program.to_path_buf(),
-            socket: root.join("support/daemon.sock"),
+            socket: SocketPath::new(root.join("support/daemon.sock")).unwrap(),
             idle_exit: Duration::from_secs(600),
             build: "1@2".to_owned(),
             model_cache: None,
-            server_socket: root.join("support/server.sock"),
+            server_socket: SocketPath::new(root.join("support/server.sock")).unwrap(),
             state_dir: None,
             stderr: root.join("logs/daemon.log"),
         }),
@@ -346,13 +346,12 @@ fn server_test_config(tmp: &tempfile::TempDir, program: &Path) -> AgentConfig {
         agent: Plist::Server(ServerAgent {
             label: "com.github.may-agent.repo-search.server.test".to_owned(),
             program: program.to_path_buf(),
-            socket: root.join("support/server.sock"),
+            socket: SocketPath::new(root.join("support/server.sock")).unwrap(),
             idle_exit: Duration::from_secs(600),
             build: "test-build".to_owned(),
             model_cache: None,
             token_file: None,
-            bind: IpAddr::V4(Ipv4Addr::LOCALHOST),
-            port: DEFAULT_PORT,
+            tcp: Some(TcpListen::DEFAULT),
             stderr: root.join("logs/server.log"),
         }),
         timeouts: Timeouts {

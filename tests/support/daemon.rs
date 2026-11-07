@@ -9,17 +9,17 @@ use std::sync::Arc;
 use std::sync::mpsc;
 use std::time::Duration;
 
+use ondevice::{Archive, Pin, Sha256};
 use repo_search::daemon::counter::Tokens;
 use repo_search::daemon::server::{Embeddings, Endpoint, ServerClient};
 use repo_search::daemon::{self, Config, Error};
-use repo_search::model_store::{ModelSpec, ModelStore, Sha256Digest};
+use repo_search::model_store::ModelStore;
 use repo_search_client::protocol::BuildId;
 use repo_search_core::StateDir;
 use repo_search_core::embed_api::Urgency;
 use repo_search_server::chip::ChipClass;
 use repo_search_server::loader::ModelState;
 use repo_search_server::stub::{Record, StubBackend};
-use sha2::Digest;
 use tokio::net::UnixListener;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -88,8 +88,11 @@ impl Daemon {
     /// task resolves once the filler is answered.
     pub async fn filler(&self, urgency: u8) -> JoinHandle<()> {
         self.server_model().await;
-        let client = ServerClient::new(&Endpoint::Unix(self.server_socket.clone()))
-            .expect("the filler's client builds");
+        let client = ServerClient::new(
+            &Endpoint::Unix(self.server_socket.clone()),
+            repo_search_core::model::MODEL_ID.to_owned(),
+        )
+        .expect("the filler's client builds");
         tokio::spawn(async move {
             client
                 .embed(vec!["filler".to_owned()], Urgency::new(urgency))
@@ -103,32 +106,44 @@ impl Daemon {
 pub enum Model {
     /// `models/<sha>/` exists, so `ensure` returns at once.
     Cached,
-    /// The dir is absent and the spec points at `url` serving `body`.
-    Served { url: String, sha: Sha256Digest },
+    /// The dir is absent and the pin, for the bytes `pinned`, points at
+    /// `url`.
+    Served { url: String, pinned: Vec<u8> },
 }
 
-pub fn digest_of(bytes: &[u8]) -> Sha256Digest {
-    Sha256Digest::from_hex(&hex::encode(sha2::Sha256::digest(bytes))).expect("hex digest")
+pub fn digest_of(bytes: &[u8]) -> Sha256 {
+    Sha256::of(bytes)
 }
 
 /// A fixed model id for the cached-model tests.
-pub fn sha_7() -> Sha256Digest {
-    Sha256Digest::from_hex(&"07".repeat(32)).expect("hex digest")
+pub fn sha_7() -> Sha256 {
+    Sha256::from_bytes([7; 32])
+}
+
+/// The pin of a cached model: never downloaded, so its URL is never
+/// reached.
+pub fn cached_pin() -> Pin<'static, Archive> {
+    Pin {
+        url: "http://127.0.0.1:1/unused",
+        sha256: sha_7(),
+        size: 0,
+        kind: Archive,
+    }
 }
 
 /// The `ModelStore` a `Model` describes, rooted at `root`.
 pub fn model_store(root: PathBuf, model: &Model) -> ModelStore {
-    let spec = match model {
-        Model::Cached => ModelSpec {
-            url: "http://127.0.0.1:1/unused".into(),
-            sha256: sha_7(),
-        },
-        Model::Served { url, sha } => ModelSpec {
-            url: url.clone(),
-            sha256: *sha,
+    let pin = match model {
+        Model::Cached => cached_pin(),
+        Model::Served { url, pinned } => Pin {
+            // The store outlives the test's frames; the URL lives as long.
+            url: url.clone().leak(),
+            sha256: digest_of(pinned),
+            size: pinned.len() as u64,
+            kind: Archive,
         },
     };
-    let store = ModelStore::new(root, spec).expect("model store");
+    let store = ModelStore::new(root, pin).expect("model store");
     if matches!(model, Model::Cached) {
         std::fs::create_dir_all(store.dir()).expect("cached model dir");
     }

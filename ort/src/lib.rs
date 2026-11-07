@@ -192,6 +192,14 @@ fn takes_any_width(chain: &[String]) -> bool {
 /// batch narrowed below its bucket rounds its width up to it.
 const WIDTH_ALIGN: usize = 8;
 
+/// The saturation probe doubles a batch while doing so raises throughput by
+/// at least this fraction: past that, a larger run mostly lengthens the
+/// wait of a more urgent request queued behind it.
+const MIN_DOUBLING_GAIN: f64 = 0.1;
+
+/// Timed runs per batch size in the saturation probe; their median counts.
+const PROBE_RUNS: usize = 3;
+
 /// The padded sequence length of a batch whose longest input has `longest`
 /// tokens and whose bucket is `bucket`.
 fn batch_width(narrow: bool, longest: usize, bucket: usize) -> usize {
@@ -199,6 +207,35 @@ fn batch_width(narrow: bool, longest: usize, bucket: usize) -> usize {
         longest.next_multiple_of(WIDTH_ALIGN).min(bucket)
     } else {
         bucket
+    }
+}
+
+/// How an embedder pads a batch: to its bucket, or to its longest input
+/// when the provider chain runs any width.
+#[derive(Debug, Clone)]
+pub struct Widths {
+    pub(crate) narrow: bool,
+    /// The bucket lengths, ascending.
+    pub(crate) buckets: Box<[usize]>,
+}
+
+impl Widths {
+    /// The padded sequence length of a batch whose longest input has
+    /// `longest` tokens; the encoder caps every input at the largest
+    /// bucket.
+    pub fn of(&self, longest: usize) -> usize {
+        let bucket = self
+            .buckets
+            .iter()
+            .copied()
+            .find(|&bucket| longest <= bucket)
+            .expect("the encoder capped every input");
+        batch_width(self.narrow, longest, bucket)
+    }
+
+    /// The smallest bucket.
+    pub fn smallest(&self) -> usize {
+        self.buckets[0]
     }
 }
 
@@ -270,13 +307,16 @@ pub struct OrtEmbedder {
     dim: usize,
     /// The manifest's declared model id, what `/v1/models` lists.
     model_id: String,
+    /// The padded tokens per run that saturate this device.
+    run_tokens: usize,
 }
 
 impl OrtEmbedder {
     /// Loads the model directory (`manifest.json`, `tokenizer.json`, the
     /// named ONNX file and its sidecar data) on the first execution-provider
     /// chain that works, then runs one warm embed per session so the first
-    /// request does not pay the initial-run cost. When that chain's
+    /// request does not pay the initial-run cost, and measures the batch
+    /// that saturates each device. When that chain's
     /// accelerator selects among devices (CUDA, TensorRT, NVRTX), the same
     /// chain is opened on device 1, 2, ... until one fails or
     /// `REPO_SEARCH_ORT_DEVICES` devices are open; each opened device yields
@@ -422,11 +462,64 @@ impl OrtEmbedder {
             narrow: takes_any_width(chain),
             dim: manifest.embedding_dim,
             model_id: manifest.model_id.clone(),
+            run_tokens: 0,
         };
         let largest = *embedder.buckets.last().expect("manifest requires buckets");
         let warm = vec![pad as u32; largest];
         embedder.embed_tokens(&warm)?;
+        embedder.run_tokens = embedder.saturating_batch(&warm)? * largest;
+        tracing::info!(
+            device,
+            run_tokens = embedder.run_tokens,
+            "device saturation measured"
+        );
         Ok(embedder)
+    }
+
+    /// The smallest batch of `ids` past which doubling the batch raises
+    /// throughput by less than [`MIN_DOUBLING_GAIN`]. Saturation depends
+    /// on the device, the provider and the graph, so it is measured here
+    /// rather than known beforehand.
+    fn saturating_batch(&mut self, ids: &[u32]) -> Result<usize, Error> {
+        let mut batch = 1;
+        let mut rate = self.throughput(batch, ids)?;
+        loop {
+            let doubled = self.throughput(batch * 2, ids)?;
+            if doubled < rate * (1.0 + MIN_DOUBLING_GAIN) {
+                return Ok(batch);
+            }
+            batch *= 2;
+            rate = doubled;
+        }
+    }
+
+    /// Inputs per second over `batch` copies of `ids`: the median of
+    /// [`PROBE_RUNS`] runs after one that settles the shape.
+    fn throughput(&mut self, batch: usize, ids: &[u32]) -> Result<f64, Error> {
+        let inputs = vec![ids.to_vec(); batch];
+        self.run(&inputs)?;
+        let mut times = Vec::with_capacity(PROBE_RUNS);
+        for _ in 0..PROBE_RUNS {
+            let started = std::time::Instant::now();
+            self.run(&inputs)?;
+            times.push(started.elapsed());
+        }
+        times.sort_unstable();
+        Ok(batch as f64 / times[PROBE_RUNS / 2].as_secs_f64())
+    }
+
+    /// The padded tokens a run should carry to keep this device saturated:
+    /// its measured saturating batch at the largest bucket.
+    pub fn run_tokens(&self) -> usize {
+        self.run_tokens
+    }
+
+    /// How this embedder pads a batch.
+    pub fn widths(&self) -> Widths {
+        Widths {
+            narrow: self.narrow,
+            buckets: self.buckets.clone(),
+        }
     }
 
     /// The manifest's `model_id`.

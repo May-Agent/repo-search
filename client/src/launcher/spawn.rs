@@ -32,7 +32,7 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt as _, BufReader};
 use tokio::net::unix::pipe;
 
-use super::paths::UserPaths;
+use super::paths::{SocketPath, UserPaths};
 use super::{Launcher, Report, SOCKET_TIMEOUT, TEARDOWN_TIMEOUT};
 use crate::client::ClientError;
 use crate::protocol::ErrorKind;
@@ -338,13 +338,17 @@ impl OnDemand {
     ///
     /// # Errors
     ///
-    /// When the user's paths do not resolve or `daemon.toml` is invalid.
+    /// When the user's paths do not resolve, `daemon.toml` is invalid or
+    /// a socket path does not fit the platform's limit.
     pub fn user(program: PathBuf) -> io::Result<Self> {
         let paths = UserPaths::user()?;
         let config =
             DaemonConfig::load(&paths.config.join("daemon.toml")).map_err(io::Error::other)?;
-        let socket = paths.runtime.join("daemon.sock");
+        let socket = SocketPath::new(paths.runtime.join("daemon.sock"))?.into_path_buf();
         let server = config.server_or(paths.runtime.join("server.sock"));
+        if let ServerTarget::Socket(path) = &server {
+            SocketPath::new(path.clone())?;
+        }
         Ok(Self::new(
             DaemonCommand::new(program, &socket, &server),
             socket,

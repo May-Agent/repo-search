@@ -18,7 +18,6 @@ use repo_search_core::embed_api::{
     EmbeddingData, EmbeddingRequest, EncodingFormat, ErrorBody, Input, ModelsResponse,
     ServerTiming, StatusBody, Urgency, decode_vector,
 };
-use repo_search_core::model::MODEL_ID;
 
 /// The request's connect deadline; there is no total timeout, so a slow
 /// answer under load is never cut off.
@@ -26,9 +25,6 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Idle pooled connections are dropped after this long.
 const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
-
-/// Idle pooled connections kept for the request bursts of an index pass.
-const POOL_MAX_IDLE: usize = 40;
 
 /// Where the embedding server listens.
 #[derive(Debug, Clone)]
@@ -118,25 +114,28 @@ impl RequestError for Error {
 }
 
 /// A reqwest client of the embedding server, built for the daemon's
-/// request bursts: HTTP/1.1 only, no proxy, a pool sized to the
-/// scheduler's in-flight window, a connect deadline and no total timeout.
+/// request bursts: HTTP/1.1 only, no proxy, a pool that keeps a
+/// connection per in-flight request until it idles out, a connect
+/// deadline and no total timeout.
 pub struct ServerClient {
     client: reqwest::Client,
     url: String,
     token: Option<String>,
+    /// The model every embedding request names: the id the daemon expects
+    /// the server to list.
+    model_id: String,
 }
 
 impl ServerClient {
-    /// The client for `endpoint`.
+    /// The client for `endpoint`, naming `model_id` in its requests.
     ///
     /// # Errors
     ///
     /// When the client cannot be built (a TLS or resolver failure).
-    pub fn new(endpoint: &Endpoint) -> Result<Self, reqwest::Error> {
+    pub fn new(endpoint: &Endpoint, model_id: String) -> Result<Self, reqwest::Error> {
         let builder = reqwest::Client::builder()
             .http1_only()
             .no_proxy()
-            .pool_max_idle_per_host(POOL_MAX_IDLE)
             .pool_idle_timeout(POOL_IDLE_TIMEOUT)
             .connect_timeout(CONNECT_TIMEOUT);
         let (builder, url, token) = match endpoint {
@@ -151,6 +150,7 @@ impl ServerClient {
             client: builder.build()?,
             url,
             token,
+            model_id,
         })
     }
 
@@ -162,7 +162,7 @@ impl ServerClient {
             .post(format!("{}/v1/embeddings", self.url))
             .header("priority", urgency.to_header())
             .json(&EmbeddingRequest {
-                model: MODEL_ID.to_owned(),
+                model: self.model_id.clone(),
                 input: Input::Many(inputs.to_vec()),
                 dimensions: None,
                 encoding_format: Some(EncodingFormat::Base64),

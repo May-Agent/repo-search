@@ -7,7 +7,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use futures_util::StreamExt;
-use repo_search_client::client::{Client, Responses};
+use repo_search_client::client::{Client, ClientError, Responses};
 use repo_search_client::protocol::{
     BuildId, Event, Final, Format, Hello, Request, SearchRequest, WireMode,
 };
@@ -79,6 +79,38 @@ pub async fn stream_request(socket: &Path, hello: &Hello, request: Request) -> R
     let client = Client::connect(socket, hello).await.expect("connect");
     client.request(request).await.expect("request sends")
 }
+
+/// Connects to a socket launchd has just created and handshakes.
+///
+/// launchd creates a `Listener` socket's path with `bind` and calls
+/// `listen` only after setting the path's owner and mode, so the path can
+/// exist before the socket accepts, and no event marks the `listen`. A
+/// connect in between is refused without queueing anything — launchd
+/// launches nothing for it — so a refused connect is tried again every
+/// [`LISTEN_RETRY`] until `within` has passed, and the last refusal is
+/// returned then. Every other outcome returns at once.
+pub async fn connect_once_listening(
+    socket: &Path,
+    hello: &Hello,
+    within: Duration,
+) -> Result<Client, ClientError> {
+    let deadline = tokio::time::Instant::now() + within;
+    loop {
+        match Client::connect(socket, hello).await {
+            Err(ClientError::Connect(error))
+                if error.kind() == std::io::ErrorKind::ConnectionRefused
+                    && tokio::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep(LISTEN_RETRY).await;
+            }
+            result => return result,
+        }
+    }
+}
+
+/// The pause between [`connect_once_listening`]'s refused attempts: far
+/// longer than launchd's few calls between `bind` and `listen`.
+const LISTEN_RETRY: Duration = Duration::from_millis(1);
 
 /// Reads `stream` to its `Final` frame, dropping any progress frames.
 pub async fn final_event(stream: &mut Responses) -> Final {

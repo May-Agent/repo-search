@@ -304,40 +304,51 @@ fn ensure_listening(listener: &tokio::net::TcpListener) -> Result<(), Error> {
 /// loopback — its queued connections are refused first — and
 /// [`Error::Io`] on listener or signal-handler failures.
 pub async fn spawn<B: Backend, M: ModelSource>(config: Config<B, M>) -> Result<Running<B>, Error> {
+    let mut refusal = None;
     for listener in &config.tcp {
-        ensure_listening(listener)?;
+        match ensure_listening(listener) {
+            Ok(()) => {}
+            Err(Error::Listener(message)) => {
+                refusal = Some(message);
+                break;
+            }
+            Err(error) => return Err(error),
+        }
     }
-    if config.token.is_none() {
-        let mut non_loopback = Vec::new();
+    if refusal.is_none() && config.token.is_none() {
         for listener in &config.tcp {
             let addr = listener.local_addr()?;
             if !addr.ip().is_loopback() {
-                non_loopback.push(addr);
+                refusal = Some(format!(
+                    "tcp listener {addr} is not loopback and no token is configured"
+                ));
+                break;
             }
         }
-        if let Some(&addr) = non_loopback.first() {
-            let message = format!("tcp listener {addr} is not loopback and no token is configured");
-            // Queued connections get the same 503 the other startup
-            // failures send — dropping the listeners would reset them.
-            // `into_std` hands each back the handle the drain needs.
-            let mut listeners = Vec::new();
-            match config.unix.into_std() {
-                Ok(listener) => listeners.push(Listener::Unix(listener)),
+    }
+    if let Some(message) = refusal {
+        // Queued connections get the same 503 the other startup failures
+        // send — dropping the listeners would reset them, and a queued
+        // unix connection left unanswered has launchd relaunch the server
+        // into the same failure. `into_std` hands each back the handle
+        // the drain needs.
+        let mut listeners = Vec::new();
+        match config.unix.into_std() {
+            Ok(listener) => listeners.push(Listener::Unix(listener)),
+            Err(error) => {
+                tracing::error!(%error, "could not un-adopt the unix listener");
+            }
+        }
+        for listener in config.tcp {
+            match listener.into_std() {
+                Ok(listener) => listeners.push(Listener::Tcp(listener)),
                 Err(error) => {
-                    tracing::error!(%error, "could not un-adopt the unix listener");
+                    tracing::error!(%error, "could not un-adopt a tcp listener");
                 }
             }
-            for listener in config.tcp {
-                match listener.into_std() {
-                    Ok(listener) => listeners.push(Listener::Tcp(listener)),
-                    Err(error) => {
-                        tracing::error!(%error, "could not un-adopt a tcp listener");
-                    }
-                }
-            }
-            refuse_http(listeners, &message).await;
-            return Err(Error::Listener(message));
         }
+        refuse_http(listeners, &message).await;
+        return Err(Error::Listener(message));
     }
     let signal = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let (fatal_tx, fatal_rx) = mpsc::channel::<Error>(64);
