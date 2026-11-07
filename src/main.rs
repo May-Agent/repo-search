@@ -504,7 +504,8 @@ fn endpoint(
         (None, Some(addr)) => Ok(Endpoint::Tcp { addr, token }),
         (None, None) => Ok(Endpoint::Unix(
             repo_search_client::launcher::paths::server_socket_path()
-                .map_err(StartupError::StateDir)?,
+                .map_err(StartupError::StateDir)?
+                .into_path_buf(),
         )),
         (Some(_), Some(_)) => unreachable!("clap marks the flags conflicting"),
     }
@@ -624,9 +625,13 @@ fn server_main(
             }
             // No socket of this name is registered: zero `Tcp` listeners
             // is a valid configuration; a missing `Unix` is caught by the
-            // count check below.
+            // count check below. For a name the plist lacks, launchd
+            // answers `ESRCH` rather than the documented `ENOENT` — once
+            // `Unix` has activated, the process is launchd's, so `ESRCH`
+            // for `Tcp` can only mean the agent has no TCP socket.
             Err(launchd::ActivateError::Launchd { source, .. })
-                if source.kind() == std::io::ErrorKind::NotFound => {}
+                if source.kind() == std::io::ErrorKind::NotFound
+                    || (name == "Tcp" && source.raw_os_error() == Some(libc::ESRCH)) => {}
             Err(error) => {
                 tracing::error!(%error, %name, "launchd socket activation failed");
                 return fail_all(
@@ -889,7 +894,7 @@ fn ort_server_main(
         let path = match socket {
             Some(path) => path,
             None => match repo_search_client::launcher::paths::server_socket_path() {
-                Ok(path) => path,
+                Ok(path) => path.into_path_buf(),
                 Err(error) => {
                     tracing::error!(%error, "could not resolve the server socket path");
                     return ExitCode::FAILURE;

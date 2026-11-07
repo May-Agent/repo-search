@@ -28,7 +28,10 @@ use repo_search_client::launcher::install::{
     self, AgentConfig, Check, Launchctl, SystemLaunchctl, ensure_agent,
 };
 use repo_search_client::launcher::kqueue::ExitWatch;
-use repo_search_client::launcher::launchd::{LABEL, LaunchAgent, SERVER_LABEL, ServerAgent};
+use repo_search_client::launcher::launchd::{
+    LABEL, LaunchAgent, SERVER_LABEL, ServerAgent, TcpListen,
+};
+use repo_search_client::launcher::paths::SocketPath;
 use repo_search_client::launcher::{LaunchdAgents, SOCKET_TIMEOUT, TEARDOWN_TIMEOUT};
 use repo_search_client::protocol::{Final, Hello, Request};
 use repo_search_core::StateDir;
@@ -91,13 +94,15 @@ fn server_config(
         agent: Plist::Server(ServerAgent {
             label: server_label(name),
             program: program.to_path_buf(),
-            socket: server_socket(dir),
+            socket: SocketPath::new(server_socket(dir)).unwrap(),
             idle_exit,
             build: client::hello_for(program).build.to_string(),
             model_cache: Some(model_cache),
             token_file: None,
-            bind: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-            port: server_port(),
+            tcp: Some(TcpListen {
+                bind: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                port: server_port(),
+            }),
             stderr: dir.join("server.log"),
         }),
         timeouts: install::Timeouts {
@@ -126,8 +131,8 @@ fn config(
             label: format!("{LABEL}.test-{}-{name}", std::process::id()),
             build: client::hello_for(&program).build.to_string(),
             program,
-            socket: dir.join("daemon.sock"),
-            server_socket: server_socket(dir),
+            socket: SocketPath::new(dir.join("daemon.sock")).unwrap(),
+            server_socket: SocketPath::new(server_socket(dir)).unwrap(),
             idle_exit,
             model_cache: Some(model_cache),
             state_dir: Some(dir.join("state")),
@@ -263,6 +268,109 @@ async fn daemon_pid(socket: &Path, hello: &Hello, worktree: &Path) -> u32 {
         Final::Status(status) => status.daemon.pid,
         other => panic!("expected a Status, got {other:?}"),
     }
+}
+
+/// Removes a runtime dir the test's agent used, after the agent.
+struct RemoveDir(PathBuf);
+
+impl Drop for RemoveDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// A home whose `~/Library` socket path would be past macOS's 104-byte
+/// `sun_path` — as a temp home under `$TMPDIR` is — still installs at
+/// once and answers: its sockets live in the runtime dir
+/// `UserPaths::for_home` derives, whatever the home's length.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "real launchd; the release gate runs it"]
+async fn a_home_past_the_socket_limit_installs_and_answers() {
+    use repo_search_client::launcher::paths::{SUN_PATH_LEN, UserPaths};
+
+    let tmp = tempfile::tempdir().expect("tmp");
+    let home = tmp.path().join("h".repeat(48));
+    std::fs::create_dir_all(&home).expect("the home");
+    let legacy = home.join("Library/Application Support/repo-search/daemon.sock");
+    assert!(
+        legacy.as_os_str().len() >= SUN_PATH_LEN,
+        "the home is long enough that {} cannot be a socket",
+        legacy.display()
+    );
+    let runtime = UserPaths::for_home(&home)
+        .expect("the paths resolve")
+        .runtime;
+    // The plist, log and state stay in the short temp dir; the sockets are
+    // the long home's.
+    let mut config = config(
+        "long-home",
+        tmp.path(),
+        program(),
+        tmp.path().join("models"),
+        Duration::from_secs(600),
+    );
+    let Plist::Daemon(daemon) = &mut config.agent else {
+        unreachable!()
+    };
+    daemon.socket = SocketPath::new(runtime.join("daemon.sock")).expect("the socket fits");
+    daemon.server_socket =
+        SocketPath::new(runtime.join("server.sock")).expect("the server socket fits");
+    let socket = config.agent.socket().to_path_buf();
+    let agent = Agent {
+        label: config.agent.label().to_owned(),
+        socket: socket.clone(),
+        _server: None,
+        _tmp: tmp,
+    };
+    let _runtime = RemoveDir(runtime);
+
+    let started = std::time::Instant::now();
+    let outcome =
+        tokio::task::block_in_place(|| ensure_agent(&config, &mut SystemLaunchctl, Check::Fast))
+            .expect("the agent installs");
+    assert_eq!(outcome, install::Agent::Installed);
+    client::connect_once_listening(&agent.socket, &hello(&program()), SOCKET_TIMEOUT)
+        .await
+        .expect("the daemon answers the handshake");
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < SOCKET_TIMEOUT,
+        "the launch took {elapsed:?}, as long as a socket wait"
+    );
+    eprintln!("installed and answered in {elapsed:?}");
+    drop(agent);
+}
+
+/// A relocated home's server agent has no TCP socket — the default port is
+/// the production agent's — and a server started from it in a fresh home
+/// answers its first request.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "real launchd and model; the release gate runs it"]
+async fn a_server_agent_without_tcp_answers() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let dir = tmp.path().to_path_buf();
+    let _store = model::model_store(dir.join("models"));
+    let mut config = server_config(
+        "no-tcp",
+        &dir,
+        &program(),
+        dir.join("models"),
+        Duration::from_secs(600),
+    );
+    let Plist::Server(server) = &mut config.agent else {
+        unreachable!()
+    };
+    server.tcp = None;
+    let socket = config.agent.socket().to_path_buf();
+    let _agent = ServerGuard::install(&config);
+    let _tmp = tmp;
+
+    let status =
+        ServerClient::new(&Endpoint::Unix(socket.clone())).expect("the status client builds");
+    tokio::time::timeout(MARGIN, status.status())
+        .await
+        .expect("the server answers within the margin")
+        .expect("the server answers /status");
 }
 
 /// A query answers, `Status` names the daemon's pid, the process exits on

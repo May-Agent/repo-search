@@ -20,10 +20,10 @@ use clap::Parser;
 use repo_search::cli::{Cli, Env, Exit, Invocation, Terminal};
 use repo_search_client::launcher::LaunchdAgents;
 use repo_search_client::launcher::install::{AgentConfig, Plist, Timeouts};
-use repo_search_client::launcher::launchd::{LaunchAgent, ServerAgent};
+use repo_search_client::launcher::launchd::{LaunchAgent, ServerAgent, TcpListen};
+use repo_search_client::launcher::paths::SocketPath;
 use repo_search_client::protocol::BuildId;
 use repo_search_server::stub::{Instance, StubBackend};
-use std::net::{IpAddr, Ipv4Addr};
 use support::client;
 use support::daemon::Model;
 use support::launchd::{FakeLaunchctl, FakeLaunchd};
@@ -53,13 +53,12 @@ fn server_config(tmp: &Path) -> AgentConfig {
         agent: Plist::Server(ServerAgent {
             label: "com.github.may-agent.repo-search.server.cli-test".to_owned(),
             program: tmp.join("search"),
-            socket: tmp.join("support/server.sock"),
+            socket: SocketPath::new(tmp.join("support/server.sock")).unwrap(),
             idle_exit: Duration::from_secs(600),
             build: "cli-test".to_owned(),
             model_cache: None,
             token_file: None,
-            bind: IpAddr::V4(Ipv4Addr::LOCALHOST),
-            port: 41827,
+            tcp: Some(TcpListen::DEFAULT),
             stderr: tmp.join("logs/server.log"),
         }),
         timeouts: Timeouts {
@@ -87,11 +86,11 @@ fn config(tmp: &tempfile::TempDir) -> AgentConfig {
         agent: Plist::Daemon(LaunchAgent {
             label: "com.github.may-agent.repo-search.cli-test".to_owned(),
             program: root.join("search"),
-            socket: root.join("support/daemon.sock"),
+            socket: SocketPath::new(root.join("support/daemon.sock")).unwrap(),
             idle_exit: Duration::from_secs(600),
             build: "1@2".to_owned(),
             model_cache: None,
-            server_socket: root.join("support/server.sock"),
+            server_socket: SocketPath::new(root.join("support/server.sock")).unwrap(),
             state_dir: None,
             stderr: root.join("logs/daemon.log"),
         }),
