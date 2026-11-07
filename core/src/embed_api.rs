@@ -181,6 +181,17 @@ pub struct StatusBody {
     pub gpu: GpuStatus,
 }
 
+/// How many single-input indexing requests a ready server wants in flight,
+/// taken from each end of the remaining work ordered by token count: the
+/// shortest items and the longest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Window {
+    /// Requests for the shortest remaining items.
+    pub short: u32,
+    /// Requests for the longest remaining items.
+    pub long: u32,
+}
+
 /// The model's state on `GET /status`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -203,6 +214,9 @@ pub enum ModelStatus {
     Ready {
         /// The model id.
         id: String,
+        /// The single-input indexing requests the server wants in flight
+        /// to keep its devices fed.
+        window: Window,
     },
     /// Download or load failed; a request retries.
     Failed {

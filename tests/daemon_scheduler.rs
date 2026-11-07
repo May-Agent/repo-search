@@ -3,7 +3,8 @@
 //! against a hyper test server.
 //!
 //! These are the `tests/scheduler.rs` cases ported to the HTTP boundary.
-//! The in-flight window — 8 short-end and 24 long-end flights — replaces
+//! The in-flight window — the Core ML server's 8 short-end and 24
+//! long-end flights unless a test sets its own — replaces
 //! the ANE/GPU pulls, so every queued item dispatches while the enqueue
 //! is handled until the window fills: an item the originals saw queued
 //! behind a gated query is in flight here, held at its gate. A search's
@@ -34,7 +35,7 @@ use repo_search::daemon::scheduler::{
 };
 use repo_search::daemon::server::{Embeddings, Endpoint, ServerClient};
 use repo_search::daemon::{Error, writer};
-use repo_search_core::embed_api::Urgency;
+use repo_search_core::embed_api::{Urgency, Window};
 use repo_search_core::reconcile::PendingChunk;
 use repo_search_core::store::{ContentHash, VectorCache};
 use repo_search_core::{QueryTask, UnitVector};
@@ -56,8 +57,17 @@ struct Rig {
     _tmp: tempfile::TempDir,
 }
 
+/// The window the rig's scheduler fills: the Core ML server's shape.
+const WINDOW: Window = Window { short: 8, long: 24 };
+
 /// A scheduler and its repository writer against `embeddings`.
 async fn rig<E: Embeddings>(embeddings: Arc<E>) -> Rig {
+    rig_with(embeddings, WINDOW).await
+}
+
+/// A scheduler filling `window`, and its repository writer, against
+/// `embeddings`.
+async fn rig_with<E: Embeddings>(embeddings: Arc<E>, window: Window) -> Rig {
     let tmp = tempfile::tempdir().expect("tempdir");
     let git = tmp.path().join("git");
     std::fs::create_dir_all(&git).expect("git dir");
@@ -68,6 +78,7 @@ async fn rig<E: Embeddings>(embeddings: Arc<E>) -> Rig {
         query_input: Arc::new(StubQueries),
         fatal: fatal_tx.clone(),
         busy: busy_tx,
+        window,
     });
     let state = repo_search_core::StateDir::new(tmp.path().join("state"));
     let cache = VectorCache::open(&state, &git)
@@ -511,6 +522,48 @@ async fn counts_track_a_window_of_flights() {
     await_counts(&rig, WORKTREE, counts(0, 0, 1, false)).await;
 
     small_gate.open();
+    stage1(&mut done).await;
+    assert_eq!(counts_of(&rig, WORKTREE).await, counts(0, 0, 0, true));
+}
+
+/// The window is the one the server reported: with no short end and two
+/// long-end slots, only the two longest items fly, and a finished one is
+/// replaced by the longest still queued.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_window_is_the_servers() {
+    let (tx, records) = mpsc::channel();
+    let mut fake = FakeEmbeddings::new(tx);
+    let tokens = [100, 200, 300, 400];
+    let gates: Vec<Gate> = (0..4)
+        .map(|seq| fake.gate(hash(seq, tokens[seq as usize])))
+        .collect();
+    let rig = rig_with(Arc::new(fake), Window { short: 0, long: 2 }).await;
+    let mut log = Vec::new();
+    let items = (0..4)
+        .map(|seq| pending(seq, tokens[seq as usize]))
+        .collect();
+    let mut done = enqueue(&rig, items, IndexClass::Stage1).await;
+    assert_eq!(counts_of(&rig, WORKTREE).await, counts(2, 0, 2, false));
+    wait_started(&mut log, &records, 2);
+    let started = |log: &Vec<Record>| -> HashSet<ContentHash> {
+        log.iter()
+            .filter(|r| r.kind == Kind::Started)
+            .filter_map(|r| r.hash)
+            .collect()
+    };
+    assert_eq!(started(&log), HashSet::from([hash(3, 400), hash(2, 300)]));
+
+    gates[3].open();
+    wait_started(&mut log, &records, 3);
+    assert!(
+        started(&log).contains(&hash(1, 200)),
+        "the longest queued item fills the slot"
+    );
+    assert_eq!(counts_of(&rig, WORKTREE).await, counts(1, 0, 2, false));
+
+    for gate in &gates[..3] {
+        gate.open();
+    }
     stage1(&mut done).await;
     assert_eq!(counts_of(&rig, WORKTREE).await, counts(0, 0, 0, true));
 }

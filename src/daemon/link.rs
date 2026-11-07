@@ -380,6 +380,25 @@ async fn link<T: Tokens>(parts: Parts<T>) -> Attempt<T> {
             () = tokio::time::sleep_until(deadline) => return Err(timed_out(bound)),
         }
     }
+    // The server lists the model: its `/status` reports the window its
+    // devices want.
+    let window = tokio::select! {
+        report = server.status() => match report {
+            Ok(embed_api::StatusBody {
+                model: embed_api::ModelStatus::Ready { window, .. },
+                ..
+            }) => window,
+            Ok(other) => {
+                return Err(retryable(format!(
+                    "the embedding server listed the model but reports {:?}",
+                    other.model
+                )));
+            }
+            Err(error) => return Err(retryable(error.to_string())),
+        },
+        _ = &mut cancel => return Err(LinkFail::Cancelled),
+        () = tokio::time::sleep_until(deadline) => return Err(timed_out(bound)),
+    };
     let (sched_busy_tx, sched_busy_rx) = watch::channel(false);
     if busy_reg
         .send(BusySource {
@@ -395,6 +414,7 @@ async fn link<T: Tokens>(parts: Parts<T>) -> Attempt<T> {
         query_input: counter.clone(),
         fatal,
         busy: sched_busy_tx,
+        window,
     });
     Ok((
         Arc::new(Embedding {
