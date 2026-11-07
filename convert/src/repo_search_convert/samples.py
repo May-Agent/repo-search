@@ -9,8 +9,27 @@ package's own committed Python, so the sample is reproducible without a fixture 
 from pathlib import Path
 
 import torch
+from tokenizers import Tokenizer
 
 from .spec import DOCUMENT_FORMAT, SAMPLES_PER_BUCKET
+
+
+class SampleTokenizer:
+    """The HF-shaped interface ``fixed_samples`` wants, over tokenizer.json."""
+
+    def __init__(self, path: Path, truncate: int | None = None):
+        self._t = Tokenizer.from_file(str(path))
+        if truncate is not None:
+            self._t.enable_truncation(truncate)
+        self.pad_token_id = self._t.token_to_id("<pad>")
+        if self.pad_token_id is None:
+            raise RuntimeError("tokenizer has no <pad> token")
+
+    def __call__(self, text: str) -> dict:
+        return {"input_ids": self._t.encode(text).ids}
+
+    def decode(self, ids, skip_special_tokens: bool = True) -> str:
+        return self._t.decode(list(ids), skip_special_tokens=skip_special_tokens)
 
 
 def _doc_ids(tok, path: Path) -> list[int]:

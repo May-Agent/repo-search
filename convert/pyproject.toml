@@ -1,7 +1,7 @@
 [project]
 name = "repo-search-convert"
 version = "0.1.0"
-description = "Convert EmbeddingGemma 2 to a Core ML multifunction model"
+description = "Convert EmbeddingGemma 2 to a Core ML multifunction model and build its ONNX archive"
 authors = [
     { name = "Lexo Liu", email = "me@lexo.cool" }
 ]
@@ -10,6 +10,9 @@ dependencies = [
     "coremltools>=9.0",
     "huggingface-hub>=2.2.0",
     "numpy>=2.5.4",
+    "onnx>=1.23.2",
+    "onnxruntime>=1.31.1",
+    "tokenizers>=0.23.3",
     "torch==2.7.0",
     "transformers>=5.20.1",
     "zstandard>=0.25.0",
@@ -17,6 +20,7 @@ dependencies = [
 
 [project.scripts]
 repo-search-convert = "repo_search_convert:main"
+repo-search-convert-onnx = "repo_search_convert.onnx_build:main"
 
 [build-system]
 requires = ["uv_build>=0.13.1,<0.14.0"]
