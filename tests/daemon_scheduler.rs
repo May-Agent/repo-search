@@ -1862,9 +1862,13 @@ async fn a_refused_chunk_is_not_committed_and_requeues() {
 // Fatal handling, through a real `ServerClient` on a hyper test server.
 // ---------------------------------------------------------------------
 
+/// The model id the test clients name.
+const TEST_MODEL: &str = "test-model";
+
 /// The client a test endpoint is built from.
 fn client(addr: SocketAddr) -> ServerClient {
-    ServerClient::new(&Endpoint::Tcp { addr, token: None }).expect("the client builds")
+    ServerClient::new(&Endpoint::Tcp { addr, token: None }, TEST_MODEL.to_owned())
+        .expect("the client builds")
 }
 
 /// A transport error is retried once — the killed connection is followed
@@ -1926,8 +1930,8 @@ async fn a_5xx_is_fatal() {
 // `ServerClient` unit tests against the hyper test server.
 // ---------------------------------------------------------------------
 
-/// The client decodes base64 vectors and sends the standard request at
-/// the urgency given.
+/// The client decodes base64 vectors and sends the standard request, for
+/// the model it was built with, at the urgency given.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn server_client_decodes_base64() {
     let server = serve(|_, _| {
@@ -1949,7 +1953,7 @@ async fn server_client_decodes_base64() {
     let request = server.next();
     assert_eq!(request.path, "/v1/embeddings");
     assert_eq!(request.priority.as_deref(), Some("u=3"));
-    assert_eq!(request.body["model"], repo_search_core::model::MODEL_ID);
+    assert_eq!(request.body["model"], TEST_MODEL);
     assert_eq!(request.body["input"], serde_json::json!(["fn main() {}"]));
     assert_eq!(request.body["encoding_format"], serde_json::json!("base64"));
 }

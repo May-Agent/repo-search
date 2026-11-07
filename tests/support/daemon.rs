@@ -88,8 +88,11 @@ impl Daemon {
     /// task resolves once the filler is answered.
     pub async fn filler(&self, urgency: u8) -> JoinHandle<()> {
         self.server_model().await;
-        let client = ServerClient::new(&Endpoint::Unix(self.server_socket.clone()))
-            .expect("the filler's client builds");
+        let client = ServerClient::new(
+            &Endpoint::Unix(self.server_socket.clone()),
+            repo_search_core::model::MODEL_ID.to_owned(),
+        )
+        .expect("the filler's client builds");
         tokio::spawn(async move {
             client
                 .embed(vec!["filler".to_owned()], Urgency::new(urgency))

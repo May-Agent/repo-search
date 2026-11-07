@@ -18,7 +18,6 @@ use repo_search_core::embed_api::{
     EmbeddingData, EmbeddingRequest, EncodingFormat, ErrorBody, Input, ModelsResponse,
     ServerTiming, StatusBody, Urgency, decode_vector,
 };
-use repo_search_core::model::MODEL_ID;
 
 /// The request's connect deadline; there is no total timeout, so a slow
 /// answer under load is never cut off.
@@ -124,15 +123,18 @@ pub struct ServerClient {
     client: reqwest::Client,
     url: String,
     token: Option<String>,
+    /// The model every embedding request names: the id the daemon expects
+    /// the server to list.
+    model_id: String,
 }
 
 impl ServerClient {
-    /// The client for `endpoint`.
+    /// The client for `endpoint`, naming `model_id` in its requests.
     ///
     /// # Errors
     ///
     /// When the client cannot be built (a TLS or resolver failure).
-    pub fn new(endpoint: &Endpoint) -> Result<Self, reqwest::Error> {
+    pub fn new(endpoint: &Endpoint, model_id: String) -> Result<Self, reqwest::Error> {
         let builder = reqwest::Client::builder()
             .http1_only()
             .no_proxy()
@@ -151,6 +153,7 @@ impl ServerClient {
             client: builder.build()?,
             url,
             token,
+            model_id,
         })
     }
 
@@ -162,7 +165,7 @@ impl ServerClient {
             .post(format!("{}/v1/embeddings", self.url))
             .header("priority", urgency.to_header())
             .json(&EmbeddingRequest {
-                model: MODEL_ID.to_owned(),
+                model: self.model_id.clone(),
                 input: Input::Many(inputs.to_vec()),
                 dimensions: None,
                 encoding_format: Some(EncodingFormat::Base64),

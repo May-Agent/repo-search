@@ -35,6 +35,7 @@ use repo_search_client::launcher::paths::SocketPath;
 use repo_search_client::launcher::{LaunchdAgents, SOCKET_TIMEOUT, TEARDOWN_TIMEOUT};
 use repo_search_client::protocol::{Final, Hello, Request};
 use repo_search_core::StateDir;
+use repo_search_core::model::MODEL_ID;
 
 /// The `search` binary the test agents run.
 fn program() -> PathBuf {
@@ -365,8 +366,8 @@ async fn a_server_agent_without_tcp_answers() {
     let _agent = ServerGuard::install(&config);
     let _tmp = tmp;
 
-    let status =
-        ServerClient::new(&Endpoint::Unix(socket.clone())).expect("the status client builds");
+    let status = ServerClient::new(&Endpoint::Unix(socket.clone()), MODEL_ID.to_owned())
+        .expect("the status client builds");
     tokio::time::timeout(MARGIN, status.status())
         .await
         .expect("the server answers within the margin")
@@ -912,8 +913,8 @@ async fn server_agent_lifecycle() {
             .and_then(|s| s.pid)
     };
     // Each poll is a request, so it resets the server's idle deadline.
-    let status =
-        ServerClient::new(&Endpoint::Unix(socket.clone())).expect("the status client builds");
+    let status = ServerClient::new(&Endpoint::Unix(socket.clone()), MODEL_ID.to_owned())
+        .expect("the status client builds");
     let deadline = std::time::Instant::now() + LOAD_BOUND + MARGIN;
     loop {
         match status
