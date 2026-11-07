@@ -19,7 +19,9 @@ use std::time::Duration;
 use askama::Template;
 
 use super::kqueue::{DirWatch, ExitWatch};
-use super::launchd::{LaunchAgent, ServerAgent, ServerConfig, domain, user_labels};
+use super::launchd::{
+    LaunchAgent, ServerAgent, ServerConfig, domain, user_default_tcp, user_labels,
+};
 use super::paths::{
     UserPaths, lock_path, log_path, plist_path, server_config_path, server_log_path,
     server_socket_path, socket_path,
@@ -57,8 +59,8 @@ impl Plist {
     /// wait verify.
     pub fn socket(&self) -> &Path {
         match self {
-            Self::Daemon(agent) => &agent.socket,
-            Self::Server(agent) => &agent.socket,
+            Self::Daemon(agent) => agent.socket.as_path(),
+            Self::Server(agent) => agent.socket.as_path(),
         }
     }
 
@@ -126,10 +128,13 @@ impl AgentConfig {
 
     /// The real per-user embedding-server agent: a per-build alias of the
     /// `search` binary at `program`, `server.toml`'s bind, port and token
-    /// file, the build identity the `--build` self-heal checks, and the
-    /// launchd labels [`super::launchd::user_labels`] chooses for `$HOME`.
+    /// file over the TCP default [`super::launchd::user_default_tcp`]
+    /// gives `$HOME`, the build identity the `--build` self-heal checks,
+    /// and the launchd labels [`super::launchd::user_labels`] chooses for
+    /// `$HOME`.
     pub fn server(program: PathBuf) -> io::Result<Self> {
-        let config = ServerConfig::load(&server_config_path()?).map_err(io::Error::other)?;
+        let config = ServerConfig::load(&server_config_path()?, user_default_tcp()?)
+            .map_err(io::Error::other)?;
         let program = program_alias(&UserPaths::user()?.state.join("bin"), &program)?;
         let (_, label) = user_labels()?;
         Ok(Self {
@@ -144,8 +149,7 @@ impl AgentConfig {
                 idle_exit: SERVER_IDLE_EXIT,
                 model_cache: None,
                 token_file: config.token_file,
-                bind: config.bind,
-                port: config.port,
+                tcp: config.tcp,
                 stderr: server_log_path()?,
             }),
             timeouts: Timeouts {
@@ -764,12 +768,11 @@ mod tests {
             label: "test".to_owned(),
             build: BuildId::of_file(&alias).unwrap().to_string(),
             program: alias.clone(),
-            socket: tmp.path().join("server.sock"),
+            socket: super::super::paths::SocketPath::new(tmp.path().join("server.sock")).unwrap(),
             idle_exit: SERVER_IDLE_EXIT,
             model_cache: None,
             token_file: None,
-            bind: "127.0.0.1".parse().unwrap(),
-            port: 41827,
+            tcp: Some(super::super::launchd::TcpListen::DEFAULT),
             stderr: tmp.path().join("server.log"),
         };
         let plist = agent.render().expect("the plist renders");

@@ -4,13 +4,89 @@
 //!
 //! [`UserPaths::user`] is the one lookup every per-user path comes from;
 //! the functions below derive the files the daemon and the client use.
-//! On macOS `runtime` and `config` coincide with `state`, so every path
-//! the launchd agents already use is unchanged; on Linux `runtime` is
+//! On macOS `config` coincides with `state`; on Linux `runtime` is
 //! `$XDG_RUNTIME_DIR`, whose machine-local tmpfs can never hand two
 //! machines sharing a home one lock or socket.
+//!
+//! A unix socket's path must fit `sockaddr_un.sun_path` (104 bytes on
+//! macOS, 108 on Linux, NUL included), so the sockets never live under
+//! `$HOME`, whose length nothing bounds: on macOS the runtime dir is a
+//! per-home directory under the short per-user `DARWIN_USER_DIR`, and
+//! every socket path is a [`SocketPath`], which cannot hold a path the
+//! platform cannot bind.
 
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+/// The size of `sockaddr_un.sun_path` on this platform. A socket path
+/// must be shorter, leaving room for its NUL.
+// SAFETY: an all-zero `sockaddr_un` is a valid value of the plain C struct.
+pub const SUN_PATH_LEN: usize = unsafe { std::mem::zeroed::<libc::sockaddr_un>() }
+    .sun_path
+    .len();
+
+/// A unix socket path that fits this platform's `sun_path`: one a
+/// socket can be bound or connected at.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SocketPath(PathBuf);
+
+/// A socket path [`SocketPath::new`] refused.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "the unix socket path {} is {len} bytes; this platform's limit is {} bytes",
+    .path.display(),
+    SUN_PATH_LEN - 1
+)]
+pub struct SocketPathTooLong {
+    /// The refused path.
+    pub path: PathBuf,
+    /// Its length in bytes.
+    pub len: usize,
+}
+
+impl From<SocketPathTooLong> for io::Error {
+    fn from(error: SocketPathTooLong) -> Self {
+        Self::new(io::ErrorKind::InvalidInput, error)
+    }
+}
+
+impl SocketPath {
+    /// `path`, when it is shorter than [`SUN_PATH_LEN`].
+    ///
+    /// # Errors
+    ///
+    /// [`SocketPathTooLong`], naming the path and the limit, when it is
+    /// not.
+    pub fn new(path: PathBuf) -> Result<Self, SocketPathTooLong> {
+        let len = path.as_os_str().len();
+        if len < SUN_PATH_LEN {
+            Ok(Self(path))
+        } else {
+            Err(SocketPathTooLong { path, len })
+        }
+    }
+
+    /// The path.
+    pub fn as_path(&self) -> &Path {
+        &self.0
+    }
+
+    /// The path, for display.
+    pub fn display(&self) -> std::path::Display<'_> {
+        self.0.display()
+    }
+
+    /// The path, owned.
+    pub fn into_path_buf(self) -> PathBuf {
+        self.0
+    }
+}
+
+impl AsRef<Path> for SocketPath {
+    fn as_ref(&self) -> &Path {
+        &self.0
+    }
+}
 
 /// The per-user roots [`UserPaths::user`] resolves.
 #[derive(Debug)]
@@ -20,8 +96,10 @@ pub struct UserPaths {
     /// `STATE_HOME` — the daemon's log.
     pub state: PathBuf,
     /// The machine-local runtime dir: `daemon.sock`, `daemon.lock`,
-    /// `spawn.lock`, `daemon.cmd` and `server.sock`. On macOS these
-    /// live in the state root, so this field equals `state` there.
+    /// `spawn.lock`, `daemon.cmd` and `server.sock`. On macOS it is
+    /// `<DARWIN_USER_DIR>/repo-search/<home key>`, short whatever the
+    /// home, and one per home, so a relocated `$HOME` never shares the
+    /// login home's sockets.
     pub runtime: PathBuf,
     /// The cache root; the tokenizer and model archives live under its
     /// `models/`.
@@ -55,14 +133,62 @@ pub(crate) fn login_home() -> io::Result<PathBuf> {
     Ok(PathBuf::from(dir))
 }
 
+/// A stable 64-bit FNV-1a hex of `home`'s bytes: the key that gives each
+/// home its own launchd labels and runtime dir.
+#[cfg(target_os = "macos")]
+pub(crate) fn home_key(home: &Path) -> String {
+    use std::os::unix::ffi::OsStrExt as _;
+    const OFFSET: u64 = 0xcbf29ce484222325;
+    const PRIME: u64 = 0x100000001b3;
+    let mut hash = OFFSET;
+    for byte in home.as_os_str().as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(PRIME);
+    }
+    format!("{hash:016x}")
+}
+
+/// The invoking user's `DARWIN_USER_DIR` (`/var/folders/…/0/`): per
+/// user, writable by that user alone, machine-local and of a fixed short
+/// length whatever `$HOME` is.
+#[cfg(target_os = "macos")]
+fn darwin_user_dir() -> io::Result<PathBuf> {
+    use std::os::unix::ffi::OsStringExt as _;
+    let mut buf = vec![0u8; libc::PATH_MAX as usize];
+    // SAFETY: `buf` is writable for its whole length, which is passed.
+    let len = unsafe {
+        libc::confstr(
+            libc::_CS_DARWIN_USER_DIR,
+            buf.as_mut_ptr().cast(),
+            buf.len(),
+        )
+    };
+    if len == 0 {
+        return Err(io::Error::other(format!(
+            "confstr(_CS_DARWIN_USER_DIR) failed: {}",
+            io::Error::last_os_error()
+        )));
+    }
+    assert!(len <= buf.len(), "DARWIN_USER_DIR is longer than PATH_MAX");
+    // `len` counts the terminating NUL.
+    buf.truncate(len - 1);
+    Ok(PathBuf::from(std::ffi::OsString::from_vec(buf)))
+}
+
 impl UserPaths {
-    /// The invoking user's paths, under `~/Library`.
+    /// The invoking user's paths, under `~/Library`, with the runtime dir
+    /// under `DARWIN_USER_DIR`.
     #[cfg(target_os = "macos")]
     pub fn user() -> io::Result<Self> {
-        let home = home()?;
+        Self::for_home(&home()?)
+    }
+
+    /// The paths of the invoking user when `$HOME` is `home`.
+    #[cfg(target_os = "macos")]
+    pub fn for_home(home: &Path) -> io::Result<Self> {
         let state = home.join("Library/Application Support/repo-search");
         Ok(Self {
-            runtime: state.clone(),
+            runtime: darwin_user_dir()?.join("repo-search").join(home_key(home)),
             config: state.clone(),
             state,
             cache: home.join("Library/Caches/repo-search"),
@@ -111,8 +237,15 @@ impl UserPaths {
 
 /// The daemon's socket: under the runtime dir, so on Linux it is
 /// machine-local.
-pub fn socket_path() -> io::Result<PathBuf> {
-    Ok(UserPaths::user()?.runtime.join("daemon.sock"))
+///
+/// # Errors
+///
+/// When the user's paths do not resolve, or the path does not fit the
+/// platform's socket path limit.
+pub fn socket_path() -> io::Result<SocketPath> {
+    Ok(SocketPath::new(
+        UserPaths::user()?.runtime.join("daemon.sock"),
+    )?)
 }
 
 /// The file the daemon's stderr — its tracing output — goes to.
@@ -121,8 +254,14 @@ pub fn log_path() -> io::Result<PathBuf> {
 }
 
 /// The embedding server's unix socket, next to the daemon's.
-pub fn server_socket_path() -> io::Result<PathBuf> {
-    Ok(UserPaths::user()?.runtime.join("server.sock"))
+///
+/// # Errors
+///
+/// As [`socket_path`].
+pub fn server_socket_path() -> io::Result<SocketPath> {
+    Ok(SocketPath::new(
+        UserPaths::user()?.runtime.join("server.sock"),
+    )?)
 }
 
 /// The file the server agent's `StandardErrorPath` writes to.
@@ -144,10 +283,78 @@ pub fn plist_path(label: &str) -> io::Result<PathBuf> {
     Ok(home()?.join(format!("Library/LaunchAgents/{label}.plist")))
 }
 
-/// The file whose `flock(2)` serializes installs. It sits next to the
-/// socket, in a directory this program owns, rather than in
+/// The file whose `flock(2)` serializes installs. It sits in the state
+/// dir, which this program owns, rather than in
 /// `~/Library/LaunchAgents`, which belongs to launchd.
 #[cfg(target_os = "macos")]
 pub fn lock_path() -> io::Result<PathBuf> {
     Ok(UserPaths::user()?.state.join("install.lock"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_socket_path_must_leave_room_for_its_nul() {
+        let fits = PathBuf::from(format!("/{}", "a".repeat(SUN_PATH_LEN - 2)));
+        assert_eq!(fits.as_os_str().len(), SUN_PATH_LEN - 1);
+        SocketPath::new(fits).expect("one byte short of sun_path fits");
+
+        let long = PathBuf::from(format!("/{}", "a".repeat(SUN_PATH_LEN - 1)));
+        let error = SocketPath::new(long.clone()).expect_err("a path filling sun_path does not");
+        assert_eq!(error.len, SUN_PATH_LEN);
+        let message = error.to_string();
+        assert!(message.contains(&long.display().to_string()), "{message}");
+        assert!(
+            message.contains(&format!("limit is {} bytes", SUN_PATH_LEN - 1)),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn a_too_long_socket_path_cannot_be_bound() {
+        // The limit is the platform's own: the longest path `SocketPath`
+        // admits binds, one byte more does not.
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("s");
+        let pad = SUN_PATH_LEN - 1 - base.as_os_str().len();
+        let fits = PathBuf::from(format!("{}{}", base.display(), "a".repeat(pad)));
+        let socket = SocketPath::new(fits).expect("fits");
+        std::os::unix::net::UnixListener::bind(socket.as_path()).expect("the kernel binds it");
+        let over = PathBuf::from(format!("{}{}", base.display(), "a".repeat(pad + 1)));
+        assert!(SocketPath::new(over.clone()).is_err());
+        std::os::unix::net::UnixListener::bind(&over).expect_err("nor can it be bound");
+    }
+
+    /// A home of any length — a temp home under `$TMPDIR`, or one far
+    /// longer — has sockets that fit, its own and stable.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn every_home_gets_sockets_that_fit() {
+        let long = PathBuf::from(format!(
+            "/private/var/folders/xx/T/.tmpUf07X1/{}",
+            "h".repeat(300)
+        ));
+        let paths = UserPaths::for_home(&long).expect("the paths resolve");
+        for name in ["daemon.sock", "server.sock"] {
+            SocketPath::new(paths.runtime.join(name)).expect("the socket fits");
+        }
+        assert!(
+            paths.state.starts_with(&long),
+            "the state stays in the home"
+        );
+        assert_eq!(
+            paths.runtime,
+            UserPaths::for_home(&long).unwrap().runtime,
+            "stable"
+        );
+        assert_ne!(
+            paths.runtime,
+            UserPaths::for_home(Path::new("/Users/example"))
+                .unwrap()
+                .runtime,
+            "per home"
+        );
+    }
 }

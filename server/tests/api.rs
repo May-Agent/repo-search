@@ -893,6 +893,60 @@ async fn tcp_without_a_token_must_bind_loopback() {
     assert!(text.contains("server_start_failed"), "{text}");
 }
 
+/// launchd hands over a socket it could not bind — its port held by
+/// another job — unbound. The server refuses it, and answers the unix
+/// client that activated it instead of leaving it queued, which would
+/// have launchd relaunch the server into the same failure.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unbound_tcp_socket_is_refused_and_the_queue_answered() {
+    use std::os::fd::{FromRawFd as _, IntoRawFd as _};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("s.sock");
+    let unix = tokio::net::UnixListener::bind(&path).expect("bind");
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    // SAFETY: the raw fd was just released by the socket, which gives up
+    // ownership.
+    let std = unsafe { std::net::TcpListener::from_raw_fd(socket.into_raw_fd()) };
+    std.set_nonblocking(true).unwrap();
+    let tcp = tokio::net::TcpListener::from_std(std).unwrap();
+    let mut queued = std::os::unix::net::UnixStream::connect(&path).expect("connect");
+    // Set before the server runs: once it has answered and closed, macOS
+    // refuses the option with EINVAL.
+    queued
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("timeout");
+    queued
+        .write_all(b"GET /v1/models HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n")
+        .expect("write");
+    let (records_tx, _records) = mpsc::channel();
+    let outcome = run(Config {
+        unix,
+        tcp: vec![tcp],
+        token: None,
+        idle_exit: Duration::from_secs(600),
+        load_bound: Duration::from_secs(60),
+        model: TempModel {
+            dir: dir.path().to_path_buf(),
+            progress: None,
+            gate: None,
+        },
+        chip: ChipClass::Wide,
+        backend: Arc::new(StubBackend::new(records_tx)),
+    })
+    .await;
+    let Err(repo_search_server::Error::Listener(message)) = outcome else {
+        panic!("an unbound tcp socket is refused");
+    };
+    assert!(message.contains("not bound"), "{message}");
+    let mut response = Vec::new();
+    queued
+        .read_to_end(&mut response)
+        .expect("the queued connection is answered");
+    let text = String::from_utf8(response).expect("utf8");
+    assert!(text.starts_with("HTTP/1.1 503"), "{text}");
+    assert!(text.contains("server_start_failed"), "{text}");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_listener_that_cannot_accept_ends_the_server_with_an_error() {
     let dir = tempfile::tempdir().unwrap();
