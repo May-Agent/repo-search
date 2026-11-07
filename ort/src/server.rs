@@ -7,10 +7,12 @@
 //! Where the Core ML server splits queries onto the ANE and bulk indexing
 //! onto a power-gated GPU, this server has interchangeable device
 //! sessions. A dispatcher thread owns the pending requests and hands each
-//! idle device at most [`RUN_INPUTS`] same-bucket inputs, taken across the
-//! pending requests of the most urgent class (the daemon sends one input
-//! per request), re-picking between runs, so a bulk index batch cannot
-//! park a query behind its full length.
+//! idle device a run of same-bucket inputs, taken across the pending
+//! requests of the most urgent class (the daemon sends one input per
+//! request) up to the padded tokens that saturate that device, re-picking
+//! between runs, so a bulk index batch cannot park a query behind its full
+//! length. `/status` reports the indexing window that keeps every device
+//! fed: two runs per device, all from the long end of the daemon's work.
 //!
 //! The unix socket carries no bearer check — its file permissions are the
 //! check; TCP listeners authenticate when the server was given a token.
@@ -33,11 +35,11 @@ use repo_search_core::UnitVector;
 use repo_search_core::embed_api::{
     EmbeddingData, EmbeddingRequest, EncodingFormat, ErrorBody, ErrorDetail, GpuStatus, Input,
     LoadStage, ModelEntry, ModelStatus, ModelsResponse, ServerTiming, StatusBody, Urgency, Usage,
-    encode_vector,
+    Window, encode_vector,
 };
 use tokio::sync::{mpsc, oneshot, watch};
 
-use crate::{Encoder, Error as EmbedError, OrtEmbedder};
+use crate::{Encoder, Error as EmbedError, OrtEmbedder, Widths};
 
 /// The request body cap: 32 MiB, the daemon-server contract's bound.
 const BODY_LIMIT: usize = 32 << 20;
@@ -47,11 +49,6 @@ const DIMENSIONS: [u32; 4] = [128, 256, 512, 768];
 
 /// The most inputs a request may carry.
 const MAX_INPUTS: usize = 2048;
-
-/// The most inputs of one inference run: a request's batch is split into
-/// runs of at most this, so an urgent request behind a bulk batch waits
-/// one run, not the whole batch.
-const RUN_INPUTS: usize = 32;
 
 /// What the server is built from.
 pub struct Config {
@@ -98,6 +95,8 @@ struct Ready {
     id: String,
     /// The tokenizer request inputs encode with.
     encoder: Encoder,
+    /// The indexing window that keeps every device fed.
+    window: Window,
 }
 
 /// One embedding request's work for the dispatcher. Runs take same-bucket
@@ -155,18 +154,18 @@ impl Job {
         bucket_of(buckets, self.remaining[0].1.len())
     }
 
-    /// Takes up to `room` remaining inputs of `bucket`, from anywhere in
-    /// `remaining`, in input order.
+    /// Takes the remaining inputs of `bucket` that `fill` admits, from
+    /// anywhere in `remaining`, in input order.
     fn take_matching(
         &mut self,
         buckets: &[usize],
         bucket: usize,
-        room: usize,
+        fill: &mut Fill<'_>,
     ) -> Vec<(usize, Vec<u32>)> {
-        let mut taken = Vec::with_capacity(room.min(self.remaining.len()));
+        let mut taken = Vec::new();
         let mut kept = Vec::with_capacity(self.remaining.len());
         for input in std::mem::take(&mut self.remaining) {
-            if taken.len() < room && bucket_of(buckets, input.1.len()) == bucket {
+            if bucket_of(buckets, input.1.len()) == bucket && fill.admit(input.1.len()) {
                 taken.push(input);
             } else {
                 kept.push(input);
@@ -200,6 +199,37 @@ impl Job {
             .map(|slot| slot.expect("a finished job filled every slot"))
             .collect();
         let _ = self.reply.send(Ok((vectors, timing)));
+    }
+}
+
+/// A run being filled for one device: an input joins while the padded run
+/// stays within the device's token budget, and the first always joins.
+struct Fill<'a> {
+    widths: &'a Widths,
+    budget: usize,
+    inputs: usize,
+    longest: usize,
+}
+
+impl<'a> Fill<'a> {
+    fn new(widths: &'a Widths, budget: usize) -> Self {
+        Self {
+            widths,
+            budget,
+            inputs: 0,
+            longest: 0,
+        }
+    }
+
+    /// Whether an input of `len` tokens joins the run; it is counted if so.
+    fn admit(&mut self, len: usize) -> bool {
+        let longest = self.longest.max(len);
+        if self.inputs > 0 && (self.inputs + 1) * self.widths.of(longest) > self.budget {
+            return false;
+        }
+        self.inputs += 1;
+        self.longest = longest;
+        true
     }
 }
 
@@ -247,13 +277,18 @@ struct Work {
     batch: Vec<Vec<u32>>,
 }
 
-/// Assembles the next run: the most urgent, oldest job's next bucket,
-/// filled up to [`RUN_INPUTS`] with that bucket's inputs from the jobs of
-/// the same urgency, oldest first. A device is never left on one input
-/// while same-bucket inputs wait in other requests — the daemon sends one
-/// input per request — and a more urgent request still waits at most one
-/// run, since lower urgencies never join its run.
-fn assemble_run(pending: &mut [Job], buckets: &[usize]) -> Option<Work> {
+/// Assembles the next run for a device: the most urgent, oldest job's next
+/// bucket, filled up to the device's token `budget` with that bucket's
+/// inputs from the jobs of the same urgency, oldest first. A device is
+/// never left on one input while same-bucket inputs wait in other requests
+/// — the daemon sends one input per request — and a more urgent request
+/// still waits at most one run, since lower urgencies never join its run.
+fn assemble_run(
+    pending: &mut [Job],
+    buckets: &[usize],
+    widths: &Widths,
+    budget: usize,
+) -> Option<Work> {
     let lead = pick(pending)?;
     let urgency = pending[lead].urgency;
     let bucket = pending[lead].lead_bucket(buckets);
@@ -265,14 +300,12 @@ fn assemble_run(pending: &mut [Job], buckets: &[usize]) -> Option<Work> {
         .iter()
         .filter(|other| other.urgency > urgency)
         .count() as u64;
-    let mut parts = Vec::with_capacity(RUN_INPUTS);
-    let mut batch = Vec::with_capacity(RUN_INPUTS);
+    let mut fill = Fill::new(widths, budget);
+    let mut parts = Vec::new();
+    let mut batch = Vec::new();
     for at in order {
-        if batch.len() == RUN_INPUTS {
-            break;
-        }
         let job = &mut pending[at];
-        let taken = job.take_matching(buckets, bucket, RUN_INPUTS - batch.len());
+        let taken = job.take_matching(buckets, bucket, &mut fill);
         if taken.is_empty() {
             continue;
         }
@@ -416,7 +449,7 @@ where
 
 /// The dispatcher thread: loads the model on every device (retrying on
 /// request), then hands the most urgent pending job's same-bucket runs of
-/// at most [`RUN_INPUTS`] to idle device workers and collects the finished
+/// within each device's token budget to idle device workers and collects the finished
 /// runs. A failed embed is fatal: the job gets the error and the server
 /// exits.
 fn dispatcher(
@@ -431,10 +464,12 @@ fn dispatcher(
     let embedders = loop {
         match OrtEmbedder::open_devices(&dir, &stage) {
             Ok(embedders) => {
-                // The model id and encoder are identical across devices.
+                // The model id, encoder and padding are identical across
+                // devices; the run budget is each device's own.
                 let ready = Arc::new(Ready {
                     id: embedders[0].model_id().to_owned(),
                     encoder: embedders[0].encoder(),
+                    window: window(&embedders),
                 });
                 if state.send(Model::Ready(ready)).is_err() {
                     return;
@@ -456,6 +491,8 @@ fn dispatcher(
 
     tracing::info!(devices = embedders.len(), "embedding devices serving");
     let buckets: Vec<usize> = embedders[0].buckets().collect();
+    let widths = embedders[0].widths();
+    let budgets: Vec<usize> = embedders.iter().map(OrtEmbedder::run_tokens).collect();
     let workers: Vec<std_mpsc::Sender<Work>> = embedders
         .into_iter()
         .enumerate()
@@ -473,11 +510,11 @@ fn dispatcher(
     let mut next_id = 0u64;
     loop {
         // Hand runs to idle devices, most urgent job first.
-        while !idle.is_empty() {
-            let Some(work) = assemble_run(&mut pending, &buckets) else {
+        while let Some(&worker) = idle.last() {
+            let Some(work) = assemble_run(&mut pending, &buckets, &widths, budgets[worker]) else {
                 break;
             };
-            let worker = idle.pop().expect("idle is nonempty");
+            idle.pop();
             if workers[worker].send(work).is_err() {
                 // The worker thread is gone: its embedder panicked.
                 let _ = fatal.try_send("a device worker is gone".to_owned());
@@ -497,6 +534,21 @@ fn dispatcher(
                 return;
             }
         }
+    }
+}
+
+/// The indexing window that keeps every device fed: per device, enough of
+/// the daemon's longest items for one run running and one queued. Items
+/// are counted at the smallest bucket, so the window still fills a run
+/// once only short items remain.
+fn window(embedders: &[OrtEmbedder]) -> Window {
+    let long = embedders
+        .iter()
+        .map(|embedder| 2 * embedder.run_tokens().div_ceil(embedder.widths().smallest()))
+        .sum::<usize>();
+    Window {
+        short: 0,
+        long: u32::try_from(long).expect("the window fits a u32"),
     }
 }
 
@@ -890,6 +942,7 @@ fn status(shared: &Shared) -> Response<Full<Bytes>> {
     let model = match &*shared.state.borrow() {
         Model::Ready(ready) => ModelStatus::Ready {
             id: ready.id.clone(),
+            window: ready.window,
         },
         Model::Loading => ModelStatus::Loading {
             stage: *shared.stage.borrow(),
@@ -992,6 +1045,20 @@ mod tests {
 
     const BUCKETS: [usize; 3] = [4, 8, 16];
 
+    /// Inputs per run of a bucket-padded device whose budget is
+    /// `ROOM * bucket`.
+    const ROOM: usize = 32;
+
+    /// A budget no test run reaches.
+    const UNBOUNDED: usize = ROOM * 16;
+
+    fn widths(narrow: bool) -> Widths {
+        Widths {
+            narrow,
+            buckets: BUCKETS.into(),
+        }
+    }
+
     type Reply = oneshot::Receiver<Result<(Vec<UnitVector>, ServerTiming), String>>;
 
     fn job(urgency: u8, lens: &[usize]) -> (Job, Reply) {
@@ -1019,25 +1086,46 @@ mod tests {
     fn take_matching_takes_one_bucket_from_anywhere_in_input_order() {
         let (mut job, _rx) = job(3, &[2, 10, 3, 12, 4, 1]);
         let bucket = job.lead_bucket(&BUCKETS);
-        let taken = job.take_matching(&BUCKETS, bucket, RUN_INPUTS);
+        let w = widths(false);
+        let taken = job.take_matching(&BUCKETS, bucket, &mut Fill::new(&w, UNBOUNDED));
         assert_eq!(indices(&taken), [0, 2, 4, 5]);
         assert_eq!(job.outstanding, 4);
         assert_eq!(indices(&job.remaining), [1, 3]);
     }
 
     #[test]
-    fn take_matching_is_capped_at_room() {
-        let (mut job, _rx) = job(3, &[2; RUN_INPUTS + 5]);
-        assert_eq!(job.take_matching(&BUCKETS, 4, RUN_INPUTS).len(), RUN_INPUTS);
+    fn take_matching_is_capped_at_the_budget() {
+        let (mut job, _rx) = job(3, &[2; ROOM + 5]);
+        let w = widths(false);
+        let mut fill = Fill::new(&w, ROOM * 4);
+        assert_eq!(job.take_matching(&BUCKETS, 4, &mut fill).len(), ROOM);
         assert_eq!(job.remaining.len(), 5);
-        assert_eq!(job.remaining[0].0, RUN_INPUTS);
+        assert_eq!(job.remaining[0].0, ROOM);
+    }
+
+    #[test]
+    fn a_narrow_run_is_budgeted_by_its_padded_width() {
+        let w = widths(true);
+        // Width 8 per input: 64 tokens hold eight.
+        let mut fill = Fill::new(&w, 64);
+        assert_eq!((0..10).filter(|_| fill.admit(5)).count(), 8);
+        // A longer input widens the whole run: nine inputs at width 16
+        // overrun 128, eight fit.
+        let mut fill = Fill::new(&w, 128);
+        assert_eq!((0..8).filter(|_| fill.admit(3)).count(), 8);
+        assert!(!fill.admit(9));
+        // The first input always joins, however long.
+        let mut fill = Fill::new(&w, 1);
+        assert!(fill.admit(16));
+        assert!(!fill.admit(1));
     }
 
     #[test]
     fn results_return_to_original_positions() {
         let (mut job, mut rx) = job(3, &[2, 10, 3]);
-        let first = job.take_matching(&BUCKETS, 4, RUN_INPUTS);
-        let second = job.take_matching(&BUCKETS, 16, RUN_INPUTS);
+        let w = widths(false);
+        let first = job.take_matching(&BUCKETS, 4, &mut Fill::new(&w, UNBOUNDED));
+        let second = job.take_matching(&BUCKETS, 16, &mut Fill::new(&w, UNBOUNDED));
         assert_eq!(indices(&first), [0, 2]);
         assert_eq!(indices(&second), [1]);
         assert!(job.remaining.is_empty() && !job.is_done());
@@ -1056,17 +1144,18 @@ mod tests {
     fn a_run_gathers_single_input_requests() {
         let mut pending = Vec::new();
         let mut replies = Vec::new();
-        for id in 0..(RUN_INPUTS + 8) as u64 {
+        for id in 0..(ROOM + 8) as u64 {
             let (job, rx) = numbered(id, 3, &[2]);
             pending.push(job);
             replies.push(rx);
         }
-        let first = assemble_run(&mut pending, &BUCKETS).expect("work");
-        assert_eq!(first.batch.len(), RUN_INPUTS);
-        assert_eq!(first.parts.len(), RUN_INPUTS);
-        let second = assemble_run(&mut pending, &BUCKETS).expect("work");
+        let w = widths(false);
+        let first = assemble_run(&mut pending, &BUCKETS, &w, ROOM * 4).expect("work");
+        assert_eq!(first.batch.len(), ROOM);
+        assert_eq!(first.parts.len(), ROOM);
+        let second = assemble_run(&mut pending, &BUCKETS, &w, ROOM * 4).expect("work");
         assert_eq!(second.batch.len(), 8);
-        assert!(assemble_run(&mut pending, &BUCKETS).is_none());
+        assert!(assemble_run(&mut pending, &BUCKETS, &w, ROOM * 4).is_none());
     }
 
     #[test]
@@ -1079,7 +1168,7 @@ mod tests {
         // The query leads (bucket 16); the bucket-16 input of the other
         // urgency-0 request joins, the bucket-4 input and the bulk job
         // do not.
-        let run = assemble_run(&mut pending, &BUCKETS).expect("work");
+        let run = assemble_run(&mut pending, &BUCKETS, &widths(false), UNBOUNDED).expect("work");
         let mut parts = run.parts.clone();
         parts.sort_unstable();
         assert_eq!(parts, [(0, 0), (1, 1)]);
@@ -1092,7 +1181,7 @@ mod tests {
         let (b, mut rx_b) = numbered(1, 3, &[2]);
         let (c, mut rx_c) = numbered(2, 3, &[2, 12]);
         let mut pending = vec![a, b, c];
-        let run = assemble_run(&mut pending, &BUCKETS).expect("work");
+        let run = assemble_run(&mut pending, &BUCKETS, &widths(false), UNBOUNDED).expect("work");
         let (fatal, mut fatal_rx) = mpsc::channel(1);
         let keep_going = absorb(
             Msg::Done {
@@ -1120,7 +1209,7 @@ mod tests {
         let (a, mut rx_a) = numbered(0, 3, &[2]);
         let (b, mut rx_b) = numbered(1, 3, &[2, 12]);
         let mut pending = vec![a, b];
-        let run = assemble_run(&mut pending, &BUCKETS).expect("work");
+        let run = assemble_run(&mut pending, &BUCKETS, &widths(false), UNBOUNDED).expect("work");
         assert_eq!(run.parts, [(0, 0), (1, 0)]);
         let (fatal, _fatal_rx) = mpsc::channel(1);
         let mut idle = Vec::new();
@@ -1146,7 +1235,7 @@ mod tests {
     #[test]
     fn pick_prefers_urgency_then_age_and_skips_dispatched_jobs() {
         let (mut spent, _a) = job(0, &[2]);
-        spent.take_matching(&BUCKETS, 4, RUN_INPUTS);
+        spent.take_matching(&BUCKETS, 4, &mut Fill::new(&widths(false), UNBOUNDED));
         let (older, _b) = job(2, &[2]);
         let (mut newer, _c) = job(2, &[2]);
         newer.queued = older.queued + Duration::from_millis(1);

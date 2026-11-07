@@ -26,9 +26,6 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Idle pooled connections are dropped after this long.
 const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// Idle pooled connections kept for the request bursts of an index pass.
-const POOL_MAX_IDLE: usize = 40;
-
 /// Where the embedding server listens.
 #[derive(Debug, Clone)]
 pub enum Endpoint {
@@ -117,8 +114,9 @@ impl RequestError for Error {
 }
 
 /// A reqwest client of the embedding server, built for the daemon's
-/// request bursts: HTTP/1.1 only, no proxy, a pool sized to the
-/// scheduler's in-flight window, a connect deadline and no total timeout.
+/// request bursts: HTTP/1.1 only, no proxy, a pool that keeps a
+/// connection per in-flight request until it idles out, a connect
+/// deadline and no total timeout.
 pub struct ServerClient {
     client: reqwest::Client,
     url: String,
@@ -138,7 +136,6 @@ impl ServerClient {
         let builder = reqwest::Client::builder()
             .http1_only()
             .no_proxy()
-            .pool_max_idle_per_host(POOL_MAX_IDLE)
             .pool_idle_timeout(POOL_IDLE_TIMEOUT)
             .connect_timeout(CONNECT_TIMEOUT);
         let (builder, url, token) = match endpoint {

@@ -584,6 +584,7 @@ fn status<B: Backend>(shared: Arc<Shared<B>>) -> Response<Full<Bytes>> {
         },
         ModelState::Ready(model) => ModelStatus::Ready {
             id: model.id.clone(),
+            window: crate::scheduler::WINDOW,
         },
         ModelState::Failed(message) => ModelStatus::Failed {
             message: message.clone(),

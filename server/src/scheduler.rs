@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use repo_search_core::UnitVector;
-use repo_search_core::embed_api::{ServerTiming, Urgency};
+use repo_search_core::embed_api::{ServerTiming, Urgency, Window};
 use repo_search_core::qos::{self, QosClass};
 use tokio::sync::{mpsc, oneshot, watch};
 use tracing::error;
@@ -29,6 +29,16 @@ const INBOX: usize = 64;
 
 /// The largest batch the GPU thread is handed.
 const GPU_BATCH: usize = 8;
+
+/// The indexing window this server wants. The ANE embeds one item at a
+/// time, so a few queued short items cover daemon stalls and
+/// forwarded-socket round trips; the GPU needs one running same-bucket
+/// batch, one full batch queued, and slack for a batch to form near
+/// bucket boundaries.
+pub const WINDOW: Window = Window {
+    short: 8,
+    long: 3 * GPU_BATCH as u32,
+};
 
 /// An embedding request, as the requester numbered it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
