@@ -17,7 +17,7 @@ _MANIFEST = Path(__file__).resolve().parents[2] / "manifest.json"
 _CHUNK = 1 << 20
 
 
-def _sha256(path: Path) -> str:
+def sha256_file(path: Path) -> str:
     h = hashlib.sha256()
     with path.open("rb") as f:
         for chunk in iter(lambda: f.read(_CHUNK), b""):
@@ -49,7 +49,7 @@ def fetch_weights(work_dir: Path) -> Path:
         if size != meta["size"]:
             raise RuntimeError(f"{name}: size {size} != manifest {meta['size']}")
         if "sha256" in meta:
-            digest = _sha256(path)
+            digest = sha256_file(path)
             if digest != meta["sha256"]:
                 raise RuntimeError(f"{name}: sha256 {digest} != manifest {meta['sha256']}")
         elif "git_blob_sha1" in meta:

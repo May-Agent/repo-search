@@ -4,7 +4,6 @@ Entries are sorted by name and stamped with fixed mtime/uid/gid/mode, so two run
 the same compiled model produce identical bytes.
 """
 
-import hashlib
 import io
 import json
 import tarfile
@@ -12,6 +11,7 @@ from pathlib import Path
 
 import zstandard
 
+from .fetch import sha256_file
 from .spec import (
     BUCKETS,
     DOCUMENT_FORMAT,
@@ -93,8 +93,15 @@ def build_archive(work_dir: Path, mlmodelc: Path, hf_dir: Path) -> Path:
     entries: list[tuple[str, object]] = _iter_mlmodelc(mlmodelc)
     entries += [(n, p) for n, p in static_files]
     entries += [(n, b) for n, b in static_bytes]
-    entries.sort(key=lambda e: e[0])
+    write_archive(out, entries)
+    return out
 
+
+def write_archive(out: Path, entries: list[tuple[str, object]]) -> str:
+    """Writes `entries` — (name, None for a directory | bytes | file path) —
+    sorted by name as a deterministic tar.zst at `out`, plus its `.sha256`
+    sidecar, and returns the archive's sha256."""
+    entries = sorted(entries, key=lambda e: e[0])
     with out.open("wb") as raw:
         with zstandard.ZstdCompressor().stream_writer(raw) as zstd:
             with tarfile.open(fileobj=zstd, mode="w|") as tar:
@@ -107,7 +114,7 @@ def build_archive(work_dir: Path, mlmodelc: Path, hf_dir: Path) -> Path:
                         with Path(payload).open("rb") as f:
                             tar.addfile(_info(name, Path(payload).stat().st_size), f)
 
-    digest = hashlib.sha256(out.read_bytes()).hexdigest()
+    digest = sha256_file(out)
     out.with_suffix(out.suffix + ".sha256").write_text(f"{digest}  {out.name}\n")
     print(f"wrote {out} sha256={digest}", flush=True)
-    return out
+    return digest
