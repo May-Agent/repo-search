@@ -21,17 +21,18 @@ pub const ARCHIVE: Pin<'static, Archive> = Pin {
 
 /// The published EmbeddingGemma 2 ONNX archive served off macOS:
 /// `manifest.json`, `tokenizer.json`, the fp16 graph and its weights,
-/// packed as `tar.zst` like the Core ML build. fp16 is the default on every
-/// execution provider: CUDA's tensor cores run it about three times faster
-/// than the int8 graph, and on a CPU it is no slower.
+/// packed as `tar.zst` like the Core ML build, as `repo-search-convert-onnx`
+/// builds it. fp16 is the default on every execution provider: CUDA's
+/// tensor cores run it about three times faster than the int8 graph, and on
+/// a CPU it is no slower.
 #[cfg(not(target_os = "macos"))]
 #[rustfmt::skip]
 pub const ONNX_ARCHIVE: Pin<'static, Archive> = Pin {
-    url: "https://huggingface.co/lexoliu/repo-search-embeddinggemma2-onnx/resolve/d4e1b374f97451cf89262d03f4f8e387822511d4/eg2-onnx-fp16-914f7f89-ac32bf70.tar.zst",
+    url: "https://huggingface.co/lexoliu/repo-search-embeddinggemma2-onnx/resolve/2984e5b2329ad4d0b9580821095c440090c88faf/eg2-onnx-fp16-914f7f89-715a4677.tar.zst",
     sha256: Sha256::from_hex(
-        "ac32bf7023a81cf0d58e5f487ecb8e46979898d966f606bc564c5dba8585b414",
+        "715a46779e5895affb7c71672778ff336d395c06c720db1b8c3f43b52c035a9c",
     ),
-    size: 444_342_448,
+    size: 444_377_768,
     kind: Archive,
 };
 
@@ -74,7 +75,7 @@ pub const MODEL_ID: &str = ARCHIVE_HEX.as_str();
 /// ML vectors never mix. The manifest a model directory ships declares
 /// this same id.
 #[cfg(not(target_os = "macos"))]
-pub const MODEL_ID: &str = "onnx-a49e227d7e0e5f4ee606d79879d084264366367bc6318f344ab179e35d4fd6a4";
+pub const MODEL_ID: &str = "onnx-730f8bdb5a3f42b2a02d3a2d23852e70c82c184d4bebcfa236c383069e25628b";
 
 /// The model build's identity of [`ONNX_INT8_ARCHIVE`], which its manifest
 /// declares: the int8 graph is a different build from [`MODEL_ID`]'s, so
