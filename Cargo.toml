@@ -9,7 +9,7 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/May-Agent/repo-search"
 
 [workspace.dependencies]
-repo-search-client = { path = "client", version = "0.0.8" }
+repo-search-client = { path = "client", version = "0.0.9" }
 repo-search-core = { path = "core", version = "0.0.10" }
 repo-search-coreml = { path = "coreml", version = "0.0.10" }
 repo-search-ort = { path = "ort", version = "0.0.9" }
@@ -26,7 +26,7 @@ clap ={ version = "4.6.7", default-features = false, features = [
 
 [package]
 name = "repo-search"
-version = "0.0.13"
+version = "0.0.14"
 description = "Search a repository for code you can describe but cannot name"
 edition.workspace = true
 rust-version.workspace = true

@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.14](https://github.com/May-Agent/repo-search/compare/v0.0.13...v0.0.14) - 2026-11-11
+
+### Fixed
+
+- start the embedding server from the spawn-on-demand launcher
+
+### Other
+
+- approve the release PR's held runs instead of dispatching CI
+- run in the merge queue and report the Linux jobs through CI result
+- release from main and retire the dev branch
+
 ## [0.0.13](https://github.com/May-Agent/repo-search/compare/v0.0.12...v0.0.13) - 2026-11-07
 
 ### Added
