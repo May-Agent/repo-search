@@ -38,10 +38,11 @@ jobs:
           command: release-pr
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      # A PR pushed with GITHUB_TOKEN triggers no pull_request workflows, so
-      # the required `CI result` runs through workflow_dispatch on the PR's head;
+      # GitHub holds the pull request runs of a pull request the Actions bot
+      # opened or pushed until they are approved, and the required
+      # `CI result` reports on the pull request only from those runs;
       # auto-merge lands it once that check is green.
-      - name: Run CI on the release PR and enable auto-merge
+      - name: Approve the release PR's CI and enable auto-merge
         if: steps.release-plz.outputs.prs_created == 'true'
         env:
           PR: ${{ steps.release-plz.outputs.pr }}
@@ -49,8 +50,7 @@ jobs:
         run: |
           set -euo pipefail
           number=$(jq -er '.number' <<<"$PR")
-          head=$(jq -er '.head_branch' <<<"$PR")
-          gh workflow run ci.yml --repo "$GITHUB_REPOSITORY" --ref "$head"
+          bash .github/scripts/approve-held-runs.sh "$number"
           gh pr merge "$number" --repo "$GITHUB_REPOSITORY" --auto --merge
 
   release:
