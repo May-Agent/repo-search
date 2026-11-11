@@ -12,7 +12,7 @@ on:
       - .github/workflows/linux.yml
   push:
     branches:
-      - dev
+      - main
     paths:
       - Cargo.toml
       - Cargo.lock

@@ -4,7 +4,7 @@ on:
   pull_request:
   push:
     branches:
-      - dev
+      - main
   workflow_dispatch:
 
 permissions:
@@ -56,3 +56,30 @@ jobs:
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: clippy each feature
         run: cargo hack clippy --locked --each-feature --all-targets --workspace -- -D warnings
+
+  release-gate:
+    # The model and corpus checks gate what reaches a release: they run on
+    # release-plz's branch (its pull request and the dispatched run), not on
+    # ordinary changes.
+    name: release gate
+    if: ${{ startsWith(github.head_ref || github.ref_name, 'release-plz-') }}
+    uses: ./.github/workflows/release-gate.yml
+
+  result:
+    # The required check on `main`: green when every job it needs succeeded
+    # or was skipped.
+    name: CI result
+    if: always()
+    needs: [rust, features, release-gate]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check job results
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          for result in $RESULTS; do
+            if [ "$result" = failure ] || [ "$result" = cancelled ]; then
+              echo "::error::a needed job ended $result"
+              exit 1
+            fi
+          done

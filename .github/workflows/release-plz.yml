@@ -3,7 +3,6 @@ name: release-plz
 on:
   push:
     branches:
-      - dev
       - main
 
 permissions:
@@ -15,8 +14,7 @@ concurrency:
 
 jobs:
   release-pr:
-    name: Update release PR against dev
-    if: github.ref == 'refs/heads/dev'
+    name: Update release PR against main
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -41,7 +39,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       # A PR pushed with GITHUB_TOKEN triggers no pull_request workflows, so
-      # the required check runs through workflow_dispatch on the PR's head;
+      # the required `CI result` runs through workflow_dispatch on the PR's head;
       # auto-merge lands it once that check is green.
       - name: Run CI on the release PR and enable auto-merge
         if: steps.release-plz.outputs.prs_created == 'true'
@@ -57,7 +55,6 @@ jobs:
 
   release:
     name: Tag releases and dispatch cargo-dist
-    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
