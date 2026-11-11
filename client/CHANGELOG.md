@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.9](https://github.com/May-Agent/repo-search/compare/client/v0.0.8...client/v0.0.9) - 2026-11-11
+
+### Fixed
+
+- start the embedding server from the spawn-on-demand launcher
+
 ## [0.0.8](https://github.com/May-Agent/repo-search/compare/client/v0.0.7...client/v0.0.8) - 2026-11-07
 
 ### Fixed
