@@ -2,6 +2,7 @@ name: ci
 
 on:
   pull_request:
+  merge_group:
   push:
     branches:
       - main
@@ -15,6 +16,55 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  changes:
+    # Path scope for the Linux jobs, which the workflow-level `paths` filter
+    # cannot express now that every job reports through `CI result`.
+    name: changed paths
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      linux: ${{ steps.scope.outputs.linux }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Detect changed paths
+        id: scope
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          MERGE_BASE: ${{ github.event.merge_group.base_sha }}
+          MERGE_HEAD: ${{ github.event.merge_group.head_sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PUSH_AFTER: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          case "$EVENT" in
+            pull_request) range="$PR_BASE...$PR_HEAD" ;;
+            merge_group) range="$MERGE_BASE..$MERGE_HEAD" ;;
+            push)
+              if [ "$PUSH_BEFORE" = 0000000000000000000000000000000000000000 ]; then
+                range=
+              else
+                range="$PUSH_BEFORE..$PUSH_AFTER"
+              fi
+              ;;
+            *) range= ;;
+          esac
+          if [ -z "$range" ]; then
+            echo "no diff range for $EVENT; running everything"
+            echo "linux=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git diff --name-only "$range" | tee changed.txt
+          if grep -qE '^(Cargo\.toml|Cargo\.lock|\.github/workflows/ci\.yml|(src|core|tests|templates)/.*)$' changed.txt; then
+            echo "linux=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "linux=false" >> "$GITHUB_OUTPUT"
+          fi
+
   rust:
     name: fmt, clippy, test
     runs-on: macos-15
@@ -57,10 +107,38 @@ jobs:
       - name: clippy each feature
         run: cargo hack clippy --locked --each-feature --all-targets --workspace -- -D warnings
 
+  linux:
+    name: clippy, test (${{ matrix.runner }})
+    needs: changes
+    if: ${{ needs.changes.outputs.linux == 'true' }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        runner:
+          - ubuntu-24.04
+          - ubuntu-24.04-arm
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: stable
+          components: clippy
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: clippy
+        run: |
+          cargo clippy --locked -p repo-search -p repo-search-core -p repo-search-client --all-targets -- -D warnings
+      - name: test
+        run: |
+          cargo test --locked -p repo-search -p repo-search-core -p repo-search-client
+
   release-gate:
     # The model and corpus checks gate what reaches a release: they run on
     # release-plz's branch (its pull request and the dispatched run), not on
-    # ordinary changes.
+    # ordinary changes or in merge queue runs.
     name: release gate
     if: ${{ startsWith(github.head_ref || github.ref_name, 'release-plz-') }}
     uses: ./.github/workflows/release-gate.yml
@@ -70,7 +148,7 @@ jobs:
     # or was skipped.
     name: CI result
     if: always()
-    needs: [rust, features, release-gate]
+    needs: [changes, rust, features, linux, release-gate]
     runs-on: ubuntu-latest
     steps:
       - name: Check job results
