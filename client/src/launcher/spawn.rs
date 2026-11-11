@@ -1,24 +1,28 @@
 //! Spawn-on-demand: the [`Launcher`] for a machine without launchd. A
 //! client that cannot reach the daemon takes `spawn.lock`,
 //! starts a detached `search --daemon --listen` and reads its readiness
-//! line off a pipe before it lets any other client spawn.
+//! line off a pipe before it lets any other client spawn. When the daemon
+//! targets the default `server.sock`, the same step first starts the
+//! embedding server (`search --server --socket`) the same way, so the
+//! socket always has a server behind it, as the server's LaunchAgent
+//! gives on macOS.
 //!
-//! Three files sit next to the daemon's socket, in the machine-local
-//! runtime dir:
+//! Three files per process sit next to its socket, in the machine-local
+//! runtime dir, named after the socket (`daemon.*` and `server.*`):
 //!
-//! - `daemon.lock`: the daemon's lifetime lock, held by the daemon until
-//!   its process exits (`Bound`); its
-//!   contents are the daemon's pid.
-//! - `spawn.lock`: the clients' spawn lock, held from the liveness probe
-//!   until the new daemon reported ready, so concurrent clients spawn
-//!   exactly one daemon. Every fd the client opens is `CLOEXEC`, so the
-//!   daemon never inherits it.
-//! - `daemon.cmd`: the rendered [`DaemonCommand`] the running daemon was
+//! - `<name>.lock`: the process's lifetime lock, held until it exits
+//!   (`Bound` for the daemon); its contents are the process's pid.
+//! - `spawn.lock`, one for both, the clients' spawn lock, held from the
+//!   liveness probe until the new process reported ready, so concurrent
+//!   clients spawn exactly one of each. Every fd the client opens is
+//!   `CLOEXEC`, so the process never inherits it.
+//! - `<name>.cmd`: the rendered [`SpawnCommand`] the running process was
 //!   started with, the counterpart of the launchd plist: a client whose
-//!   rendered command differs replaces the daemon.
+//!   rendered command differs replaces the process.
 //!
 //! The daemon's configuration is `daemon.toml` ([`DaemonConfig`]): where
-//! it reaches the embedding server.
+//! it reaches the embedding server. A server it names is the user's own;
+//! the launcher starts nothing for it.
 
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions, TryLockError};
@@ -35,7 +39,7 @@ use tokio::net::unix::pipe;
 use super::paths::{SocketPath, UserPaths};
 use super::{Launcher, Report, SOCKET_TIMEOUT, TEARDOWN_TIMEOUT};
 use crate::client::ClientError;
-use crate::protocol::ErrorKind;
+use crate::protocol::{BuildId, ErrorKind};
 
 /// How long a client waits for the spawned daemon's readiness line: the
 /// previous daemon's shutdown tail plus the new daemon's startup — the
@@ -229,26 +233,45 @@ impl DaemonConfig {
     }
 }
 
-/// The command a client starts the daemon with.
+/// The command a client starts the daemon or the server with.
 ///
 /// The token a TCP server needs never enters the command: only the file
 /// holding it does, so `daemon.cmd` and `ps` never show it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DaemonCommand {
+pub struct SpawnCommand {
     /// The executable.
     pub program: PathBuf,
     /// Its arguments.
     pub args: Vec<OsString>,
     /// Environment variables added to the client's own; not part of the
-    /// rendered command. A host that wraps the daemon — the tests
+    /// rendered command. A host that wraps the process — the tests
     /// re-execute their own binary — configures it here.
     pub env: Vec<(OsString, OsString)>,
 }
 
-impl DaemonCommand {
+impl SpawnCommand {
+    /// `program --server --socket <listen> --ready-fd 3 --build <build>`:
+    /// the embedding server, which refuses to run as any other build, so
+    /// a rebuilt `program` renders another command and replaces it.
+    pub fn server(program: PathBuf, listen: &Path, build: &BuildId) -> Self {
+        Self {
+            program,
+            args: vec![
+                "--server".into(),
+                "--socket".into(),
+                listen.into(),
+                "--ready-fd".into(),
+                READY_FD.to_string().into(),
+                "--build".into(),
+                build.to_string().into(),
+            ],
+            env: Vec::new(),
+        }
+    }
+
     /// `program --daemon --listen <listen> --ready-fd 3` followed by the
     /// server flags `server` renders to.
-    pub fn new(program: PathBuf, listen: &Path, server: &ServerTarget) -> Self {
+    pub fn daemon(program: PathBuf, listen: &Path, server: &ServerTarget) -> Self {
         let mut args: Vec<OsString> = vec![
             "--daemon".into(),
             "--listen".into(),
@@ -291,87 +314,72 @@ impl DaemonCommand {
 #[derive(Debug, thiserror::Error)]
 enum SpawnError {
     #[error("cannot {what}: {source}")]
-    Io {
-        what: &'static str,
-        source: io::Error,
+    Io { what: String, source: io::Error },
+    #[error("the {unit}.lock names no pid to replace: {text:?}")]
+    Pid { unit: &'static str, text: String },
+    #[error("the {unit} failed to start: {message}; see {log}")]
+    Failed {
+        unit: &'static str,
+        message: String,
+        log: String,
     },
-    #[error("the daemon.lock names no pid to replace: {0:?}")]
-    Pid(String),
-    #[error("the daemon failed to start: {message}; see {log}")]
-    Failed { message: String, log: String },
-    #[error("the daemon exited before it was ready; see {log}")]
-    Exited { log: String },
-    #[error("the daemon was not ready within {after:?}; see {log}")]
-    Timeout { after: Duration, log: String },
-    #[error("the daemon said {line:?} instead of ready; see {log}")]
-    Garbled { line: String, log: String },
+    #[error("the {unit} exited before it was ready; see {log}")]
+    Exited { unit: &'static str, log: String },
+    #[error("the {unit} was not ready within {after:?}; see {log}")]
+    Timeout {
+        unit: &'static str,
+        after: Duration,
+        log: String,
+    },
+    #[error("the {unit} said {line:?} instead of ready; see {log}")]
+    Garbled {
+        unit: &'static str,
+        line: String,
+        log: String,
+    },
 }
 
 impl SpawnError {
-    fn io(what: &'static str) -> impl FnOnce(io::Error) -> Self {
-        move |source| Self::Io { what, source }
+    fn io(what: impl Into<String>) -> impl FnOnce(io::Error) -> Self {
+        move |source| Self::Io {
+            what: what.into(),
+            source,
+        }
     }
 }
 
-/// Keeps a daemon reachable by spawning it when a connect fails.
-pub struct OnDemand {
-    command: DaemonCommand,
+/// One process the launcher keeps: the daemon or the embedding server,
+/// each bound to a socket whose name gives its lifetime lock and command
+/// record (`daemon.sock` → `daemon.lock`, `daemon.cmd`).
+struct Unit {
+    /// `daemon` or `server`, for messages.
+    name: &'static str,
+    command: SpawnCommand,
     socket: PathBuf,
     log: PathBuf,
 }
 
-impl OnDemand {
-    /// A launcher that starts `command` — which must bind `socket` — and
-    /// whose stderr goes to `log`. The lock files and `daemon.cmd` sit in
-    /// `socket`'s directory.
-    pub fn new(command: DaemonCommand, socket: PathBuf, log: PathBuf) -> Self {
-        Self {
-            command,
-            socket,
-            log,
-        }
-    }
-
-    /// The invoking user's launcher for the `search` at `program`: the
-    /// socket and locks in the runtime dir, the log in the logs dir, the
-    /// server from `daemon.toml` in the config dir.
-    ///
-    /// # Errors
-    ///
-    /// When the user's paths do not resolve, `daemon.toml` is invalid or
-    /// a socket path does not fit the platform's limit.
-    pub fn user(program: PathBuf) -> io::Result<Self> {
-        let paths = UserPaths::user()?;
-        let config =
-            DaemonConfig::load(&paths.config.join("daemon.toml")).map_err(io::Error::other)?;
-        let socket = SocketPath::new(paths.runtime.join("daemon.sock"))?.into_path_buf();
-        let server = config.server_or(paths.runtime.join("server.sock"));
-        if let ServerTarget::Socket(path) = &server {
-            SocketPath::new(path.clone())?;
-        }
-        Ok(Self::new(
-            DaemonCommand::new(program, &socket, &server),
-            socket,
-            paths.logs.join("daemon.log"),
-        ))
-    }
-
+impl Unit {
     /// A file next to the socket.
     fn sibling(&self, name: &str) -> PathBuf {
         self.socket.with_file_name(name)
     }
 
-    /// The daemon's lifetime lock, next to its socket as
-    /// `Bound` names it.
-    fn daemon_lock(&self) -> PathBuf {
+    /// The lifetime lock, next to the socket as `Bound` names it.
+    fn lock(&self) -> PathBuf {
         self.socket.with_extension("lock")
     }
 
-    /// Whether a daemon holds `daemon.lock`: a shared try-lock fails
-    /// only against the daemon's exclusive one, so concurrent probes
-    /// never mistake each other for a daemon.
+    /// The rendered command's record.
+    fn record(&self) -> PathBuf {
+        self.socket.with_extension("cmd")
+    }
+
+    /// Whether the process holds its lifetime lock: a shared try-lock
+    /// fails only against its exclusive one, so concurrent probes never
+    /// mistake each other for the process.
     async fn alive(&self) -> Result<bool, SpawnError> {
-        let path = self.daemon_lock();
+        let path = self.lock();
         tokio::task::spawn_blocking(move || {
             let lock = match File::open(&path) {
                 Ok(lock) => lock,
@@ -386,60 +394,52 @@ impl OnDemand {
         })
         .await
         .expect("the probe does not panic")
-        .map_err(SpawnError::io("probe daemon.lock"))
+        .map_err(SpawnError::io(format!("probe {}.lock", self.name)))
     }
 
-    /// Whether `daemon.cmd` records a command other than this launcher's.
-    /// A missing file records none.
+    /// Whether the command record holds a command other than this
+    /// launcher's. A missing file records none.
     async fn recorded_differs(&self) -> Result<bool, SpawnError> {
-        match tokio::fs::read_to_string(self.sibling("daemon.cmd")).await {
+        match tokio::fs::read_to_string(self.record()).await {
             Ok(recorded) => Ok(recorded != self.command.render()),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
-            Err(error) => Err(SpawnError::io("read daemon.cmd")(error)),
+            Err(error) => Err(SpawnError::io(format!("read {}.cmd", self.name))(error)),
         }
     }
 
-    /// The pid `daemon.lock` names, sent SIGTERM.
+    /// Whether the live process was started with another command: the
+    /// one a launcher step replaces.
+    async fn stale(&self) -> Result<bool, SpawnError> {
+        if self.recorded_differs().await? {
+            self.alive().await
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// The pid the lifetime lock names, sent SIGTERM.
     async fn terminate(&self) -> Result<(), SpawnError> {
-        let text = tokio::fs::read_to_string(self.daemon_lock())
+        let text = tokio::fs::read_to_string(self.lock())
             .await
-            .map_err(SpawnError::io("read daemon.lock"))?;
-        let pid: libc::pid_t = text
-            .trim()
-            .parse()
-            .map_err(|_| SpawnError::Pid(text.clone()))?;
+            .map_err(SpawnError::io(format!("read {}.lock", self.name)))?;
+        let pid: libc::pid_t = text.trim().parse().map_err(|_| SpawnError::Pid {
+            unit: self.name,
+            text: text.clone(),
+        })?;
         // SAFETY: `kill` takes plain integers.
         let rc = unsafe { libc::kill(pid, libc::SIGTERM) };
         if rc == -1 {
             let error = io::Error::last_os_error();
-            // The daemon exited between the probe and now.
+            // The process exited between the probe and now.
             if error.raw_os_error() != Some(libc::ESRCH) {
-                return Err(SpawnError::io("signal the daemon")(error));
+                return Err(SpawnError::io(format!("signal the {}", self.name))(error));
             }
         }
         Ok(())
     }
 
-    /// Takes `spawn.lock`, blocking off the executor until the holder
-    /// lets go.
-    async fn spawn_lock(&self) -> Result<File, SpawnError> {
-        let path = self.sibling("spawn.lock");
-        tokio::task::spawn_blocking(move || {
-            let lock = OpenOptions::new()
-                .create(true)
-                .truncate(false)
-                .write(true)
-                .open(path)?;
-            lock.lock()?;
-            Ok(lock)
-        })
-        .await
-        .expect("the lock wait does not panic")
-        .map_err(SpawnError::io("take spawn.lock"))
-    }
-
-    /// Starts the daemon detached, records its command and waits for its
-    /// readiness line.
+    /// Starts the process detached, records its command and waits for
+    /// its readiness line.
     async fn start(&self) -> Result<(), SpawnError> {
         let log_text = self.log.display().to_string();
         let (reader, writer) = std::io::pipe().map_err(SpawnError::io("create the ready pipe"))?;
@@ -448,7 +448,7 @@ impl OnDemand {
             .append(true)
             .open(&self.log)
             .await
-            .map_err(SpawnError::io("open the daemon log"))?
+            .map_err(SpawnError::io(format!("open the {} log", self.name)))?
             .into_std()
             .await;
         let mut command = tokio::process::Command::new(&self.command.program);
@@ -486,22 +486,22 @@ impl OnDemand {
         }
         let child = command
             .spawn()
-            .map_err(SpawnError::io("start the daemon"))?;
-        // Only the daemon holds the write end now, so its exit is EOF.
+            .map_err(SpawnError::io(format!("start the {}", self.name)))?;
+        // Only the process holds the write end now, so its exit is EOF.
         drop(command);
         drop(writer);
 
         // `spawn.lock` is held by the caller, so no other writer touches
         // the temp file; the rename keeps a reader from seeing half a
         // command.
-        let record = self.sibling("daemon.cmd");
-        let staging = self.sibling("daemon.cmd.tmp");
+        let write = || SpawnError::io(format!("write {}.cmd", self.name));
+        let staging = self.sibling(&format!("{}.cmd.tmp", self.name));
         tokio::fs::write(&staging, self.command.render())
             .await
-            .map_err(SpawnError::io("write daemon.cmd"))?;
-        tokio::fs::rename(&staging, &record)
+            .map_err(write())?;
+        tokio::fs::rename(&staging, self.record())
             .await
-            .map_err(SpawnError::io("write daemon.cmd"))?;
+            .map_err(write())?;
 
         let receiver = pipe::Receiver::from_owned_fd(OwnedFd::from(reader))
             .map_err(SpawnError::io("read the ready pipe"))?;
@@ -516,19 +516,25 @@ impl OnDemand {
         drop(child);
         match read {
             Err(_) => Err(SpawnError::Timeout {
+                unit: self.name,
                 after: READY_DEADLINE,
                 log: log_text,
             }),
             Ok(Err(error)) => Err(SpawnError::io("read the ready pipe")(error)),
-            Ok(Ok(0)) => Err(SpawnError::Exited { log: log_text }),
+            Ok(Ok(0)) => Err(SpawnError::Exited {
+                unit: self.name,
+                log: log_text,
+            }),
             Ok(Ok(_)) => match line.trim_end() {
                 "ready" => Ok(()),
                 other => match other.strip_prefix("failed: ") {
                     Some(message) => Err(SpawnError::Failed {
+                        unit: self.name,
                         message: message.to_owned(),
                         log: log_text,
                     }),
                     None => Err(SpawnError::Garbled {
+                        unit: self.name,
                         line: other.to_owned(),
                         log: log_text,
                     }),
@@ -537,23 +543,14 @@ impl OnDemand {
         }
     }
 
-    /// Makes a daemon reachable at the socket: under `spawn.lock`, a live
-    /// daemon with a socket needs nothing, otherwise one is started —
-    /// after signalling the live one when `replace` and the recorded
-    /// command still differs. `spawn.lock` is released only once the new
-    /// daemon is ready.
-    async fn bring_up(&self, replace: bool) -> Result<(), SpawnError> {
-        for dir in [self.socket.parent(), self.log.parent()]
-            .into_iter()
-            .flatten()
-        {
-            tokio::fs::create_dir_all(dir)
-                .await
-                .map_err(SpawnError::io("create the daemon's dirs"))?;
-        }
-        let _spawn_lock = self.spawn_lock().await?;
+    /// Makes the process reachable at its socket, the caller holding
+    /// `spawn.lock`: a live process with a socket needs nothing,
+    /// otherwise one is started — after signalling the live one when
+    /// `replace` and the recorded command still differs. Returns once the
+    /// new process is ready.
+    async fn ensure(&self, replace: bool) -> Result<(), SpawnError> {
         let alive = self.alive().await?;
-        // Another client may have replaced the daemon while this one
+        // Another client may have replaced the process while this one
         // waited for the lock.
         let replace = replace && alive && self.recorded_differs().await?;
         if alive && !replace && self.socket.exists() {
@@ -564,10 +561,142 @@ impl OnDemand {
         }
         self.start().await
     }
+}
+
+/// Keeps a daemon reachable by spawning it when a connect fails, and the
+/// default embedding server behind it.
+pub struct OnDemand {
+    daemon: Unit,
+    /// The server the launcher starts; `None` when `daemon.toml` names
+    /// one the user runs.
+    server: Option<Unit>,
+}
+
+impl OnDemand {
+    /// A launcher that starts `command` — which must bind `socket` — and
+    /// whose stderr goes to `log`. The lock files and `daemon.cmd` sit in
+    /// `socket`'s directory. It starts no server: [`OnDemand::with_server`]
+    /// adds one.
+    pub fn new(command: SpawnCommand, socket: PathBuf, log: PathBuf) -> Self {
+        Self {
+            daemon: Unit {
+                name: "daemon",
+                command,
+                socket,
+                log,
+            },
+            server: None,
+        }
+    }
+
+    /// The same launcher, which also starts `command` — which must bind
+    /// `socket` — as the embedding server the daemon targets, with its
+    /// stderr going to `log`. The server's lock and command record sit in
+    /// its socket's directory.
+    #[must_use]
+    pub fn with_server(mut self, command: SpawnCommand, socket: PathBuf, log: PathBuf) -> Self {
+        self.server = Some(Unit {
+            name: "server",
+            command,
+            socket,
+            log,
+        });
+        self
+    }
+
+    /// The invoking user's launcher for the `search` at `program`: the
+    /// socket and locks in the runtime dir, the log in the logs dir, the
+    /// server from `daemon.toml` in the config dir. Only when that file
+    /// names no server is the default `server.sock` one the launcher
+    /// starts itself.
+    ///
+    /// # Errors
+    ///
+    /// When the user's paths do not resolve, `daemon.toml` is invalid, the
+    /// program's build cannot be identified or a socket path does not fit
+    /// the platform's limit.
+    pub fn user(program: PathBuf) -> io::Result<Self> {
+        let paths = UserPaths::user()?;
+        let config =
+            DaemonConfig::load(&paths.config.join("daemon.toml")).map_err(io::Error::other)?;
+        Self::in_paths(program, &paths, config)
+    }
+
+    /// [`OnDemand::user`] for the given `paths` and `config`.
+    fn in_paths(program: PathBuf, paths: &UserPaths, config: DaemonConfig) -> io::Result<Self> {
+        let socket = SocketPath::new(paths.runtime.join("daemon.sock"))?.into_path_buf();
+        let local = config.server.is_none();
+        let server = config.server_or(paths.runtime.join("server.sock"));
+        if let ServerTarget::Socket(path) = &server {
+            SocketPath::new(path.clone())?;
+        }
+        let launcher = Self::new(
+            SpawnCommand::daemon(program.clone(), &socket, &server),
+            socket,
+            paths.logs.join("daemon.log"),
+        );
+        match server {
+            ServerTarget::Socket(server_socket) if local => {
+                let build = BuildId::of_file(&program)?;
+                Ok(launcher.with_server(
+                    SpawnCommand::server(program, &server_socket, &build),
+                    server_socket,
+                    paths.logs.join("server.log"),
+                ))
+            }
+            _ => Ok(launcher),
+        }
+    }
+
+    /// Takes `spawn.lock`, blocking off the executor until the holder
+    /// lets go. It sits next to the daemon's socket and serializes both
+    /// processes' spawns.
+    async fn spawn_lock(&self) -> Result<File, SpawnError> {
+        let path = self.daemon.sibling("spawn.lock");
+        tokio::task::spawn_blocking(move || {
+            let lock = OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(path)?;
+            lock.lock()?;
+            Ok(lock)
+        })
+        .await
+        .expect("the lock wait does not panic")
+        .map_err(SpawnError::io("take spawn.lock"))
+    }
+
+    /// Makes the processes reachable, under `spawn.lock`, which is
+    /// released only once each started process is ready: the server
+    /// first — so the daemon never starts against a socket with nothing
+    /// behind it — replaced when it was started with another command,
+    /// then the daemon as `daemon` says.
+    async fn bring_up(&self, daemon: Step) -> Result<(), SpawnError> {
+        for unit in self.server.iter().chain([&self.daemon]) {
+            for dir in [unit.socket.parent(), unit.log.parent()]
+                .into_iter()
+                .flatten()
+            {
+                tokio::fs::create_dir_all(dir)
+                    .await
+                    .map_err(SpawnError::io(format!("create the {}'s dirs", unit.name)))?;
+            }
+        }
+        let _spawn_lock = self.spawn_lock().await?;
+        if let Some(server) = &self.server {
+            server.ensure(true).await?;
+        }
+        match daemon {
+            Step::Skip => Ok(()),
+            Step::Ensure => self.daemon.ensure(false).await,
+            Step::Replace => self.daemon.ensure(true).await,
+        }
+    }
 
     /// `bring_up` as a launcher step's report.
-    async fn report(&self, replace: bool) -> Report {
-        match self.bring_up(replace).await {
+    async fn report(&self, daemon: Step) -> Report {
+        match self.bring_up(daemon).await {
             Ok(()) => Report::default(),
             Err(error) => Report {
                 notes: Vec::new(),
@@ -575,29 +704,51 @@ impl OnDemand {
             },
         }
     }
+
+    /// Whether the server is missing, or alive but started with another
+    /// command.
+    async fn server_due(&self) -> Result<bool, SpawnError> {
+        let Some(server) = &self.server else {
+            return Ok(false);
+        };
+        Ok(!server.alive().await? || server.stale().await?)
+    }
+}
+
+/// What a launcher step does about the daemon.
+#[derive(Clone, Copy)]
+enum Step {
+    /// Leave it.
+    Skip,
+    /// Start it unless it is live.
+    Ensure,
+    /// Start it, replacing a live one whose command differs.
+    Replace,
 }
 
 impl Launcher for OnDemand {
     fn socket(&self) -> &Path {
-        &self.socket
+        &self.daemon.socket
     }
 
     fn log(&self) -> &Path {
-        &self.log
+        &self.daemon.log
     }
 
-    /// Reads `daemon.cmd`; only a daemon that is alive and was started
-    /// with another command is replaced. A warm search spawns nothing and
-    /// takes no lock.
+    /// Reads the command records: a live process started with another
+    /// command is replaced, and a server that is not running — it exits
+    /// when idle, while the daemon may outlive it — is started. A warm
+    /// search spawns nothing and takes no lock.
     async fn prepare(&mut self) -> Report {
-        let replace = match self.recorded_differs().await {
-            Ok(true) => self.alive().await,
-            Ok(false) => Ok(false),
-            Err(error) => Err(error),
-        };
-        match replace {
-            Ok(true) => self.report(true).await,
-            Ok(false) => Report::default(),
+        let due = async {
+            let replace_daemon = self.daemon.stale().await?;
+            Ok::<_, SpawnError>((replace_daemon, self.server_due().await?))
+        }
+        .await;
+        match due {
+            Ok((true, _)) => self.report(Step::Replace).await,
+            Ok((false, true)) => self.report(Step::Skip).await,
+            Ok((false, false)) => Report::default(),
             Err(error) => Report {
                 notes: Vec::new(),
                 error: Some(error.to_string()),
@@ -625,7 +776,7 @@ impl Launcher for OnDemand {
     }
 
     async fn recover(&mut self) -> Report {
-        self.report(false).await
+        self.report(Step::Ensure).await
     }
 }
 
@@ -730,7 +881,7 @@ mod tests {
     #[test]
     fn the_command_renders_the_daemon_flags_and_never_a_token() {
         let socket = Path::new("/run/daemon.sock");
-        let unix = DaemonCommand::new(
+        let unix = SpawnCommand::daemon(
             PathBuf::from("/bin/search"),
             socket,
             &ServerTarget::Socket(PathBuf::from("/run/server.sock")),
@@ -739,7 +890,7 @@ mod tests {
             unix.render(),
             "/bin/search\n--daemon\n--listen\n/run/daemon.sock\n--ready-fd\n3\n--server-socket\n/run/server.sock\n"
         );
-        let tcp = DaemonCommand::new(
+        let tcp = SpawnCommand::daemon(
             PathBuf::from("/bin/search"),
             socket,
             &ServerTarget::Tcp {
@@ -754,11 +905,36 @@ mod tests {
         assert_ne!(unix.render(), tcp.render());
     }
 
+    /// A rebuilt program renders another server command, so a client of
+    /// the new build replaces the old build's server.
+    #[test]
+    fn the_server_command_carries_the_build() {
+        let build = |ino| BuildId {
+            dev: 1,
+            ino,
+            size: 2,
+            mtime_ns: 3,
+        };
+        let command = |build: &BuildId| {
+            SpawnCommand::server(
+                PathBuf::from("/bin/search"),
+                Path::new("/run/server.sock"),
+                build,
+            )
+            .render()
+        };
+        assert_eq!(
+            command(&build(7)),
+            "/bin/search\n--server\n--socket\n/run/server.sock\n--ready-fd\n3\n--build\n7@3\n"
+        );
+        assert_ne!(command(&build(7)), command(&build(8)));
+    }
+
     /// Which connect failures a fresh daemon can cure.
     #[test]
     fn recoverable_connect_failures() {
         let launcher = OnDemand::new(
-            DaemonCommand::new(
+            SpawnCommand::daemon(
                 PathBuf::from("search"),
                 Path::new("/run/daemon.sock"),
                 &ServerTarget::Socket(PathBuf::from("/run/server.sock")),
@@ -789,6 +965,52 @@ mod tests {
             refused(ErrorKind::Model),
         ] {
             assert!(!launcher.recoverable(&fatal), "{fatal:?} is final");
+        }
+    }
+
+    /// The launcher for `daemon.toml`'s `text` under a fixed set of
+    /// paths.
+    fn user_launcher(text: &str) -> OnDemand {
+        let paths = UserPaths {
+            state: PathBuf::from("/s/state"),
+            runtime: PathBuf::from("/s/run"),
+            cache: PathBuf::from("/s/cache"),
+            logs: PathBuf::from("/s/logs"),
+            config: PathBuf::from("/s/config"),
+        };
+        let program = std::env::current_exe().expect("the test binary");
+        OnDemand::in_paths(program, &paths, parse(text).expect("the config parses"))
+            .expect("the launcher builds")
+    }
+
+    /// With no server named, the launcher starts the default one at
+    /// `server.sock`; the daemon targets the same socket.
+    #[test]
+    fn the_default_server_is_started_by_the_launcher() {
+        let launcher = user_launcher("");
+        let server = launcher.server.as_ref().expect("a server to start");
+        assert_eq!(server.socket, PathBuf::from("/s/run/server.sock"));
+        assert_eq!(server.log, PathBuf::from("/s/logs/server.log"));
+        assert!(
+            launcher
+                .daemon
+                .command
+                .args
+                .windows(2)
+                .any(|pair| pair[0] == "--server-socket" && pair[1] == "/s/run/server.sock"),
+            "the daemon targets the server the launcher starts"
+        );
+    }
+
+    /// A `daemon.toml` naming a server points at one the user runs.
+    #[test]
+    fn a_named_server_is_never_started() {
+        for text in [
+            "server_socket = \"/elsewhere/s.sock\"\n",
+            "server_addr = \"127.0.0.1:41827\"\n",
+            "server_addr = \"127.0.0.1:41827\"\ntoken_file = \"/t\"\n",
+        ] {
+            assert!(user_launcher(text).server.is_none(), "{text}");
         }
     }
 }

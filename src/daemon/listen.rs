@@ -76,6 +76,48 @@ pub struct Bound {
     lock: File,
 }
 
+/// Takes the lifetime lock next to `path` (`daemon.sock` →
+/// `daemon.lock`, `server.sock` → `server.lock`), writes this process's
+/// pid into it, then unlinks any stale socket and binds. When another
+/// process holds the lock the call blocks until it exits, so the new
+/// owner starts only once the old one's tail has run. The lock is held
+/// while the returned file stays open.
+///
+/// # Errors
+///
+/// When the lock file cannot be opened, locked or written, the stale
+/// socket cannot be removed, or the socket cannot be bound.
+pub fn acquire_blocking(path: &Path) -> io::Result<(std::os::unix::net::UnixListener, File)> {
+    let lock_path = path.with_extension("lock");
+    let mut lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)?;
+    match lock.try_lock() {
+        Ok(()) => {}
+        Err(TryLockError::WouldBlock) => {
+            // The previous owner is in its shutdown tail; the client's
+            // ready deadline is what the user sees, so the wait blocks.
+            let owner = path.file_stem().unwrap_or_default().to_string_lossy();
+            tracing::info!("waiting for the previous {owner} to exit");
+            lock.lock()?;
+        }
+        Err(TryLockError::Error(error)) => return Err(error),
+    }
+    lock.set_len(0)?;
+    lock.write_all(format!("{}\n", std::process::id()).as_bytes())?;
+    // Holding the lock proves nobody owns a stale socket file.
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    let listener = std::os::unix::net::UnixListener::bind(path)?;
+    Ok((listener, lock))
+}
+
 /// A [`Bound`]'s lifetime lock, held past `close`/`refuse`. [`run`]
 /// keeps it until the shutdown tail has finished and it returns; the
 /// production entry points drop it only by exiting, so the flock's
@@ -108,34 +150,7 @@ impl Bound {
     pub async fn acquire(path: impl AsRef<Path>) -> io::Result<Self> {
         let path = path.as_ref().to_path_buf();
         let (listener, lock, path) = tokio::task::spawn_blocking(move || {
-            // `daemon.sock`'s lock is `daemon.lock`, next to it.
-            let lock_path = path.with_extension("lock");
-            let mut lock = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .open(&lock_path)?;
-            match lock.try_lock() {
-                Ok(()) => {}
-                Err(TryLockError::WouldBlock) => {
-                    // The previous daemon is in its shutdown tail; the
-                    // client's ready deadline is what the user sees, so
-                    // the wait blocks.
-                    tracing::info!("waiting for the previous daemon to exit");
-                    lock.lock()?;
-                }
-                Err(TryLockError::Error(error)) => return Err(error),
-            }
-            lock.set_len(0)?;
-            lock.write_all(format!("{}\n", std::process::id()).as_bytes())?;
-            // Holding the lock proves nobody owns a stale socket file.
-            match std::fs::remove_file(&path) {
-                Ok(()) => {}
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error),
-            }
-            let listener = std::os::unix::net::UnixListener::bind(&path)?;
+            let (listener, lock) = acquire_blocking(&path)?;
             listener.set_nonblocking(true)?;
             Ok::<_, io::Error>((listener, lock, path))
         })
