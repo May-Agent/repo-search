@@ -60,7 +60,8 @@ fn main() -> ExitCode {
             model_dir,
             socket,
             addr,
-        } => ort_server_main(
+            ready_fd,
+        } => ort_server_main(OrtServer {
             idle_exit,
             token_file,
             build,
@@ -68,7 +69,8 @@ fn main() -> ExitCode {
             model_cache,
             socket,
             addr,
-        ),
+            ready_fd,
+        }),
         client => client_main(client),
     }
 }
@@ -447,6 +449,19 @@ fn checks(
     Ok((tokens, server, state, build))
 }
 
+/// The flags of `search --server` off macOS.
+#[cfg(not(target_os = "macos"))]
+struct OrtServer {
+    idle_exit: Option<Duration>,
+    token_file: Option<PathBuf>,
+    build: Option<String>,
+    model_dir: Option<PathBuf>,
+    model_cache: Option<PathBuf>,
+    socket: Option<PathBuf>,
+    addr: Vec<std::net::SocketAddr>,
+    ready_fd: Option<std::os::fd::RawFd>,
+}
+
 /// The daemon flags its startup checks read.
 struct DaemonArgs {
     /// `--build`, when given: the build the agent registered.
@@ -820,36 +835,42 @@ fn onnx_store() -> Result<repo_search::model_store::ModelStore, repo_search::mod
 /// listeners (a unix socket, plus optional TCP), the `--model-dir`
 /// model and the same idle exit. The `--build` check matches the launchd
 /// agent's: a mismatched registered build refuses to run.
+///
+/// Under the spawn launcher (`--ready-fd`) it reports `ready` once its
+/// listeners are bound — the model loads after, as a launchd-activated
+/// server's does behind its queued connections — and `failed: <message>`
+/// for every startup failure before that.
 #[cfg(not(target_os = "macos"))]
-fn ort_server_main(
-    idle_exit: Option<Duration>,
-    token_file: Option<PathBuf>,
-    build: Option<String>,
-    model_dir: Option<PathBuf>,
-    model_cache: Option<PathBuf>,
-    socket: Option<PathBuf>,
-    addr: Vec<std::net::SocketAddr>,
-) -> ExitCode {
+fn ort_server_main(args: OrtServer) -> ExitCode {
+    let OrtServer {
+        idle_exit,
+        token_file,
+        build,
+        model_dir,
+        model_cache,
+        socket,
+        addr,
+        ready_fd,
+    } = args;
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_max_level(tracing::Level::INFO)
         .init();
+    let fail = |message: String| {
+        tracing::error!("{message}");
+        fail_ready(ready_fd, &message)
+    };
     #[cfg(unix)]
     if let Some(expected) = &build {
         match repo_search_client::protocol::BuildId::of_current_exe() {
             Ok(actual) if actual.to_string() == *expected => {}
             Ok(actual) => {
-                let _ = std::io::stderr().write_all(
-                    format!("search: --build {expected} does not match this binary {actual}\n")
-                        .as_bytes(),
-                );
-                return ExitCode::from(2);
+                return fail(format!(
+                    "--build {expected} does not match this binary {actual}"
+                ));
             }
             Err(error) => {
-                let _ = std::io::stderr().write_all(
-                    format!("search: could not identify the running binary: {error}\n").as_bytes(),
-                );
-                return ExitCode::from(2);
+                return fail(format!("could not identify the running binary: {error}"));
             }
         }
     }
@@ -857,23 +878,17 @@ fn ort_server_main(
         Some(path) => match std::fs::read_to_string(path) {
             Ok(token) => Some(token.trim_end_matches(['\n', '\r']).to_owned()),
             Err(error) => {
-                let _ = std::io::stderr().write_all(
-                    format!(
-                        "search: could not read the token file {}: {error}\n",
-                        path.display()
-                    )
-                    .as_bytes(),
-                );
-                return ExitCode::from(2);
+                return fail(format!(
+                    "could not read the token file {}: {error}",
+                    path.display()
+                ));
             }
         },
         None => None,
     };
     // A non-loopback TCP listener without a token is open to the network.
     if token.is_none() && addr.iter().any(|addr| !addr.ip().is_loopback()) {
-        let _ =
-            std::io::stderr().write_all(b"search: a non-loopback --addr requires --token-file\n");
-        return ExitCode::from(2);
+        return fail("a non-loopback --addr requires --token-file".to_owned());
     }
 
     let runtime = match tokio::runtime::Builder::new_multi_thread()
@@ -882,104 +897,79 @@ fn ort_server_main(
         .build()
     {
         Ok(runtime) => runtime,
-        Err(error) => {
-            tracing::error!(%error, "could not build the tokio runtime");
-            return ExitCode::FAILURE;
-        }
+        Err(error) => return fail(format!("could not build the tokio runtime: {error}")),
     };
 
+    // The lifetime lock `server.lock` next to the socket proves its
+    // owner and makes a replacement wait out the previous server; it is
+    // held until this process exits.
     #[cfg(unix)]
-    let unix = {
-        use std::os::unix::net::UnixListener as StdUnixListener;
+    let (unix, _lifetime_lock) = {
         let path = match socket {
             Some(path) => path,
             None => match repo_search_client::launcher::paths::server_socket_path() {
                 Ok(path) => path.into_path_buf(),
                 Err(error) => {
-                    tracing::error!(%error, "could not resolve the server socket path");
-                    return ExitCode::FAILURE;
+                    return fail(format!("could not resolve the server socket path: {error}"));
                 }
             },
         };
         if let Some(parent) = path.parent()
             && let Err(error) = std::fs::create_dir_all(parent)
         {
-            tracing::error!(%error, "could not create {}", parent.display());
-            return ExitCode::FAILURE;
+            return fail(format!("could not create {}: {error}", parent.display()));
         }
-        // A stale socket file from a dead server is removed; a live one is
-        // left alone and the bind error is reported.
-        if path.exists() {
-            match std::os::unix::net::UnixStream::connect(&path) {
-                Ok(_) => {
-                    tracing::error!("a server already answers on {}", path.display());
-                    return ExitCode::FAILURE;
-                }
-                Err(_) => {
-                    if let Err(error) = std::fs::remove_file(&path) {
-                        tracing::error!(%error, "could not remove the stale {}", path.display());
-                        return ExitCode::FAILURE;
-                    }
-                }
-            }
-        }
-        let listener = match StdUnixListener::bind(&path) {
-            Ok(listener) => listener,
-            Err(error) => {
-                tracing::error!(%error, "could not bind {}", path.display());
-                return ExitCode::FAILURE;
-            }
+        let (listener, lock) = match repo_search::daemon::listen::acquire_blocking(&path) {
+            Ok(bound) => bound,
+            Err(error) => return fail(format!("could not bind {}: {error}", path.display())),
         };
         // The socket's file permissions are the unix listener's auth.
         use std::os::unix::fs::PermissionsExt as _;
         if let Err(error) = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
         {
-            tracing::error!(%error, "could not permission {}", path.display());
-            return ExitCode::FAILURE;
+            return fail(format!("could not permission {}: {error}", path.display()));
         }
-        listener
+        (listener, lock)
     };
 
     let mut tcp = Vec::new();
     for addr in addr {
-        let listener = match std::net::TcpListener::bind(addr) {
-            Ok(listener) => listener,
+        match std::net::TcpListener::bind(addr) {
+            Ok(listener) => tcp.push(listener),
             Err(error) => {
-                tracing::error!(%error, %addr, "could not bind the TCP listener");
-                return ExitCode::FAILURE;
+                return fail(format!("could not bind the TCP listener {addr}: {error}"));
             }
-        };
-        tcp.push(listener);
+        }
     }
 
     let _guard = runtime.enter();
     #[cfg(unix)]
     let unix = {
         if let Err(error) = unix.set_nonblocking(true) {
-            tracing::error!(%error, "could not set the unix listener nonblocking");
-            return ExitCode::FAILURE;
+            return fail(format!(
+                "could not set the unix listener nonblocking: {error}"
+            ));
         }
         match tokio::net::UnixListener::from_std(unix) {
             Ok(listener) => Some(listener),
-            Err(error) => {
-                tracing::error!(%error, "could not adopt the unix listener");
-                return ExitCode::FAILURE;
-            }
+            Err(error) => return fail(format!("could not adopt the unix listener: {error}")),
         }
     };
     let mut adopted = Vec::with_capacity(tcp.len());
     for listener in tcp {
         if let Err(error) = listener.set_nonblocking(true) {
-            tracing::error!(%error, "could not set a TCP listener nonblocking");
-            return ExitCode::FAILURE;
+            return fail(format!("could not set a TCP listener nonblocking: {error}"));
         }
         match tokio::net::TcpListener::from_std(listener) {
             Ok(listener) => adopted.push(listener),
-            Err(error) => {
-                tracing::error!(%error, "could not adopt a TCP listener");
-                return ExitCode::FAILURE;
-            }
+            Err(error) => return fail(format!("could not adopt a TCP listener: {error}")),
         }
+    }
+    // The listeners are bound: a connection made now queues until the
+    // model has loaded, so the client may go on.
+    if let Err(error) = report_ready(ready_fd, "ready\n") {
+        tracing::error!(%error, "could not report readiness");
+        return ExitCode::FAILURE;
     }
     let result = runtime.block_on(async {
         // `--model-dir` points at an unpacked model directory; without it

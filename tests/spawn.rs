@@ -25,7 +25,7 @@ use repo_search::daemon::listen::{Bound, LifetimeLock, Listener};
 use repo_search::daemon::server::Endpoint;
 use repo_search::daemon::{self, Config, StartupError};
 use repo_search_client::launcher::Launcher as _;
-use repo_search_client::launcher::spawn::{DaemonCommand, DaemonConfig, OnDemand, ServerTarget};
+use repo_search_client::launcher::spawn::{DaemonConfig, OnDemand, ServerTarget, SpawnCommand};
 use repo_search_client::protocol::{self, ErrorKind, Event, Final};
 use repo_search_core::StateDir;
 use repo_search_core::model::MODEL_ID;
@@ -259,7 +259,7 @@ impl World {
     /// `spawn_host`, configured by `self.host`.
     fn launcher(&self, target: &ServerTarget) -> OnDemand {
         let exe = std::env::current_exe().expect("the test binary");
-        let mut command = DaemonCommand::new(exe, &self.socket(), target);
+        let mut command = SpawnCommand::daemon(exe, &self.socket(), target);
         command.args.splice(
             0..0,
             [

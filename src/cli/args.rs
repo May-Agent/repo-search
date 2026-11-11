@@ -175,11 +175,12 @@ struct RawCli {
     )]
     listen: Option<PathBuf>,
 
-    /// The fd the daemon reports `ready` or `failed: <message>` on.
+    /// The fd the daemon or the server reports `ready` or
+    /// `failed: <message>` on.
     #[arg(
         long,
         hide = true,
-        requires = "daemon",
+        requires = "agent",
         conflicts_with = "query",
         value_name = "FD"
     )]
@@ -369,6 +370,8 @@ pub enum Invocation {
         /// Every `--addr`. The flag exists only off macOS, so this is
         /// always empty there.
         addr: Vec<SocketAddr>,
+        /// `--ready-fd`, when given.
+        ready_fd: Option<RawFd>,
     },
     /// `search --daemon`: the agent's entry point, socket-activated on
     /// macOS and self-bound under spawn on Linux.
@@ -438,6 +441,7 @@ impl Cli {
                 model_dir,
                 socket,
                 addr,
+                ready_fd: raw.ready_fd,
             };
         }
         if raw.daemon {
