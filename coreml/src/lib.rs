@@ -1,7 +1,7 @@
 //! Core ML token embedding for `repo-search` (Apple Silicon).
 //!
 //! A [`CoreMlEmbedder`] is the EmbeddingGemma 2 conversion's
-//! [`ondevice_coreml::Model`] — one function per bucket (`len_128`,
+//! [`ondevice_coreml::BucketModel`] — one function per bucket (`len_128`,
 //! `len_256`, `len_512`) sharing the weights of one `.mlmodelc` — plus what
 //! embedding means for it: token ids padded with `<pad>` and an attention
 //! mask of ones in, the `float16 [1, dim]` embedding normalized to a
@@ -10,7 +10,7 @@
 
 use std::path::Path;
 
-use ondevice_coreml::{DataType, Dim, Input, Manifest, Model, Prediction, Sequence, f16};
+use ondevice_coreml::{BucketModel, DataType, Dim, Input, Manifest, Prediction, Sequence, f16};
 use repo_search_core::UnitVector;
 use tokenizers::Tokenizer;
 
@@ -100,7 +100,7 @@ fn contract(manifest: &Manifest) -> Result<(String, usize), Error> {
 
 /// Embeds token ids through the compiled multifunction Core ML model.
 pub struct CoreMlEmbedder {
-    model: Model,
+    model: BucketModel,
     pad: i32,
     /// The single declared output's feature name.
     embedding: String,
@@ -171,7 +171,7 @@ impl CoreMlEmbedder {
             gpu_headroom()?;
         }
         let dir = dir.as_ref();
-        let model = Model::open(dir, units)?;
+        let model = BucketModel::open(dir, units)?;
         let (embedding, dim) = contract(model.manifest())?;
         let tokenizer = Tokenizer::from_file(dir.join("tokenizer.json"))?;
         if tokenizer.get_vocab_size(true) > i32::MAX as usize {
@@ -257,7 +257,7 @@ impl CoreMlEmbedder {
 
     /// The prediction's embedding, normalized.
     fn read(&self, prediction: &Prediction) -> Result<UnitVector, Error> {
-        let embedding = prediction.output::<f16>(&self.embedding)?;
+        let embedding = prediction.tensor::<f16>(&self.embedding)?.read();
         if embedding.data().len() != self.dim {
             return Err(Error::EmbeddingDim {
                 got: embedding.data().len(),

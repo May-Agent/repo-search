@@ -1726,8 +1726,7 @@ dependencies = [
 [[package]]
 name = "ondevice-coreml"
 version = "0.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8ec4af1d47db93f72f58d244b6a0a66d6c1a877db75219a510cd465e5f015bfd"
+source = "git+https://github.com/May-Agent/ondevice?branch=feat%2Fgeneral-coreml#115247e41431fa9432fa9de131812e048bc8528c"
 dependencies = [
  "block2",
  "half",
@@ -1739,7 +1738,6 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
- "tracing",
 ]
 
 [[package]]
