@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.15](https://github.com/May-Agent/repo-search/compare/v0.0.14...v0.0.15) - 2026-11-17
+
+### Fixed
+
+- *(launcher)* name the server alias by content and remove replaced builds' Core ML caches
+
+### Other
+
+- *(deps)* depend on ondevice-coreml 0.0.2 from crates.io
+- *(store)* rank with the built-in bm25() and drop the exact_bm25 statistics
+- *(deps)* upgrade every dependency to its latest release
+- *(coreml)* track merged ondevice runtime on dev
+- *(coreml)* migrate embedding to general inference runtime
+
 ## [0.0.14](https://github.com/May-Agent/repo-search/compare/v0.0.13...v0.0.14) - 2026-11-11
 
 ### Fixed
