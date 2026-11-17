@@ -14,8 +14,8 @@ repo-search-core = { path = "core", version = "0.0.10" }
 repo-search-coreml = { path = "coreml", version = "0.0.10" }
 repo-search-ort = { path = "ort", version = "0.0.9" }
 repo-search-server = { path = "server", version = "0.0.10" }
-ondevice = { version = "0.0.1", default-features = false }
-ondevice-coreml = { git = "https://github.com/May-Agent/ondevice", branch = "dev", default-features = false }
+ondevice = { version = "0.0.2", default-features = false }
+ondevice-coreml = { version = "0.0.2", default-features = false }
 clap ={ version = "4.6.8", default-features = false, features = [
     "std",
     "derive",
