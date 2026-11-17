@@ -4,7 +4,7 @@ members = ["client", "core", "coreml", "ort", "server"]
 
 [workspace.package]
 edition = "2024"
-rust-version = "1.90"
+rust-version = "1.95"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/May-Agent/repo-search"
 
@@ -16,7 +16,7 @@ repo-search-ort = { path = "ort", version = "0.0.9" }
 repo-search-server = { path = "server", version = "0.0.10" }
 ondevice = { version = "0.0.1", default-features = false }
 ondevice-coreml = { git = "https://github.com/May-Agent/ondevice", branch = "dev", default-features = false }
-clap ={ version = "4.6.7", default-features = false, features = [
+clap ={ version = "4.6.8", default-features = false, features = [
     "std",
     "derive",
     "help",
@@ -44,16 +44,16 @@ askama = { version = "0.16.1", default-features = false, features = [
     "derive",
     "std",
 ] }
-bytes = { version = "1.11.0", default-features = false }
+bytes = { version = "1.12.1", default-features = false }
 clap.workspace = true
-const_format = { version = "0.2.36", default-features = false }
+const_format = { version = "0.2.37", default-features = false }
 futures-util = { version = "0.3.34", default-features = false, features = [
     "sink",
     "std",
 ] }
 hex = { version = "0.4.3", default-features = false, features = ["alloc"] }
 libc = { version = "0.2.191", default-features = false, features = ["std"] }
-notify = { version = "8.2.0", default-features = false, features = [
+notify = { version = "8.2.2", default-features = false, features = [
     "macos_fsevent",
 ] }
 ondevice = { workspace = true, features = ["archive"] }
@@ -101,12 +101,12 @@ hyper-util = { version = "0.1.21", default-features = false, features = [
 tar = { version = "0.4.46", default-features = false }
 tempfile = { version = "3.27.0", default-features = false }
 tokio = { version = "1.54.1", default-features = false, features = ["test-util"] }
-zstd = { version = "0.14.3", default-features = false }
+zstd = { version = "0.14.4", default-features = false }
 
 [target.'cfg(target_os = "macos")'.dev-dependencies]
 repo-search-coreml.workspace = true
 repo-search-server = { workspace = true, features = ["stub"] }
-rusqlite = { version = "0.40.2", default-features = false }
+rusqlite = { version = "0.43.0", default-features = false }
 socket2 = { version = "0.6.5", default-features = false }
 
 [target.'cfg(target_os = "macos")'.dependencies]

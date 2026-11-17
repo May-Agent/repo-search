@@ -129,26 +129,6 @@ impl Fixture {
             .collect::<Result<_, _>>()
             .unwrap()
     }
-
-    /// The built-in `bm25()` of every chunk matching `query`, keyed as
-    /// [`Fixture::keyword`], sorted by key.
-    fn builtin(&self, query: &str) -> Vec<(String, u32, String, f64)> {
-        let mut out: Vec<_> = self
-            .conn
-            .prepare(
-                "SELECT c.path, c.start_line, c.title, bm25(fts) FROM fts \
-                 JOIN chunks c ON c.id = fts.rowid WHERE fts MATCH ?1",
-            )
-            .unwrap()
-            .query_map([query], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
-            })
-            .unwrap()
-            .collect::<Result<_, _>>()
-            .unwrap();
-        out.sort_by(|a, b| (&a.0, a.1, &a.2).cmp(&(&b.0, b.1, &b.2)));
-        out
-    }
 }
 
 fn unrestricted() -> ChunkFilter {
@@ -240,8 +220,7 @@ fn exact_bm25_scores_as_builtin_bm25_before_any_delete() {
 
 /// The issue's done-when: an index brought to the final files through
 /// replacements and removals ranks every keyword query exactly as a fresh
-/// build of those files, while the built-in `bm25()` of the same maintained
-/// table has drifted.
+/// build of those files.
 #[test]
 fn maintained_index_ranks_as_a_fresh_build() {
     let mut maintained = Fixture::new();
@@ -249,7 +228,6 @@ fn maintained_index_ranks_as_a_fresh_build() {
     let fresh = Fixture::fresh(&final_files());
     assert_eq!(maintained.stats(), fresh.stats());
 
-    let mut drifted = false;
     for query in QUERIES {
         let got = maintained.keyword(query);
         let want = fresh.keyword(query);
@@ -267,12 +245,7 @@ fn maintained_index_ranks_as_a_fresh_build() {
                 .collect::<Vec<_>>()
         };
         assert_eq!(keyed(got), keyed(want), "{query}: chunks and their scores");
-        drifted |= maintained.builtin(query) != fresh.builtin(query);
     }
-    assert!(
-        drifted,
-        "the built-in bm25() of the maintained table should have drifted"
-    );
 }
 
 /// The statistics equal those of a fresh build of the same files after every

@@ -32,32 +32,32 @@ seed = ["dep:reflink-copy"]
 
 [build-dependencies]
 sha2 = { version = "0.11.1", default-features = false }
-toml_edit = { version = "0.25.17", default-features = false, features = ["parse"] }
+toml_edit = { version = "0.25.19", default-features = false, features = ["parse"] }
 
 [dependencies]
 askama = { version = "0.16.1", default-features = false, features = ["derive", "std"] }
 base64 = { version = "0.23.1", default-features = false, features = ["std"] }
 blake3 = { version = "1.8.7", default-features = false }
-git2 = { version = "0.20.3", default-features = false }
-globset = { version = "0.4.20", default-features = false }
-ignore = { version = "0.4.33", default-features = false }
+git2 = { version = "0.21.0", default-features = false }
+globset = { version = "0.4.21", default-features = false }
+ignore = { version = "0.4.34", default-features = false }
 jsonc-parser = { version = "0.34.0", default-features = false }
-memmap2 = { version = "0.9.11", default-features = false }
-numkong = { version = "7.8.5", default-features = false }
+memmap2 = { version = "0.9.12", default-features = false }
+numkong = { version = "7.8.7", default-features = false }
 ondevice.workspace = true
-pulldown-cmark = { version = "0.13.5", default-features = false }
-reflink-copy = { version = "0.1.32", default-features = false, optional = true }
-rusqlite = { version = "0.40.2", default-features = false, features = ["bundled"] }
-saphyr-parser = { version = "0.2.2", default-features = false }
+pulldown-cmark = { version = "0.13.6", default-features = false }
+reflink-copy = { version = "0.1.33", default-features = false, optional = true }
+rusqlite = { version = "0.43.0", default-features = false, features = ["bundled"] }
+saphyr-parser = { version = "0.3.4", default-features = false }
 serde = { version = "1.0.229", default-features = false, features = ["derive", "std"] }
 serde_json = { version = "1.0.154", default-features = false, features = ["std"] }
-sfv = { version = "0.16.0", default-features = false, features = ["parsed-types"] }
-smallvec = { version = "1.16.3", default-features = false }
+sfv = { version = "0.16.1", default-features = false, features = ["parsed-types"] }
+smallvec = { version = "1.16.5", default-features = false }
 thiserror = { version = "2.0.21", default-features = false }
 tokio = { version = "1.54.1", default-features = false, features = ["macros", "sync"] }
-toml_edit = { version = "0.25.17", default-features = false, features = ["parse"] }
+toml_edit = { version = "0.25.19", default-features = false, features = ["parse"] }
 tracing = { version = "0.1.44", default-features = false, features = ["std"] }
-tree-sitter = { version = "=0.27.1", default-features = false }
+tree-sitter = { version = "=0.27.2", default-features = false }
 tree-sitter-c = { version = "=0.24.2", default-features = false, optional = true }
 tree-sitter-cpp = { version = "=0.23.4", default-features = false, optional = true }
 tree-sitter-go = { version = "=0.25.0", default-features = false, optional = true }
