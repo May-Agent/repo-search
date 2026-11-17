@@ -6,7 +6,6 @@
 
 mod index;
 mod query;
-mod rank;
 mod records;
 mod vectors;
 

@@ -155,7 +155,7 @@ pub(super) fn bm25(
         .collect())
 }
 
-/// [`bm25`] with each chunk's `exact_bm25` score: negative, lower is better.
+/// [`bm25`] with each chunk's built-in `bm25()` score: negative, lower is better.
 pub(super) fn bm25_scored(
     conn: &Connection,
     query: &str,
