@@ -2195,6 +2195,7 @@ name = "repo-search-client"
 version = "0.0.9"
 dependencies = [
  "askama",
+ "blake3",
  "etcetera",
  "futures-util",
  "kqueue",

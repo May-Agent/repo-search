@@ -23,8 +23,8 @@ use super::launchd::{
     LaunchAgent, ServerAgent, ServerConfig, domain, user_default_tcp, user_labels,
 };
 use super::paths::{
-    UserPaths, lock_path, log_path, plist_path, server_config_path, server_log_path,
-    server_socket_path, socket_path,
+    UserPaths, lock_path, log_path, plist_path, server_caches_dir, server_config_path,
+    server_log_path, server_socket_path, socket_path,
 };
 use super::{DAEMON_IDLE_EXIT, SERVER_IDLE_EXIT, SOCKET_TIMEOUT, TEARDOWN_TIMEOUT};
 use crate::protocol::BuildId;
@@ -135,7 +135,11 @@ impl AgentConfig {
     pub fn server(program: PathBuf) -> io::Result<Self> {
         let config = ServerConfig::load(&server_config_path()?, user_default_tcp()?)
             .map_err(io::Error::other)?;
-        let program = program_alias(&UserPaths::user()?.state.join("bin"), &program)?;
+        let program = program_alias(
+            &UserPaths::user()?.state.join("bin"),
+            &server_caches_dir()?,
+            &program,
+        )?;
         let (_, label) = user_labels()?;
         Ok(Self {
             domain: domain(),
@@ -166,33 +170,37 @@ impl AgentConfig {
 }
 
 /// The executable name the server agent runs under: `search-` plus a
-/// stable hex of the build's [`BuildId`]. Core ML's e5rt compile cache
+/// stable hex of the binary's content. Core ML's e5rt compile cache
 /// lives under `~/Library/Caches/<process name>`, so a per-build name
 /// gives every build its own compiled-bundles cache — a different
 /// `search` binary, another release or a dev build, can no longer evict
-/// this one's ANE bundles.
-fn server_program_name(build: &BuildId) -> String {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in build.to_string().bytes() {
-        hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    format!("search-{hash:016x}")
+/// this one's ANE bundles — and, being a function of the content alone,
+/// every copy of one build shares that cache wherever it is installed.
+fn server_program_name(program: &Path) -> io::Result<String> {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update_reader(std::fs::File::open(program)?)?;
+    // The first 8 bytes of the digest: the name must stay within the e5rt
+    // process-name budget.
+    let prefix = hasher.finalize().as_bytes()[..8]
+        .try_into()
+        .expect("8 bytes of a 32-byte digest");
+    Ok(format!("search-{:016x}", u64::from_be_bytes(prefix)))
 }
 
 /// The program the server agent execs: an alias for `program` under
-/// `bin_dir`, named by [`server_program_name`] of `program`'s build.
+/// `bin_dir`, named by [`server_program_name`] of `program`.
 /// The alias is a hard link so the alias and `program` share one
 /// [`BuildId`]; where hard links cannot cross filesystems the binary is
 /// copied and the `--build` identity is taken from the alias itself.
-/// Aliases of other builds are removed.
-fn program_alias(bin_dir: &Path, program: &Path) -> io::Result<PathBuf> {
+/// Aliases of other builds are removed, each with the Core ML compile
+/// cache `caches` holds under the alias's name.
+fn program_alias(bin_dir: &Path, caches: &Path, program: &Path) -> io::Result<PathBuf> {
     use std::os::unix::fs::MetadataExt;
 
     const EXDEV: i32 = 18;
 
     let build = BuildId::of_file(program)?;
-    let alias = bin_dir.join(server_program_name(&build));
+    let alias = bin_dir.join(server_program_name(program)?);
     std::fs::create_dir_all(bin_dir)?;
     let current = std::fs::metadata(&alias)
         .map(|meta| meta.dev() == build.dev && meta.ino() == build.ino)
@@ -215,6 +223,10 @@ fn program_alias(bin_dir: &Path, program: &Path) -> io::Result<PathBuf> {
         let entry = entry?;
         if entry.file_name() != name && entry.file_name().to_string_lossy().starts_with("search-") {
             std::fs::remove_file(entry.path())?;
+            match std::fs::remove_dir_all(caches.join(entry.file_name())) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                result => result?,
+            }
         }
     }
     Ok(alias)
@@ -625,15 +637,6 @@ mod tests {
 
     use super::*;
 
-    fn build_id(ino: u64, mtime_ns: i128) -> BuildId {
-        BuildId {
-            dev: 1,
-            ino,
-            size: 100,
-            mtime_ns,
-        }
-    }
-
     /// Captured from `launchctl print user/501/com.apple.trustd.agent`,
     /// trimmed; the nested `path` and `pid` are a socket block's.
     const SERVICE_PRINT: &str = "user/501/com.apple.trustd.agent = {
@@ -716,13 +719,66 @@ mod tests {
     }
 
     #[test]
-    fn the_server_program_name_is_a_stable_per_build_hex() {
-        let one = server_program_name(&build_id(7, 8));
-        assert_eq!(one, server_program_name(&build_id(7, 8)));
-        assert_ne!(one, server_program_name(&build_id(7, 9)));
-        assert_ne!(one, server_program_name(&build_id(8, 8)));
+    fn the_server_program_name_is_a_function_of_the_content() {
+        let tmp = tempfile::tempdir().expect("a tempdir");
+        let write = |name: &str, content: &[u8]| {
+            let path = tmp.path().join(name);
+            std::fs::write(&path, content).expect("the program writes");
+            path
+        };
+        let one = server_program_name(&write("one", b"build one")).expect("hashes");
+        assert_eq!(
+            one,
+            server_program_name(&write("copy", b"build one")).expect("hashes"),
+            "a copy of one binary at another path is one build"
+        );
+        assert_ne!(
+            one,
+            server_program_name(&write("two", b"build two")).expect("hashes"),
+            "another binary is another build"
+        );
         assert!(one.starts_with("search-"));
         assert!(one.len() <= 24, "{one} is longer than the e5rt name budget");
+    }
+
+    #[test]
+    fn replacing_an_alias_removes_the_replaced_builds_cache() {
+        let tmp = tempfile::tempdir().expect("a tempdir");
+        let bin_dir = tmp.path().join("bin");
+        let caches = tmp.path().join("Caches");
+        let program = tmp.path().join("search");
+        std::fs::write(&program, b"build one").expect("the program writes");
+        let cache_of = |alias: &Path| caches.join(alias.file_name().expect("a file name"));
+        let compile = |alias: &Path| {
+            let dir = cache_of(alias);
+            std::fs::create_dir_all(dir.join("e5rt")).expect("the cache creates");
+            std::fs::write(dir.join("e5rt/bundle"), b"compiled").expect("the cache fills");
+        };
+
+        let old = program_alias(&bin_dir, &caches, &program).expect("the alias links");
+        let unrelated = caches.join("repo-search");
+        std::fs::create_dir_all(&unrelated).expect("the unrelated cache creates");
+        program_alias(&bin_dir, &caches, &program).expect("a missing cache is no error");
+        compile(&old);
+
+        // The same content at a new path keeps the alias name and its cache.
+        let copy = tmp.path().join("search-copy");
+        std::fs::copy(&program, &copy).expect("the copy writes");
+        let same = program_alias(&bin_dir, &caches, &copy).expect("the copy links");
+        assert_eq!(same, old);
+        assert!(cache_of(&same).join("e5rt/bundle").exists());
+
+        let next = tmp.path().join("search-new");
+        std::fs::write(&next, b"build two").expect("the next build writes");
+        let current = program_alias(&bin_dir, &caches, &next).expect("the next alias links");
+        compile(&current);
+        assert!(!old.exists(), "the replaced alias is removed");
+        assert!(!cache_of(&old).exists(), "the replaced build's cache goes");
+        assert!(
+            cache_of(&current).exists(),
+            "the current build's cache stays"
+        );
+        assert!(unrelated.exists(), "a cache of no alias stays");
     }
 
     #[test]
@@ -732,10 +788,12 @@ mod tests {
         let program = tmp.path().join("search");
         std::fs::write(&program, b"build one").expect("the program writes");
 
-        let alias = program_alias(&bin_dir, &program).expect("the alias links");
+        let caches = tmp.path().join("Caches");
+
+        let alias = program_alias(&bin_dir, &caches, &program).expect("the alias links");
         assert_eq!(
             alias.file_name().and_then(|n| n.to_str()),
-            Some(server_program_name(&BuildId::of_file(&program).unwrap()).as_str())
+            Some(server_program_name(&program).unwrap().as_str())
         );
         assert_eq!(
             std::fs::metadata(&alias).unwrap().ino(),
@@ -743,13 +801,13 @@ mod tests {
             "the alias shares the program's inode"
         );
         assert_eq!(
-            program_alias(&bin_dir, &program).expect("the alias is idempotent"),
+            program_alias(&bin_dir, &caches, &program).expect("the alias is idempotent"),
             alias
         );
 
         let next = tmp.path().join("search-new");
         std::fs::write(&next, b"build two").expect("the next build writes");
-        let other = program_alias(&bin_dir, &next).expect("the next alias links");
+        let other = program_alias(&bin_dir, &caches, &next).expect("the next alias links");
         assert_ne!(other, alias);
         assert!(!alias.exists(), "the old build's alias is removed");
         assert_eq!(
@@ -763,7 +821,12 @@ mod tests {
         let tmp = tempfile::tempdir().expect("a tempdir");
         let program = tmp.path().join("search");
         std::fs::write(&program, b"a build").expect("the program writes");
-        let alias = program_alias(&tmp.path().join("bin"), &program).expect("links");
+        let alias = program_alias(
+            &tmp.path().join("bin"),
+            &tmp.path().join("Caches"),
+            &program,
+        )
+        .expect("links");
         let agent = ServerAgent {
             label: "test".to_owned(),
             build: BuildId::of_file(&alias).unwrap().to_string(),

@@ -13,6 +13,7 @@ repository.workspace = true
 # recover sequence.
 launcher = [
     "dep:askama",
+    "dep:blake3",
     "dep:libc",
     "dep:tempfile",
     "dep:toml_edit",
@@ -44,6 +45,7 @@ tokio-util = { version = "0.7.20", default-features = false, features = [
 ] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
+blake3 = { version = "1.8.7", optional = true, default-features = false, features = ["std"] }
 askama = { version = "0.16.1", optional = true, default-features = false, features = [
     "derive",
     "std",

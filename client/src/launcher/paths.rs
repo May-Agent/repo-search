@@ -133,6 +133,15 @@ pub(crate) fn login_home() -> io::Result<PathBuf> {
     Ok(PathBuf::from(dir))
 }
 
+/// The directory the embedding server's Core ML compile caches live in,
+/// `<login home>/Library/Caches`: Core ML writes `<process name>` there,
+/// and the server runs as a launchd agent whose plist sets no
+/// environment, so its home is the passwd home whatever `$HOME` is here.
+#[cfg(target_os = "macos")]
+pub(crate) fn server_caches_dir() -> io::Result<PathBuf> {
+    Ok(login_home()?.join("Library/Caches"))
+}
+
 /// A stable 64-bit FNV-1a hex of `home`'s bytes: the key that gives each
 /// home its own launchd labels and runtime dir.
 #[cfg(target_os = "macos")]
