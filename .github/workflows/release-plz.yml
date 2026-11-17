@@ -77,7 +77,9 @@ jobs:
           command: release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      - name: Dispatch cargo-dist release
+      # A tag pushed with GITHUB_TOKEN starts no workflow, so the release's
+      # binaries (cargo-dist) and its crates.io publish are dispatched on it.
+      - name: Dispatch the release build and publish
         env:
           RELEASES: ${{ steps.release-plz.outputs.releases }}
           GH_TOKEN: ${{ github.token }}
@@ -89,3 +91,4 @@ jobs:
             exit 0
           fi
           gh workflow run release.yml --repo "$GITHUB_REPOSITORY" --ref "$tag" -f tag="$tag"
+          gh workflow run publish.yml --repo "$GITHUB_REPOSITORY" --ref "$tag"
