@@ -1710,9 +1710,9 @@ checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
 name = "ondevice"
-version = "0.0.1"
+version = "0.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d2ed3c861324ab4e50ef077681c748a179f6b63ea9200f12b46848f175e1899d"
+checksum = "a0b790b115a1cbbb88a4ddb94f64f8fd3d9195cad5ff5c71296948152a2ce393"
 dependencies = [
  "async-fs",
  "async-io",
@@ -1729,8 +1729,9 @@ dependencies = [
 
 [[package]]
 name = "ondevice-coreml"
-version = "0.0.1"
-source = "git+https://github.com/May-Agent/ondevice?branch=dev#0528e485730afce91a800372928464750924d14b"
+version = "0.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "22bf2f97bc43f53a8aa7d3fbe0a8aa26552052ecffaac3cc09589aa2eef344d6"
 dependencies = [
  "block2",
  "half",
