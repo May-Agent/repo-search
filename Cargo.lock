@@ -2159,7 +2159,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "repo-search"
-version = "0.0.14"
+version = "0.0.15"
 dependencies = [
  "askama",
  "bytes",
@@ -2197,7 +2197,7 @@ dependencies = [
 
 [[package]]
 name = "repo-search-client"
-version = "0.0.9"
+version = "0.0.10"
 dependencies = [
  "askama",
  "blake3",
@@ -2216,7 +2216,7 @@ dependencies = [
 
 [[package]]
 name = "repo-search-core"
-version = "0.0.10"
+version = "0.0.11"
 dependencies = [
  "askama",
  "base64 0.23.1",
@@ -2258,7 +2258,7 @@ dependencies = [
 
 [[package]]
 name = "repo-search-coreml"
-version = "0.0.10"
+version = "0.0.11"
 dependencies = [
  "ondevice-coreml",
  "repo-search-core",
@@ -2270,7 +2270,7 @@ dependencies = [
 
 [[package]]
 name = "repo-search-ort"
-version = "0.0.9"
+version = "0.0.10"
 dependencies = [
  "constant_time_eq 0.6.1",
  "http-body-util",
@@ -2288,7 +2288,7 @@ dependencies = [
 
 [[package]]
 name = "repo-search-server"
-version = "0.0.10"
+version = "0.0.11"
 dependencies = [
  "constant_time_eq 0.6.1",
  "http-body-util",

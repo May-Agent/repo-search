@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.11](https://github.com/May-Agent/repo-search/compare/core/v0.0.10...core/v0.0.11) - 2026-11-17
+
+### Other
+
+- *(store)* rank with the built-in bm25() and drop the exact_bm25 statistics
+- *(deps)* upgrade every dependency to its latest release
+
 ## [0.0.10](https://github.com/May-Agent/repo-search/compare/core/v0.0.9...core/v0.0.10) - 2026-11-07
 
 ### Added

@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.10](https://github.com/May-Agent/repo-search/compare/ort/v0.0.9...ort/v0.0.10) - 2026-11-17
+
+### Other
+
+- *(deps)* upgrade every dependency to its latest release
+
 ## [0.0.9](https://github.com/May-Agent/repo-search/compare/ort/v0.0.8...ort/v0.0.9) - 2026-11-07
 
 ### Added
