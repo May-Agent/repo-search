@@ -11,7 +11,7 @@ repository.workspace = true
 # dependency is target-gated, so `ort` and the ONNX Runtime binaries are never
 # fetched or built there.
 [target.'cfg(not(target_os = "macos"))'.dependencies]
-constant_time_eq = { version = "0.4.2", default-features = false }
+constant_time_eq = { version = "0.6.1", default-features = false }
 http-body-util = { version = "0.1.5", default-features = false }
 hyper = { version = "1.12.0", default-features = false, features = [
     "http1",

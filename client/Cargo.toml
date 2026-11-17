@@ -28,7 +28,7 @@ launcher = [
 
 [dependencies]
 libc = { version = "0.2.191", optional = true, default-features = false, features = ["std"] }
-toml_edit = { version = "0.25.17", optional = true, default-features = false, features = ["parse"] }
+toml_edit = { version = "0.25.19", optional = true, default-features = false, features = ["parse"] }
 futures-util = { version = "0.3.34", default-features = false, features = [
     "sink",
     "std",
