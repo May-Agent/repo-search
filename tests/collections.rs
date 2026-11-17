@@ -109,35 +109,21 @@ fn embeds(d: &Daemon) -> usize {
         .count()
 }
 
-/// The keyword statistics and row counts of a collection's index, read
-/// straight from its database: `(bm25 rows, title tokens, body tokens,
-/// chunk rows, fts rows)`.
-fn keyword_statistics(state: &StateDir, collection: &str) -> (i64, i64, i64, i64, i64) {
+/// The row counts of a collection's index, read straight from its database:
+/// `(chunk rows, fts rows)`.
+fn keyword_rows(state: &StateDir, collection: &str) -> (i64, i64) {
     let conn = rusqlite::Connection::open_with_flags(
         state.collection_index(collection),
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
     )
     .expect("the collection's index opens");
-    let stats = conn
-        .query_row(
-            "SELECT rows, title_tokens, body_tokens FROM bm25_stats",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )
-        .expect("the statistics row");
     let count = |table: &str| -> i64 {
         conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
             row.get(0)
         })
         .expect("a count")
     };
-    (
-        stats.0,
-        stats.1,
-        stats.2,
-        count("chunks"),
-        count("fts_docsize"),
-    )
+    (count("chunks"), count("fts_docsize"))
 }
 
 fn corpus() -> Vec<Document> {
@@ -215,16 +201,16 @@ async fn an_unchanged_document_embeds_nothing_an_update_replaces_chunks_and_a_de
     let d = start().await;
     let first = upsert(&d, "support", corpus()).await;
     assert_eq!(embeds(&d), first.chunks_total as usize);
-    let (rows, _, _, chunk_rows, fts_rows) = keyword_statistics(&d.state, "support");
-    assert_eq!(rows as u64, first.chunks_total);
-    assert_eq!((chunk_rows, fts_rows), (rows, rows));
+    let (chunk_rows, fts_rows) = keyword_rows(&d.state, "support");
+    assert_eq!(chunk_rows as u64, first.chunks_total);
+    assert_eq!(fts_rows, chunk_rows);
 
     // The same documents again: nothing is chunked or embedded.
     let again = upsert(&d, "support", corpus()).await;
     assert_eq!((again.changed, again.unchanged, again.embedded), (0, 3, 0));
     assert_eq!(again.chunks_total, first.chunks_total);
     assert_eq!(embeds(&d), 0, "an unchanged upsert reaches the embedder");
-    assert_eq!(keyword_statistics(&d.state, "support").0, rows);
+    assert_eq!(keyword_rows(&d.state, "support").0, chunk_rows);
 
     // An update replaces the document's chunks and only those.
     let mut documents = corpus();
@@ -242,12 +228,11 @@ async fn an_unchanged_document_embeds_nothing_an_update_replaces_chunks_and_a_de
     assert!(!old.has_results, "the old text no longer matches");
     let new = ask(&d, "support", "receipt spreadsheet", WireMode::Lexical).await;
     assert_eq!(ids(&new), ["kb:invoices"]);
-    let (rows, _, _, chunk_rows, fts_rows) = keyword_statistics(&d.state, "support");
-    assert_eq!(rows as u64, updated.chunks_total);
-    assert_eq!((chunk_rows, fts_rows), (rows, rows));
+    let (chunk_rows, fts_rows) = keyword_rows(&d.state, "support");
+    assert_eq!(chunk_rows as u64, updated.chunks_total);
+    assert_eq!(fts_rows, chunk_rows);
 
-    // A deleted document no longer matches and leaves no keyword
-    // statistics.
+    // A deleted document no longer matches and leaves no keyword rows.
     let removed = delete(&d, "support", &["kb:password", "kb:missing"]).await;
     assert_eq!(
         (removed.changed, removed.unchanged, removed.embedded),
@@ -256,16 +241,16 @@ async fn an_unchanged_document_embeds_nothing_an_update_replaces_chunks_and_a_de
     assert_eq!(embeds(&d), 0);
     let gone = ask(&d, "support", "forgotten password reset", WireMode::Lexical).await;
     assert!(!gone.has_results);
-    let (rows, _, _, chunk_rows, fts_rows) = keyword_statistics(&d.state, "support");
-    assert_eq!(rows as u64, removed.chunks_total);
-    assert_eq!((chunk_rows, fts_rows), (rows, rows));
+    let (chunk_rows, fts_rows) = keyword_rows(&d.state, "support");
+    assert_eq!(chunk_rows as u64, removed.chunks_total);
+    assert_eq!(fts_rows, chunk_rows);
 
     let rest = delete(&d, "support", &["kb:invoices", "kb:storage"]).await;
     assert_eq!((rest.changed, rest.chunks_total), (2, 0));
     assert_eq!(
-        keyword_statistics(&d.state, "support"),
-        (0, 0, 0, 0, 0),
-        "an empty collection holds no keyword statistics"
+        keyword_rows(&d.state, "support"),
+        (0, 0),
+        "an empty collection holds no keyword rows"
     );
 }
 

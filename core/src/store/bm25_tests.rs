@@ -1,5 +1,6 @@
-//! `exact_bm25` and the BM25 statistics the index keeps for it, over the
-//! chunks of the crate's Rust fixtures.
+//! The built-in `bm25()` of an index maintained through the indexer's
+//! writes against a fresh build of the same rows, over the chunks of the
+//! crate's Rust fixtures.
 
 use std::collections::BTreeMap;
 
@@ -34,11 +35,6 @@ const QUERIES: &[&str] = &[
 const CHUNKER: &str = "fixture-chunker";
 const MODEL: &str = "fixture-model";
 
-/// The statistics arguments `exact_bm25` takes, as `bm25_head.sql` passes
-/// them.
-const STATS_ARGS: &str = "(SELECT rows FROM bm25_stats), (SELECT title_tokens FROM bm25_stats), \
-     (SELECT body_tokens FROM bm25_stats)";
-
 /// An index database in its own tempdir, opened as the actor opens it.
 struct Fixture {
     conn: Connection,
@@ -64,43 +60,6 @@ impl Fixture {
         apply(&mut self.conn, &changes).unwrap();
     }
 
-    /// The `bm25_stats` row: rows, title tokens, body tokens.
-    fn stats(&self) -> [i64; 3] {
-        self.conn
-            .query_row(
-                "SELECT rows, title_tokens, body_tokens FROM bm25_stats",
-                [],
-                |row| Ok([row.get(0)?, row.get(1)?, row.get(2)?]),
-            )
-            .unwrap()
-    }
-
-    /// The statistics counted independently of the store: the `fts` rows
-    /// and, per column, the token instances `fts5vocab` reads from the full-
-    /// text index. Exact only for a table that has never seen a delete.
-    fn vocab_stats(&self) -> [i64; 3] {
-        self.conn
-            .execute_batch(
-                "CREATE VIRTUAL TABLE IF NOT EXISTS temp.vocab USING fts5vocab(main, fts, 'col')",
-            )
-            .unwrap();
-        self.conn
-            .query_row(
-                "SELECT (SELECT count(*) FROM fts_docsize), \
-                 (SELECT total(cnt) FROM temp.vocab WHERE col = 'title'), \
-                 (SELECT total(cnt) FROM temp.vocab WHERE col = 'body')",
-                [],
-                |row| {
-                    Ok([
-                        row.get(0)?,
-                        row.get::<_, f64>(1)? as i64,
-                        row.get::<_, f64>(2)? as i64,
-                    ])
-                },
-            )
-            .unwrap()
-    }
-
     /// Every chunk matching `query`, in the production keyword order, as
     /// `(path, first line, title, score)`.
     fn keyword(&self, query: &str) -> Vec<(String, u32, String, f64)> {
@@ -112,22 +71,6 @@ impl Fixture {
             .zip(scored)
             .map(|(row, (_, score))| (row.path, *row.lines.start(), row.title, score))
             .collect()
-    }
-
-    /// `(rowid, built-in bm25, exact_bm25)` of every row matching `query`,
-    /// with `weights` appended to both calls.
-    fn both_scores(&self, query: &str, weights: &str) -> Vec<(i64, f64, f64)> {
-        let sql = format!(
-            "SELECT rowid, bm25(fts{weights}), exact_bm25(fts, {STATS_ARGS}{weights}) \
-             FROM fts WHERE fts MATCH ?1 ORDER BY rowid"
-        );
-        self.conn
-            .prepare(&sql)
-            .unwrap()
-            .query_map([query], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
-            .unwrap()
-            .collect::<Result<_, _>>()
-            .unwrap()
     }
 }
 
@@ -197,36 +140,14 @@ fn edit_to_final(fx: &mut Fixture) {
     ]);
 }
 
-/// On a table that has never seen a delete, `exact_bm25` over the stored
-/// statistics scores every row as the built-in `bm25()` does, with and
-/// without column weights: the formula is SQLite's.
-#[test]
-fn exact_bm25_scores_as_builtin_bm25_before_any_delete() {
-    let fx = Fixture::fresh(&final_files());
-    assert_eq!(fx.stats(), fx.vocab_stats());
-    for query in QUERIES {
-        for weights in ["", ", 1.0", ", 2.5, 0.5", ", 0.0, 3.0"] {
-            let rows = fx.both_scores(query, weights);
-            assert!(!rows.is_empty(), "{query} matches nothing");
-            for (rowid, builtin, exact) in rows {
-                assert!(
-                    (builtin - exact).abs() <= 1e-12 * builtin.abs().max(1.0),
-                    "{query}{weights}: row {rowid} built-in {builtin} exact {exact}"
-                );
-            }
-        }
-    }
-}
-
-/// The issue's done-when: an index brought to the final files through
-/// replacements and removals ranks every keyword query exactly as a fresh
-/// build of those files.
+/// An index brought to the final files through replacements and removals
+/// ranks every keyword query, through the production query, exactly as a
+/// fresh build of those files.
 #[test]
 fn maintained_index_ranks_as_a_fresh_build() {
     let mut maintained = Fixture::new();
     edit_to_final(&mut maintained);
     let fresh = Fixture::fresh(&final_files());
-    assert_eq!(maintained.stats(), fresh.stats());
 
     for query in QUERIES {
         let got = maintained.keyword(query);
@@ -248,15 +169,86 @@ fn maintained_index_ranks_as_a_fresh_build() {
     }
 }
 
-/// The statistics equal those of a fresh build of the same files after every
-/// write path: insert, replace, remove, unchunkable, and the chunker
-/// realign's `delete-all` followed by a full re-index.
+/// A chunk's identity independent of its rowid: path, first line, title.
+type ChunkKey = (String, u32, String);
+
+/// Every chunk matching `query` with the built-in `bm25(fts{weights})` score,
+/// read straight from `fts`, in rank order.
+fn builtin_ranking(fx: &Fixture, query: &str, weights: &str) -> Vec<(ChunkKey, f64)> {
+    let sql = format!(
+        "SELECT c.path, c.start_line, c.title, bm25(fts{weights}) AS score \
+         FROM fts JOIN chunks c ON c.id = fts.rowid WHERE fts MATCH ?1 \
+         ORDER BY score, c.path, c.start_line, c.title"
+    );
+    fx.conn
+        .prepare(&sql)
+        .unwrap()
+        .query_map([query], |row| {
+            Ok(((row.get(0)?, row.get(1)?, row.get(2)?), row.get(3)?))
+        })
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+}
+
+/// The built-in `bm25()` of `maintained` ranks every query as that of `fresh`:
+/// the same chunks, each with a score equal within f64 tolerance, in an order
+/// whose score sequence is equal within the same tolerance.
+fn assert_ranks_alike(maintained: &Fixture, fresh: &Fixture, step: &str) {
+    let close = |a: f64, b: f64| (a - b).abs() <= 1e-9 * a.abs().max(b.abs()).max(1.0);
+    for query in QUERIES {
+        for weights in ["", ", 1.0", ", 2.5, 0.5", ", 0.0, 3.0"] {
+            let got = builtin_ranking(maintained, query, weights);
+            let want = builtin_ranking(fresh, query, weights);
+            assert_eq!(got.len(), want.len(), "{step}: {query}{weights}: matches");
+            for ((_, g), (_, w)) in got.iter().zip(&want) {
+                assert!(
+                    close(*g, *w),
+                    "{step}: {query}{weights}: rank-order score {g} vs {w}"
+                );
+            }
+            let keyed = |rows: Vec<(ChunkKey, f64)>| -> BTreeMap<ChunkKey, f64> {
+                rows.into_iter().collect()
+            };
+            let (got, want) = (keyed(got), keyed(want));
+            assert_eq!(
+                got.keys().collect::<Vec<_>>(),
+                want.keys().collect::<Vec<_>>(),
+                "{step}: {query}{weights}: matching chunks"
+            );
+            for (key, g) in &got {
+                assert!(
+                    close(*g, want[key]),
+                    "{step}: {query}{weights}: {key:?} scores {g} vs {}",
+                    want[key]
+                );
+            }
+        }
+    }
+}
+
+/// On the bundled SQLite, an index maintained through the indexer's writes
+/// ranks with the built-in `bm25()` as a fresh build of its final rows.
 #[test]
-fn stats_stay_exact_through_every_fts_write() {
+fn builtin_bm25_of_a_maintained_index_ranks_as_a_fresh_build() {
+    let mut maintained = Fixture::new();
+    edit_to_final(&mut maintained);
+    let fresh = Fixture::fresh(&final_files());
+    for query in QUERIES {
+        assert!(
+            !builtin_ranking(&fresh, query, "").is_empty(),
+            "{query} matches nothing"
+        );
+    }
+    assert_ranks_alike(&maintained, &fresh, "final");
+}
+
+/// The same after every write path: insert, replace, remove, unchunkable, and
+/// the chunker realign's `delete-all` followed by a full re-index.
+#[test]
+fn builtin_bm25_ranks_as_a_fresh_build_after_every_fts_write() {
     let check = |fx: &Fixture, files: &BTreeMap<&str, &str>, step: &str| {
-        let fresh = Fixture::fresh(files);
-        assert_eq!(fresh.stats(), fresh.vocab_stats(), "{step}: fresh build");
-        assert_eq!(fx.stats(), fresh.stats(), "{step}");
+        assert_ranks_alike(fx, &Fixture::fresh(files), step);
     };
     let mut fx = Fixture::new();
     let mut files = BTreeMap::new();
@@ -301,18 +293,4 @@ fn stats_stay_exact_through_every_fts_write() {
             .collect(),
     );
     check(&fx, &final_files(), "re-index after realign");
-}
-
-/// The SQLite varint decoder reads the one- to nine-byte forms.
-#[test]
-fn sqlite_varints_decode() {
-    use super::sqlite_varint;
-    assert_eq!(sqlite_varint(&[0x00]), Some((0, 1)));
-    assert_eq!(sqlite_varint(&[0x7f, 0xff]), Some((127, 1)));
-    assert_eq!(sqlite_varint(&[0x81, 0x00]), Some((128, 2)));
-    assert_eq!(sqlite_varint(&[0xff, 0x7f]), Some((16_383, 2)));
-    assert_eq!(sqlite_varint(&[0x81, 0x80, 0x00]), Some((16_384, 3)));
-    assert_eq!(sqlite_varint(&[0xff; 9]), Some((u64::MAX, 9)));
-    assert_eq!(sqlite_varint(&[0x81]), None);
-    assert_eq!(sqlite_varint(&[]), None);
 }
